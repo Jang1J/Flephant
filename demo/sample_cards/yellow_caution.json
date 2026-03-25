@@ -1,0 +1,123 @@
+{
+  "scenario": "yellow_caution",
+  "title": "🟡 경계 시장 — 비중 50% 축소 적용",
+  "description": "VIX 상승 중. 신규 매수 비중을 50%로 축소.",
+  "regime": {
+    "label": "yellow",
+    "vix_proxy": 24.5,
+    "market_breadth": 0.38,
+    "regime_reason": "VIX proxy=24.5 → yellow; Market breadth=0.38 → yellow"
+  },
+  "strategy_cards": [
+    {
+      "ticker": "000660",
+      "name": "SK하이닉스",
+      "signal": "strong_buy",
+      "confidence": 0.91,
+      "pre_risk_score": 0.8,
+      "news_signal": 0.7,
+      "rationale": "HBM3E 양산 기대감 + 엔비디아 수주"
+    },
+    {
+      "ticker": "035420",
+      "name": "NAVER",
+      "signal": "buy",
+      "confidence": 0.68,
+      "pre_risk_score": 0.35,
+      "news_signal": 0.25,
+      "rationale": "AI 검색 도입 + 광고 매출 회복"
+    },
+    {
+      "ticker": "009150",
+      "name": "삼성전기",
+      "signal": "buy",
+      "confidence": 0.55,
+      "pre_risk_score": 0.2,
+      "news_signal": 0.1,
+      "rationale": "MLCC 수요 회복 기대"
+    }
+  ],
+  "risk_card": {
+    "tier1_pass": true,
+    "position_risks": [
+      {
+        "ticker": "000660",
+        "risk_flag": "pass",
+        "approved_weight": 10.0,
+        "reason": "yellow regime: 비중 50% 축소 (20→10%)"
+      },
+      {
+        "ticker": "035420",
+        "risk_flag": "pass",
+        "approved_weight": 10.0,
+        "reason": "yellow regime: 비중 50% 축소 (20→10%)"
+      },
+      {
+        "ticker": "009150",
+        "risk_flag": "reject",
+        "approved_weight": 0,
+        "reason": "confidence 0.55 → yellow regime에서 min_confidence 미달"
+      }
+    ]
+  },
+  "candidate_order_plan": {
+    "orders": [
+      {
+        "ticker": "000660",
+        "name": "SK하이닉스",
+        "action": "buy",
+        "weight": 10.0,
+        "confidence": 0.91
+      },
+      {
+        "ticker": "035420",
+        "name": "NAVER",
+        "action": "buy",
+        "weight": 10.0,
+        "confidence": 0.68
+      }
+    ],
+    "portfolio_summary": {
+      "total_exposure": 20.0,
+      "cash_ratio": 80.0,
+      "position_count": 2
+    }
+  },
+  "final_decision": {
+    "decisions": [
+      {
+        "ticker": "000660",
+        "name": "SK하이닉스",
+        "decision": "approve",
+        "weight": 10.0,
+        "veto_reason": null
+      },
+      {
+        "ticker": "035420",
+        "name": "NAVER",
+        "decision": "approve",
+        "weight": 10.0,
+        "veto_reason": null
+      }
+    ],
+    "explanation": "시장이 경계 국면(yellow regime)이므로 신규 매수 비중을 50% 축소했습니다. SK하이닉스는 HBM 수주 모멘텀이 강해 축소된 비중으로도 진입 가치가 있습니다. 삼성전기는 confidence가 낮아 yellow regime에서는 진입하지 않습니다. 총 노출 20%, 현금 80%로 방어적 포지셔닝입니다."
+  },
+  "audit_log": [
+    {
+      "rule": "regime_gate",
+      "action": "yellow",
+      "reason": "Yellow regime — 신규 매수 비중 ×0.5"
+    },
+    {
+      "rule": "min_confidence",
+      "ticker": "009150",
+      "action": "reject",
+      "reason": "confidence 0.55 < 0.6 (yellow 강화 기준)"
+    },
+    {
+      "rule": "uq_tail_cap",
+      "action": "skip",
+      "reason": "Phase 1 비활성화"
+    }
+  ]
+}

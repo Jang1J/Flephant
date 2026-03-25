@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FinalDecisionCard",
+  "description": "Final Decision Agent 최종 출력. CandidateOrderPlan을 approve/veto한 결과. can_change_weight=false 원칙 적용.",
+  "type": "object",
+  "required": ["decision_id", "snapshot_dt", "artifact_version", "plan_id", "fallback_used", "decisions", "conflicts", "execution_summary"],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "pattern": "^FDC-\\d{8}-\\d{6}$"
+    },
+    "snapshot_dt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifact_version": {
+      "type": "string",
+      "description": "스키마 버전 (e.g., v1.0)"
+    },
+    "plan_id": {
+      "type": "string",
+      "description": "원본 CandidateOrderPlan ID"
+    },
+    "fallback_used": {
+      "type": "boolean",
+      "description": "true면 Kanana-o 실패로 GPT-4o fallback 사용"
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ticker", "action", "weight", "decision"],
+        "properties": {
+          "ticker": { "type": "string" },
+          "name": { "type": "string" },
+          "action": {
+            "type": "string",
+            "enum": ["buy", "hold", "sell"]
+          },
+          "weight": {
+            "type": "number",
+            "description": "Risk Agent가 정한 비중 (변경 불가)"
+          },
+          "decision": {
+            "type": "string",
+            "enum": ["approve", "veto"],
+            "description": "approve=승인, veto=거부 (비중 수정 아님)"
+          },
+          "veto_reason": {
+            "type": ["string", "null"],
+            "description": "veto 시 사유 (LLM 생성). approve 시 null."
+          },
+          "evidence_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "판단 근거 데이터 추적 ID"
+          },
+          "uncertainty_score": {
+            "type": ["number", "null"],
+            "description": "SC에서 전달된 uncertainty_score (0~1). 모델 없을 때 null."
+          }
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "description": "에이전트 간 충돌 목록 (LLM이 해석/중재)",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ticker": { "type": "string" },
+          "conflict_type": {
+            "type": "string",
+            "enum": ["signal_disagreement", "risk_override", "confidence_gap", "regime_conflict", "stop_loss_conflict", "backtest_conflict", "holding_conflict", "confidence_weight_conflict"]
+          },
+          "description": { "type": "string" },
+          "resolution": { "type": "string" },
+          "llm_conflict_analysis": {
+            "type": ["object", "null"],
+            "description": "Kanana-o가 생성한 갈등 분석 (LLM 실패 시 null)",
+            "properties": {
+              "conflict_analysis": { "type": "string", "description": "갈등 분석 2~3문장 (한국어)" },
+              "recommended_action": {
+                "type": "string",
+                "enum": ["approve", "veto", "cautious_approve"],
+                "description": "LLM 권장 액션 (참고용, 최종 판단은 deterministic rule)"
+              },
+              "reasoning": { "type": "string", "description": "근거 요약 1문장" },
+              "model_used": { "type": "string", "description": "사용된 LLM 모델명" }
+            }
+          }
+        }
+      }
+    },
+    "execution_summary": {
+      "type": "object",
+      "properties": {
+        "approved_count": { "type": "integer" },
+        "vetoed_count": { "type": "integer" },
+        "total_exposure": { "type": "number" },
+        "cash_ratio": { "type": "number" },
+        "explanation": {
+          "type": "string",
+          "description": "오늘의 투자 결정 종합 설명 (LLM 생성, 한국어)"
+        }
+      }
+    }
+  }
+}

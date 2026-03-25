@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UQ Model I/O Specification",
+  "description": "Uncertainty Quantification 모델 입출력 스펙. AI #2가 모델 학습, AI #1이 threshold calibration + online inference 담당.",
+
+  "input": {
+    "description": "UQ 모델에 입력되는 feature set (Execution Uncertainty Proxy v0: logistic regression)",
+    "type": "object",
+    "required": ["ticker", "snapshot_dt", "features"],
+    "properties": {
+      "ticker": { "type": "string" },
+      "snapshot_dt": { "type": "string", "format": "date-time" },
+      "features": {
+        "type": "object",
+        "description": "Phase 2에서 정의될 feature set. 아래는 초안 후보.",
+        "properties": {
+          "strategy_confidence": { "type": "number", "description": "Strategy Agent의 confidence 값" },
+          "signal_agreement": { "type": "number", "description": "Quant-News 신호 일치도 (0~1)" },
+          "volume_ratio": { "type": "number", "description": "당일거래량/20일평균" },
+          "volatility_20d": { "type": "number", "description": "20일 수익률 표준편차" },
+          "regime_label": { "type": "string", "enum": ["green", "yellow", "red"] },
+          "sector_momentum": { "type": "number", "description": "섹터 모멘텀 (20일 수익률)" },
+          "mktcap_rank": { "type": "integer", "description": "시가총액 순위 (유니버스 내)" }
+        }
+      }
+    }
+  },
+
+  "output": {
+    "description": "UQ 모델 출력. Risk Agent의 Tier 2 판단에 사용.",
+    "type": "object",
+    "required": ["ticker", "uncertainty_score", "p85_value", "calibration_info"],
+    "properties": {
+      "ticker": { "type": "string" },
+      "uncertainty_score": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "실행 불확실성 추정치 (0=확실, 1=매우 불확실)"
+      },
+      "p85_value": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "85번째 백분위수 tail 값. > threshold이면 비중 감축."
+      },
+      "calibration_info": {
+        "type": "object",
+        "properties": {
+          "model_version": { "type": "string" },
+          "train_end_date": { "type": "string", "format": "date" },
+          "brier_score": { "type": "number", "description": "보정 성능 (낮을수록 좋음)" },
+          "ece": { "type": "number", "description": "Expected Calibration Error" }
+        }
+      }
+    }
+  },
+
+  "model_spec": {
+    "phase1": "비활성 (Phase 1에서는 UQ 미적용)",
+    "phase2": {
+      "algorithm": "Logistic Regression",
+      "target": "실제 수익률 부호와 예측 부호 불일치 여부 (binary)",
+      "train_owner": "AI #2 (Backtest Agent에서 학습)",
+      "inference_owner": "AI #1 (Risk Agent에서 online 추론)",
+      "calibration_owner": "AI #1 (threshold 조정 + tail-cap policy)"
+    }
+  }
+}

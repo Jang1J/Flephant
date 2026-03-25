@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AblationResult",
+  "description": "Ablation 실험 결과 비교 아티팩트. Baseline vs Variant 결과를 비교한다.",
+  "type": "object",
+  "required": ["ablation_id", "experiment", "target_date", "generated_at", "baseline", "variant", "comparison"],
+  "properties": {
+    "ablation_id": {
+      "type": "string",
+      "pattern": "^ABL-(uq|pfs)-\\d{8}$",
+      "description": "Ablation 고유 ID (e.g., ABL-uq-20260324)"
+    },
+    "experiment": {
+      "type": "string",
+      "enum": ["uq_on_off", "pfs_stateful_stateless", "pure_quant_vs_full", "semantic_vs_keyword"],
+      "description": "실험 종류"
+    },
+    "target_date": {
+      "type": "string",
+      "description": "실험 대상 날짜 (YYYYMMDD)"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "결과 생성 시각 (ISO 8601)"
+    },
+    "baseline": {
+      "type": "object",
+      "description": "기본 설정 결과 요약",
+      "required": ["label", "approved_count", "vetoed_count", "total_exposure", "cash_ratio"],
+      "properties": {
+        "label": {"type": "string", "description": "설정 레이블 (e.g., UQ ON, Stateful)"},
+        "approved_count": {"type": "integer"},
+        "vetoed_count": {"type": "integer"},
+        "total_exposure": {"type": "number"},
+        "cash_ratio": {"type": "number"},
+        "positions": {
+          "type": "object",
+          "description": "ticker → weight 매핑",
+          "additionalProperties": {"type": "number"}
+        },
+        "turnover": {"type": ["number", "null"]},
+        "stop_loss_count": {"type": ["integer", "null"]}
+      }
+    },
+    "variant": {
+      "type": "object",
+      "description": "변형 설정 결과 요약 (baseline과 동일 구조)",
+      "required": ["label", "approved_count", "vetoed_count", "total_exposure", "cash_ratio"],
+      "properties": {
+        "label": {"type": "string"},
+        "approved_count": {"type": "integer"},
+        "vetoed_count": {"type": "integer"},
+        "total_exposure": {"type": "number"},
+        "cash_ratio": {"type": "number"},
+        "positions": {
+          "type": "object",
+          "additionalProperties": {"type": "number"}
+        },
+        "turnover": {"type": ["number", "null"]},
+        "stop_loss_count": {"type": ["integer", "null"]}
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "required": ["exposure_delta", "approval_diff", "weight_changes", "summary"],
+      "properties": {
+        "exposure_delta": {
+          "type": "number",
+          "description": "variant.total_exposure - baseline.total_exposure"
+        },
+        "approval_diff": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "승인 결과가 다른 종목 목록"
+        },
+        "weight_changes": {
+          "type": "object",
+          "description": "ticker → (variant_weight - baseline_weight) 차이. 양수면 variant가 더 높음.",
+          "additionalProperties": {"type": "number"}
+        },
+        "summary": {
+          "type": "string",
+          "description": "실험 결과 한 줄 요약"
+        }
+      }
+    }
+  }
+}

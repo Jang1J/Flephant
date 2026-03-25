@@ -1,0 +1,55 @@
+{
+  "pack_id": "TTP-20260322-005930",
+  "snapshot_dt": "2026-03-22T18:00:00+09:00",
+  "artifact_version": "v1.0",
+  "ticker": "005930",
+  "sector_name": "반도체",
+  "macro_docs": [
+    {
+      "doc_id": "MACRO-20260322-001",
+      "source": "ecos",
+      "title": "한국은행 기준금리 동결 (2.5%)",
+      "content": "한국은행 금융통화위원회는 3월 회의에서 기준금리를 2.5%로 동결하였다. 위원회는 국내 경기 회복세가 완만하나 물가 안정 기조가 유지되고 있다고 판단하였다.",
+      "published_at": "2026-03-20T10:00:00+09:00",
+      "evidence_id": "ECOS-BASERATE-20260320"
+    }
+  ],
+  "sector_docs": [
+    {
+      "doc_id": "SECTOR-20260322-001",
+      "source": "naver_news",
+      "title": "글로벌 반도체 업황 1분기 반등 전망…HBM 수요 견인",
+      "content": "시장조사기관 가트너는 2026년 1분기 글로벌 반도체 매출이 전년 동기 대비 12% 증가할 것으로 전망했다. 특히 AI 서버용 HBM 수요가 핵심 성장 동력으로 지목됐다.",
+      "published_at": "2026-03-22T08:00:00+09:00",
+      "evidence_id": "NEWS-20260322-SECTOR-001"
+    }
+  ],
+  "target_company_docs": [
+    {
+      "doc_id": "TARGET-20260322-001",
+      "source": "naver_news",
+      "title": "삼성전자, HBM4 양산 본격화…SK하이닉스와 격차 좁힌다",
+      "content": "삼성전자가 HBM4 양산을 본격화하며 SK하이닉스와의 기술 격차를 빠르게 좁히고 있다. 업계에서는 삼성전자의 HBM4가 2분기부터 엔비디아 인증을 받을 것으로 기대하고 있다.",
+      "published_at": "2026-03-22T09:30:00+09:00",
+      "evidence_id": "NEWS-20260322-001"
+    },
+    {
+      "doc_id": "TARGET-20260322-002",
+      "source": "dart",
+      "title": "삼성전자 사업보고서 (2025.12)",
+      "content": "2025년 4분기 매출액 79조원, 영업이익 12.8조원을 기록하였다. 반도체 부문이 실적 개선을 견인하였으며, 파운드리 부문은 적자 폭을 축소하였다.",
+      "published_at": "2026-03-15T17:00:00+09:00",
+      "evidence_id": "DART-20260315-005930"
+    }
+  ],
+  "meta": {
+    "as_of_dt": "2026-03-22T18:00:00+09:00",
+    "available_at": "2026-03-22T18:03:12+09:00",
+    "doc_count": {
+      "macro": 1,
+      "sector": 1,
+      "target": 2
+    },
+    "dedup_ratio": 1.0
+  }
+}

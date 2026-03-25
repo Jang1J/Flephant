@@ -1,0 +1,12 @@
+{
+  "status": "recalibrated",
+  "total_samples": 50,
+  "loss_samples": 12,
+  "win_samples": 38,
+  "previous_threshold": 0.7,
+  "new_threshold": 0.432,
+  "p50_loss_score": 0.2727,
+  "p85_all_scores": 0.3889,
+  "note": "Phase 2에서 자동 적용. Phase 1에서는 참고용.",
+  "generated_at": "2026-03-25T15:50:05+09:00"
+}

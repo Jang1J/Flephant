@@ -1,0 +1,30 @@
+# === Secrets ===
+.env
+
+# === Virtual Environment ===
+.venv/
+
+# === macOS ===
+.DS_Store
+__MACOSX/
+
+# === Claude Code ===
+.claude/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# === Logs & Artifacts (generated) ===
+logs/
+artifacts/
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+
+# === Jupyter ===
+.ipynb_checkpoints/

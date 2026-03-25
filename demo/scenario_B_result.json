@@ -1,0 +1,267 @@
+{
+  "scenario": "B",
+  "generated_at": "2026-03-25T17:07:27+09:00",
+  "target_date": "20260325",
+  "override": {
+    "vix_proxy": 85.0,
+    "market_breadth": 0.35
+  },
+  "regime": "yellow",
+  "approved_orders": [
+    {
+      "ticker": "051910",
+      "name": "LG화학",
+      "action": "buy",
+      "weight": 10.0,
+      "signal": "buy",
+      "confidence": 0.82,
+      "rationale": "[MOCK] LG화학 자동 생성 전략 카드",
+      "risk_flag": "pass",
+      "risk_tags": [],
+      "evidence_ids": [
+        "MOCK-051910"
+      ],
+      "sizing_rule": "equal_weight",
+      "uncertainty_p85": 0.1698
+    },
+    {
+      "ticker": "009150",
+      "name": "삼성전기",
+      "action": "buy",
+      "weight": 10.0,
+      "signal": "buy",
+      "confidence": 0.58,
+      "rationale": "[MOCK] 삼성전기 자동 생성 전략 카드",
+      "risk_flag": "pass",
+      "risk_tags": [],
+      "evidence_ids": [
+        "MOCK-009150"
+      ],
+      "sizing_rule": "equal_weight",
+      "uncertainty_p85": 0.2494
+    },
+    {
+      "ticker": "005380",
+      "name": "현대차",
+      "action": "buy",
+      "weight": 10.0,
+      "signal": "buy",
+      "confidence": 0.37,
+      "rationale": "[MOCK] 현대차 자동 생성 전략 카드",
+      "risk_flag": "pass",
+      "risk_tags": [],
+      "evidence_ids": [
+        "MOCK-005380"
+      ],
+      "sizing_rule": "equal_weight",
+      "uncertainty_p85": 0.3118
+    }
+  ],
+  "vetoed_count": 0,
+  "total_exposure": 30.0,
+  "cash_ratio": 70.0,
+  "uq_cap_applied": false,
+  "commentary": "현재 KOSPI 시장은 경계 국면에 있으며, VIX의 상승과 시장 폭의 축소가 관찰되고 있습니다. 승인된 종목인 LG화학, 삼성전기, 현대차에 각각 10%씩 노출되어 총 30%의 포트폴리오가 구성되어 있습니다. 투자자들은 변동성 증가에 따른 리스크 관리에 주의해야 하며, 시장 상황을 면밀히 모니터링하는 것이 중요합니다.",
+  "fdc_explanation": "이번 투자 결정은 시장의 \"yellow\" 레짐 상태를 고려하여 이루어졌습니다. 이는 시장의 변동성이 중간 정도이며, 신중한 접근이 필요함을 의미합니다. 총 노출 30%로 제한하여 포트폴리오의 안정성을 유지하면서도, LG화학, 삼성전기, 현대차 각각에 10%씩 투자하여 분산 투자를 통해 리스크를 관리하고자 했습니다. 이러한 결정은 각 기업의 현재 시장 위치와 성장 가능성을 긍정적으로 평가한 결과입니다.",
+  "fdc": {
+    "decision_id": "FDC-20260325-180000",
+    "snapshot_dt": "2026-03-25T18:00:00+09:00",
+    "artifact_version": "v1.0",
+    "plan_id": "COP-20260325-180000",
+    "fallback_used": true,
+    "decisions": [
+      {
+        "ticker": "051910",
+        "name": "LG화학",
+        "action": "buy",
+        "weight": 10.0,
+        "decision": "approve",
+        "veto_reason": null,
+        "evidence_ids": [
+          "MOCK-051910"
+        ],
+        "uncertainty_score": 0.1698
+      },
+      {
+        "ticker": "009150",
+        "name": "삼성전기",
+        "action": "buy",
+        "weight": 10.0,
+        "decision": "approve",
+        "veto_reason": null,
+        "evidence_ids": [
+          "MOCK-009150"
+        ],
+        "uncertainty_score": 0.2494
+      },
+      {
+        "ticker": "005380",
+        "name": "현대차",
+        "action": "buy",
+        "weight": 10.0,
+        "decision": "approve",
+        "veto_reason": null,
+        "evidence_ids": [
+          "MOCK-005380"
+        ],
+        "uncertainty_score": 0.3118
+      }
+    ],
+    "conflicts": [],
+    "execution_summary": {
+      "approved_count": 3,
+      "vetoed_count": 0,
+      "total_exposure": 30.0,
+      "cash_ratio": 70.0,
+      "explanation": "이번 투자 결정은 시장의 \"yellow\" 레짐 상태를 고려하여 이루어졌습니다. 이는 시장의 변동성이 중간 정도이며, 신중한 접근이 필요함을 의미합니다. 총 노출 30%로 제한하여 포트폴리오의 안정성을 유지하면서도, LG화학, 삼성전기, 현대차 각각에 10%씩 투자하여 분산 투자를 통해 리스크를 관리하고자 했습니다. 이러한 결정은 각 기업의 현재 시장 위치와 성장 가능성을 긍정적으로 평가한 결과입니다."
+    }
+  },
+  "cop": {
+    "plan_id": "COP-20260325-180000",
+    "snapshot_dt": "2026-03-25T18:00:00+09:00",
+    "artifact_version": "v1.0",
+    "regime": "yellow",
+    "execution_time": "t+1 open",
+    "orders": [
+      {
+        "ticker": "051910",
+        "name": "LG화학",
+        "action": "buy",
+        "weight": 10.0,
+        "signal": "buy",
+        "confidence": 0.82,
+        "rationale": "[MOCK] LG화학 자동 생성 전략 카드",
+        "risk_flag": "pass",
+        "risk_tags": [],
+        "evidence_ids": [
+          "MOCK-051910"
+        ],
+        "sizing_rule": "equal_weight",
+        "uncertainty_p85": 0.1698
+      },
+      {
+        "ticker": "009150",
+        "name": "삼성전기",
+        "action": "buy",
+        "weight": 10.0,
+        "signal": "buy",
+        "confidence": 0.58,
+        "rationale": "[MOCK] 삼성전기 자동 생성 전략 카드",
+        "risk_flag": "pass",
+        "risk_tags": [],
+        "evidence_ids": [
+          "MOCK-009150"
+        ],
+        "sizing_rule": "equal_weight",
+        "uncertainty_p85": 0.2494
+      },
+      {
+        "ticker": "005380",
+        "name": "현대차",
+        "action": "buy",
+        "weight": 10.0,
+        "signal": "buy",
+        "confidence": 0.37,
+        "rationale": "[MOCK] 현대차 자동 생성 전략 카드",
+        "risk_flag": "pass",
+        "risk_tags": [],
+        "evidence_ids": [
+          "MOCK-005380"
+        ],
+        "sizing_rule": "equal_weight",
+        "uncertainty_p85": 0.3118
+      }
+    ],
+    "portfolio_summary": {
+      "total_exposure": 30.0,
+      "cash_ratio": 70.0,
+      "position_count": 3,
+      "sector_breakdown": {
+        "화학": 10.0,
+        "IT하드웨어": 10.0,
+        "자동차": 10.0
+      }
+    }
+  },
+  "risk_card": {
+    "risk_id": "RC-20260325-180000",
+    "snapshot_dt": "2026-03-25T18:00:00+09:00",
+    "artifact_version": "v1.0",
+    "regime": {
+      "label": "yellow",
+      "vix_proxy": 85.0,
+      "market_breadth": 0.35,
+      "regime_reason": "VIX proxy=85.0 → yellow; Market breadth=0.35 → yellow"
+    },
+    "tier1_pass": true,
+    "uq_enabled": false,
+    "portfolio_constraints": {
+      "max_position_count": 10,
+      "max_single_weight": 20.0,
+      "max_sector_weight": 40.0,
+      "max_total_exposure": 100
+    },
+    "position_risks": [
+      {
+        "ticker": "051910",
+        "risk_flag": "pass",
+        "approved_weight": 10.0,
+        "uncertainty_p85": null,
+        "reason": "정상 통과: confidence=0.82",
+        "reasons": [
+          "정상 통과: confidence=0.82"
+        ],
+        "holding_days": 6,
+        "entry_price": 292000,
+        "unrealized_pnl_pct": 9.08,
+        "uncertainty_score": 0.1698,
+        "uq_cap_applied": false,
+        "weight_before_cap": null,
+        "weight_after_cap": null
+      },
+      {
+        "ticker": "009150",
+        "risk_flag": "pass",
+        "approved_weight": 10.0,
+        "uncertainty_p85": null,
+        "reason": "정상 통과: confidence=0.58",
+        "reasons": [
+          "정상 통과: confidence=0.58"
+        ],
+        "holding_days": 6,
+        "entry_price": 413000,
+        "unrealized_pnl_pct": 10.41,
+        "uncertainty_score": 0.2494,
+        "uq_cap_applied": false,
+        "weight_before_cap": null,
+        "weight_after_cap": null
+      },
+      {
+        "ticker": "005380",
+        "risk_flag": "pass",
+        "approved_weight": 10.0,
+        "uncertainty_p85": null,
+        "reason": "정상 통과: confidence=0.37",
+        "reasons": [
+          "정상 통과: confidence=0.37"
+        ],
+        "holding_days": 1,
+        "entry_price": 492000,
+        "unrealized_pnl_pct": 2.85,
+        "uncertainty_score": 0.3118,
+        "uq_cap_applied": false,
+        "weight_before_cap": null,
+        "weight_after_cap": null
+      }
+    ],
+    "llm_risk_analysis": {
+      "risk_narrative": "현재 시장은 'yellow' 상태로, VIX 대용 지표가 85.0으로 높아 변동성이 증가할 가능성이 있습니다. 그러나 포지션 노출이 30.0%로 제한적이고, stop-loss에 해당하는 종목이 없어 리스크 관리가 잘 이루어지고 있습니다. 시장의 폭이 0.35로 다소 제한적이므로, 시장의 방향성을 주의 깊게 모니터링해야 합니다.",
+      "risk_level": "moderate",
+      "attention_items": [
+        "시장 변동성 증가 가능성",
+        "시장 폭 제한"
+      ],
+      "model_used": "gpt-4o-2024-08-06"
+    }
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DailyMarketPacket",
+  "description": "t-day 18:00 KST 스냅샷. Data Agent → Strategy Agent 전달용. 유니버스 전체 종목의 시장 데이터 + 뉴스/공시 인덱스 + 매크로 스냅샷.",
+  "type": "object",
+  "required": ["snapshot_id", "snapshot_dt", "available_at", "artifact_version", "tickers", "market_data", "macro_snapshot", "news_index", "disclosure_index", "meta"],
+  "properties": {
+    "snapshot_id": {
+      "type": "string",
+      "description": "고유 ID (e.g., DMP-20260322-180000)",
+      "pattern": "^DMP-\\d{8}-\\d{6}$"
+    },
+    "snapshot_dt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "스냅샷 생성 시각 (ISO 8601, KST)"
+    },
+    "available_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "PIT-safe: 이 데이터가 실제로 사용 가능해진 시각"
+    },
+    "artifact_version": {
+      "type": "string",
+      "description": "스키마 버전 (e.g., v1.0)"
+    },
+    "tickers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "유니버스 종목코드 리스트 (e.g., [\"005930\", \"000660\", ...])"
+    },
+    "market_data": {
+      "type": "object",
+      "description": "종목코드별 시장 데이터",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["ohlcv", "volume", "mktcap", "tech_features"],
+        "properties": {
+          "ohlcv": {
+            "type": "object",
+            "required": ["open", "high", "low", "close"],
+            "properties": {
+              "open": { "type": "number" },
+              "high": { "type": "number" },
+              "low": { "type": "number" },
+              "close": { "type": "number" }
+            }
+          },
+          "volume": { "type": "integer" },
+          "mktcap": { "type": ["number", "null"], "description": "시가총액 (원, pykrx 호환 이슈로 Phase 1에서 null 가능)" },
+          "tech_features": {
+            "type": "object",
+            "description": "기술적 지표 (Phase 1: SMA, RSI 등 수동 팩터)",
+            "properties": {
+              "sma_5": { "type": "number" },
+              "sma_20": { "type": "number" },
+              "sma_60": { "type": "number" },
+              "rsi_14": { "type": "number" },
+              "bb_upper": { "type": "number" },
+              "bb_lower": { "type": "number" },
+              "macd": { "type": "number" },
+              "macd_signal": { "type": "number" },
+              "atr_14": { "type": "number" },
+              "volume_ratio_20": { "type": "number", "description": "당일거래량 / 20일평균거래량" }
+            }
+          }
+        }
+      }
+    },
+    "macro_snapshot": {
+      "type": "object",
+      "description": "거시경제 스냅샷 (ECOS 기반)",
+      "properties": {
+        "base_rate": { "type": ["number", "null"], "description": "한국은행 기준금리 (%)" },
+        "treasury_3y": { "type": ["number", "null"], "description": "국고채 3년 금리 (%)" },
+        "treasury_10y": { "type": ["number", "null"], "description": "국고채 10년 금리 (%)" },
+        "usd_krw": { "type": ["number", "null"], "description": "원/달러 환율" },
+        "kospi_index": { "type": ["number", "null"], "description": "KOSPI 지수" },
+        "vix_proxy": { "type": ["number", "null"], "description": "KOSPI200 변동성 프록시 (Phase 1에서는 null 가능)" },
+        "market_breadth": { "type": ["number", "null"], "description": "시장 폭 (상승종목비율, Phase 1에서는 null 가능)" }
+      }
+    },
+    "news_index": {
+      "type": "array",
+      "description": "당일 수집된 뉴스 목록",
+      "items": {
+        "type": "object",
+        "required": ["evidence_id", "ticker", "headline", "source", "published_at", "available_at"],
+        "properties": {
+          "evidence_id": { "type": "string", "description": "원본 추적용 고유 ID (URL hash 등)" },
+          "ticker": { "type": "string" },
+          "headline": { "type": "string" },
+          "source": { "type": "string" },
+          "published_at": { "type": "string", "format": "date-time", "description": "기사 발행 시각" },
+          "available_at": { "type": "string", "format": "date-time", "description": "PIT-safe: 수집 완료 시각" },
+          "url": { "type": "string", "format": "uri" }
+        }
+      }
+    },
+    "disclosure_index": {
+      "type": "array",
+      "description": "당일 DART 공시 목록",
+      "items": {
+        "type": "object",
+        "required": ["evidence_id", "ticker", "report_nm", "rcept_dt", "available_at"],
+        "properties": {
+          "evidence_id": { "type": "string", "description": "DART 접수번호 (rcept_no)" },
+          "ticker": { "type": "string" },
+          "corp_name": { "type": "string" },
+          "report_nm": { "type": "string" },
+          "rcept_dt": { "type": "string" },
+          "rcept_no": { "type": "string" },
+          "available_at": { "type": "string", "format": "date-time", "description": "PIT-safe: 공시 공개 시각" }
+        }
+      }
+    },
+    "llm_market_analysis": {
+      "type": ["object", "null"],
+      "description": "Kanana-o가 생성한 일일 시장 코멘터리 (LLM 실패 시 null)",
+      "properties": {
+        "market_commentary": { "type": "string", "description": "시장 분석 3~4문장 (한국어)" },
+        "market_mood": {
+          "type": "string",
+          "enum": ["bullish", "bearish", "neutral", "uncertain"],
+          "description": "시장 분위기 판단"
+        },
+        "key_drivers": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "주요 동인 키워드 3~5개"
+        },
+        "model_used": { "type": "string", "description": "사용된 LLM 모델명" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["as_of_dt", "universe_version", "data_quality"],
+      "properties": {
+        "as_of_dt": { "type": "string", "format": "date-time", "description": "PIT-safe 기준 시각" },
+        "universe_version": { "type": "string", "description": "e.g., v1" },
+        "data_quality": {
+          "type": "object",
+          "properties": {
+            "missing_tickers": { "type": "array", "items": { "type": "string" } },
+            "stale_data_tickers": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DataQualityReport",
+  "description": "DailyMarketPacket + TickerTextPack 데이터 품질 점검 결과. build_data_quality_report.py가 생성.",
+  "type": "object",
+  "required": ["report_id", "target_date", "generated_at", "overall_pass"],
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "pattern": "^DQR-\\d{8}$",
+      "description": "리포트 식별자 (e.g., DQR-20260320)"
+    },
+    "target_date": {
+      "type": "string",
+      "pattern": "^\\d{8}$",
+      "description": "점검 대상 날짜 (YYYYMMDD)"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "리포트 생성 시각 (ISO 8601 KST)"
+    },
+    "overall_pass": {
+      "type": "boolean",
+      "description": "DMP + TTP 모두 이슈 없으면 true"
+    },
+    "dmp": {
+      "type": ["object", "null"],
+      "description": "DailyMarketPacket 품질 체크 결과",
+      "properties": {
+        "stats": {
+          "type": "object",
+          "properties": {
+            "ticker_count": { "type": "integer" },
+            "market_data_count": { "type": "integer" },
+            "news_count": { "type": "integer" },
+            "disclosure_count": { "type": "integer" },
+            "missing_tickers": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "stale_tickers": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "null_mktcap_count": { "type": "integer" },
+            "empty_tech_count": { "type": "integer" },
+            "null_macro_fields": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "duplicate_news": { "type": "integer" }
+          }
+        },
+        "issues": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "발견된 품질 이슈 설명 목록"
+        },
+        "pass": {
+          "type": "boolean",
+          "description": "이슈가 없으면 true"
+        }
+      }
+    },
+    "ttp": {
+      "type": ["object", "null"],
+      "description": "TickerTextPack 전체 품질 체크 결과",
+      "properties": {
+        "stats": {
+          "type": "object",
+          "properties": {
+            "pack_count": { "type": "integer" },
+            "total_docs": { "type": "integer" },
+            "avg_dedup_ratio": { "type": "number" },
+            "empty_packs": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "issues": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "pass": { "type": "boolean" }
+      }
+    }
+  }
+}

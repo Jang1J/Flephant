@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PortfolioState",
+  "description": "포트폴리오 보유 상태 — 진입가 기반 stop-loss, 실제 turnover, 보유일수 추적",
+  "type": "object",
+  "required": ["state_id", "snapshot_dt", "artifact_version", "positions", "cash_ratio", "daily_turnover", "total_exposure"],
+  "properties": {
+    "state_id": {
+      "type": "string",
+      "pattern": "^PFS-\\d{8}-\\d{6}$",
+      "description": "PFS-YYYYMMDD-HHMMSS"
+    },
+    "snapshot_dt": {
+      "type": "string",
+      "description": "ISO 8601 datetime with timezone"
+    },
+    "artifact_version": {
+      "type": "string"
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ticker", "name", "entry_date", "entry_price", "current_price", "weight", "unrealized_pnl_pct", "holding_days"],
+        "properties": {
+          "ticker": { "type": "string" },
+          "name": { "type": "string" },
+          "entry_date": { "type": "string", "description": "YYYYMMDD" },
+          "entry_price": { "type": "number" },
+          "current_price": { "type": "number" },
+          "weight": { "type": "number", "description": "현재 비중 (%)" },
+          "unrealized_pnl_pct": { "type": "number", "description": "미실현 손익률 (%)" },
+          "holding_days": { "type": "integer", "description": "보유일수" },
+          "stop_loss_hit": { "type": "boolean", "description": "stop-loss 도달 여부" }
+        }
+      }
+    },
+    "cash_ratio": {
+      "type": "number",
+      "description": "현금 비율 (%)"
+    },
+    "total_exposure": {
+      "type": "number",
+      "description": "총 노출 비율 (%)"
+    },
+    "daily_turnover": {
+      "type": "number",
+      "description": "금일 누적 turnover (%)"
+    },
+    "realized_pnl": {
+      "type": "array",
+      "description": "금일 실현 손익 (청산된 포지션)",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ticker": { "type": "string" },
+          "entry_price": { "type": "number" },
+          "exit_price": { "type": "number" },
+          "pnl_pct": { "type": "number" },
+          "reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

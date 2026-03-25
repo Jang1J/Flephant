@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StrategyCard",
+  "description": "Strategy Agent → Risk Agent 전달. 종목별 투자 신호 + confidence. AI #2가 생성.",
+  "type": "object",
+  "required": ["card_id", "snapshot_dt", "artifact_version", "ticker", "direction", "signal", "confidence", "pre_risk_score", "rationale", "source_strategy", "evidence_ids"],
+  "properties": {
+    "card_id": {
+      "type": "string",
+      "pattern": "^SC-\\d{8}-[A-Z0-9]+$"
+    },
+    "snapshot_dt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifact_version": {
+      "type": "string",
+      "description": "스키마 버전 (e.g., v1.0)"
+    },
+    "ticker": { "type": "string" },
+    "name": {
+      "type": "string",
+      "description": "종목명 (optional, universe_v1.csv 참조용)"
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["long", "short", "neutral"],
+      "description": "투자 방향"
+    },
+    "signal": {
+      "type": "string",
+      "enum": ["strong_buy", "buy", "hold", "sell", "strong_sell"],
+      "description": "투자 신호"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "신호 확신도 (0~1)"
+    },
+    "pre_risk_score": {
+      "type": "number",
+      "description": "Quant + News 결합 deterministic pre-score (Risk 적용 전)"
+    },
+    "quant_score": {
+      "type": "number",
+      "description": "Quant Strategy 점수 (LightGBM ranker output)"
+    },
+    "news_signal": {
+      "type": "number",
+      "description": "News/Market Strategy 점수 (Kanana-o output)"
+    },
+    "rationale": {
+      "type": "string",
+      "description": "투자 근거 요약 (LLM General Synthesizer 출력)"
+    },
+    "source_strategy": {
+      "type": "string",
+      "enum": ["quant", "news", "synthesized"],
+      "description": "주요 신호 출처"
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "근거 데이터 추적용 ID 리스트 (DailyMarketPacket/TickerTextPack의 evidence_id 참조)"
+    },
+    "features_used": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "사용된 주요 feature 목록"
+    },
+    "uncertainty_score": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "UQ 모델의 uncertainty 추정치 (Phase 1에서는 null, Phase 2+에서 활성화)"
+    }
+  }
+}

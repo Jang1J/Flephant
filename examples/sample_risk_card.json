@@ -1,0 +1,41 @@
+{
+  "risk_id": "RC-20260322-180000",
+  "snapshot_dt": "2026-03-22T18:00:00+09:00",
+  "artifact_version": "v1.0",
+  "regime": {
+    "label": "green",
+    "vix_proxy": 17.8,
+    "market_breadth": 0.53,
+    "regime_reason": "VIX 프록시 17.8 (< 20), 시장폭 53% (> 45%): 정상 시장"
+  },
+  "tier1_pass": true,
+  "portfolio_constraints": {
+    "max_position_count": 10,
+    "max_single_weight": 20.0,
+    "max_sector_weight": 40.0,
+    "max_total_exposure": 100.0
+  },
+  "position_risks": [
+    {
+      "ticker": "005930",
+      "risk_flag": "pass",
+      "approved_weight": 15.0,
+      "uncertainty_p85": null,
+      "reason": "정상 통과: confidence 0.82, 유동성 충분"
+    },
+    {
+      "ticker": "000660",
+      "risk_flag": "pass",
+      "approved_weight": 12.0,
+      "uncertainty_p85": null,
+      "reason": "정상 통과: confidence 0.75, 반도체 섹터 비중 27% (< 40%)"
+    },
+    {
+      "ticker": "005380",
+      "risk_flag": "cap",
+      "approved_weight": 8.0,
+      "uncertainty_p85": null,
+      "reason": "비중 제한: 원래 12% 요청이나 자동차 섹터 비중 제한으로 8%로 감축"
+    }
+  ]
+}

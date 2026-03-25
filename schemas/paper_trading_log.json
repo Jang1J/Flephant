@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PaperTradingLog",
+  "description": "모의 투자 주문 실행 로그",
+  "type": "object",
+  "required": ["log_id", "target_date", "generated_at", "dry_run", "orders", "summary"],
+  "properties": {
+    "log_id": {
+      "type": "string",
+      "pattern": "^PTL-\\d{8}$"
+    },
+    "target_date": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "portfolio_value": {
+      "type": "number"
+    },
+    "max_order_notional": {
+      "type": "number"
+    },
+    "fdc_id": {
+      "type": "string"
+    },
+    "orders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["order_id", "ticker", "action", "status"],
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "ticker": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": ["buy", "sell", "cancel"]
+          },
+          "weight": {
+            "type": "number"
+          },
+          "quantity": {
+            "type": "integer"
+          },
+          "price": {
+            "type": "number"
+          },
+          "notional": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["executed", "rejected", "dry_run", "cancelled", "cancel_failed"]
+          },
+          "reject_reason": {
+            "type": ["string", "null"]
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "total_orders": {
+          "type": "integer"
+        },
+        "executed_count": {
+          "type": "integer"
+        },
+        "rejected_count": {
+          "type": "integer"
+        },
+        "cancelled_count": {
+          "type": "integer"
+        },
+        "total_notional": {
+          "type": "number"
+        },
+        "execution_rate": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

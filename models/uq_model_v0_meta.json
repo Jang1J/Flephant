@@ -1,0 +1,24 @@
+{
+  "model_type": "logistic_regression",
+  "features": [
+    "confidence",
+    "pre_risk_score",
+    "rsi_14",
+    "volume_ratio_20",
+    "return_5d"
+  ],
+  "p85_threshold": 0.3587359832875278,
+  "cv_auc_mean": 0.5492,
+  "cv_auc_std": 0.0359,
+  "coefficients": {
+    "confidence": -0.257,
+    "pre_risk_score": 0.0703,
+    "rsi_14": 0.0252,
+    "volume_ratio_20": 0.2385,
+    "return_5d": -0.2006
+  },
+  "intercept": -1.0212,
+  "miss_rate": 0.272,
+  "trained_at": "2026-03-22T14:23:18+09:00",
+  "note": "Phase 1 — synthetic data, 실제 StrategyCard + 실현수익률 연결 전"
+}

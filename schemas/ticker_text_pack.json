@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TickerTextPack",
+  "description": "종목별 텍스트 데이터 패키지. 3-level 구조: macro → sector → target_company. Data Agent → Strategy Agent (News/Market Strategy).",
+  "type": "object",
+  "required": ["pack_id", "snapshot_dt", "artifact_version", "ticker", "sector_name", "macro_docs", "sector_docs", "target_company_docs", "meta"],
+  "properties": {
+    "pack_id": {
+      "type": "string",
+      "pattern": "^TTP-\\d{8}-[A-Z0-9]+$",
+      "description": "고유 ID (e.g., TTP-20260322-005930)"
+    },
+    "snapshot_dt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifact_version": {
+      "type": "string",
+      "description": "스키마 버전 (e.g., v1.0)"
+    },
+    "ticker": {
+      "type": "string",
+      "description": "대상 종목코드"
+    },
+    "sector_name": {
+      "type": "string",
+      "description": "WICS/WI26 기준 정식 섹터명"
+    },
+    "macro_docs": {
+      "type": "array",
+      "description": "거시경제 관련 문서 (금리, 환율, 경기지표 등)",
+      "items": {
+        "$ref": "#/$defs/TextDocument"
+      }
+    },
+    "sector_docs": {
+      "type": "array",
+      "description": "해당 종목이 속한 섹터 관련 문서",
+      "items": {
+        "$ref": "#/$defs/TextDocument"
+      }
+    },
+    "target_company_docs": {
+      "type": "array",
+      "description": "해당 종목 직접 관련 문서 (뉴스, 공시, 리포트)",
+      "items": {
+        "$ref": "#/$defs/TextDocument"
+      }
+    },
+    "llm_news_analysis": {
+      "type": ["object", "null"],
+      "description": "Kanana-o 뉴스 요약/감성 분석 결과 (Phase 1: 선택적)",
+      "properties": {
+        "news_summary": {"type": "string"},
+        "news_sentiment": {"type": "number", "minimum": -1, "maximum": 1},
+        "key_topics": {"type": "array", "items": {"type": "string"}},
+        "model_used": {"type": "string"}
+      }
+    },
+    "llm_disclosure_analysis": {
+      "type": ["object", "null"],
+      "description": "Kanana-o 공시 해석 결과 (Phase 1: 선택적)",
+      "properties": {
+        "disclosure_summary": {"type": "string"},
+        "disclosure_impact": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+        "risk_flags": {"type": "array", "items": {"type": "string"}},
+        "model_used": {"type": "string"}
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["as_of_dt", "available_at", "doc_count"],
+      "properties": {
+        "as_of_dt": { "type": "string", "format": "date-time", "description": "PIT-safe 기준 시각" },
+        "available_at": { "type": "string", "format": "date-time", "description": "데이터 사용 가능 시점" },
+        "doc_count": {
+          "type": "object",
+          "properties": {
+            "macro": { "type": "integer" },
+            "sector": { "type": "integer" },
+            "target": { "type": "integer" }
+          }
+        },
+        "dedup_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "중복 제거 비율 (1.0 = 중복 없음, 0.5 = 절반 중복 제거)"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "TextDocument": {
+      "type": "object",
+      "required": ["doc_id", "source", "title", "content", "published_at"],
+      "properties": {
+        "doc_id": { "type": "string" },
+        "source": { "type": "string", "enum": ["naver_news", "dart", "ecos", "manual"] },
+        "title": { "type": "string" },
+        "content": { "type": "string", "description": "본문 텍스트 (최대 2000자)" },
+        "published_at": { "type": "string", "format": "date-time" },
+        "evidence_id": { "type": "string", "description": "원본 추적용 ID (URL 또는 접수번호)" }
+      }
+    }
+  }
+}

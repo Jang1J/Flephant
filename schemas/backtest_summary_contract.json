@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BacktestSummary",
+  "description": "AI #2 Backtest Agent → AI #1 FDA handoff. FDA가 투자 판단 시 참조하는 백테스트 요약.",
+  "type": "object",
+  "required": ["status"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["live", "phase1_placeholder", "stale", "error"],
+      "description": "live=실제 데이터, phase1_placeholder=Phase1 미구현, stale=오래된 데이터, error=생성 실패"
+    },
+    "win_rate_hint": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "최근 N거래일 승률 (null이면 미제공)"
+    },
+    "baseline_delta": {
+      "type": ["number", "null"],
+      "description": "baseline 대비 초과수익률 (%, null이면 미제공)"
+    },
+    "failure_tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "최근 실패 패턴 태그 (e.g., 'sector_concentration', 'momentum_reversal')"
+    },
+    "confidence_band": {
+      "type": ["object", "null"],
+      "properties": {
+        "lower": {"type": "number"},
+        "upper": {"type": "number"}
+      },
+      "description": "전략 수익률 confidence interval"
+    },
+    "recent_sharpe": {
+      "type": ["number", "null"],
+      "description": "최근 구간 Sharpe ratio"
+    },
+    "recent_mdd": {
+      "type": ["number", "null"],
+      "description": "최근 구간 Maximum Drawdown (%)"
+    },
+    "last_updated": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "마지막 업데이트 시각"
+    },
+    "note": {
+      "type": ["string", "null"],
+      "description": "부가 설명"
+    }
+  }
+}

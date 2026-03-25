@@ -1,0 +1,225 @@
+{
+  "title": "DashboardPayloadContract",
+  "description": "AI → BE 대시보드 payload 인터페이스 정의",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "recommendation_history": {
+      "description": "종목별 추천 이력 (FDC 시계열)",
+      "type": "object",
+      "required": ["payload_id", "generated_at", "history"],
+      "properties": {
+        "payload_id": {
+          "type": "string",
+          "pattern": "^RH-\\d{8}-\\d{8}$",
+          "description": "ex) RH-20260316-20260320"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "생성 시각 (ISO 8601, KST)"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["date", "recommendations"],
+            "properties": {
+              "date": {
+                "type": "string",
+                "pattern": "^\\d{8}$"
+              },
+              "recommendations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["ticker", "name", "action", "weight", "decision"],
+                  "properties": {
+                    "ticker": {
+                      "type": "string",
+                      "pattern": "^\\d{6}$"
+                    },
+                    "name": { "type": "string" },
+                    "action": {
+                      "type": "string",
+                      "enum": ["buy", "sell", "hold"]
+                    },
+                    "weight": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "decision": {
+                      "type": "string",
+                      "enum": ["approve", "veto"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "portfolio_nav": {
+      "description": "포트폴리오 순자산 추이 (PFS 시계열)",
+      "type": "object",
+      "required": ["payload_id", "generated_at", "nav_series"],
+      "properties": {
+        "payload_id": {
+          "type": "string",
+          "pattern": "^NAV-\\d{8}-\\d{8}$"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "nav_series": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["date", "total_exposure", "cash_ratio", "position_count", "daily_turnover"],
+            "properties": {
+              "date": {
+                "type": "string",
+                "pattern": "^\\d{8}$"
+              },
+              "total_exposure": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "총 투자 비중 (%)"
+              },
+              "cash_ratio": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100,
+                "description": "현금 비중 (%)"
+              },
+              "position_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "daily_turnover": {
+                "type": "number",
+                "minimum": 0,
+                "description": "일일 회전율 (%)"
+              }
+            }
+          }
+        }
+      }
+    },
+    "paper_trading_log_summary": {
+      "description": "Paper trading 거래 요약 (PTL 시계열)",
+      "type": "object",
+      "required": ["payload_id", "generated_at", "trading_summary"],
+      "properties": {
+        "payload_id": {
+          "type": "string",
+          "pattern": "^PTS-\\d{8}-\\d{8}$"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "trading_summary": {
+          "type": "object",
+          "required": ["total_orders", "executed", "rejected", "cancelled", "total_notional", "daily_breakdown"],
+          "properties": {
+            "total_orders": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "executed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rejected": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cancelled": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "total_notional": {
+              "type": "number",
+              "minimum": 0,
+              "description": "총 거래대금 (원)"
+            },
+            "daily_breakdown": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["date", "total_orders", "executed", "rejected", "cancelled", "total_notional"],
+                "properties": {
+                  "date": {
+                    "type": "string",
+                    "pattern": "^\\d{8}$"
+                  },
+                  "total_orders": { "type": "integer", "minimum": 0 },
+                  "executed": { "type": "integer", "minimum": 0 },
+                  "rejected": { "type": "integer", "minimum": 0 },
+                  "cancelled": { "type": "integer", "minimum": 0 },
+                  "total_notional": { "type": "number", "minimum": 0 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "risk_trace": {
+      "description": "리스크 추적 (RC 시계열)",
+      "type": "object",
+      "required": ["payload_id", "generated_at", "risk_trace"],
+      "properties": {
+        "payload_id": {
+          "type": "string",
+          "pattern": "^RT-\\d{8}-\\d{8}$"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "risk_trace": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["date", "regime", "vix_proxy", "market_breadth", "position_count", "uq_enabled"],
+            "properties": {
+              "date": {
+                "type": "string",
+                "pattern": "^\\d{8}$"
+              },
+              "regime": {
+                "type": ["string", "null"],
+                "enum": ["green", "yellow", "red", null],
+                "description": "레짐 레이블. RC 없거나 label 누락 시 null"
+              },
+              "vix_proxy": {
+                "type": ["number", "null"],
+                "description": "VIX proxy 값. 데이터 없으면 null"
+              },
+              "market_breadth": {
+                "type": ["number", "null"],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "시장 너비 (0~1). 데이터 없으면 null"
+              },
+              "position_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "uq_enabled": {
+                "type": "boolean",
+                "description": "UQ 불확실성 추정 활성화 여부"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

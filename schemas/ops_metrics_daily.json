@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpsMetricsDaily",
+  "description": "일일 운영 메트릭 (7종 + latency)",
+  "type": "object",
+  "required": ["metrics_id", "target_date", "generated_at", "metrics"],
+  "properties": {
+    "metrics_id": {
+      "type": "string",
+      "pattern": "^OPM-\\d{8}$"
+    },
+    "target_date": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "order_success_rate": {
+          "type": ["number", "null"],
+          "description": "주문 성공률 (0~1). PTL status=executed||dry_run 비율."
+        },
+        "order_reject_rate": {
+          "type": ["number", "null"],
+          "description": "주문 거부율 (0~1). PTL status=rejected 비율."
+        },
+        "llm_fallback_rate": {
+          "type": ["number", "null"],
+          "description": "Kanana→GPT-4o 전환 비율. FDC fallback_used 기반 (0 또는 1)."
+        },
+        "daily_turnover": {
+          "type": ["number", "null"],
+          "description": "일일 회전율 (%). PFS daily_turnover 값 직접 읽기."
+        },
+        "cash_ratio_drift": {
+          "type": ["number", "null"],
+          "description": "현금 비율 변화 (%p). 오늘 PFS cash_ratio - 전일 PFS cash_ratio."
+        },
+        "reconciliation_mismatch_rate": {
+          "type": ["number", "null"],
+          "description": "PFS↔PTL 불일치율 (0~1). BRR mismatches 수 / pfs_positions."
+        },
+        "emergency_veto_count": {
+          "type": ["integer", "null"],
+          "description": "FDA 긴급 거부 건수. regime=red 상태에서 FDC decisions 중 decision=veto 건수."
+        },
+        "p50_latency_sec": {
+          "type": ["number", "null"],
+          "description": "E2E 소요 시간 중앙값 (초). latency_samples 없으면 null."
+        },
+        "p95_latency_sec": {
+          "type": ["number", "null"],
+          "description": "E2E 소요 시간 95th percentile (초). latency_samples 없으면 null."
+        }
+      }
+    },
+    "artifacts_used": {
+      "type": "object",
+      "description": "메트릭 산출에 사용된 아티팩트 ID"
+    },
+    "note": {
+      "type": ["string", "null"]
+    }
+  }
+}

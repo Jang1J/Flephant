@@ -1,0 +1,131 @@
+{
+  "scenario": "green_normal",
+  "title": "🟢 정상 시장 — 3종목 매수 승인",
+  "description": "VIX 낮고 시장 폭 넓음. 반도체/자동차/금융 섹터 분산 투자.",
+  "regime": {
+    "label": "green",
+    "vix_proxy": 15.2,
+    "market_breadth": 0.62,
+    "regime_reason": "VIX proxy=15.2 → green; Market breadth=0.62 → green"
+  },
+  "strategy_cards": [
+    {
+      "ticker": "005930",
+      "name": "삼성전자",
+      "signal": "strong_buy",
+      "confidence": 0.87,
+      "pre_risk_score": 0.72,
+      "news_signal": 0.65,
+      "rationale": "HBM 수주 확대 + 반도체 업황 개선 기대"
+    },
+    {
+      "ticker": "005380",
+      "name": "현대차",
+      "signal": "buy",
+      "confidence": 0.71,
+      "pre_risk_score": 0.45,
+      "news_signal": 0.3,
+      "rationale": "전기차 글로벌 판매 호조 + 환율 효과"
+    },
+    {
+      "ticker": "105560",
+      "name": "KB금융",
+      "signal": "buy",
+      "confidence": 0.65,
+      "pre_risk_score": 0.38,
+      "news_signal": 0.2,
+      "rationale": "금리 안정화 기대 + 배당 매력"
+    }
+  ],
+  "risk_card": {
+    "tier1_pass": true,
+    "position_risks": [
+      {
+        "ticker": "005930",
+        "risk_flag": "pass",
+        "approved_weight": 20.0,
+        "reason": "정상 통과"
+      },
+      {
+        "ticker": "005380",
+        "risk_flag": "pass",
+        "approved_weight": 20.0,
+        "reason": "정상 통과"
+      },
+      {
+        "ticker": "105560",
+        "risk_flag": "pass",
+        "approved_weight": 20.0,
+        "reason": "정상 통과"
+      }
+    ]
+  },
+  "candidate_order_plan": {
+    "orders": [
+      {
+        "ticker": "005930",
+        "name": "삼성전자",
+        "action": "buy",
+        "weight": 20.0,
+        "confidence": 0.87
+      },
+      {
+        "ticker": "005380",
+        "name": "현대차",
+        "action": "buy",
+        "weight": 20.0,
+        "confidence": 0.71
+      },
+      {
+        "ticker": "105560",
+        "name": "KB금융",
+        "action": "buy",
+        "weight": 20.0,
+        "confidence": 0.65
+      }
+    ],
+    "portfolio_summary": {
+      "total_exposure": 60.0,
+      "cash_ratio": 40.0,
+      "position_count": 3
+    }
+  },
+  "final_decision": {
+    "decisions": [
+      {
+        "ticker": "005930",
+        "name": "삼성전자",
+        "decision": "approve",
+        "weight": 20.0,
+        "veto_reason": null
+      },
+      {
+        "ticker": "005380",
+        "name": "현대차",
+        "decision": "approve",
+        "weight": 20.0,
+        "veto_reason": null
+      },
+      {
+        "ticker": "105560",
+        "name": "KB금융",
+        "decision": "approve",
+        "weight": 20.0,
+        "veto_reason": null
+      }
+    ],
+    "explanation": "시장 환경이 안정적이고(green regime), 3종목 모두 confidence > 0.6으로 충분합니다. 섹터 분산(반도체/자동차/금융)이 확보되어 있어 집중 리스크가 낮습니다. 총 노출 60%, 현금 40%로 보수적 포지셔닝 유지합니다."
+  },
+  "audit_log": [
+    {
+      "rule": "regime_gate",
+      "action": "pass",
+      "reason": "Green regime — 정상 투자 가능"
+    },
+    {
+      "rule": "uq_tail_cap",
+      "action": "skip",
+      "reason": "Phase 1 비활성화"
+    }
+  ]
+}
