@@ -116,17 +116,25 @@ def compute_tech_features(df: pd.DataFrame) -> dict:
     else:
         features["volume_ratio_20"] = None
 
-    # return_5d / return_20d
+    # return_5d / return_20d (PIT-safe: 과거 종가만 사용)
+    # 데이터 부족(< 6일) 또는 분모=0인 경우 0.0 fallback으로 UQ 입력 보장
+    current_close = float(close.iloc[-1])
     if len(close) >= 6:
         close_5d_ago = float(close.iloc[-6])
-        current_close = float(close.iloc[-1])
         if close_5d_ago != 0:
             features["return_5d"] = round((current_close - close_5d_ago) / close_5d_ago * 100, 4)
+        else:
+            features["return_5d"] = 0.0
+    else:
+        features["return_5d"] = 0.0
     if len(close) >= 21:
         close_20d_ago = float(close.iloc[-21])
-        current_close = float(close.iloc[-1])
         if close_20d_ago != 0:
             features["return_20d"] = round((current_close - close_20d_ago) / close_20d_ago * 100, 4)
+        else:
+            features["return_20d"] = 0.0
+    else:
+        features["return_20d"] = 0.0
 
     # None 제거
     return {k: v for k, v in features.items() if v is not None}
@@ -153,16 +161,21 @@ def collect_news_index(universe_df: pd.DataFrame, target_date: str) -> list:
                 continue
 
             for _, n in df.iterrows():
-                # pubDate → ISO 8601 KST 변환
+                # pubDate → ISO 8601 KST 변환 (ZoneInfo 기반)
                 try:
-                    pub_dt = pd.to_datetime(n["pubDate"]).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+                    _raw = pd.to_datetime(n["pubDate"])
+                    if _raw.tzinfo is None:
+                        from zoneinfo import ZoneInfo as _ZI
+                        _raw = _raw.tz_localize(_ZI("Asia/Seoul"))
+                    pub_dt = _raw.isoformat(timespec="seconds")
                     pub_ts = pd.Timestamp(pub_dt)
                 except Exception:
-                    # pubDate 파싱 실패 — PIT-safety 보장 불가, 해당 뉴스 제외
+                    # pubDate 파싱 실패 → pub_ts를 신뢰할 수 없으므로 보수적으로 제외 (PIT-Safety)
                     filtered_count += 1
                     continue
 
                 # ── PIT-safe 필터: snapshot 이후 뉴스 제거 ──
+                # (파싱 실패 뉴스는 위 except에서 이미 제외됨 — None 통과 없음)
                 if pub_ts > snapshot_ts:
                     filtered_count += 1
                     continue
@@ -187,12 +200,17 @@ def collect_news_index(universe_df: pd.DataFrame, target_date: str) -> list:
 
 
 def collect_disclosure_index(target_date: str, universe_tickers: list = None) -> list:
-    """DART 공시 수집 → disclosure_index 생성 (유니버스 필터링 적용)"""
+    """DART 공시 수집 → disclosure_index 생성 (유니버스 필터링 적용)
+    PIT-Safety: target_date 당일 공시는 보수적으로 제외 (전일까지만 수집).
+    """
     now_str = now_kst_iso()
     disclosures = []
 
+    # target_date 전일까지만 수집 (당일 공시는 PIT-safe하지 않으므로 제외)
+    prev_date = (datetime.strptime(target_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+
     try:
-        df = get_disclosure_list(bgn_de=target_date, end_de=target_date, page_count=100)
+        df = get_disclosure_list(bgn_de=prev_date, end_de=prev_date, page_count=100)
         if df.empty:
             return []
 

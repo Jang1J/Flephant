@@ -61,7 +61,9 @@
               "macd": { "type": "number" },
               "macd_signal": { "type": "number" },
               "atr_14": { "type": "number" },
-              "volume_ratio_20": { "type": "number", "description": "당일거래량 / 20일평균거래량" }
+              "volume_ratio_20": { "type": "number", "description": "당일거래량 / 20일평균거래량" },
+              "return_5d": {"type": ["number", "null"], "description": "최근 5거래일 수익률"},
+              "return_20d": {"type": ["number", "null"], "description": "최근 20거래일 수익률"}
             }
           }
         }

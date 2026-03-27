@@ -1,0 +1,22 @@
+# Strategy Profile Configuration
+# 사용자가 선택하는 투자 성향 → 어떤 SC generator를 사용할지 매핑
+
+profiles:
+  momentum:
+    description: "추세추종형 (AI #2 LightGBM ranker)"
+    variant_dir: "artifacts/strategy_card_variants/momentum"
+    generator: "jobs/build_strategy_card_momentum.py"  # AI #2 담당
+    alpha_family: "continuation"
+
+  rebound:
+    description: "반등포착형 (KR-Rebound-CNN)"
+    variant_dir: "artifacts/strategy_card_variants/rebound"
+    generator: "jobs/build_strategy_card_rebound.py"
+    alpha_family: "reversal"
+
+default_profile: "rebound"
+
+# 공통 설정 (모든 profile에 적용)
+common:
+  risk_policy: "config/risk_policy_v0.yaml"  # Risk policy는 공통
+  sc_schema: "schemas/strategy_card.json"     # SC 스키마 공통

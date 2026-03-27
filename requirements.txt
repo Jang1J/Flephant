@@ -8,9 +8,11 @@ pykrx>=1.0           # KRX 주식 데이터
 dart-fss>=0.4        # OpenDART 공시
 python-dotenv>=1.0   # 환경변수 (.env)
 
-# === ML (Phase 1) ===
+# === ML (Phase 1 + CNN) ===
 lightgbm>=4.3
 scikit-learn>=1.4
+torch                # KR-Rebound-CNN 모델
+Pillow               # build_strategy_card_rebound.py 이미지 처리
 
 # === LLM ===
 openai>=1.30         # GPT-4o fallback
@@ -23,3 +25,4 @@ jupyter>=1.0
 # === Utils ===
 tqdm>=4.66
 pyyaml>=6.0
+jsonschema           # SC/RC/FDC 스키마 검증

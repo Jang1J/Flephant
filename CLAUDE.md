@@ -97,6 +97,7 @@ python connectors/llm_router.py
 | `/run-pipeline [YYYYMMDD\|replay N]` | runner + qa-inspector | 파이프라인 실행 + 아티팩트 검증 |
 | `/validate [schema\|policy\|all]` | qa-inspector + reviewer | 정합성 검증 |
 | `/smoke-test [커넥터명\|all]` | runner 단독 | 커넥터 smoke test |
+| `/build-model [dataset\|train\|evaluate\|emit\|publish]` | modeler + fixer + qa-inspector | KR-Rebound-CNN 모델 구축 |
 
 ### 복합 작업 — 오케스트레이터
 ```

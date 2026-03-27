@@ -13,6 +13,7 @@ Usage:
 
 import json
 import yaml
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -40,6 +41,18 @@ class FinalDecisionAgent:
         self.use_llm = use_llm
         self.contract = self._load_contract()
         self._policy = self._load_policy()
+        self._sector_map = self._load_sector_map()
+
+    def _load_sector_map(self) -> dict:
+        """universe_v1.csv에서 ticker→wics_sector 매핑 로드 (Rule 6b 전용)"""
+        csv_path = _BASE_DIR / "config" / "universe_v1.csv"
+        try:
+            df = pd.read_csv(csv_path, dtype={"ticker": str})
+            df["ticker"] = df["ticker"].apply(lambda x: str(x).zfill(6))
+            return dict(zip(df["ticker"], df["wics_sector"]))
+        except Exception as e:
+            print(f"[FDA] universe_v1.csv sector 매핑 로드 실패: {e}")
+            return {}
 
     def _load_policy(self) -> dict:
         """risk_policy_v0.yaml 로드"""
@@ -266,10 +279,12 @@ class FinalDecisionAgent:
                 print(f"  [FDA] [{order.get('ticker', '')}] Rule 6a 경고: 승률 {win_rate:.0%} < 35%")
 
             # Rule 6b: failure_tags 매칭
+            # sector는 SC 스키마에 없으므로 universe_v1.csv에서 lookup한다.
             failure_tags = backtest_summary.get("failure_tags", [])
             if failure_tags:
                 sc = strategy_card or {}
-                sector = sc.get("sector", "")
+                ticker_key = order.get("ticker", "")
+                sector = self._sector_map.get(str(ticker_key).zfill(6), "")
                 signal = sc.get("signal", "")
                 matched_tags = []
                 if "sector_concentration" in failure_tags and sector:
@@ -278,7 +293,7 @@ class FinalDecisionAgent:
                     matched_tags.append("momentum_reversal")
                 if matched_tags:
                     warnings.append(f"failure_tags 매칭: {matched_tags}")
-                    print(f"  [FDA] [{order.get('ticker', '')}] Rule 6b 경고: {matched_tags}")
+                    print(f"  [FDA] [{ticker_key}] Rule 6b 경고: {matched_tags}")
 
             # Rule 6c: Sharpe/MDD 기반 전략 신뢰도 (포트폴리오 전체 경고)
             recent_sharpe = backtest_summary.get("recent_sharpe")

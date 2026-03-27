@@ -25,6 +25,91 @@ SCHEMA_PATH = _BASE_DIR / "schemas" / "strategy_card.json"
 REPORT_DIR = _BASE_DIR / "artifacts" / "validation_report"
 
 
+def validate_semantic(cards: list, target_date: str) -> list:
+    """SC의 의미론적 정합성을 검증한다.
+
+    검증 항목:
+      1. ticker unique
+      2. ticker ∈ universe_v1.csv
+      3. snapshot_dt <= target_date 18:00 KST (PIT-Safety)
+      4. signal/direction 일관성
+      5. confidence ∈ [0, 1]
+      6. evidence_ids 비어 있지 않은지
+    """
+    import pandas as pd
+
+    issues = []
+
+    # 1. ticker unique 검증
+    tickers = [str(c.get("ticker", "")).zfill(6) for c in cards]
+    if len(tickers) != len(set(tickers)):
+        dupes = [t for t in set(tickers) if tickers.count(t) > 1]
+        issues.append(f"중복 ticker: {set(dupes)}")
+
+    # 2. ticker ∈ universe 검증 + 26종목 coverage 체크
+    universe = None
+    try:
+        universe = pd.read_csv(
+            _BASE_DIR / "config" / "universe_v1.csv", dtype={"ticker": str}
+        )
+        universe["ticker"] = universe["ticker"].apply(lambda x: str(x).zfill(6))
+        valid_tickers = set(universe["ticker"].tolist())
+        for t in tickers:
+            if t not in valid_tickers:
+                issues.append(f"universe 미포함 ticker: {t}")
+    except Exception as e:
+        issues.append(f"universe_v1.csv 로드 실패 — ticker 검증 불가: {e}")
+
+    # 3. snapshot_dt <= target_date 18:00 KST (PIT-Safety)
+    expected_limit = (
+        f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}T18:00:00+09:00"
+    )
+    for c in cards:
+        sdt = c.get("snapshot_dt", "")
+        if sdt and sdt > expected_limit:
+            issues.append(
+                f"{c.get('ticker', '?')}: snapshot_dt({sdt}) > 허용 상한({expected_limit})"
+            )
+
+    # 4. signal/direction 일관성 검증
+    for c in cards:
+        sig = c.get("signal", "")
+        dir_ = c.get("direction", "")
+        t = c.get("ticker", "?")
+        if sig in ("strong_buy", "buy") and dir_ != "long":
+            issues.append(f"{t}: signal={sig} 이지만 direction={dir_} (long 이어야 함)")
+        if sig == "hold" and dir_ not in ("neutral", "long"):
+            issues.append(f"{t}: signal=hold 이지만 direction={dir_} (neutral 또는 long 이어야 함)")
+        if sig in ("sell", "strong_sell") and dir_ not in ("neutral", "short"):
+            issues.append(f"{t}: signal={sig} 이지만 direction={dir_} (neutral 또는 short 이어야 함)")
+
+    # 5. confidence ∈ [0, 1] 검증
+    for c in cards:
+        conf = c.get("confidence")
+        t = c.get("ticker", "?")
+        if conf is not None and (conf < 0 or conf > 1):
+            issues.append(f"{t}: confidence={conf} 범위 벗어남 (0~1 이어야 함)")
+
+    # 6. evidence_ids 비어 있지 않은지 검증
+    for c in cards:
+        t = c.get("ticker", "?")
+        if not c.get("evidence_ids"):
+            issues.append(f"{t}: evidence_ids 비어 있음")
+
+    # 7. 26종목 전체 카드 생성 여부 확인 (coverage 체크)
+    if universe is not None:
+        try:
+            universe_tickers = set(universe["ticker"].tolist())
+            card_tickers = set(str(c.get("ticker", "")).zfill(6) for c in cards)
+            missing = universe_tickers - card_tickers
+            if missing:
+                issues.append(f"유니버스 미커버 종목 {len(missing)}개: {sorted(missing)}")
+        except Exception as e:
+            issues.append(f"coverage 체크 실패: {e}")
+
+    return issues
+
+
 def validate_handoff(target_date: str):
     print(f"\n{'='*60}")
     print(f"  AI #2 Handoff 검증: {target_date}")
@@ -107,6 +192,16 @@ def validate_handoff(target_date: str):
         print(f"  → PIT 검증 이슈 {len(pit_issues)}건 (E2E는 계속 진행)")
     else:
         print(f"  → PIT 검증 PASS")
+
+    # ── 2c. SC Semantic Validation ──
+    print(f"\n[2c/4] SC Semantic Validation...")
+    sem_issues = validate_semantic(cards, target_date)
+    if sem_issues:
+        for issue in sem_issues:
+            print(f"  WARN {issue}")
+        print(f"  → Semantic 검증 이슈 {len(sem_issues)}건 (E2E는 계속 진행)")
+    else:
+        print(f"  → Semantic 검증 PASS")
 
     # ── 3. E2E 실행 (real StrategyCard) ──
     print(f"\n[3/4] E2E Pipeline (real StrategyCard)...")

@@ -1,0 +1,122 @@
+# KR-Rebound-CNN Configuration
+model:
+  name: "KR-Rebound-CNN"
+  version: "v1.0"
+
+data:
+  lookback_days: 20          # 차트 윈도우 (20 거래일)
+  forecast_horizon: 5        # 예측 horizon (5 거래일)
+  rebound_threshold: 0.0     # excess return label: y=1 if excess > 0.0%
+  min_history_days: 60       # 최소 히스토리 요구
+
+  features:
+    ohlcv: ["open", "high", "low", "close", "volume"]
+    technical: ["sma_5", "sma_20", "sma_60", "rsi_14", "macd", "bb_upper", "bb_lower"]
+    sector_relative:
+      - "ret_5d_sector_z"
+      - "rsi_14_sector_z"
+      - "close_sma20_ratio_sector_rank"
+      - "volume_ratio_20_sector_pct"
+    macro: ["vix_proxy", "market_breadth", "fx_rate", "base_rate"]
+
+  # Context Branch 피처 정의 (설계서 §10.2 기준)
+  # 총 context 차원: macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
+  #                  + sector_onehot(n_sectors) + market_cap_rank(1)
+  # universe_v1.csv 기준 16개 섹터 → 총 26차원 (4+5+2+3+11+1=26 설계서 명세)
+  # 실제 n_sectors는 dataset.py에서 universe CSV 읽어 동적 계산 후 config["n_context_features"]로 전달
+  context_features:
+    macro:               # 4개
+      - vix_proxy
+      - market_breadth
+      - fx_rate          # DMP 키: fx_rate (usd_krw 대응)
+      - base_rate
+    technical:           # 5개
+      - rsi_14
+      - atr_14_ratio     # atr_14 / close
+      - volume_ratio_20
+      - macd
+      - macd_signal
+    price_stretch:       # 2개
+      - close_sma5_ratio    # close/sma_5 - 1
+      - close_sma20_ratio   # close/sma_20 - 1
+    sector_relative:     # 3개
+      - ret_5d_sector_z
+      - rsi_14_sector_z
+      - volume_ratio_20_sector_pct
+    meta:                # sector_onehot(n_sectors) + market_cap_rank(1)
+      - sector_onehot    # n_sectors-dim one-hot (WICS 대분류, universe CSV에서 동적 계산)
+      - market_cap_rank  # 0~1 range (percentile rank within universe)
+
+  # n_context_features_base: sector_onehot 제외 고정 차원 수 (14 + 1 = 15)
+  # 최종 n_context_features = 15 + n_sectors (dataset.py에서 계산)
+  n_context_features_base: 15  # macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + market_cap_rank(1)
+
+  image:
+    height: 64               # chart image height
+    width: 64                # chart image width
+    channels: 3              # Ch1: candlestick body-wick, Ch2: volume, Ch3: indicator overlay
+
+training:
+  batch_size: 64
+  learning_rate: 0.001
+  max_epochs: 50
+  early_stopping_patience: 8
+  walk_forward:
+    mode: "expanding"        # expanding (시작점 고정, 끝점 확장) 또는 sliding (기존 동작)
+    train_window: 120        # 학습 기간 (거래일)
+    val_window: 20           # 검증 기간
+    step_size: 20            # 슬라이딩 스텝
+
+  optimizer: "adamw"
+  loss: "weighted_bce"       # pos_weight = n_neg / n_pos
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  seed: 42
+  ensemble_seeds: [42, 123, 456]
+
+calibration:
+  method: "isotonic"         # isotonic / platt
+  min_samples: 100
+
+inference:
+  confidence_threshold: 0.5  # signal 분류 기준
+  signal_map:
+    strong_buy: 0.70
+    buy: 0.55
+    hold: 0.0
+
+evaluation:
+  assumed_positive_return: 0.02   # portfolio layer 가상 수익률 (y=1 종목)
+  assumed_negative_return: -0.005 # portfolio layer 가상 수익률 (y=0 종목)
+
+oversold_gate:
+  min_conditions: 2
+  ret_5d_threshold: 0.0        # ret_5d < 0
+  rsi_14_threshold: 45
+  close_sma20_threshold: 0.0   # close < sma_20 (비율 기준: ratio < 0)
+  bb_pos_threshold: 0.35
+  sector_ret5_z_threshold: -0.25
+  sector_bottom_pct: 0.40
+  relaxation:
+    enabled: true
+    min_candidates: 3
+    rsi_relaxed: 48
+    sector_bottom_pct_relaxed: 0.50
+
+# Committee v1.1: ElasticNet tabular core + CNN confirmation fusion
+# enabled=false: 기존 CNN-only 동작 무변경. true로 전환 시 Stage B1+B2 활성화.
+committee:
+  enabled: true
+  tab_weight: 0.65
+  cnn_weight: 0.35
+  agreement_threshold: 0.55
+
+# ElasticNet logistic regression 하이퍼파라미터 (committee.enabled=true 시 사용)
+elasticnet:
+  alpha: 0.01
+  l1_ratio: 0.5
+
+# Signal Persistence Filter (설계서 §19.2)
+# enabled=false: 기존 동작 무변경. true로 전환 시 이전 거래일 SC 비교 후 신호 억제.
+persistence_filter:
+  enabled: false

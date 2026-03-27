@@ -57,9 +57,12 @@
           "entry_price": { "type": "number" },
           "exit_price": { "type": "number" },
           "pnl_pct": { "type": "number" },
-          "reason": { "type": "string" }
+          "reason": { "type": "string" },
+          "exit_reason": {"type": ["string", "null"], "description": "청산 사유 (stop_loss, fda_sell, rebalance 등)"},
+          "exit_date": {"type": ["string", "null"], "description": "청산 날짜 (YYYYMMDD)"}
         }
       }
-    }
+    },
+    "generated_at": {"type": "string", "description": "PFS 생성 시각 (ISO 8601)"}
   }
 }

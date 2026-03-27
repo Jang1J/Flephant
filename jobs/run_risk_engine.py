@@ -149,7 +149,9 @@ def apply_position_constraints(cards: list, regime: dict, policy: dict, universe
     # 기존 보유 노출 합산 (신규 buy 허용 여부 계산용)
     existing_exposure = sum(pos.get("weight", 0) for pos in pfs_positions.values())
 
-    # buy/strong_buy만 신규 주문 대상 (기존 보유 종목 제외)
+    # [RiskEngine] v1 운영 정책: buy/strong_buy 신호만 주문 후보로 처리.
+    # rebound 전략(long/neutral)과 현재 downstream 계약에 부합.
+    # sell/short 소비는 Phase 2에서 구현 예정.
     buy_cards = [
         c for c in cards
         if c["signal"] in ["strong_buy", "buy"]
@@ -264,6 +266,12 @@ def apply_position_constraints(cards: list, regime: dict, policy: dict, universe
                 "evidence_ids": card.get("evidence_ids", []),
                 "sizing_rule": "equal_weight",
                 "sell_reason": None,
+                "pre_risk_score": card.get("pre_risk_score"),
+                "quant_score": card.get("quant_score"),
+                "news_signal": card.get("news_signal"),
+                "source_strategy": card.get("source_strategy"),
+                "features_used": card.get("features_used", []),
+                "uncertainty_score": card.get("uncertainty_score"),
             })
 
         _reason_str = reason if reason else f"정상 통과: confidence={card['confidence']}"
@@ -492,6 +500,12 @@ def generate_hold_sell_orders(cards: list, dmp: dict, policy: dict,
             "evidence_ids": sc.get("evidence_ids", []),
             "sizing_rule": None,
             "sell_reason": sell_reason,
+            "pre_risk_score": sc.get("pre_risk_score"),
+            "quant_score": sc.get("quant_score"),
+            "news_signal": sc.get("news_signal"),
+            "source_strategy": sc.get("source_strategy"),
+            "features_used": sc.get("features_used", []),
+            "uncertainty_score": sc.get("uncertainty_score"),
         })
 
     return hold_sell_orders

@@ -170,9 +170,14 @@ def collect_macro_docs(target_date: str) -> list:
                 title = normalize_headline(row["title"])
                 desc = normalize_headline(row.get("description", ""))
                 try:
-                    pub_dt = pd.to_datetime(row["pubDate"]).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+                    from zoneinfo import ZoneInfo as _ZI
+                    _raw = pd.to_datetime(row["pubDate"])
+                    if _raw.tzinfo is None:
+                        _raw = _raw.tz_localize(_ZI("Asia/Seoul"))
+                    pub_dt = _raw.isoformat(timespec="seconds")
                 except Exception:
-                    pub_dt = row["pubDate"]
+                    # pubDate 파싱 실패 → 보수적으로 제외 (PIT-Safety)
+                    continue
 
                 # PIT-safe 필터
                 if not is_within_snapshot(pub_dt, target_date):
@@ -206,9 +211,14 @@ def collect_sector_docs(sector: str, target_date: str) -> list:
                 title = normalize_headline(row["title"])
                 desc = normalize_headline(row.get("description", ""))
                 try:
-                    pub_dt = pd.to_datetime(row["pubDate"]).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+                    from zoneinfo import ZoneInfo as _ZI
+                    _raw = pd.to_datetime(row["pubDate"])
+                    if _raw.tzinfo is None:
+                        _raw = _raw.tz_localize(_ZI("Asia/Seoul"))
+                    pub_dt = _raw.isoformat(timespec="seconds")
                 except Exception:
-                    pub_dt = row["pubDate"]
+                    # pubDate 파싱 실패 → 보수적으로 제외 (PIT-Safety)
+                    continue
 
                 # PIT-safe 필터
                 if not is_within_snapshot(pub_dt, target_date):
@@ -241,9 +251,14 @@ def collect_target_docs(name: str, ticker: str, target_date: str) -> list:
                 title = normalize_headline(row["title"])
                 desc = normalize_headline(row.get("description", ""))
                 try:
-                    pub_dt = pd.to_datetime(row["pubDate"]).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+                    from zoneinfo import ZoneInfo as _ZI
+                    _raw = pd.to_datetime(row["pubDate"])
+                    if _raw.tzinfo is None:
+                        _raw = _raw.tz_localize(_ZI("Asia/Seoul"))
+                    pub_dt = _raw.isoformat(timespec="seconds")
                 except Exception:
-                    pub_dt = row["pubDate"]
+                    # pubDate 파싱 실패 → 보수적으로 제외 (PIT-Safety)
+                    continue
 
                 # PIT-safe 필터
                 if not is_within_snapshot(pub_dt, target_date):
@@ -262,23 +277,36 @@ def collect_target_docs(name: str, ticker: str, target_date: str) -> list:
         pass
 
     # DART 공시
+    # PIT-Safety: 공시 접수 시각(rcept_tm)이 없으면 당일(target_date) 공시는 제외.
+    # 이유: same-day 공시는 장중/장후 접수일 수 있어 정확한 시각 없이 09:00 가정 시
+    #       미래 데이터 leakage 발생 위험. 전일(target_date - 1) 이전 공시만 포함.
     try:
         start_dt = (datetime.strptime(target_date, "%Y%m%d") - timedelta(days=7)).strftime("%Y%m%d")
-        disc_df = get_disclosure_list(bgn_de=start_dt, end_de=target_date, page_count=20)
+        # end_de를 target_date 전일까지로 제한하여 same-day 공시 전체 제외
+        end_dt = (datetime.strptime(target_date, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+        disc_df = get_disclosure_list(bgn_de=start_dt, end_de=end_dt, page_count=20)
         if not disc_df.empty:
             # 종목코드 기준 필터
             disc_df["stock_code"] = disc_df["stock_code"].astype(str).str.strip()
             ticker_discs = disc_df[disc_df["stock_code"] == ticker]
+            dart_excluded = 0
             for _, row in ticker_discs.iterrows():
                 rcept_no = str(row.get("rcept_no", ""))
                 rcept_dt = str(row.get("rcept_dt", ""))
                 report_nm = str(row.get("report_nm", ""))
                 corp_name = str(row.get("corp_name", ""))
-                pub_dt = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}T09:00:00+09:00" if len(rcept_dt) == 8 else ""
 
-                # PIT-safe 필터
-                if pub_dt and not is_within_snapshot(pub_dt, target_date):
+                # rcept_dt 누락/형식 오류 → 보수적으로 제외
+                if len(rcept_dt) != 8:
+                    dart_excluded += 1
                     continue
+
+                # same-day 공시 이중 방어: end_de 설정에도 불구하고 혹시 포함된 경우 제거
+                if rcept_dt >= target_date:
+                    dart_excluded += 1
+                    continue
+
+                pub_dt = f"{rcept_dt[:4]}-{rcept_dt[4:6]}-{rcept_dt[6:8]}T18:00:00+09:00"
 
                 docs.append({
                     "doc_id": make_evidence_id(f"DART-{ticker}", rcept_no),
@@ -288,6 +316,9 @@ def collect_target_docs(name: str, ticker: str, target_date: str) -> list:
                     "published_at": pub_dt,
                     "evidence_id": rcept_no if rcept_no else make_evidence_id("DART", str(row)),
                 })
+
+            if dart_excluded > 0:
+                print(f"[TTP] {ticker} DART same-day/형식오류 공시 {dart_excluded}건 제외 (PIT-Safety)")
     except Exception as e:
         print(f"[TTP] {ticker} DART 조회 실패: {e}")  # DART API 실패 시 뉴스만으로 진행
 

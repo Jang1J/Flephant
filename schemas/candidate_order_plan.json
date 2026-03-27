@@ -79,7 +79,13 @@
           "sell_reason": {
             "type": ["string", "null"],
             "description": "sell 사유 (stop_loss, signal_sell, regime_red 등). action=sell일 때만 사용, 그 외 null"
-          }
+          },
+          "pre_risk_score": {"type": ["number", "null"], "minimum": -1, "maximum": 1},
+          "quant_score": {"type": ["number", "null"], "minimum": -1, "maximum": 1},
+          "news_signal": {"type": ["number", "null"]},
+          "source_strategy": {"type": ["string", "null"]},
+          "features_used": {"type": "array", "items": {"type": "string"}},
+          "uncertainty_score": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
         }
       }
     },

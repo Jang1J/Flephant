@@ -155,12 +155,30 @@ class PortfolioManager:
 
             if is_approved_sell:
                 sell_reason = cop_order.get("sell_reason") or decision.get("veto_reason") or "sell signal"
+                # 청산 사유를 분류하여 audit trail 강화
+                is_stop_loss = (sell_reason == "stop_loss") or (
+                    "stop_loss" in str(cop_order.get("sell_reason", "")).lower()
+                )
+                exit_date = state.get("snapshot_dt", "")[:10]
+                if is_stop_loss:
+                    print(
+                        f"[PortfolioManager] {ticker} 스톱로스 청산: "
+                        f"pnl={pnl_pct:.2f}% (임계값={self.stop_loss_threshold}%), "
+                        f"진입가={entry_price}, 현재가={current_price}, 날짜={exit_date}"
+                    )
+                else:
+                    print(
+                        f"[PortfolioManager] {ticker} 청산 (사유={sell_reason}): "
+                        f"pnl={pnl_pct:.2f}%, 진입가={entry_price}, 현재가={current_price}, 날짜={exit_date}"
+                    )
                 realized.append({
                     "ticker": ticker,
                     "entry_price": entry_price,
                     "exit_price": current_price,
                     "pnl_pct": pnl_pct,
                     "reason": sell_reason,
+                    "exit_reason": "stop_loss" if is_stop_loss else sell_reason,
+                    "exit_date": exit_date,
                 })
                 exit_weight_sum += pos["weight"]
                 continue
