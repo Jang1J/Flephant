@@ -206,6 +206,17 @@
 
 ---
 
+### AI #1 추가 구현: Backup Strategy Agent (KR-Rebound-Committee v1.1)
+
+AI #1은 기존 계획(Data Agent + Risk Agent + FDA)에 더해, 독립형 backup Strategy Agent를 추가 구현했다.
+- **전략**: KR-Rebound-Committee v1.1 — Oversold Gate → ElasticNet core + CNN confirmation → score fusion
+- **설계 근거**: GPT Pro 작성 KR-Rebound-CNN v1.0 설계서 (문헌 기반, peer-reviewed journals 2025~2026)
+- **통합 방식**: 기존 StrategyCard 스키마 100% 호환, variant→publish→canonical SC 구조로 기존 파이프라인에 무수정 연결
+- **성과**: 401일 DMP, 14-fold genuine expanding walk-forward, 평균 Val AUC ~0.64, 실가격 backtest +3.51% (95거래일)
+- KR-Rebound-Committee는 AI #2의 momentum 전략과 plugin형으로 교체 가능한 독립 모듈이다.
+
+---
+
 ## 8. Strategy Agent 세부 구조
 
 Strategy Agent는 단일 모델이 아니라, **두 가지 핵심 전략 축 + 종합 계층**으로 구성한다.
@@ -516,6 +527,10 @@ AI #1은 **online serving / governance**, AI #2는 **offline modeling / validati
 
 AI 팀은 멀티에이전트 트레이딩 엔진, BE 팀은 이를 연결한 서비스 레이어를 맡는다.
 
+현재 AI #2의 공식 Strategy Agent(LightGBM + News + Synthesizer)는 구현 진행 중이다.
+
+AI 측 handoff contract/payload는 준비 완료되었으며, BE 서비스 구현은 별도 레포/팀에서 진행한다.
+
 ---
 
 ## 17. 일정 계획
@@ -574,7 +589,13 @@ AI 팀은 멀티에이전트 트레이딩 엔진, BE 팀은 이를 연결한 서
 
 ---
 
-## 20. 결론
+## 20. 실가격 Backtest 결과
+
+실제 가격 기반 replay backtest 모듈(run_backtest_replay.py)이 구현되었으며, 95거래일 기준 +3.51% 수익(벤치마크 EW 대비 -13.56%)을 기록했다. 이는 synthetic simulation이 아닌 t+1 시가 체결 기반 실가격 결과이다.
+
+---
+
+## 21. 결론
 
 본 프로젝트는 단일 주가 예측 모델이 아니라, KOSPI 대형주를 대상으로 한 멀티에이전트 트레이딩 알고리즘을 개발하고, 이를 바탕으로 사용자가 활용할 수 있는 모의 자동매매/추천 앱 프로토타입을 구현하는 것을 목표로 한다.
 

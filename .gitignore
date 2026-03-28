@@ -28,3 +28,15 @@ artifacts/
 
 # === Jupyter ===
 .ipynb_checkpoints/
+# === Model Artifacts (재학습으로 재생성 가능) ===                                                                  
+  *.pkl           
+  *.pt                                                                                                                
+  models/rebound_cnn/training_log.json
+  models/rebound_cnn/calibrator_meta.json
+                                                                                                                      
+  # === Reports (재실행으로 재생성 가능) ===
+  reports/                                                                                                            
+                  
+  # === External Skills (도구 템플릿) ===                                                                             
+  skills/
+

@@ -194,6 +194,29 @@ P85 threshold 기준: `config/risk_policy_v0.yaml` 참조 (하드코딩 금지)
 
 ---
 
+## Rebound Profile 운영 명령
+
+### Rebound Profile 운영 명령
+
+# SC 생성
+```bash
+/opt/anaconda3/envs/elephant/bin/python jobs/build_strategy_card_rebound.py YYYYMMDD
+```
+
+# Publish
+```bash
+/opt/anaconda3/envs/elephant/bin/python jobs/publish_strategy_variant.py --profile rebound --date YYYYMMDD
+```
+
+# Backtest
+```bash
+/opt/anaconda3/envs/elephant/bin/python jobs/run_backtest_replay.py --days 100
+```
+
+SC 생성 후 반드시 26종목 전체 카드가 생성되었는지 확인한다.
+
+---
+
 ## 장애 대응
 
 ### DMP 생성 실패
@@ -204,6 +227,7 @@ P85 threshold 기준: `config/risk_policy_v0.yaml` 참조 (하드코딩 금지)
 - KRX API 실패: `mktcap: null` 허용 (Phase 1 정상)
 - ECOS API 실패: `macro_snapshot` 일부 필드 null 허용
 - DQR `overall_pass: false` 이어도 파이프라인 진행 가능 (판단 후 결정)
+- DMP macro_snapshot의 필드가 None인 경우 SC 생성 시 float(None) 에러가 발생할 수 있다. backfill 후 DMP 재생성을 권장한다.
 
 ### TTP 생성 실패
 ```bash

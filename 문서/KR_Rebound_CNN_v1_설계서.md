@@ -1,4 +1,4 @@
-# KR-Rebound-CNN v1.0 설계서
+# KR-Rebound-CNN v1.1 설계서
 
 > GPT Pro 작성, 2026-03-26
 > 문헌 근거: 2025 하반기~2026 초 peer-reviewed journals
@@ -586,3 +586,24 @@ variant publish 방식으로 기존 AI #1 pipeline에 무수정 연결한다.
 - AI #2의 LightGBM momentum과 명확히 차별화되며,
 - 현재 repo의 strategy_loader.py, run_e2e_pipeline.py, run_risk_engine.py 제약과도 맞고,
 - 10주 capstone 범위 안에서 구현 가능한 수준이다.
+
+---
+
+## 24. v1.1 업데이트 (2026-03-28)
+
+### Committee v1.1
+- ElasticNet logistic core + CNN confirmation + score fusion (0.65:0.35)
+- disagreement 기반 uncertainty: agreement < 0.55 → 보수적 hold
+
+### Calibration 비교기
+- Temperature Scaling vs Isotonic Regression 자동 비교
+- Brier + ECE 기준 winner 결정, calibrator_meta.json 저장
+
+### Signal Persistence Filter
+- 코드 구현 완료 (persistence_filter.enabled=false, v1.1 활성화 대기)
+- 신규 buy는 이전 p>=0.50 필요, strong_buy는 급락 방어
+
+### 현재 남은 이슈
+- genuine walk-forward val AUC 평균 0.64 (데이터 추가 시 개선 예상)
+- 실가격 backtest: +3.51% / Sharpe 0.45 / MDD -16% (95거래일)
+- market_cap_rank: DMP mktcap 기반 계산 구현됨, 일부 DMP에 mktcap 미포함

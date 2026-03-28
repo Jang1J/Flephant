@@ -91,6 +91,24 @@ AI #2는 아래 3종 branch output을 함께 저장한다:
 
 ---
 
+## 8. Signal 제약 (v1.1 rebound profile)
+
+v1.1부터 rebound profile의 SC는 strong_buy/buy/hold 3단계만 생성한다. sell/strong_sell은 생성하지 않는다.
+
+---
+
+## 9. Coverage 제약
+
+SC는 유니버스 26종목 전체에 대해 생성되어야 한다. 누락 종목이 있으면 validator가 경고한다.
+
+---
+
+## 10. Committee 메타데이터
+
+committee 사용 시에도 SC schema는 변경하지 않는다. committee_score, agreement_score 등은 별도 report artifact로 관리한다.
+
+---
+
 ## 합의
 
 - [ ] AI #1 확인

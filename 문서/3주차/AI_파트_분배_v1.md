@@ -62,6 +62,22 @@ uncertainty 모델 자체의 offline 학습은 AI #2가 지원하지만, P85 thr
 
 모든 LLM 호출은 선택적(optional). 실패해도 파이프라인 정상 동작. Kanana-o primary, GPT-4o fallback 자동 전환.
 
+### AI #1 추가 역할: Backup Strategy Agent
+
+기존 역할(Data Agent + Risk Agent + FDA + UQ calibration)에 더해, AI #1은 다음을 추가 구현했다:
+- KR-Rebound-Committee v1.1 (Oversold Gate → ElasticNet + CNN confirmation)
+- Signal Persistence Filter, Calibration 비교기 (temperature vs isotonic)
+- 실가격 기반 Replay Backtest (run_backtest_replay.py)
+- GPT Pro 설계서 기반 2nd Strategy Agent 전체 구현
+
+추가 산출물:
+- models/rebound_cnn/ (model.py, dataset.py, train.py, evaluate.py, committee.py, config.yaml)
+- jobs/build_strategy_card_rebound.py, jobs/publish_strategy_variant.py, jobs/run_backtest_replay.py
+- config/strategy_profiles.yaml
+- 문서/KR_Rebound_CNN_v1_설계서.md
+
+---
+
 ### AI #2 (팀원): Strategy Agent (Quant + News + Synthesizer) + Backtest Agent
 
 **왜 이 조합인가:**
@@ -79,6 +95,8 @@ Quant가 shortlist를 만들고, 그 shortlist에 대해서만 News/Market Strat
 historical uncertainty score, calibration curve, reliability diagram, no-UQ ablation은 offline validation에 가깝기 때문에 AI #2가 만드는 것이 효율적이다.
 
 **핵심 키워드: offline modeling + validation + ML core engine + evaluation**
+
+AI #2의 공식 momentum/news strategy와 true backtest suite는 구현 진행 중이다.
 
 ---
 

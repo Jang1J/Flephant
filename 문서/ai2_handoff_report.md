@@ -38,6 +38,12 @@
 3. E2E Pipeline (real SC → Risk → FDA → FDC)
 4. 결과 요약 + JSON 리포트 저장
 
+validate_ai2_handoff.py는 다음 semantic 검증을 수행한다: (1) ticker unique (2) ticker ∈ universe (3) snapshot_dt PIT-Safety (4) signal/direction 일관성 (5) confidence ∈ [0,1] (6) evidence_ids 비어있지 않음 (7) 26종목 전체 coverage
+
+현재 AI #1의 backup strategy(KR-Rebound-Committee)도 동일한 SC contract를 사용하며, 동일한 handoff validator를 통과해야 한다.
+
+SC는 유니버스 26종목 전체에 대해 생성되어야 한다.
+
 ### 2.4 FDA Real SC 처리
 - `final_decision_agent.py`가 `strategy_cards: list`를 직접 수신
 - SC의 `signal`, `confidence`, `source_strategy`를 conflict detection에 활용
