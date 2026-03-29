@@ -3,6 +3,7 @@ name: paper-trending
 description: "논문 트렌드 조사 스킬. 금융 ML, 퀀트 트레이딩, multi-agent 시스템 분야의 최신 논문 트렌드를 조사한다. '논문 트렌드', '최신 연구', 'paper trending', 'SOTA', '최신 논문', 'trending papers' 키워드 시 사용. 특정 주제 심층 조사는 /agent-research가 처리한다."
 argument-hint: "[분야: quant | multi-agent | financial-ml | all]"
 user-invocable: true
+agent: analyst
 allowed-tools: Read, Grep, Glob, Bash, WebSearch, WebFetch
 ---
 

@@ -1,0 +1,546 @@
+[
+  {
+    "date": "20251106",
+    "ticker": "000270",
+    "action": "buy",
+    "price": 112500.0,
+    "shares": 400,
+    "cost": 6750.0
+  },
+  {
+    "date": "20251106",
+    "ticker": "329180",
+    "action": "buy",
+    "price": 543000.0,
+    "shares": 82,
+    "cost": 6678.9
+  },
+  {
+    "date": "20251107",
+    "ticker": "329180",
+    "action": "sell",
+    "price": 521000.0,
+    "shares": 82,
+    "cost": 6408.3
+  },
+  {
+    "date": "20251107",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 119000.0,
+    "shares": 201,
+    "cost": 3587.85
+  },
+  {
+    "date": "20251110",
+    "ticker": "000270",
+    "action": "sell",
+    "price": 111500.0,
+    "shares": 400,
+    "cost": 6690.0
+  },
+  {
+    "date": "20251110",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 128100.0,
+    "shares": 201,
+    "cost": 3862.21
+  },
+  {
+    "date": "20251110",
+    "ticker": "329180",
+    "action": "buy",
+    "price": 523000.0,
+    "shares": 171,
+    "cost": 13414.95
+  },
+  {
+    "date": "20251112",
+    "ticker": "329180",
+    "action": "sell",
+    "price": 542000.0,
+    "shares": 171,
+    "cost": 13902.3
+  },
+  {
+    "date": "20251112",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 127100.0,
+    "shares": 728,
+    "cost": 13879.32
+  },
+  {
+    "date": "20251114",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 126800.0,
+    "shares": 728,
+    "cost": 13846.56
+  },
+  {
+    "date": "20251117",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 131200.0,
+    "shares": 703,
+    "cost": 13835.04
+  },
+  {
+    "date": "20251124",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 120800.0,
+    "shares": 703,
+    "cost": 12738.36
+  },
+  {
+    "date": "20251125",
+    "ticker": "000660",
+    "action": "buy",
+    "price": 546000.0,
+    "shares": 39,
+    "cost": 3194.1
+  },
+  {
+    "date": "20251125",
+    "ticker": "000270",
+    "action": "buy",
+    "price": 112200.0,
+    "shares": 190,
+    "cost": 3197.7
+  },
+  {
+    "date": "20251125",
+    "ticker": "105560",
+    "action": "buy",
+    "price": 122500.0,
+    "shares": 174,
+    "cost": 3197.25
+  },
+  {
+    "date": "20251125",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 120000.0,
+    "shares": 178,
+    "cost": 3204.0
+  },
+  {
+    "date": "20251126",
+    "ticker": "000270",
+    "action": "sell",
+    "price": 113200.0,
+    "shares": 190,
+    "cost": 3226.2
+  },
+  {
+    "date": "20251127",
+    "ticker": "105560",
+    "action": "sell",
+    "price": 123600.0,
+    "shares": 174,
+    "cost": 3225.96
+  },
+  {
+    "date": "20251128",
+    "ticker": "000660",
+    "action": "sell",
+    "price": 551000.0,
+    "shares": 39,
+    "cost": 3223.35
+  },
+  {
+    "date": "20251128",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 110000.0,
+    "shares": 178,
+    "cost": 2937.0
+  },
+  {
+    "date": "20260128",
+    "ticker": "329180",
+    "action": "buy",
+    "price": 594000.0,
+    "shares": 142,
+    "cost": 12652.2
+  },
+  {
+    "date": "20260129",
+    "ticker": "329180",
+    "action": "sell",
+    "price": 584000.0,
+    "shares": 142,
+    "cost": 12439.2
+  },
+  {
+    "date": "20260209",
+    "ticker": "005380",
+    "action": "buy",
+    "price": 484000.0,
+    "shares": 172,
+    "cost": 12487.2
+  },
+  {
+    "date": "20260210",
+    "ticker": "005380",
+    "action": "sell",
+    "price": 499000.0,
+    "shares": 172,
+    "cost": 12874.2
+  },
+  {
+    "date": "20260211",
+    "ticker": "005380",
+    "action": "buy",
+    "price": 480500.0,
+    "shares": 89,
+    "cost": 6414.67
+  },
+  {
+    "date": "20260211",
+    "ticker": "329180",
+    "action": "buy",
+    "price": 538000.0,
+    "shares": 79,
+    "cost": 6375.3
+  },
+  {
+    "date": "20260212",
+    "ticker": "005380",
+    "action": "sell",
+    "price": 512000.0,
+    "shares": 89,
+    "cost": 6835.2
+  },
+  {
+    "date": "20260212",
+    "ticker": "329180",
+    "action": "sell",
+    "price": 543000.0,
+    "shares": 79,
+    "cost": 6434.55
+  },
+  {
+    "date": "20260304",
+    "ticker": "105560",
+    "action": "buy",
+    "price": 148300.0,
+    "shares": 298,
+    "cost": 6629.01
+  },
+  {
+    "date": "20260304",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 127800.0,
+    "shares": 346,
+    "cost": 6632.82
+  },
+  {
+    "date": "20260305",
+    "ticker": "000660",
+    "action": "buy",
+    "price": 976000.0,
+    "shares": 1,
+    "cost": 146.4
+  },
+  {
+    "date": "20260305",
+    "ticker": "000270",
+    "action": "buy",
+    "price": 171600.0,
+    "shares": 10,
+    "cost": 257.4
+  },
+  {
+    "date": "20260305",
+    "ticker": "086790",
+    "action": "buy",
+    "price": 114800.0,
+    "shares": 15,
+    "cost": 258.3
+  },
+  {
+    "date": "20260306",
+    "ticker": "000660",
+    "action": "sell",
+    "price": 912000.0,
+    "shares": 1,
+    "cost": 136.8
+  },
+  {
+    "date": "20260309",
+    "ticker": "000660",
+    "action": "buy",
+    "price": 851000.0,
+    "shares": 1,
+    "cost": 127.65
+  },
+  {
+    "date": "20260310",
+    "ticker": "105560",
+    "action": "sell",
+    "price": 149700.0,
+    "shares": 298,
+    "cost": 6691.59
+  },
+  {
+    "date": "20260311",
+    "ticker": "000270",
+    "action": "sell",
+    "price": 169000.0,
+    "shares": 10,
+    "cost": 253.5
+  },
+  {
+    "date": "20260311",
+    "ticker": "000660",
+    "action": "sell",
+    "price": 954000.0,
+    "shares": 1,
+    "cost": 143.1
+  },
+  {
+    "date": "20260311",
+    "ticker": "005380",
+    "action": "buy",
+    "price": 550000.0,
+    "shares": 21,
+    "cost": 1732.5
+  },
+  {
+    "date": "20260311",
+    "ticker": "055550",
+    "action": "buy",
+    "price": 90900.0,
+    "shares": 130,
+    "cost": 1772.55
+  },
+  {
+    "date": "20260312",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 132300.0,
+    "shares": 346,
+    "cost": 6866.37
+  },
+  {
+    "date": "20260312",
+    "ticker": "086790",
+    "action": "sell",
+    "price": 112300.0,
+    "shares": 15,
+    "cost": 252.67
+  },
+  {
+    "date": "20260312",
+    "ticker": "005380",
+    "action": "sell",
+    "price": 524000.0,
+    "shares": 21,
+    "cost": 1650.6
+  },
+  {
+    "date": "20260313",
+    "ticker": "005380",
+    "action": "buy",
+    "price": 502000.0,
+    "shares": 78,
+    "cost": 5873.4
+  },
+  {
+    "date": "20260316",
+    "ticker": "005930",
+    "action": "buy",
+    "price": 184600.0,
+    "shares": 59,
+    "cost": 1633.71
+  },
+  {
+    "date": "20260316",
+    "ticker": "086790",
+    "action": "buy",
+    "price": 107000.0,
+    "shares": 102,
+    "cost": 1637.1
+  },
+  {
+    "date": "20260317",
+    "ticker": "005930",
+    "action": "sell",
+    "price": 198000.0,
+    "shares": 59,
+    "cost": 1752.3
+  },
+  {
+    "date": "20260317",
+    "ticker": "006400",
+    "action": "buy",
+    "price": 395000.0,
+    "shares": 14,
+    "cost": 829.5
+  },
+  {
+    "date": "20260317",
+    "ticker": "035720",
+    "action": "buy",
+    "price": 51100.0,
+    "shares": 113,
+    "cost": 866.14
+  },
+  {
+    "date": "20260317",
+    "ticker": "030200",
+    "action": "buy",
+    "price": 59100.0,
+    "shares": 97,
+    "cost": 859.9
+  },
+  {
+    "date": "20260318",
+    "ticker": "055550",
+    "action": "sell",
+    "price": 93800.0,
+    "shares": 130,
+    "cost": 1829.1
+  },
+  {
+    "date": "20260318",
+    "ticker": "030200",
+    "action": "sell",
+    "price": 60700.0,
+    "shares": 97,
+    "cost": 883.18
+  },
+  {
+    "date": "20260319",
+    "ticker": "005380",
+    "action": "sell",
+    "price": 521000.0,
+    "shares": 78,
+    "cost": 6095.7
+  },
+  {
+    "date": "20260319",
+    "ticker": "006400",
+    "action": "sell",
+    "price": 397000.0,
+    "shares": 14,
+    "cost": 833.7
+  },
+  {
+    "date": "20260319",
+    "ticker": "042660",
+    "action": "buy",
+    "price": 130600.0,
+    "shares": 197,
+    "cost": 3859.23
+  },
+  {
+    "date": "20260320",
+    "ticker": "042660",
+    "action": "sell",
+    "price": 130000.0,
+    "shares": 197,
+    "cost": 3841.5
+  },
+  {
+    "date": "20260320",
+    "ticker": "005380",
+    "action": "buy",
+    "price": 527000.0,
+    "shares": 36,
+    "cost": 2845.8
+  },
+  {
+    "date": "20260320",
+    "ticker": "329180",
+    "action": "buy",
+    "price": 569000.0,
+    "shares": 33,
+    "cost": 2816.55
+  },
+  {
+    "date": "20260324",
+    "ticker": "035720",
+    "action": "sell",
+    "price": 48300.0,
+    "shares": 113,
+    "cost": 818.68
+  },
+  {
+    "date": "20260324",
+    "ticker": "005930",
+    "action": "buy",
+    "price": 195500.0,
+    "shares": 49,
+    "cost": 1436.92
+  },
+  {
+    "date": "20260324",
+    "ticker": "105560",
+    "action": "buy",
+    "price": 149000.0,
+    "shares": 64,
+    "cost": 1430.4
+  },
+  {
+    "date": "20260325",
+    "ticker": "005380",
+    "action": "sell",
+    "price": 509000.0,
+    "shares": 36,
+    "cost": 2748.6
+  },
+  {
+    "date": "20260325",
+    "ticker": "005930",
+    "action": "sell",
+    "price": 193700.0,
+    "shares": 49,
+    "cost": 1423.69
+  },
+  {
+    "date": "20260325",
+    "ticker": "105560",
+    "action": "sell",
+    "price": 152100.0,
+    "shares": 64,
+    "cost": 1460.16
+  },
+  {
+    "date": "20260325",
+    "ticker": "000270",
+    "action": "buy",
+    "price": 160600.0,
+    "shares": 134,
+    "cost": 3228.06
+  },
+  {
+    "date": "20260326",
+    "ticker": "329180",
+    "action": "sell",
+    "price": 529000.0,
+    "shares": 33,
+    "cost": 2618.55
+  },
+  {
+    "date": "20260326",
+    "ticker": "055550",
+    "action": "buy",
+    "price": 93100.0,
+    "shares": 218,
+    "cost": 3044.37
+  },
+  {
+    "date": "20260327",
+    "ticker": "055550",
+    "action": "sell",
+    "price": 93400.0,
+    "shares": 218,
+    "cost": 3054.18
+  }
+]

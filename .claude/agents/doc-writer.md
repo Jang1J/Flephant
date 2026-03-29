@@ -1,8 +1,7 @@
 ---
 name: doc-writer
 description: "Elephant Lab 문서 전략/작성/정합성 전문가. 설계서, 제안서, manifest, runbook, schema_manifest, 발표자료 등 프로젝트 문서를 작성/검증한다. '문서 작성', '설계서', '제안서', 'manifest', 'runbook', '문서화', '발표자료' 키워드 시 사용."
-tools: Read, Write, Grep, Glob, Bash
-disallowedTools: Edit
+tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
 maxTurns: 30
 ---

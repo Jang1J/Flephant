@@ -36,7 +36,9 @@ UNIVERSE_PATH     = _BASE_DIR / "config" / "universe_v1.csv"
 RISK_POLICY_PATH  = _BASE_DIR / "config" / "risk_policy_v0.yaml"
 MODEL_DIR         = _BASE_DIR / "models" / "strategy_model"
 MODEL_CONFIG_PATH = MODEL_DIR / "config.yaml"
-MODEL_PKL_PATH    = MODEL_DIR / "model.pkl"
+MODEL_PKL_PATH    = MODEL_DIR / "model.pkl"                              # legacy fallback
+ARTIFACT_MODEL_DIR = _BASE_DIR / "artifacts" / "strategy_model"
+CANONICAL_MODEL_PATH = ARTIFACT_MODEL_DIR / "latest_model.pkl"           # canonical path
 DMP_DIR           = _BASE_DIR / "artifacts" / "daily_market_packet"
 TTP_DIR           = _BASE_DIR / "artifacts" / "ticker_text_pack"
 SC_SCHEMA_PATH    = _BASE_DIR / "schemas" / "strategy_card.json"
@@ -215,20 +217,36 @@ def build_feature_matrix(dmp: dict, tickers: list, cfg: dict) -> pd.DataFrame:
 def load_or_mock_model(cfg: dict):
     """
     학습된 LightGBM 모델을 로드한다.
-    모델 파일이 없으면 None 반환 (호출부에서 fallback 처리).
+    탐색 순서:
+      1. artifacts/strategy_model/latest_model.pkl (canonical path)
+      2. models/strategy_model/model.pkl (legacy fallback)
+    둘 다 없으면 None 반환 (호출부 heuristic fallback 사용).
     """
-    if not MODEL_PKL_PATH.exists():
-        print(f"[SCMomentum] 모델 파일 없음: {MODEL_PKL_PATH} — 점수 fallback 사용")
-        return None
-    try:
-        import pickle
-        with open(MODEL_PKL_PATH, "rb") as f:
-            model = pickle.load(f)
-        print(f"[SCMomentum] 모델 로드 완료: {MODEL_PKL_PATH}")
-        return model
-    except Exception as e:
-        print(f"[SCMomentum] 모델 로드 실패: {e} — fallback 사용")
-        return None
+    import pickle
+
+    # 1. canonical path
+    if CANONICAL_MODEL_PATH.exists():
+        try:
+            with open(CANONICAL_MODEL_PATH, "rb") as f:
+                model = pickle.load(f)
+            print(f"[SCMomentum] 모델 로드 완료 (canonical): {CANONICAL_MODEL_PATH}")
+            return model
+        except Exception as e:
+            print(f"[SCMomentum] canonical 모델 로드 실패: {e} — legacy 경로 시도")
+
+    # 2. legacy fallback
+    if MODEL_PKL_PATH.exists():
+        try:
+            with open(MODEL_PKL_PATH, "rb") as f:
+                model = pickle.load(f)
+            print(f"[SCMomentum] 모델 로드 완료 (legacy): {MODEL_PKL_PATH}")
+            return model
+        except Exception as e:
+            print(f"[SCMomentum] legacy 모델 로드 실패: {e} — heuristic fallback 사용")
+
+    # 3. heuristic fallback
+    print(f"[SCMomentum] 모델 파일 없음 (탐색: {CANONICAL_MODEL_PATH}, {MODEL_PKL_PATH}) — 점수 fallback 사용")
+    return None
 
 
 def predict_quant_scores(model, X: pd.DataFrame) -> np.ndarray:
@@ -238,14 +256,31 @@ def predict_quant_scores(model, X: pd.DataFrame) -> np.ndarray:
     """
     if model is not None:
         try:
-            proba = model.predict_proba(X)
-            # binary classifier: positive class probability
-            if proba.ndim == 2 and proba.shape[1] == 2:
-                scores = proba[:, 1]
+            # lgbm_ranker.py는 {'model': LGBMClassifier, 'feature_cols': [...], 'col_means': {...}} 형태로 저장
+            estimator = model["model"] if isinstance(model, dict) else model
+            feature_cols = model.get("feature_cols") if isinstance(model, dict) else None
+            col_means = model.get("col_means", {}) if isinstance(model, dict) else {}
+            # feature_cols가 있으면 정렬 + 누락 컬럼 채움
+            if feature_cols is not None:
+                for c in feature_cols:
+                    if c not in X.columns:
+                        X[c] = col_means.get(c, 0.0)
+                X = X[feature_cols]
+            if hasattr(estimator, "predict_proba"):
+                # Binary classifier mode
+                proba = estimator.predict_proba(X)
+                if proba.ndim == 2 and proba.shape[1] == 2:
+                    scores = proba[:, 1]
+                else:
+                    scores = proba.ravel()
+                scores = scores * 2.0 - 1.0
             else:
-                scores = proba.ravel()
-            # [0, 1] → [-1, 1] 정규화
-            scores = scores * 2.0 - 1.0
+                # LambdaMART ranker mode — predict() returns relevance scores
+                raw = estimator.predict(X)
+                # cross-sectional rank normalize to [-1, 1]
+                mn, mx = raw.min(), raw.max()
+                rng = mx - mn if mx > mn else 1.0
+                scores = (raw - mn) / rng * 2.0 - 1.0
             return np.clip(scores, -1.0, 1.0)
         except Exception as e:
             print(f"[SCMomentum] 모델 예측 실패: {e} — fallback 사용")
@@ -449,22 +484,37 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
     quant_only_cards = []
     news_only_cards = []
 
+    # Cross-sectional rank normalization (GPT Pro #8)
+    # 모델이 단일 날짜에서 절대 확률이 낮더라도, 상대 rank로 top-K 선별
+    n = len(tickers)
+    synth_scores = []
+    for i in range(n):
+        qs = float(quant_scores_arr[i])
+        ns = news_signals.get(tickers[i], 0.0)
+        synth_scores.append(synthesize_scores(qs, ns, quant_weight=0.7))
+
+    # rank normalize: synth_scores를 유니버스 내 순위로 [-1, 1] 재매핑
+    ranked = np.argsort(np.argsort(synth_scores)).astype(float)  # 0 ~ n-1
+    ranked_norm = ranked / max(n - 1, 1) * 2.0 - 1.0  # [-1, 1]
+
     for i, ticker in enumerate(tickers):
         name = ticker_name_map.get(ticker, ticker)
         qs   = float(quant_scores_arr[i])
         ns   = news_signals.get(ticker, 0.0)
 
-        # Branch 1: synthesized (quant 0.7 + news 0.3)
-        pre_synth = synthesize_scores(qs, ns, quant_weight=0.7)
+        # Branch 1: synthesized — rank-normalized score 사용
+        pre_synth = round(float(ranked_norm[i]), 4)
         momentum_cards.append(make_strategy_card(
             target_date, ticker, name, qs, ns,
             pre_synth, "synthesized", feature_names, min_conf
         ))
 
-        # Branch 2: quant only
+        # Branch 2: quant only — quant rank-normalized
+        q_ranked = np.argsort(np.argsort(quant_scores_arr)).astype(float)
+        q_norm = q_ranked / max(n - 1, 1) * 2.0 - 1.0
         quant_only_cards.append(make_strategy_card(
             target_date, ticker, name, qs, ns,
-            round(qs, 4), "quant", feature_names, min_conf
+            round(float(q_norm[i]), 4), "quant", feature_names, min_conf
         ))
 
         # Branch 3: news only

@@ -3,7 +3,8 @@ name: worklog
 description: "작업 로그 기록 스킬. 세션별 작업 내역, 구현 진행률, 변경 사항을 체계적으로 기록한다. '작업 로그', 'worklog', '진행 상황', '오늘 한 일', '변경 이력', '작업 기록' 키워드 시 사용. git log만 보려면 이 스킬이 아니라 직접 git log를 사용하라."
 argument-hint: "[기록할 내용 또는 'status']"
 user-invocable: true
-allowed-tools: Read, Write, Grep, Glob, Bash
+agent: doc-writer
+allowed-tools: Read, Write, Edit, Grep, Glob, Bash
 ---
 
 # Worklog -- 작업 로그 기록 스킬

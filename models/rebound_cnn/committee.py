@@ -1,10 +1,12 @@
 """
-KR-Rebound-Committee v1.1
-- Stage B1: ElasticNet logistic on context features only (tabular core)
+KR-Rebound-Committee v2.0 (GPT Pro #8)
+- Stage B1: LightGBM/ElasticNet on context features (tabular core)
 - Stage B2: CNN branch (existing KR-Rebound-CNN)
 - Stage C: score fusion + agreement-based uncertainty
 
 committee.enabled=false 기본값: 기존 동작 무변경.
+v2.0: ElasticNet → LightGBM tree core 전환 (한국 시장 data-constrained context에서 tree 우위)
+      ElasticNet fallback 유지 (LightGBM 미설치 시)
 """
 
 import pickle
@@ -16,47 +18,65 @@ MODEL_DIR = Path(__file__).resolve().parent
 
 
 def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
-    """ElasticNet logistic regression 학습.
+    """Tree core (LightGBM) 학습. LightGBM 미설치 시 ElasticNet fallback.
 
-    SGDClassifier(loss='log_loss', penalty='elasticnet')로 구현.
-    반환: (enet_model, metrics_dict)
+    GPT Pro #8: 한국 시장 data-constrained context에서 tree-based가 ElasticNet보다 안정적.
+    반환: (model, metrics_dict)
     """
-    from sklearn.linear_model import SGDClassifier
     from sklearn.metrics import roc_auc_score, brier_score_loss
 
-    alpha = config.get("elasticnet", {}).get("alpha", 0.01)
-    l1_ratio = config.get("elasticnet", {}).get("l1_ratio", 0.5)
+    # LightGBM 우선 시도
+    try:
+        import lightgbm as lgb
+        use_tree = True
+    except ImportError:
+        use_tree = False
 
-    print(
-        f"[Committee] ElasticNet 학습 시작: "
-        f"alpha={alpha}, l1_ratio={l1_ratio}, "
-        f"train={len(X_train)}, val={len(X_val)}"
-    )
+    if use_tree:
+        print(f"[Committee] LightGBM tree core 학습 시작: train={len(X_train)}, val={len(X_val)}")
 
-    enet = SGDClassifier(
-        loss="log_loss",
-        penalty="elasticnet",
-        alpha=alpha,
-        l1_ratio=l1_ratio,
-        max_iter=1000,
-        random_state=42,
-    )
-    enet.fit(X_train, y_train)
+        pos_count = int(y_train.sum())
+        neg_count = len(y_train) - pos_count
+        scale_pos = neg_count / pos_count if pos_count > 0 else 1.0
 
-    train_prob = enet.predict_proba(X_train)[:, 1]
-    train_auc = (
-        roc_auc_score(y_train, train_prob)
-        if len(np.unique(y_train)) >= 2
-        else 0.5
-    )
+        model = lgb.LGBMClassifier(
+            n_estimators=100,
+            num_leaves=15,
+            learning_rate=0.05,
+            min_child_samples=max(5, len(X_train) // 50),
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            scale_pos_weight=scale_pos,
+            verbose=-1,
+            n_jobs=1,  # MPS + LightGBM OMP 충돌 방지
+        )
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)] if len(X_val) > 0 else None,
+            callbacks=[lgb.early_stopping(stopping_rounds=15, verbose=False)] if len(X_val) > 0 else None,
+        )
+        model_type = "LightGBM"
+    else:
+        # ElasticNet fallback
+        from sklearn.linear_model import SGDClassifier
+        alpha = config.get("elasticnet", {}).get("alpha", 0.01)
+        l1_ratio = config.get("elasticnet", {}).get("l1_ratio", 0.5)
+        print(f"[Committee] ElasticNet fallback: alpha={alpha}, l1_ratio={l1_ratio}")
+        model = SGDClassifier(
+            loss="log_loss", penalty="elasticnet",
+            alpha=alpha, l1_ratio=l1_ratio, max_iter=1000, random_state=42,
+        )
+        model.fit(X_train, y_train)
+        model_type = "ElasticNet"
+
+    train_prob = model.predict_proba(X_train)[:, 1]
+    train_auc = roc_auc_score(y_train, train_prob) if len(np.unique(y_train)) >= 2 else 0.5
 
     if len(X_val) > 0 and len(y_val) > 0:
-        val_prob = enet.predict_proba(X_val)[:, 1]
-        val_auc = (
-            roc_auc_score(y_val, val_prob)
-            if len(np.unique(y_val)) >= 2
-            else 0.5
-        )
+        val_prob = model.predict_proba(X_val)[:, 1]
+        val_auc = roc_auc_score(y_val, val_prob) if len(np.unique(y_val)) >= 2 else 0.5
         val_brier = float(brier_score_loss(y_val, val_prob))
     else:
         val_auc = train_auc
@@ -67,14 +87,10 @@ def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
         "val_auc": round(float(val_auc), 4),
         "val_brier": round(val_brier, 4) if not np.isnan(val_brier) else None,
         "n_features": int(X_train.shape[1]),
-        "alpha": alpha,
-        "l1_ratio": l1_ratio,
+        "model_type": model_type,
     }
-    print(
-        f"[Committee] ElasticNet 완료: "
-        f"train_auc={metrics['train_auc']}, val_auc={metrics['val_auc']}"
-    )
-    return enet, metrics
+    print(f"[Committee] {model_type} 완료: train_auc={metrics['train_auc']}, val_auc={metrics['val_auc']}")
+    return model, metrics
 
 
 def fuse_scores(

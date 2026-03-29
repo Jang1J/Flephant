@@ -3,6 +3,9 @@ model:
   version: "v1.0"
 
 lgbm:
+  # v2.0: sector-neutral label + binary classifier (단일 날짜 추론 호환)
+  # LambdaMART는 학습 AUC 0.729이지만 단일 날짜 추론 시 cross-sectional context 부족으로
+  # 모든 종목에 동일 score 출력 문제가 있음. binary + sector-neutral label이 현재 최적.
   objective: "binary"
   metric: "auc"
   num_leaves: 31

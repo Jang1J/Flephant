@@ -1,0 +1,40 @@
+{
+  "report_id": "BTR-20251031-20260327",
+  "generated_at": "2026-03-29T21:45:47+09:00",
+  "artifact_version": "v1.0",
+  "strategy": "momentum",
+  "period": {
+    "start": "20251031",
+    "end": "20260327"
+  },
+  "n_trading_days": 100,
+  "walk_forward_config": {
+    "mode": "expanding",
+    "train_window": 200,
+    "val_window": 20,
+    "step_size": 20,
+    "purge_days": 5,
+    "embargo_days": 5
+  },
+  "portfolio_config": {
+    "max_position_count": 10,
+    "stop_loss_pct": -5.0,
+    "turnover_cap_pct": 30.0,
+    "min_cash_ratio_pct": 10.0,
+    "cost_per_side": 0.00015
+  },
+  "aggregate_metrics": {
+    "total_return": 0.0,
+    "sharpe_ratio": 0.0,
+    "max_drawdown": 0.0,
+    "win_rate": 0.0,
+    "turnover_avg": 0.0,
+    "total_trades": 0,
+    "avg_turnover": 0.0,
+    "n_folds": 0
+  },
+  "fold_results": [],
+  "baselines": {},
+  "nav_history": [],
+  "trade_history": []
+}

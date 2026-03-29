@@ -1,13 +1,13 @@
 """
-LightGBM Cross-Sectional Momentum Ranker (v1.0)
+LightGBM Cross-Sectional Momentum Ranker (v2.0)
 AI #2 — 유니버스 내 종목 상대 순위 예측 모델
 
 설계 개요:
 - DMP 히스토리(artifacts/daily_market_packet/)에서 피처 행렬 구축
 - Manual factors + MLF-lite + UMI-lite 피처 조합
-- 날짜별 forward 5일 수익률 기준 상위 25% → y=1 레이블
+- 날짜별 sector-neutral excess return rank 레이블 (GPT Pro #8 권고)
 - Walk-forward expanding window + purge(5d) + embargo(5d)
-- LightGBM binary classifier (AUC 최적화)
+- LightGBM LambdaMART ranker (NDCG@5 최적화) — binary fallback 지원
 - 모델, 피처 중요도, 예측 결과 저장
 
 Usage:
@@ -338,21 +338,62 @@ def build_feature_matrix(dates: list[str], dmp_dir: Path | None = None) -> pd.Da
     return df
 
 
-def _build_labels(df: pd.DataFrame, top_quantile: float = 0.25) -> pd.DataFrame:
+def _build_labels(df: pd.DataFrame, top_quantile: float = 0.25, use_sector_neutral: bool = True) -> pd.DataFrame:
     """
     날짜별 cross-sectional 순위 레이블 생성.
-    fwd_ret_5d 기준 상위 top_quantile → y=1, 나머지 → y=0.
+
+    v2.0 (GPT Pro #8): sector-neutral excess return rank 사용.
+    - 종목 수익률에서 동일 섹터 평균을 빼서 sector-neutral residual 계산
+    - 해당 residual 기준 상위 top_quantile → y=1
+    - ranking objective용 relevance label도 생성 (0~4 등급)
+
     fwd_ret_5d가 NaN인 행은 제거된다.
     """
     df = df.dropna(subset=["fwd_ret_5d"]).copy()
 
+    # 유니버스 섹터 매핑 로드
+    try:
+        _univ = pd.read_csv(UNIVERSE_CSV, dtype={"ticker": str})
+        _univ["ticker"] = _univ["ticker"].apply(lambda t: str(t).zfill(6))
+        _sector_map = dict(zip(_univ["ticker"], _univ["wics_sector"]))
+    except Exception:
+        _sector_map = {}
+        use_sector_neutral = False
+
     def _label(group: pd.DataFrame) -> pd.DataFrame:
-        threshold = group["fwd_ret_5d"].quantile(1.0 - top_quantile)
         group = group.copy()
-        group["label"] = (group["fwd_ret_5d"] >= threshold).astype(int)
+
+        if use_sector_neutral and _sector_map:
+            # sector-neutral residual: 종목 수익률 - 섹터 평균
+            group["_sector"] = group["ticker"].map(_sector_map).fillna("Unknown")
+            sector_mean = group.groupby("_sector")["fwd_ret_5d"].transform("mean")
+            group["_excess"] = group["fwd_ret_5d"] - sector_mean
+            rank_col = "_excess"
+        else:
+            rank_col = "fwd_ret_5d"
+
+        # binary label (backward compat)
+        threshold = group[rank_col].quantile(1.0 - top_quantile)
+        group["label"] = (group[rank_col] >= threshold).astype(int)
+
+        # ranking relevance label (0~4): LambdaMART용
+        # 상위 10% → 4, 상위 25% → 3, 상위 50% → 2, 상위 75% → 1, 하위 → 0
+        pct = group[rank_col].rank(pct=True)
+        group["rank_label"] = 0
+        group.loc[pct >= 0.25, "rank_label"] = 1
+        group.loc[pct >= 0.50, "rank_label"] = 2
+        group.loc[pct >= 0.75, "rank_label"] = 3
+        group.loc[pct >= 0.90, "rank_label"] = 4
+
+        # cleanup
+        group.drop(columns=["_sector", "_excess"], errors="ignore", inplace=True)
         return group
 
-    df = df.groupby("date", group_keys=False).apply(_label)
+    result_parts = []
+    for date_val, group in df.groupby("date"):
+        labeled = _label(group)
+        result_parts.append(labeled)
+    df = pd.concat(result_parts, ignore_index=True)
     return df
 
 
@@ -463,40 +504,98 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
             fold_idx += 1
             continue
 
-        # LightGBM 학습
-        pos_count = int(y_train.sum())
-        neg_count = len(y_train) - pos_count
-        scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+        # LightGBM 학습 — LambdaMART ranker or binary classifier
+        objective = lgbm_cfg.get("objective", "lambdarank")
+        use_ranker = objective in ("lambdarank", "rank_xendcg")
 
-        params = {
-            "objective": lgbm_cfg.get("objective", "binary"),
-            "metric": lgbm_cfg.get("metric", "auc"),
-            "num_leaves": lgbm_cfg.get("num_leaves", 31),
-            "learning_rate": lgbm_cfg.get("learning_rate", 0.05),
-            "min_child_samples": lgbm_cfg.get("min_child_samples", 10),
-            "subsample": lgbm_cfg.get("subsample", 0.8),
-            "colsample_bytree": lgbm_cfg.get("colsample_bytree", 0.8),
-            "reg_alpha": lgbm_cfg.get("reg_alpha", 0.1),
-            "reg_lambda": lgbm_cfg.get("reg_lambda", 0.1),
-            "scale_pos_weight": scale_pos_weight,
-            "verbose": -1,
-            "n_jobs": -1,
-        }
         n_estimators = lgbm_cfg.get("n_estimators", 200)
 
-        model = lgb.LGBMClassifier(n_estimators=n_estimators, **params)
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
-        )
+        if use_ranker:
+            # LambdaMART ranking mode (GPT Pro #8 권고)
+            y_train_rank = train_df["rank_label"].values if "rank_label" in train_df.columns else y_train
+            y_val_rank = val_df["rank_label"].values if "rank_label" in val_df.columns else y_val
 
-        val_proba = model.predict_proba(X_val)[:, 1]
-        try:
-            val_auc = float(roc_auc_score(y_val, val_proba))
-        except Exception:
-            val_auc = np.nan
+            # group size: 날짜별 종목 수
+            train_groups = train_df.groupby("date").size().values
+            val_groups = val_df.groupby("date").size().values
+
+            model = lgb.LGBMRanker(
+                objective=objective,
+                metric="ndcg",
+                ndcg_eval_at=[5],
+                n_estimators=n_estimators,
+                num_leaves=lgbm_cfg.get("num_leaves", 31),
+                learning_rate=lgbm_cfg.get("learning_rate", 0.05),
+                min_child_samples=lgbm_cfg.get("min_child_samples", 10),
+                subsample=lgbm_cfg.get("subsample", 0.8),
+                colsample_bytree=lgbm_cfg.get("colsample_bytree", 0.8),
+                reg_alpha=lgbm_cfg.get("reg_alpha", 0.1),
+                reg_lambda=lgbm_cfg.get("reg_lambda", 0.1),
+                verbose=-1,
+                n_jobs=-1,
+            )
+            model.fit(
+                X_train, y_train_rank,
+                group=train_groups,
+                eval_set=[(X_val, y_val_rank)],
+                eval_group=[val_groups],
+                callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+            )
+
+            # 평가: 날짜별 Precision@5 + RankIC
+            val_scores = model.predict(X_val)
+            val_df_eval = val_df[["date", "ticker"]].copy()
+            val_df_eval["score"] = val_scores
+            val_df_eval["fwd_ret"] = val_df["fwd_ret_5d"].values
+
+            p5_list, ric_list = [], []
+            for _, g in val_df_eval.groupby("date"):
+                top5 = g.nlargest(5, "score")
+                p5 = (top5["fwd_ret"] > g["fwd_ret"].median()).mean()
+                p5_list.append(p5)
+                if len(g) > 2:
+                    ric_list.append(float(g["score"].corr(g["fwd_ret"], method="spearman")))
+            val_p5 = float(np.mean(p5_list)) if p5_list else 0.0
+            val_ric = float(np.nanmean(ric_list)) if ric_list else 0.0
+
+            # AUC도 보조 지표로 계산
+            try:
+                val_auc = float(roc_auc_score(y_val, val_scores))
+            except Exception:
+                val_auc = np.nan
+
+        else:
+            # Binary classifier fallback (기존 방식)
+            pos_count = int(y_train.sum())
+            neg_count = len(y_train) - pos_count
+            scale_pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+
+            params = {
+                "objective": "binary",
+                "metric": lgbm_cfg.get("metric", "auc"),
+                "num_leaves": lgbm_cfg.get("num_leaves", 31),
+                "learning_rate": lgbm_cfg.get("learning_rate", 0.05),
+                "min_child_samples": lgbm_cfg.get("min_child_samples", 10),
+                "subsample": lgbm_cfg.get("subsample", 0.8),
+                "colsample_bytree": lgbm_cfg.get("colsample_bytree", 0.8),
+                "reg_alpha": lgbm_cfg.get("reg_alpha", 0.1),
+                "reg_lambda": lgbm_cfg.get("reg_lambda", 0.1),
+                "scale_pos_weight": scale_pos_weight,
+                "verbose": -1,
+                "n_jobs": -1,
+            }
+            model = lgb.LGBMClassifier(n_estimators=n_estimators, **params)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+            )
+            val_scores = model.predict_proba(X_val)[:, 1]
+            try:
+                val_auc = float(roc_auc_score(y_val, val_scores))
+            except Exception:
+                val_auc = np.nan
+            val_p5, val_ric = 0.0, 0.0
 
         # 피처 중요도
         importance = dict(zip(available_cols, model.feature_importances_.tolist()))
@@ -510,6 +609,9 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
             "n_train": len(train_df),
             "n_val": len(val_df),
             "val_auc": val_auc,
+            "val_precision_at_5": val_p5,
+            "val_rank_ic": val_ric,
+            "objective": objective,
             "feature_importance": importance,
             "model": model,
             "feature_cols": available_cols,
@@ -517,11 +619,14 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
         }
         fold_results.append(fold_result)
 
+        metric_str = f"AUC={val_auc:.4f}"
+        if use_ranker:
+            metric_str += f", P@5={val_p5:.3f}, RankIC={val_ric:.3f}"
         print(
             f"[LGBMRanker] Fold {fold_idx:02d} | "
             f"train {train_dates[0]}~{train_dates[-1]} ({len(train_df)}행) | "
             f"val {val_dates[0]}~{val_dates[-1] if val_dates else 'N/A'} | "
-            f"AUC={val_auc:.4f}"
+            f"{metric_str}"
         )
 
         val_end += step_size
@@ -578,6 +683,12 @@ def _save_model(fold_results: list[dict], run_id: str) -> None:
             f,
         )
     print(f"[LGBMRanker] 모델 저장: {model_path}")
+
+    # canonical path에도 복사 (추론 시 latest_model.pkl로 탐색)
+    latest_path = OUTPUT_DIR / "latest_model.pkl"
+    import shutil as _shutil
+    _shutil.copy2(model_path, latest_path)
+    print(f"[LGBMRanker] Latest 모델 복사: {latest_path}")
 
     # 피처 중요도 (전체 fold 평균)
     importance_accum: dict[str, list[float]] = {}

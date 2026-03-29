@@ -1,0 +1,17 @@
+{
+  "winner": "isotonic",
+  "raw": {
+    "n_samples": 54,
+    "brier": 0.087787,
+    "ece": 0.094265
+  },
+  "temperature": {
+    "brier": 0.087352,
+    "ece": 0.063409,
+    "T": 1.1
+  },
+  "isotonic": {
+    "brier": 0.063657,
+    "ece": 0.0
+  }
+}

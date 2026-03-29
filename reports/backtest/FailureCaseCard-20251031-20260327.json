@@ -1,0 +1,17 @@
+{
+  "card_id": "FCC-20260327",
+  "generated_at": "2026-03-29T21:45:47+09:00",
+  "artifact_version": "v1.0",
+  "strategy": "momentum",
+  "period": {
+    "start": "20251031",
+    "end": "20260327"
+  },
+  "failure_cases": [],
+  "summary": {
+    "total_failures": 0,
+    "failure_rate": 0.0,
+    "top_failure_types": [],
+    "failure_tags": []
+  }
+}

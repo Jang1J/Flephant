@@ -101,6 +101,7 @@ python connectors/llm_router.py
 | doc-writer | 문서 작성/갱신/정합성 | Read/Write |
 | analyst | ML 성능 분석/해석 | Read-only |
 | gpt-feedback-tracker | GPT Pro 피드백 추적 | Read-only |
+| cleaner | dead code/문서/아티팩트 정리 탐지 | Read-only |
 
 ### 단일 작업 — 전문 스킬 직접 호출
 | 명령 | 팀 구성 | 기능 |
@@ -114,6 +115,8 @@ python connectors/llm_router.py
 | `/agent-research [주제]` | analyst | 논문/기술 조사 |
 | `/worklog [내용\|status]` | doc-writer | 작업 로그 기록 |
 | `/paper-trending [분야]` | analyst | 논문 트렌드 조사 |
+| `/gpt [답변 붙여넣기\|status]` | gpt-feedback-tracker | GPT Pro 피드백 처리 |
+| `/cleanup [all\|code\|docs\|artifacts]` | cleaner | dead code/문서/아티팩트 정리 탐지 |
 
 ### 복합 작업 — 오케스트레이터
 ```

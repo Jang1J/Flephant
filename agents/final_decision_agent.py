@@ -279,11 +279,12 @@ class FinalDecisionAgent:
         if backtest_summary and backtest_summary.get("status") == "live":
             warnings = []
 
-            # Rule 6a: 낮은 승률 경고
+            # Rule 6a: 낮은 승률 경고 (임계값: risk_policy fda_constraints.backtest_win_rate_warn)
+            _bt_warn = _fda_constraints.get("backtest_win_rate_warn", 0.35)
             win_rate = backtest_summary.get("win_rate_hint")
-            if win_rate is not None and win_rate < 0.35:
-                warnings.append(f"백테스트 승률 {win_rate:.0%} 미달 (임계값 35%)")
-                print(f"  [FDA] [{order.get('ticker', '')}] Rule 6a 경고: 승률 {win_rate:.0%} < 35%")
+            if win_rate is not None and win_rate < _bt_warn:
+                warnings.append(f"백테스트 승률 {win_rate:.0%} 미달 (임계값 {_bt_warn:.0%})")
+                print(f"  [FDA] [{order.get('ticker', '')}] Rule 6a 경고: 승률 {win_rate:.0%} < {_bt_warn:.0%}")
 
             # Rule 6b: failure_tags 매칭
             # sector는 SC 스키마에 없으므로 universe_v1.csv에서 lookup한다.
@@ -316,8 +317,10 @@ class FinalDecisionAgent:
             # 경고가 있으면 veto_reason에 반영 (approve이지만 explanation에 포함)
             if warnings:
                 warning_text = "; ".join(warnings)
-                # 승률 미달 + 고비중이면 veto (기존 Rule 6 로직 유지)
-                if win_rate is not None and win_rate < 0.4 and weight > 15:
+                # 승률 미달 + 고비중이면 veto (임계값: risk_policy fda_constraints)
+                _bt_veto = _fda_constraints.get("backtest_win_rate_veto", 0.4)
+                _bt_wt_cap = _fda_constraints.get("backtest_weight_veto_cap", 15)
+                if win_rate is not None and win_rate < _bt_veto and weight > _bt_wt_cap:
                     return "veto", f"백테스트 승률 {win_rate:.0%} 미달 + 비중 {weight}% 과다", True
                 # 그 외 경고는 approve이지만 경고 텍스트를 veto_reason에 저장 (explanation 반영용)
                 return "approve", f"[백테스트 경고] {warning_text}", False

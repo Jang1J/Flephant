@@ -1,0 +1,33 @@
+version: "v0.1"
+description: "사용자 성향 → 전략 profile 라우팅 규칙"
+
+survey_axes:
+  - name: "trend_following"
+    weight: 0.3
+    description: "추세추종 선호도 (1~5)"
+  - name: "rebound_hunting"
+    weight: 0.3
+    description: "반등포착 선호도 (1~5)"
+  - name: "trade_frequency"
+    weight: 0.15
+    description: "잦은 매매 허용도 (1~5)"
+  - name: "loss_aversion"
+    weight: 0.15
+    description: "손실 회피 성향 (1~5)"
+  - name: "explainability"
+    weight: 0.1
+    description: "설명 선호도 (1~5)"
+
+routing_rules:
+  momentum_bias_threshold: 0.55
+  rebound_bias_threshold: 0.55
+  default_on_tie: "momentum"
+
+system_recommended:
+  enabled: false
+  source: "artifacts/strategy_health/SHR-latest.json"
+  description: "Alpha Half-Life Monitor 기반 자동 추천 (Phase 2)"
+
+publish_mode:
+  demo: "single_profile"
+  web: "dual_generate_selective_serve"

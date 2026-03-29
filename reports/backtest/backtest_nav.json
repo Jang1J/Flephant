@@ -1,0 +1,857 @@
+[
+  {
+    "date": "20251103",
+    "nav": 1.0,
+    "cash": 100000000,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251104",
+    "nav": 1.0,
+    "cash": 100000000,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251105",
+    "nav": 1.0,
+    "cash": 100000000,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251106",
+    "nav": 0.983106,
+    "cash": 10460571.1,
+    "n_positions": 2,
+    "exposure": 0.8936,
+    "n_buys": 2,
+    "n_sells": 0
+  },
+  {
+    "date": "20251107",
+    "nav": 0.987804,
+    "cash": 29253574.95,
+    "n_positions": 2,
+    "exposure": 0.7039,
+    "n_buys": 2,
+    "n_sells": 1
+  },
+  {
+    "date": "20251110",
+    "nav": 1.021427,
+    "cash": 10144707.78,
+    "n_positions": 1,
+    "exposure": 0.9007,
+    "n_buys": 1,
+    "n_sells": 2
+  },
+  {
+    "date": "20251111",
+    "nav": 1.014587,
+    "cash": 10144707.78,
+    "n_positions": 1,
+    "exposure": 0.9,
+    "n_buys": 1,
+    "n_sells": 0
+  },
+  {
+    "date": "20251112",
+    "nav": 1.023621,
+    "cash": 10270126.17,
+    "n_positions": 1,
+    "exposure": 0.8997,
+    "n_buys": 1,
+    "n_sells": 1
+  },
+  {
+    "date": "20251113",
+    "nav": 1.052741,
+    "cash": 10270126.17,
+    "n_positions": 1,
+    "exposure": 0.9024,
+    "n_buys": 1,
+    "n_sells": 0
+  },
+  {
+    "date": "20251114",
+    "nav": 1.025667,
+    "cash": 102566679.61,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 1
+  },
+  {
+    "date": "20251117",
+    "nav": 1.023419,
+    "cash": 10319244.56,
+    "n_positions": 1,
+    "exposure": 0.8992,
+    "n_buys": 1,
+    "n_sells": 0
+  },
+  {
+    "date": "20251124",
+    "nav": 0.952289,
+    "cash": 95228906.2,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 1
+  },
+  {
+    "date": "20251125",
+    "nav": 0.925879,
+    "cash": 9929113.15,
+    "n_positions": 4,
+    "exposure": 0.8928,
+    "n_buys": 4,
+    "n_sells": 0
+  },
+  {
+    "date": "20251126",
+    "nav": 0.938419,
+    "cash": 31433886.95,
+    "n_positions": 3,
+    "exposure": 0.665,
+    "n_buys": 3,
+    "n_sells": 1
+  },
+  {
+    "date": "20251127",
+    "nav": 0.938221,
+    "cash": 52937060.99,
+    "n_positions": 2,
+    "exposure": 0.4358,
+    "n_buys": 2,
+    "n_sells": 1
+  },
+  {
+    "date": "20251128",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 2
+  },
+  {
+    "date": "20251201",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251202",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251203",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251204",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251205",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251208",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251209",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251210",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251211",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251212",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251215",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251216",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251217",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251218",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251219",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251222",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251223",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251224",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251226",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251229",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20251230",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260102",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260105",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260106",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260107",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260108",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260109",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260112",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260113",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260114",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260115",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260116",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260119",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260120",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260121",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260122",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260123",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260126",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260127",
+    "nav": 0.939999,
+    "cash": 93999900.64,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260128",
+    "nav": 0.928512,
+    "cash": 9639248.44,
+    "n_positions": 1,
+    "exposure": 0.8962,
+    "n_buys": 1,
+    "n_sells": 0
+  },
+  {
+    "date": "20260129",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 1
+  },
+  {
+    "date": "20260130",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260202",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260203",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260204",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260205",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260206",
+    "nav": 0.925548,
+    "cash": 92554809.24,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260209",
+    "nav": 0.915103,
+    "cash": 9294322.04,
+    "n_positions": 1,
+    "exposure": 0.8984,
+    "n_buys": 1,
+    "n_sells": 0
+  },
+  {
+    "date": "20260210",
+    "nav": 0.951094,
+    "cash": 95109447.84,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 1
+  },
+  {
+    "date": "20260211",
+    "nav": 0.975542,
+    "cash": 9830157.87,
+    "n_positions": 2,
+    "exposure": 0.8992,
+    "n_buys": 2,
+    "n_sells": 0
+  },
+  {
+    "date": "20260212",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 2
+  },
+  {
+    "date": "20260213",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260219",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260220",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260223",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260224",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260225",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260226",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260227",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260303",
+    "nav": 0.982819,
+    "cash": 98281888.12,
+    "n_positions": 0,
+    "exposure": 0.0,
+    "n_buys": 0,
+    "n_sells": 0
+  },
+  {
+    "date": "20260304",
+    "nav": 0.88432,
+    "cash": 9856426.29,
+    "n_positions": 2,
+    "exposure": 0.8885,
+    "n_buys": 2,
+    "n_sells": 0
+  },
+  {
+    "date": "20260305",
+    "nav": 0.963634,
+    "cash": 5441764.19,
+    "n_positions": 5,
+    "exposure": 0.9435,
+    "n_buys": 5,
+    "n_sells": 0
+  },
+  {
+    "date": "20260306",
+    "nav": 0.974415,
+    "cash": 6353627.39,
+    "n_positions": 4,
+    "exposure": 0.9348,
+    "n_buys": 4,
+    "n_sells": 1
+  },
+  {
+    "date": "20260309",
+    "nav": 0.94786,
+    "cash": 5502499.74,
+    "n_positions": 5,
+    "exposure": 0.9419,
+    "n_buys": 5,
+    "n_sells": 0
+  },
+  {
+    "date": "20260310",
+    "nav": 0.973453,
+    "cash": 50106408.15,
+    "n_positions": 4,
+    "exposure": 0.4853,
+    "n_buys": 4,
+    "n_sells": 1
+  },
+  {
+    "date": "20260311",
+    "nav": 1.002791,
+    "cash": 29379506.5,
+    "n_positions": 4,
+    "exposure": 0.707,
+    "n_buys": 4,
+    "n_sells": 2
+  },
+  {
+    "date": "20260312",
+    "nav": 0.99782,
+    "cash": 87835036.85,
+    "n_positions": 1,
+    "exposure": 0.1197,
+    "n_buys": 1,
+    "n_sells": 3
+  },
+  {
+    "date": "20260313",
+    "nav": 1.008032,
+    "cash": 48673163.45,
+    "n_positions": 2,
+    "exposure": 0.5171,
+    "n_buys": 2,
+    "n_sells": 0
+  },
+  {
+    "date": "20260316",
+    "nav": 1.002226,
+    "cash": 26864492.64,
+    "n_positions": 4,
+    "exposure": 0.732,
+    "n_buys": 4,
+    "n_sells": 0
+  },
+  {
+    "date": "20260317",
+    "nav": 1.023499,
+    "cash": 21505184.79,
+    "n_positions": 6,
+    "exposure": 0.7899,
+    "n_buys": 6,
+    "n_sells": 1
+  },
+  {
+    "date": "20260318",
+    "nav": 1.052629,
+    "cash": 39584372.51,
+    "n_positions": 4,
+    "exposure": 0.6239,
+    "n_buys": 4,
+    "n_sells": 2
+  },
+  {
+    "date": "20260319",
+    "nav": 1.028478,
+    "cash": 60041383.88,
+    "n_positions": 3,
+    "exposure": 0.4162,
+    "n_buys": 3,
+    "n_sells": 2
+  },
+  {
+    "date": "20260320",
+    "nav": 1.021483,
+    "cash": 47892880.03,
+    "n_positions": 4,
+    "exposure": 0.5311,
+    "n_buys": 4,
+    "n_sells": 1
+  },
+  {
+    "date": "20260322",
+    "nav": 1.021483,
+    "cash": 47892880.03,
+    "n_positions": 4,
+    "exposure": 0.5311,
+    "n_buys": 4,
+    "n_sells": 0
+  },
+  {
+    "date": "20260323",
+    "nav": 0.980306,
+    "cash": 47892880.03,
+    "n_positions": 4,
+    "exposure": 0.5114,
+    "n_buys": 4,
+    "n_sells": 0
+  },
+  {
+    "date": "20260324",
+    "nav": 0.985315,
+    "cash": 34231594.02,
+    "n_positions": 5,
+    "exposure": 0.6526,
+    "n_buys": 5,
+    "n_sells": 1
+  },
+  {
+    "date": "20260325",
+    "nav": 0.998586,
+    "cash": 50252033.5,
+    "n_positions": 3,
+    "exposure": 0.4968,
+    "n_buys": 3,
+    "n_sells": 3
+  },
+  {
+    "date": "20260326",
+    "nav": 1.00011,
+    "cash": 47407570.58,
+    "n_positions": 3,
+    "exposure": 0.526,
+    "n_buys": 3,
+    "n_sells": 1
+  },
+  {
+    "date": "20260327",
+    "nav": 0.999037,
+    "cash": 67765716.4,
+    "n_positions": 2,
+    "exposure": 0.3217,
+    "n_buys": 2,
+    "n_sells": 1
+  }
+]

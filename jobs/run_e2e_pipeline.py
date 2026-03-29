@@ -87,18 +87,26 @@ def run_e2e(target_date: str, disable_uq: bool = False, use_mock: bool = False):
     if not use_mock:
         use_mock = not has_real_sc(target_date)
 
-    # Phase 1 backtest_summary placeholder (W6에서 AI #2 Backtest Agent 연결 예정)
-    backtest_summary = {
-        "status": "phase1_placeholder",
-        "win_rate_hint": None,
-        "baseline_delta": None,
-        "failure_tags": [],
-        "confidence_band": None,
-        "recent_sharpe": None,
-        "recent_mdd": None,
-        "last_updated": None,
-        "note": "Phase 1: Backtest Agent 미구현. W6에서 AI #2가 연결 예정.",
-    }
+    # Backtest Summary 로드 — 실제 리포트가 있으면 사용, 없으면 placeholder
+    _bt_summary_path = _BASE_DIR / "reports" / "backtest" / "backtest_summary.json"
+    if _bt_summary_path.exists():
+        import json as _json
+        with open(_bt_summary_path, encoding="utf-8") as _f:
+            backtest_summary = _json.load(_f)
+        print(f"  → Backtest summary 로드: status={backtest_summary.get('status', '?')}")
+    else:
+        backtest_summary = {
+            "status": "phase1_placeholder",
+            "win_rate_hint": None,
+            "baseline_delta": None,
+            "failure_tags": [],
+            "confidence_band": None,
+            "recent_sharpe": None,
+            "recent_mdd": None,
+            "last_updated": None,
+            "note": "Backtest 리포트 미생성. run_backtest.py 또는 run_backtest_replay.py 실행 필요.",
+        }
+        print(f"  → Backtest summary 없음 — placeholder 사용")
 
     print(f"\n[Step 4/7] Risk Engine ({'mock' if use_mock else 'real'} StrategyCard)...")
     risk_card, cop = run_risk_engine(

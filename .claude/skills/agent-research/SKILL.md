@@ -3,6 +3,7 @@ name: agent-research
 description: "논문/기술 조사 스킬. 프로젝트 관련 학술 논문, 기술 블로그, 오픈소스 구현체를 조사한다. '논문 조사', '기술 리서치', '관련 연구', 'related work', 'literature review', '선행 연구' 키워드 시 사용. 단순 코드 검색은 /code-review가 처리한다."
 argument-hint: "[조사 주제]"
 user-invocable: true
+agent: analyst
 allowed-tools: Read, Grep, Glob, Bash, WebSearch, WebFetch, Agent
 ---
 

@@ -121,18 +121,18 @@ def load_dmp_data(date_str: str) -> dict:
             "return_5d":            float(tech.get("return_5d")  or (close / sma_5  - 1 if sma_5  > 0 else 0)),
             "return_20d":           float(tech.get("return_20d") or (close / sma_20 - 1 if sma_20 > 0 else 0)),
             "return_60d":           float(tech.get("return_60d") or (close / sma_60 - 1 if sma_60 > 0 else 0)),
-            "rsi_14":               float(tech.get("rsi_14", 50.0)),
-            "volume_ratio_20":      float(tech.get("volume_ratio_20", 1.0)),
-            "macd":                 float(tech.get("macd", 0.0)),
-            "macd_signal":          float(tech.get("macd_signal", 0.0)),
-            "atr_14":               float(tech.get("atr_14", 0.0)),
+            "rsi_14":               float(tech.get("rsi_14") or 50.0),
+            "volume_ratio_20":      float(tech.get("volume_ratio_20") or 1.0),
+            "macd":                 float(tech.get("macd") or 0.0),
+            "macd_signal":          float(tech.get("macd_signal") or 0.0),
+            "atr_14":               float(tech.get("atr_14") or 0.0),
             "sma5_ratio":           (close / sma_5  - 1.0) if sma_5  > 0 else 0.0,
             "sma20_ratio":          (close / sma_20 - 1.0) if sma_20 > 0 else 0.0,
             "sma60_ratio":          (close / sma_60 - 1.0) if sma_60 > 0 else 0.0,
-            "period_agreement_score": float(tech.get("period_agreement_score", 0.0)),
-            "stock_sync_score":     float(tech.get("stock_sync_score", 0.0)),
-            "market_synchronism":   float(tech.get("market_synchronism", 0.0)),
-            "rational_price_gap":   float(tech.get("rational_price_gap", 0.0)),
+            "period_agreement_score": float(tech.get("period_agreement_score") or 0.0),
+            "stock_sync_score":     float(tech.get("stock_sync_score") or 0.0),
+            "market_synchronism":   float(tech.get("market_synchronism") or 0.0),
+            "rational_price_gap":   float(tech.get("rational_price_gap") or 0.0),
         }
     return result
 
@@ -278,13 +278,30 @@ def train_lgbm(X: pd.DataFrame, y: pd.Series, cfg: dict):
 
 
 def predict_proba_scores(model, X: pd.DataFrame) -> np.ndarray:
-    """LightGBM 예측 → [-1, 1] 점수."""
+    """LightGBM 예측 → [-1, 1] 점수. LGBMRanker/Classifier 양쪽 호환."""
     if model is None or X.empty:
         return np.zeros(len(X))
     try:
-        proba = model.predict_proba(X)
-        scores = proba[:, 1] if proba.ndim == 2 else proba.ravel()
-        return np.clip(scores * 2 - 1, -1.0, 1.0)
+        # dict wrapper 해제
+        estimator = model["model"] if isinstance(model, dict) else model
+        feature_cols = model.get("feature_cols") if isinstance(model, dict) else None
+        col_means = model.get("col_means", {}) if isinstance(model, dict) else {}
+        if feature_cols is not None:
+            for c in feature_cols:
+                if c not in X.columns:
+                    X[c] = col_means.get(c, 0.0)
+            X = X[feature_cols]
+
+        if hasattr(estimator, "predict_proba"):
+            proba = estimator.predict_proba(X)
+            scores = proba[:, 1] if proba.ndim == 2 else proba.ravel()
+            return np.clip(scores * 2 - 1, -1.0, 1.0)
+        else:
+            # LGBMRanker: cross-sectional rank normalize
+            raw = estimator.predict(X)
+            mn, mx = raw.min(), raw.max()
+            rng = mx - mn if mx > mn else 1.0
+            return np.clip((raw - mn) / rng * 2 - 1, -1.0, 1.0)
     except Exception as e:
         print(f"[Backtest] 예측 실패: {e}")
         return np.zeros(len(X))
@@ -488,7 +505,7 @@ def signals_main(
         combined = qs * quant_weight + ns * (1 - quant_weight)
         scored.append((ticker, combined))
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [tk for tk, _ in scored[:top_k] if _ > 0]
+    return [tk for tk, _ in scored[:top_k]]  # 상위 K 무조건 선택 (cross-sectional rank)
 
 
 def signals_quant_only(
@@ -499,7 +516,7 @@ def signals_quant_only(
     q_scores = predict_proba_scores(model, X)
     scored = [(str(t).zfill(6), float(s)) for t, s in zip(tickers, q_scores)]
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [tk for tk, s in scored[:top_k] if s > 0]
+    return [tk for tk, s in scored[:top_k]]  # 상위 K 무조건 선택
 
 
 def signals_news_only(
@@ -507,7 +524,7 @@ def signals_news_only(
 ) -> list:
     scored = [(str(t).zfill(6), float(news_signals.get(str(t).zfill(6), 0.0))) for t in tickers]
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [tk for tk, s in scored[:top_k] if s > 0]
+    return [tk for tk, s in scored[:top_k]]  # 상위 K 무조건 선택
 
 
 def signals_momentum_20d(
@@ -519,7 +536,7 @@ def signals_momentum_20d(
         for t in tickers
     ]
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [tk for tk, s in scored[:top_k] if s > 0]
+    return [tk for tk, s in scored[:top_k]]  # 상위 K 무조건 선택
 
 
 def signals_ew_rebalance(tickers: list, date_str: str, top_k: int = 10) -> list:

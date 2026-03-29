@@ -14,7 +14,10 @@ profiles:
     generator: "jobs/build_strategy_card_rebound.py"
     alpha_family: "reversal"
 
-default_profile: "rebound"
+# official_baseline: momentum (AI #2 공식 전략 — 제안서 기준)
+# default_profile: 운영 기본값 (Preference Resolver 미설정 시 fallback)
+# runtime default는 config/preference_resolver.yaml이 결정
+default_profile: "momentum"  # rebound에서 변경
 
 # 공통 설정 (모든 profile에 적용)
 common:
