@@ -116,6 +116,12 @@ class FinalDecisionAgent:
                 backtest_summary,
             )
 
+            # warning_reason 분리: approve이면서 경고 텍스트가 있으면 warning_reason으로 이동
+            warning_reason = None
+            if decision == "approve" and veto_reason and veto_reason.startswith("["):
+                warning_reason = veto_reason
+                veto_reason = None
+
             if decision == "approve":
                 approved += 1
             else:
@@ -152,6 +158,7 @@ class FinalDecisionAgent:
                 "weight": order["weight"],  # can_change_weight = false
                 "decision": decision,
                 "veto_reason": veto_reason,
+                "warning_reason": warning_reason,
                 "evidence_ids": order.get("evidence_ids", []),
                 "uncertainty_score": uq_score,
             })
@@ -374,9 +381,22 @@ class FinalDecisionAgent:
                 raw_content = llm_result.get("content", "")
                 model_used = llm_result.get("model", "unknown")
 
-                json_match = re.search(r'\{.*\}', raw_content, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group())
+                # balanced bracket 매칭 (그리디 매칭 방지)
+                parsed = None
+                _s = raw_content.find("{")
+                if _s != -1:
+                    _depth, _e = 0, _s
+                    for _ci, _ch in enumerate(raw_content[_s:], _s):
+                        if _ch == "{": _depth += 1
+                        elif _ch == "}": _depth -= 1
+                        if _depth == 0:
+                            _e = _ci + 1
+                            break
+                    try:
+                        parsed = json.loads(raw_content[_s:_e])
+                    except json.JSONDecodeError:
+                        parsed = None
+                if parsed:
                     recommended = parsed.get("recommended_action", "veto")
                     valid_actions = ["approve", "veto", "cautious_approve"]
                     if recommended not in valid_actions:

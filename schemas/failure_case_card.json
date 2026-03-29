@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FailureCaseCard",
+  "description": "백테스트에서 발견된 실패 케이스. AI #2가 생성, Risk/FDA가 참조.",
+  "type": "object",
+  "required": ["card_id", "generated_at", "artifact_version", "strategy", "period", "failure_cases", "summary"],
+  "properties": {
+    "card_id": {
+      "type": "string",
+      "pattern": "^FCC-\\d{8}$",
+      "description": "FailureCaseCard 고유 ID (e.g., FCC-20260325)"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "카드 생성 시각 (KST ISO 8601)"
+    },
+    "artifact_version": {
+      "type": "string",
+      "description": "스키마 버전 (e.g., v1.0)"
+    },
+    "strategy": {
+      "type": "string",
+      "description": "백테스트 대상 전략 이름 (e.g., momentum, rebound)"
+    },
+    "period": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "백테스트 시작일 (YYYYMMDD)"
+        },
+        "end": {
+          "type": "string",
+          "description": "백테스트 종료일 (YYYYMMDD)"
+        }
+      }
+    },
+    "failure_cases": {
+      "type": "array",
+      "description": "개별 실패 케이스 목록",
+      "items": {
+        "type": "object",
+        "required": ["date", "ticker", "signal", "actual_return", "failure_type"],
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "실패 발생 날짜 (YYYYMMDD)"
+          },
+          "ticker": {
+            "type": "string",
+            "description": "종목코드 6자리 zfill"
+          },
+          "signal": {
+            "type": "string",
+            "enum": ["strong_buy", "buy", "hold", "sell", "strong_sell"],
+            "description": "발행된 투자 신호"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "신호 발행 당시 confidence"
+          },
+          "actual_return": {
+            "type": "number",
+            "description": "실제 수익률 (소수 형태, e.g., -0.053)"
+          },
+          "failure_type": {
+            "type": "string",
+            "enum": [
+              "false_positive",
+              "false_negative",
+              "sector_concentration",
+              "momentum_reversal",
+              "regime_miss"
+            ],
+            "description": "실패 유형 분류"
+          },
+          "description": {
+            "type": "string",
+            "description": "실패 케이스 설명 (자동 생성)"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "description": "실패 케이스 전체 요약",
+      "properties": {
+        "total_failures": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "전체 실패 케이스 수"
+        },
+        "failure_rate": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "전체 예측 대비 실패율 (0~1)"
+        },
+        "top_failure_types": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "빈도 상위 실패 유형 목록"
+        },
+        "failure_tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "실패 패턴 태그 (Risk/FDA 참조용)"
+        }
+      }
+    }
+  }
+}

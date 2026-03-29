@@ -89,6 +89,19 @@ python connectors/llm_router.py
 
 ## 하네스 시스템
 
+### 에이전트 (8개)
+
+| 에이전트 | 역할 | 권한 |
+|---------|------|------|
+| reviewer | 코드 리뷰 (PIT-safety, 정책, 스키마) | Read-only |
+| fixer | 코드 수정 + 버그 픽스 | Read/Write |
+| runner | 파이프라인 실행 + 테스트 | Read-only |
+| qa-inspector | 통합 정합성 검증 | Read-only |
+| modeler | KR-Rebound-CNN ML 모델링 | Read/Write |
+| doc-writer | 문서 작성/갱신/정합성 | Read/Write |
+| analyst | ML 성능 분석/해석 | Read-only |
+| gpt-feedback-tracker | GPT Pro 피드백 추적 | Read-only |
+
 ### 단일 작업 — 전문 스킬 직접 호출
 | 명령 | 팀 구성 | 기능 |
 |------|---------|------|
@@ -98,6 +111,9 @@ python connectors/llm_router.py
 | `/validate [schema\|policy\|all]` | qa-inspector + reviewer | 정합성 검증 |
 | `/smoke-test [커넥터명\|all]` | runner 단독 | 커넥터 smoke test |
 | `/build-model [dataset\|train\|evaluate\|emit\|publish]` | modeler + fixer + qa-inspector | KR-Rebound-CNN 모델 구축 |
+| `/agent-research [주제]` | analyst | 논문/기술 조사 |
+| `/worklog [내용\|status]` | doc-writer | 작업 로그 기록 |
+| `/paper-trending [분야]` | analyst | 논문 트렌드 조사 |
 
 ### 복합 작업 — 오케스트레이터
 ```
@@ -113,10 +129,14 @@ python connectors/llm_router.py
 
 ### 에이전트 모드 (세션 전체)
 ```bash
-claude --agent reviewer         # 리뷰 전용
-claude --agent fixer            # 코드 수정 전용
-claude --agent runner           # 파이프라인 실행 전용
-claude --agent qa-inspector     # 정합성 검증 전용
+claude --agent reviewer             # 리뷰 전용
+claude --agent fixer                # 코드 수정 전용
+claude --agent runner               # 파이프라인 실행 전용
+claude --agent qa-inspector         # 정합성 검증 전용
+claude --agent modeler              # ML 모델링 전용
+claude --agent doc-writer           # 문서 작성 전용
+claude --agent analyst              # 성능 분석 전용
+claude --agent gpt-feedback-tracker # GPT Pro 피드백 추적
 ```
 
 ### 자동화 Hooks

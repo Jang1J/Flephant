@@ -467,11 +467,22 @@ def build_packet(target_date: str) -> dict:
         raw_content = llm_result.get("content", "")
         model_used = llm_result.get("model", "unknown")
 
-        # JSON 파싱 시도
-        import re
-        json_match = re.search(r'\{.*\}', raw_content, re.DOTALL)
-        if json_match:
-            parsed = json.loads(json_match.group())
+        # JSON 파싱 시도 (balanced bracket 매칭 — 그리디 매칭 방지)
+        parsed = None
+        _start = raw_content.find("{")
+        if _start != -1:
+            _depth, _end = 0, _start
+            for _ci, _ch in enumerate(raw_content[_start:], _start):
+                if _ch == "{": _depth += 1
+                elif _ch == "}": _depth -= 1
+                if _depth == 0:
+                    _end = _ci + 1
+                    break
+            try:
+                parsed = json.loads(raw_content[_start:_end])
+            except json.JSONDecodeError:
+                parsed = None
+        if parsed:
             llm_market_analysis = {
                 "market_commentary": parsed.get("market_commentary", ""),
                 "market_mood": parsed.get("market_mood", "uncertain"),

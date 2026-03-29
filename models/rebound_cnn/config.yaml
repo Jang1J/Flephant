@@ -20,10 +20,11 @@ data:
     macro: ["vix_proxy", "market_breadth", "fx_rate", "base_rate"]
 
   # Context Branch 피처 정의 (설계서 §10.2 기준)
-  # 총 context 차원: macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
-  #                  + sector_onehot(n_sectors) + market_cap_rank(1)
-  # universe_v1.csv 기준 16개 섹터 → 총 26차원 (4+5+2+3+11+1=26 설계서 명세)
-  # 실제 n_sectors는 dataset.py에서 universe CSV 읽어 동적 계산 후 config["n_context_features"]로 전달
+  # 총 context 차원 = n_context_features_base(15) + n_sectors (동적)
+  #   = macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
+  #     + sector_onehot(n_sectors) + market_cap_rank(1)
+  # universe_v1.csv 기준 11개 고유 섹터 → 15 + 11 = 26차원 (설계서 명세)
+  # n_sectors는 preprocess.py _build_wics_sector_list()에서 동적 계산
   context_features:
     macro:               # 4개
       - vix_proxy
@@ -47,8 +48,9 @@ data:
       - sector_onehot    # n_sectors-dim one-hot (WICS 대분류, universe CSV에서 동적 계산)
       - market_cap_rank  # 0~1 range (percentile rank within universe)
 
-  # n_context_features_base: sector_onehot 제외 고정 차원 수 (14 + 1 = 15)
-  # 최종 n_context_features = 15 + n_sectors (dataset.py에서 계산)
+  # n_context_features_base: sector_onehot 제외 고정 차원 수
+  #   macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + market_cap_rank(1) = 15
+  # 최종 n_context_features = 15 + n_sectors (preprocess.py에서 계산)
   n_context_features_base: 15  # macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + market_cap_rank(1)
 
   image:

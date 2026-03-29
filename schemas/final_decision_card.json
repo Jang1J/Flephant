@@ -50,6 +50,10 @@
             "type": ["string", "null"],
             "description": "veto 시 사유 (LLM 생성). approve 시 null."
           },
+          "warning_reason": {
+            "type": ["string", "null"],
+            "description": "approve이지만 백테스트 등 경고가 있을 때 사유. 경고 없으면 null."
+          },
           "evidence_ids": {
             "type": "array",
             "items": { "type": "string" },

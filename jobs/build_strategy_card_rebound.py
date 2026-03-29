@@ -25,7 +25,7 @@ import pandas as pd
 import yaml
 
 from connectors import make_snapshot_dt
-from models.rebound_cnn.dataset import compute_sector_relative_features, make_chart_tensor
+from models.rebound_cnn.preprocess import compute_sector_relative_features, make_chart_tensor
 
 # ── 경로 설정 ──────────────────────────────────────────────────
 UNIVERSE_PATH = _BASE_DIR / "config" / "universe_v1.csv"

@@ -1,0 +1,62 @@
+model:
+  name: "LightGBM-Momentum-Ranker"
+  version: "v1.0"
+
+lgbm:
+  objective: "binary"
+  metric: "auc"
+  num_leaves: 31
+  learning_rate: 0.05
+  n_estimators: 200
+  min_child_samples: 10
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+
+walk_forward:
+  mode: "expanding"
+  train_window: 200
+  val_window: 20
+  step_size: 20
+  purge_days: 5
+  embargo_days: 5
+
+features:
+  manual:
+    - return_5d
+    - return_20d
+    - rsi_14
+    - volume_ratio_20
+    - macd
+    - macd_signal
+    - atr_14
+    - sma5_ratio
+    - sma20_ratio
+    - sma60_ratio
+  mlf_lite:
+    # return_5d, return_20d는 manual에 이미 포함 — 여기엔 추가 피처만 등재
+    - return_60d
+    - period_agreement_score
+  umi_lite:
+    - stock_sync_score
+    - market_synchronism
+    - rational_price_gap
+
+label:
+  forward_horizon: 5
+  top_quantile: 0.25
+
+# 신호 분류 임계값 (synthesizer.py에서 로드)
+signal_thresholds:
+  strong_buy: 0.70
+  buy: 0.55
+  hold: 0.30     # risk_policy_v0.yaml min_confidence=0.3과 정렬
+
+# 합성 가중치 (build_strategy_card_momentum.py + synthesizer.py 공통 기준)
+synthesis:
+  quant_weight: 0.7
+  news_weight: 0.3
+
+# 거래 비용 (backtest에서 사용)
+cost_per_side: 0.00015  # 편도 0.015%

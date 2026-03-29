@@ -3,7 +3,7 @@
   "title": "BacktestSummary",
   "description": "AI #2 Backtest Agent → AI #1 FDA handoff. FDA가 투자 판단 시 참조하는 백테스트 요약.",
   "type": "object",
-  "required": ["status"],
+  "required": ["status", "win_rate_hint", "baseline_delta", "failure_tags", "confidence_band"],
   "properties": {
     "status": {
       "type": "string",

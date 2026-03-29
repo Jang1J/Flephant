@@ -5,9 +5,15 @@ Must-have ablation (AI #1 담당):
   #2: UQ on vs No-UQ Risk — UQ tail cap 있음 vs 없음
   #3: PFS(stateful) vs stateless — 진입가 기반 vs return_5d
 
+Must-have ablation (AI #2 담당):
+  #1: pure-quant vs full(quant+news) — 뉴스 신호 기여도 측정
+  #4: synthesis weight sensitivity — quant_weight 0.5/0.7/0.9 비교
+
 Usage:
     python jobs/run_ablation.py 20260324 --experiment uq          # #2만
     python jobs/run_ablation.py 20260324 --experiment pfs         # #3만
+    python jobs/run_ablation.py 20260324 --experiment quant_news  # #1만
+    python jobs/run_ablation.py 20260324 --experiment synth_weight # #4만
     python jobs/run_ablation.py 20260324 --experiment all         # 전부
     python jobs/run_ablation.py --replay 5 --experiment all       # 5일 replay 기반
 """
@@ -289,6 +295,185 @@ def run_pfs_ablation(target_date: str) -> dict:
     return result
 
 
+# ── Ablation #1 (AI #2): pure-quant vs full(quant+news) ──────
+
+
+def run_quant_news_ablation(target_date: str) -> dict:
+    """
+    AI #2 Ablation #1: pure-quant SC vs full(quant+news) SC 비교.
+    뉴스 신호의 실질적 기여도를 측정한다.
+    """
+    print(f"\n[Ablation] #1 pure-quant vs full(quant+news): {target_date}")
+
+    quant_only_path = _BASE_DIR / "artifacts" / "strategy_card_variants" / "quant_only" / f"SC-{target_date}.json"
+    momentum_path = _BASE_DIR / "artifacts" / "strategy_card_variants" / "momentum" / f"SC-{target_date}.json"
+
+    # SC가 없으면 먼저 생성 시도
+    if not quant_only_path.exists() or not momentum_path.exists():
+        print(f"[Ablation] SC 미생성 — build_strategy_card_momentum.py 실행...")
+        import subprocess
+        subprocess.run(
+            [sys.executable, str(_BASE_DIR / "jobs" / "build_strategy_card_momentum.py"), target_date],
+            cwd=str(_BASE_DIR),
+        )
+
+    if not quant_only_path.exists() or not momentum_path.exists():
+        print(f"[Ablation] SC 생성 실패 — 건너뜀")
+        return {"error": f"SC 생성 실패: {target_date}"}
+
+    with open(quant_only_path, encoding="utf-8") as f:
+        quant_cards = json.load(f)
+    with open(momentum_path, encoding="utf-8") as f:
+        full_cards = json.load(f)
+
+    # signal 분포 비교
+    def _signal_dist(cards):
+        dist = {}
+        for c in cards:
+            sig = c.get("signal", "unknown")
+            dist[sig] = dist.get(sig, 0) + 1
+        return dist
+
+    def _buy_tickers(cards):
+        return set(c["ticker"] for c in cards if c.get("signal") in ("strong_buy", "buy"))
+
+    quant_dist = _signal_dist(quant_cards)
+    full_dist = _signal_dist(full_cards)
+    quant_buys = _buy_tickers(quant_cards)
+    full_buys = _buy_tickers(full_cards)
+
+    # confidence 차이 분석
+    quant_conf_map = {c["ticker"]: c.get("confidence", 0) for c in quant_cards}
+    full_conf_map = {c["ticker"]: c.get("confidence", 0) for c in full_cards}
+    conf_diffs = {}
+    for tk in quant_conf_map:
+        diff = round(full_conf_map.get(tk, 0) - quant_conf_map.get(tk, 0), 4)
+        if abs(diff) > 0.001:
+            conf_diffs[tk] = diff
+
+    result = {
+        "ablation_id": f"ABL-quant_news-{target_date}",
+        "experiment": "pure_quant_vs_full",
+        "target_date": target_date,
+        "generated_at": datetime.now(KST).isoformat(),
+        "baseline": {"label": "pure-quant", "signal_dist": quant_dist, "buy_count": len(quant_buys)},
+        "variant": {"label": "full(quant+news)", "signal_dist": full_dist, "buy_count": len(full_buys)},
+        "comparison": {
+            "buy_overlap": sorted(quant_buys & full_buys),
+            "quant_only_buys": sorted(quant_buys - full_buys),
+            "news_added_buys": sorted(full_buys - quant_buys),
+            "confidence_diffs": conf_diffs,
+            "summary": (
+                f"quant BUY {len(quant_buys)}종목, full BUY {len(full_buys)}종목, "
+                f"겹침 {len(quant_buys & full_buys)}종목, "
+                f"뉴스로 추가 {len(full_buys - quant_buys)}종목, "
+                f"뉴스로 제거 {len(quant_buys - full_buys)}종목"
+            ),
+        },
+    }
+
+    out_path = ABL_DIR / f"ABL-quant_news-{target_date}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"[Ablation] 결과 저장: {out_path}")
+    print(f"[Ablation] 요약: {result['comparison']['summary']}")
+
+    return result
+
+
+# ── Ablation #4 (AI #2): synthesis weight sensitivity ────────
+
+
+def run_synth_weight_ablation(target_date: str) -> dict:
+    """
+    AI #2 Ablation #4: quant_weight 0.5/0.7/0.9에 따른 SC 변화 측정.
+    같은 quant_scores + news_signals에서 가중치만 변경하여 비교한다.
+    """
+    print(f"\n[Ablation] #4 synthesis weight sensitivity: {target_date}")
+
+    import numpy as np
+    import pandas as pd
+
+    dmp_path = DMP_DIR / f"DMP-{target_date}.json"
+    if not dmp_path.exists():
+        return {"error": f"DMP 없음: {target_date}"}
+
+    with open(dmp_path, encoding="utf-8") as f:
+        dmp = json.load(f)
+
+    universe_csv = _BASE_DIR / "config" / "universe_v1.csv"
+    universe = pd.read_csv(universe_csv, dtype={"ticker": str})
+    tickers = [str(t).zfill(6) for t in universe["ticker"]]
+
+    # quant scores: DMP return_5d 기반 rank → 0~1 정규화 (모델 미학습 시 fallback)
+    scores = {}
+    for tk in tickers:
+        tf = dmp.get("market_data", {}).get(tk, {}).get("tech_features", {})
+        scores[tk] = float(tf.get("return_5d", 0.0))
+    vals = list(scores.values())
+    mn, mx = min(vals), max(vals)
+    rng = mx - mn if mx > mn else 1.0
+    quant_scores = {tk: (v - mn) / rng for tk, v in scores.items()}
+
+    # news signals: 간단히 0.0 (뉴스 미사용 baseline)
+    news_signals = {tk: 0.0 for tk in tickers}
+    try:
+        from models.strategy_model.news_strategy import compute_news_signals
+        ns = compute_news_signals(target_date, tickers)
+        if ns:
+            news_signals = ns
+    except Exception as e:
+        print(f"[Ablation] 뉴스 로드 실패 (0.0 사용): {e}")
+
+    # 가중치별 SC 생성 비교
+    weights = [0.5, 0.7, 0.9]
+    results_by_weight = {}
+
+    for qw in weights:
+        nw = round(1.0 - qw, 2)
+        buy_tickers = []
+        confs = {}
+        for tk in tickers:
+            qs = quant_scores.get(tk, 0.5)
+            ns_val = news_signals.get(tk, 0.0)
+            combined = qs * qw + ((ns_val + 1) / 2) * nw
+            confs[tk] = round(combined, 4)
+            if combined >= 0.55:
+                buy_tickers.append(tk)
+        results_by_weight[f"qw_{qw}"] = {
+            "quant_weight": qw,
+            "news_weight": nw,
+            "buy_count": len(buy_tickers),
+            "buy_tickers": sorted(buy_tickers),
+            "avg_confidence": round(sum(confs.values()) / len(confs), 4) if confs else 0,
+        }
+        print(f"[Ablation] qw={qw}: BUY {len(buy_tickers)}종목, avg_conf={results_by_weight[f'qw_{qw}']['avg_confidence']}")
+
+    result = {
+        "ablation_id": f"ABL-synth_weight-{target_date}",
+        "experiment": "synthesis_weight_sensitivity",
+        "target_date": target_date,
+        "generated_at": datetime.now(KST).isoformat(),
+        "variants": results_by_weight,
+        "comparison": {
+            "weight_range": [0.5, 0.7, 0.9],
+            "buy_counts": {k: v["buy_count"] for k, v in results_by_weight.items()},
+            "summary": " / ".join(
+                f"qw={v['quant_weight']}: BUY {v['buy_count']}종목"
+                for v in results_by_weight.values()
+            ),
+        },
+    }
+
+    out_path = ABL_DIR / f"ABL-synth_weight-{target_date}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"[Ablation] 결과 저장: {out_path}")
+    print(f"[Ablation] 요약: {result['comparison']['summary']}")
+
+    return result
+
+
 # ── Replay 모드: N거래일 연속 ablation ────────────────────────
 
 
@@ -321,6 +506,10 @@ def run_replay_ablation(days: int, experiment: str):
                 all_results[f"uq-{td}"] = run_uq_ablation(td)
             if experiment in ("pfs", "all"):
                 all_results[f"pfs-{td}"] = run_pfs_ablation(td)
+            if experiment in ("quant_news", "all"):
+                all_results[f"quant_news-{td}"] = run_quant_news_ablation(td)
+            if experiment in ("synth_weight", "all"):
+                all_results[f"synth_weight-{td}"] = run_synth_weight_ablation(td)
         except Exception as e:
             print(f"[Ablation] {td} 실패: {e}")
             all_results[f"error-{td}"] = str(e)
@@ -339,8 +528,8 @@ if __name__ == "__main__":
         help="대상 날짜 YYYYMMDD (--replay 사용 시 불필요)"
     )
     parser.add_argument(
-        "--experiment", choices=["uq", "pfs", "all"], default="all",
-        help="실험 종류 (uq=#2, pfs=#3, all=전부)"
+        "--experiment", choices=["uq", "pfs", "quant_news", "synth_weight", "all"], default="all",
+        help="실험 종류 (uq=#2, pfs=#3, quant_news=#1, synth_weight=#4, all=전부)"
     )
     parser.add_argument(
         "--replay", type=int, default=None, metavar="N",
@@ -365,3 +554,7 @@ if __name__ == "__main__":
             run_uq_ablation(target)
         if args.experiment in ("pfs", "all"):
             run_pfs_ablation(target)
+        if args.experiment in ("quant_news", "all"):
+            run_quant_news_ablation(target)
+        if args.experiment in ("synth_weight", "all"):
+            run_synth_weight_ablation(target)
