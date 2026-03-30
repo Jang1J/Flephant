@@ -20,10 +20,10 @@ data:
     macro: ["vix_proxy", "market_breadth", "fx_rate", "base_rate"]
 
   # Context Branch 피처 정의 (설계서 §10.2 기준)
-  # 총 context 차원 = n_context_features_base(15) + n_sectors (동적)
+  # 총 context 차원 = n_context_features_base(23) + n_sectors (동적)
   #   = macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
-  #     + sector_onehot(n_sectors) + market_cap_rank(1)
-  # universe_v1.csv 기준 11개 고유 섹터 → 15 + 11 = 26차원 (설계서 명세)
+  #     + confirmation(8) + sector_onehot(n_sectors) + market_cap_rank(1)
+  # universe_v1.csv 기준 11개 고유 섹터 → 23 + 11 = 34차원
   # n_sectors는 preprocess.py _build_wics_sector_list()에서 동적 계산
   context_features:
     macro:               # 4개
@@ -44,14 +44,23 @@ data:
       - ret_5d_sector_z
       - rsi_14_sector_z
       - volume_ratio_20_sector_pct
+    confirmation:        # 8개 (GPT Pro #9 P0)
+      - ret_5d_rank_in_sector          # 섹터 내 5일 수익률 순위 percentile
+      - close_sma20_ratio_sector_rank  # 섹터 내 close/sma20 비율 순위
+      - bb_pos                         # 볼린저 밴드 위치 (0~1)
+      - overnight_gap                  # (open - prev_close) / prev_close
+      - intraday_range                 # (high - low) / close
+      - upper_shadow                   # (high - max(open,close)) / (high - low + 1e-8)
+      - lower_shadow                   # (min(open,close) - low) / (high - low + 1e-8)
+      - body_ratio                     # abs(close - open) / (high - low + 1e-8)
     meta:                # sector_onehot(n_sectors) + market_cap_rank(1)
       - sector_onehot    # n_sectors-dim one-hot (WICS 대분류, universe CSV에서 동적 계산)
       - market_cap_rank  # 0~1 range (percentile rank within universe)
 
   # n_context_features_base: sector_onehot 제외 고정 차원 수
-  #   macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + market_cap_rank(1) = 15
-  # 최종 n_context_features = 15 + n_sectors (preprocess.py에서 계산)
-  n_context_features_base: 15  # macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + market_cap_rank(1)
+  #   macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + confirmation(8) + market_cap_rank(1) = 23
+  # 최종 n_context_features = 23 + n_sectors (preprocess.py에서 계산)
+  n_context_features_base: 23  # macro(4) + technical(5) + price_stretch(2) + sector_relative(3) + confirmation(8) + market_cap_rank(1)
 
   image:
     height: 64               # chart image height
@@ -59,8 +68,8 @@ data:
     channels: 3              # Ch1: candlestick body-wick, Ch2: volume, Ch3: indicator overlay
 
 training:
-  batch_size: 64
-  learning_rate: 0.001
+  batch_size: 32
+  learning_rate: 0.0003
   max_epochs: 50
   early_stopping_patience: 8
   walk_forward:
@@ -70,7 +79,7 @@ training:
     step_size: 20            # 슬라이딩 스텝
 
   optimizer: "adamw"
-  loss: "weighted_bce"       # pos_weight = n_neg / n_pos
+  loss: "bce_with_logits"    # BCEWithLogitsLoss (pos_weight = n_neg / n_pos)
   weight_decay: 0.01
   gradient_clip: 1.0
   seed: 42
@@ -92,6 +101,7 @@ evaluation:
   assumed_negative_return: -0.005 # portfolio layer 가상 수익률 (y=0 종목)
 
 oversold_gate:
+  train_gate_filter: false  # Gemini Pro: false=학습 시 전체 유니버스 사용 (Gate는 추론만), true=기존 동작
   min_conditions: 2
   ret_5d_threshold: 0.0        # ret_5d < 0
   rsi_14_threshold: 45
@@ -104,17 +114,23 @@ oversold_gate:
     min_candidates: 3
     rsi_relaxed: 48
     sector_bottom_pct_relaxed: 0.50
+  top_n_after_gate: 5  # Gate 통과 종목 중 상위 N개만 BUY 허용
 
-# Committee v1.1: ElasticNet tabular core + CNN confirmation fusion
+# Committee v1.1: LightGBM tree core + CNN confirmatory fusion
 # enabled=false: 기존 CNN-only 동작 무변경. true로 전환 시 Stage B1+B2 활성화.
+# GPT Pro: tree 0.7 / CNN 0.3 권장 (data-constrained setting에서 tree 우위)
+# CNN 역할: confirmatory/complementary branch (주력 alpha가 아님)
 committee:
   enabled: true
-  tab_weight: 0.65
-  cnn_weight: 0.35
+  tab_weight: 0.70
+  cnn_weight: 0.30
+  cnn_role: "confirmatory"  # "primary" | "confirmatory" — CNN은 확인용 branch
   agreement_threshold: 0.55
+  require_directional_agreement: true  # R8: CNN과 Tab 방향 일치 요구
 
-# ElasticNet logistic regression 하이퍼파라미터 (committee.enabled=true 시 사용)
-elasticnet:
+# Tree core 하이퍼파라미터 (committee.enabled=true 시 사용)
+# LightGBM 주력, ElasticNet fallback (LightGBM 미설치 시)
+tree_core:
   alpha: 0.01
   l1_ratio: 0.5
 

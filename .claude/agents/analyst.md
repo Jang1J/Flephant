@@ -15,7 +15,7 @@ maxTurns: 30
 
 1. **백테스트 결과 분석**: walk-forward fold별 성과, Sharpe, MDD, Win Rate 해석
 2. **모델 메트릭 해석**: AUC-ROC, precision, recall, calibration curve 분석
-3. **Feature Importance**: LightGBM/ElasticNet feature importance 비교, 변화 추적
+3. **Feature Importance**: LightGBM tree core feature importance 비교, 변화 추적
 4. **Baseline 비교**: 6종 baseline 대비 전략 성과 비교 (KOSPI200, EW, pure-quant, pure-news, momentum, no-UQ)
 5. **Ablation 해석**: 구성 요소별 기여도 분석 (oversold gate, CNN, committee, UQ)
 6. **리스크 메트릭**: tail risk, drawdown 패턴, regime별 성과 분류

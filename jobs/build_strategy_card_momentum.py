@@ -30,6 +30,10 @@ import pandas as pd
 import yaml
 
 from connectors import make_snapshot_dt, now_kst_iso
+from models.strategy_model.feature_factory import (
+    build_cross_sectional_raw,
+    extract_single_ticker_features,
+)
 
 # ── 경로 설정 ──────────────────────────────────────────────────
 UNIVERSE_PATH     = _BASE_DIR / "config" / "universe_v1.csv"
@@ -140,73 +144,103 @@ def load_ttp_news_signal(target_date: str, ticker: str) -> float:
 
 # ── 피처 추출 ─────────────────────────────────────────────────
 
-def build_feature_row(dmp: dict, ticker: str) -> dict:
+def build_feature_matrix(dmp: dict, tickers: list, cfg: dict, target_date_hint: str = "") -> pd.DataFrame:
     """
-    DMP에서 단일 종목의 feature row를 추출한다.
-    models/strategy_model/config.yaml features.manual + mlf_lite + umi_lite 기반.
+    모든 종목의 feature matrix를 구성한다.
+
+    feature_factory.extract_single_ticker_features()를 통해 Train과 동일한
+    피처 계산 로직을 사용한다 (Train-Serve Skew 방지).
+
+    Serve 경로 특이사항:
+    - close_history=None: sma60_ratio/return_60d/macd는 DMP tech_features에서 직접 읽음
+    - date_idx=None: 전체 시계열 사용 (단일 날짜이므로 항상 None)
+    - cross_sectional_pct: 당일 DMP 전체 종목 데이터로 계산
     """
-    market_data = dmp.get("market_data", {})
-    td = market_data.get(ticker, {})
-    ohlcv = td.get("ohlcv", {})
-    tech = td.get("tech_features", {})
+    mdata = dmp.get("market_data", {})
+    macro = dmp.get("macro_snapshot", {})
 
-    close = float(ohlcv.get("close") or 0)
-    sma_5  = float(tech.get("sma_5", close) or close or 1)
-    sma_20 = float(tech.get("sma_20", close) or close or 1)
-    sma_60 = float(tech.get("sma_60", close) or close or 1)
+    # 유니버스 정보 로드
+    uni = load_universe()
+    universe_tickers = uni["ticker"].tolist()
+    sector_map = dict(zip(uni["ticker"], uni["wics_sector"]))
 
-    # return_Xd 직접 추출 (없으면 sma 비율로 대체)
-    return_5d  = float(tech.get("return_5d")  or (close / sma_5  - 1 if sma_5  > 0 else 0))
-    return_20d = float(tech.get("return_20d") or (close / sma_20 - 1 if sma_20 > 0 else 0))
-    return_60d = float(tech.get("return_60d") or (close / sma_60 - 1 if sma_60 > 0 else 0))
-
-    sma5_ratio  = (close / sma_5  - 1.0) if sma_5  > 0 else 0.0
-    sma20_ratio = (close / sma_20 - 1.0) if sma_20 > 0 else 0.0
-    sma60_ratio = (close / sma_60 - 1.0) if sma_60 > 0 else 0.0
-
-    return {
-        # manual features
-        "return_5d":        return_5d,
-        "return_20d":       return_20d,
-        "rsi_14":           float(tech.get("rsi_14", 50.0)),
-        "volume_ratio_20":  float(tech.get("volume_ratio_20", 1.0)),
-        "macd":             float(tech.get("macd", 0.0)),
-        "macd_signal":      float(tech.get("macd_signal", 0.0)),
-        "atr_14":           float(tech.get("atr_14", 0.0)),
-        "sma5_ratio":       sma5_ratio,
-        "sma20_ratio":      sma20_ratio,
-        "sma60_ratio":      sma60_ratio,
-        # mlf_lite
-        "return_60d":                float(return_60d),
-        "period_agreement_score":    float(tech.get("period_agreement_score", 0.0)),
-        # umi_lite
-        "stock_sync_score":          float(tech.get("stock_sync_score", 0.0)),
-        "market_synchronism":        float(tech.get("market_synchronism", 0.0)),
-        "rational_price_gap":        float(tech.get("rational_price_gap", 0.0)),
-    }
-
-
-def build_feature_matrix(dmp: dict, tickers: list, cfg: dict) -> pd.DataFrame:
-    """모든 종목의 feature matrix를 구성한다."""
     # config에서 사용 피처 목록 조립
     feat_cfg = cfg.get("features", {})
     all_feats = (
         feat_cfg.get("manual", [])
         + feat_cfg.get("mlf_lite", [])
         + feat_cfg.get("umi_lite", [])
+        + feat_cfg.get("cross_sectional_pct", [])
+        + feat_cfg.get("ohlcv_micro", [])
     )
     # 중복 제거 (순서 보존)
-    seen = set()
-    feature_cols = []
+    seen: set = set()
+    feature_cols: list = []
     for f in all_feats:
         if f not in seen:
             feature_cols.append(f)
             seen.add(f)
 
+    # P0-1 GPT Pro: 이전 날짜 DMP에서 prev_close 로드 (overnight_gap serve skew 제거)
+    prev_close_map: dict = {}
+    try:
+        dmp_files = sorted(DMP_DIR.glob("DMP-*.json"))
+        prev_files = [f for f in dmp_files if f.stem.replace("DMP-", "") < target_date_hint]
+        if prev_files:
+            with open(prev_files[-1], encoding="utf-8") as _pf:
+                _prev_dmp = json.load(_pf)
+            for _t in universe_tickers:
+                _pc = _prev_dmp.get("market_data", {}).get(_t, {}).get("ohlcv", {}).get("close")
+                if _pc is not None:
+                    prev_close_map[_t] = float(_pc)
+            print(f"[SCMomentum] 전일 DMP 로드 완료: {prev_files[-1].name} ({len(prev_close_map)}종목)")
+    except Exception as _e:
+        print(f"[SCMomentum] 전일 DMP 로드 실패 ({_e}), overnight_gap=0.0 fallback")
+
+    # Cross-sectional percentile rank 원시값 — 당일 DMP 전체 종목으로 계산
+    cs_raw = build_cross_sectional_raw(
+        mdata, universe_tickers, close_history=None, date_idx=None
+    )
+
+    # 섹터별 close/sma20 평균 (rational_price_gap 기준)
+    _scs: dict[str, list[float]] = {}
+    for _t in universe_tickers:
+        _td2 = mdata.get(_t, {})
+        _cl2 = _td2.get("ohlcv", {}).get("close")
+        _s20_2 = _td2.get("tech_features", {}).get("sma_20")
+        _sec2 = sector_map.get(_t, "Unknown")
+        if _cl2 is not None and _s20_2 and float(_s20_2) != 0:
+            _scs.setdefault(_sec2, []).append(float(_cl2) / float(_s20_2) - 1.0)
+    sector_mean_ratio = {
+        sec: float(np.mean(vals)) for sec, vals in _scs.items() if vals
+    }
+
+    # 유니버스 평균 return_5d
+    _urs: list[float] = []
+    for _t in universe_tickers:
+        _r5 = mdata.get(_t, {}).get("tech_features", {}).get("return_5d")
+        if _r5 is not None:
+            _urs.append(float(_r5))
+    universe_mean_ret5 = float(np.nanmean(_urs)) if _urs else np.nan
+
     rows = []
     for ticker in tickers:
-        row = build_feature_row(dmp, ticker)
-        rows.append({col: row.get(col, 0.0) for col in feature_cols})
+        feats = extract_single_ticker_features(
+            dmp_market_data=mdata,
+            ticker=ticker,
+            close_history=None,      # Serve 경로: 단일 DMP만 보유
+            date_idx=None,
+            sector_map=sector_map,
+            universe_tickers=universe_tickers,
+            macro=macro,
+            cs_raw=cs_raw,
+            sector_mean_ratio=sector_mean_ratio,
+            universe_mean_ret5=universe_mean_ret5,
+            prev_close_val=prev_close_map.get(ticker),  # P0-1: 전일 종가 전달
+        )
+        if feats is None:
+            feats = {}
+        rows.append({col: feats.get(col, 0.0) for col in feature_cols})
 
     df = pd.DataFrame(rows, index=tickers, columns=feature_cols)
     return df
@@ -270,9 +304,23 @@ def predict_quant_scores(model, X: pd.DataFrame) -> np.ndarray:
                 # Binary classifier mode
                 proba = estimator.predict_proba(X)
                 if proba.ndim == 2 and proba.shape[1] == 2:
-                    scores = proba[:, 1]
+                    binary_scores = proba[:, 1]
                 else:
-                    scores = proba.ravel()
+                    binary_scores = proba.ravel()
+
+                # P0-3 GPT Pro: ordinal_model이 있으면 class2 확률로 보조 점수 혼합
+                ordinal_model = model.get("ordinal_model") if isinstance(model, dict) else None
+                if ordinal_model is not None and hasattr(ordinal_model, "predict_proba"):
+                    try:
+                        ord_proba = ordinal_model.predict_proba(X)
+                        ord_top = ord_proba[:, -1]  # class2 (top 25%) 확률
+                        scores = binary_scores * 0.6 + ord_top * 0.4
+                        print(f"[SCMomentum] ordinal 혼합 적용: binary(0.6)+ordinal(0.4)")
+                    except Exception as _oe:
+                        print(f"[SCMomentum] ordinal 예측 실패 ({_oe}), binary only")
+                        scores = binary_scores
+                else:
+                    scores = binary_scores
                 scores = scores * 2.0 - 1.0
             else:
                 # LambdaMART ranker mode — predict() returns relevance scores
@@ -304,24 +352,18 @@ def score_to_signal_direction(score: float, min_confidence: float) -> tuple:
     """
     pre_risk_score → (signal, direction, confidence).
 
-    signal 분류 기준:
+    signal 분류 기준 (long-bias: sell/strong_sell → hold 통일, GPT Pro 권고):
       score >= 0.5  → strong_buy / long
       score >= 0.2  → buy / long
-      score >= -0.2 → hold / neutral
-      score >= -0.5 → sell / short
-      score < -0.5  → strong_sell / short
+      score < 0.2   → hold / neutral
     """
     abs_score = abs(score)
     if score >= 0.5:
         signal, direction = "strong_buy", "long"
     elif score >= 0.2:
         signal, direction = "buy", "long"
-    elif score >= -0.2:
-        signal, direction = "hold", "neutral"
-    elif score >= -0.5:
-        signal, direction = "sell", "short"
     else:
-        signal, direction = "strong_sell", "short"
+        signal, direction = "hold", "neutral"
 
     confidence = round(min(abs_score + 0.1, 1.0), 3)
     confidence = max(confidence, min_confidence)
@@ -458,6 +500,8 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
         feat_cfg.get("manual", [])
         + feat_cfg.get("mlf_lite", [])
         + feat_cfg.get("umi_lite", [])
+        + feat_cfg.get("cross_sectional_pct", [])
+        + feat_cfg.get("ohlcv_micro", [])
     )
     seen_f: set = set()
     feature_names: list = []
@@ -466,7 +510,7 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
             feature_names.append(f)
             seen_f.add(f)
 
-    X = build_feature_matrix(dmp, tickers, cfg)
+    X = build_feature_matrix(dmp, tickers, cfg, target_date_hint=target_date)
     print(f"[SCMomentum] Feature matrix: {X.shape}")
 
     # 모델 로드 및 예측
@@ -522,6 +566,29 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
             target_date, ticker, name, qs, ns,
             round(ns, 4), "news", feature_names, min_conf
         ))
+
+    # Top-K shortlist: risk_policy max_position_count까지만 BUY 허용
+    max_positions = policy["position_constraints"]["max_position_count"]
+    print(f"[SCMomentum] Top-K shortlist 적용: 상위 {max_positions}종목만 BUY 허용")
+
+    # synth_scores 내림차순 정렬 → 상위 K개 인덱스
+    synth_arr = np.array(synth_scores)
+    ranked_indices = np.argsort(synth_arr)[::-1]
+    top_k_set = set(ranked_indices[:max_positions])
+
+    for i, card in enumerate(momentum_cards):
+        if i not in top_k_set and card["signal"] in ("buy", "strong_buy"):
+            card["signal"] = "hold"
+            card["direction"] = "neutral"
+
+    # quant_only_cards에도 동일 로직 적용 (quant_scores_arr 기준)
+    quant_ranked_indices = np.argsort(quant_scores_arr)[::-1]
+    quant_top_k_set = set(quant_ranked_indices[:max_positions])
+
+    for i, card in enumerate(quant_only_cards):
+        if i not in quant_top_k_set and card["signal"] in ("buy", "strong_buy"):
+            card["signal"] = "hold"
+            card["direction"] = "neutral"
 
     return {
         "momentum":   momentum_cards,

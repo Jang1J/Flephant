@@ -31,6 +31,11 @@ import yaml
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_BASE_DIR))
 
+from models.strategy_model.feature_factory import (
+    build_cross_sectional_raw,
+    extract_single_ticker_features,
+)
+
 MODEL_DIR = Path(__file__).resolve().parent
 ARTIFACTS_DIR = _BASE_DIR / "artifacts" / "daily_market_packet"
 OUTPUT_DIR = _BASE_DIR / "artifacts" / "strategy_model"
@@ -167,124 +172,74 @@ def build_feature_matrix(dates: list[str], dmp_dir: Path | None = None) -> pd.Da
         mdata = dmp.get("market_data", {})
         macro = dmp.get("macro_snapshot", {})
 
-        # 매크로 피처
-        vix_proxy = macro.get("vix_proxy") or np.nan
-        market_breadth = macro.get("market_breadth") or np.nan
-        base_rate = macro.get("base_rate") or np.nan
-        usd_krw = macro.get("usd_krw") or np.nan
+        # ── 날짜 단위 사전 계산 (feature_factory에 전달) ──────────────────────
+        # UMI-lite: 유니버스 평균 수익률
+        _urs: list[float] = []
+        for _t in universe_tickers:
+            _r5 = mdata.get(_t, {}).get("tech_features", {}).get("return_5d")
+            if _r5 is not None:
+                _urs.append(float(_r5))
+        universe_mean_ret5 = float(np.nanmean(_urs)) if _urs else np.nan
 
-        # UMI-lite: 유니버스 평균 수익률 (market_synchronism 계산 기준)
-        universe_ret5 = []
-        universe_close = []
-        universe_sma20 = []
-        for ticker in universe_tickers:
-            td = mdata.get(ticker, {})
-            tech = td.get("tech_features", {})
-            r5 = tech.get("return_5d")
-            cl = td.get("ohlcv", {}).get("close")
-            s20 = tech.get("sma_20")
-            if r5 is not None:
-                universe_ret5.append(r5)
-            if cl is not None:
-                universe_close.append(cl)
-            if s20 is not None:
-                universe_sma20.append(s20)
-
-        universe_mean_ret5 = float(np.nanmean(universe_ret5)) if universe_ret5 else np.nan
-        universe_mean_close_sma20 = (
-            float(np.nanmean([c / s - 1.0 for c, s in zip(universe_close, universe_sma20) if s and s != 0]))
-            if universe_close and universe_sma20
-            else np.nan
-        )
-
-        # 섹터별 종가 평균 close/sma20 비율 (rational_price_gap 기준)
-        sector_close_sma20: dict[str, list[float]] = {}
-        for ticker in universe_tickers:
-            td = mdata.get(ticker, {})
-            cl = td.get("ohlcv", {}).get("close")
-            s20 = td.get("tech_features", {}).get("sma_20")
-            sec = sector_map.get(ticker, "Unknown")
-            if cl is not None and s20 and s20 != 0:
-                sector_close_sma20.setdefault(sec, []).append(cl / s20 - 1.0)
+        # 섹터별 close/sma20 평균 (rational_price_gap 기준)
+        _scs: dict[str, list[float]] = {}
+        for _t in universe_tickers:
+            _td2 = mdata.get(_t, {})
+            _cl2 = _td2.get("ohlcv", {}).get("close")
+            _s20_2 = _td2.get("tech_features", {}).get("sma_20")
+            _sec2 = sector_map.get(_t, "Unknown")
+            if _cl2 is not None and _s20_2 and float(_s20_2) != 0:
+                _scs.setdefault(_sec2, []).append(float(_cl2) / float(_s20_2) - 1.0)
         sector_mean_ratio = {
-            sec: float(np.mean(vals)) for sec, vals in sector_close_sma20.items() if vals
+            sec: float(np.mean(vals)) for sec, vals in _scs.items() if vals
         }
 
+        # Cross-sectional percentile rank 원시값 수집 (feature_factory)
+        # PIT-safe: 동일 날짜 내 종목 간 비교만 수행
+        _cs_raw = build_cross_sectional_raw(
+            mdata, universe_tickers, close_history, date_idx
+        )
+
         for ticker in universe_tickers:
-            tdata = mdata.get(ticker, {})
-            if not tdata:
+            # 전일 종가 (overnight_gap 계산용)
+            _prev_idx = date_idx - 1
+            _prev_c = close_history[ticker][_prev_idx] if _prev_idx >= 0 else None
+
+            feats = extract_single_ticker_features(
+                dmp_market_data=mdata,
+                ticker=ticker,
+                close_history=close_history,
+                date_idx=date_idx,
+                sector_map=sector_map,
+                universe_tickers=universe_tickers,
+                macro=macro,
+                cs_raw=_cs_raw,
+                sector_mean_ratio=sector_mean_ratio,
+                universe_mean_ret5=universe_mean_ret5,
+                prev_close_val=_prev_c,
+            )
+            if feats is None:
                 continue
 
-            ohlcv = tdata.get("ohlcv", {})
-            tech = tdata.get("tech_features", {})
-            close = ohlcv.get("close")
-            if close is None or close == 0:
-                continue
-            close = float(close)
+            # forward 수익률 (레이블 생성 전용) — PIT-safe: 학습 시에만 사용
+            close = float(mdata.get(ticker, {}).get("ohlcv", {}).get("close", 0))
 
-            # ── Manual factors ──
-            return_5d = tech.get("return_5d", np.nan)
-            return_20d = tech.get("return_20d", np.nan)
-            rsi_14 = tech.get("rsi_14", np.nan)
-            volume_ratio_20 = tech.get("volume_ratio_20", np.nan)
-            atr_14 = tech.get("atr_14", np.nan)
+            # O-I Decoupling v1: overnight(close→open) + intraday(open→close) 분리
+            # t+1 시가와 종가를 각각 읽어 overnight/intraday 수익률 계산
+            fwd_1_idx = date_idx + 1
+            fwd_overnight_ret = np.nan
+            fwd_intraday_ret = np.nan
+            if fwd_1_idx < len(valid_dates):
+                fwd1_date = valid_dates[fwd_1_idx]
+                fwd1_dmp = all_dmps.get(fwd1_date, {})
+                fwd1_td = fwd1_dmp.get("market_data", {}).get(ticker, {})
+                fwd1_open = fwd1_td.get("ohlcv", {}).get("open")
+                fwd1_close = fwd1_td.get("ohlcv", {}).get("close")
+                if fwd1_open and close != 0:
+                    fwd_overnight_ret = (float(fwd1_open) / close - 1.0) * 100.0
+                if fwd1_open and fwd1_close and float(fwd1_open) != 0:
+                    fwd_intraday_ret = (float(fwd1_close) / float(fwd1_open) - 1.0) * 100.0
 
-            sma_5 = tech.get("sma_5")
-            sma_20 = tech.get("sma_20")
-            sma5_ratio = (close / sma_5 - 1.0) if sma_5 and sma_5 != 0 else np.nan
-            sma20_ratio = (close / sma_20 - 1.0) if sma_20 and sma_20 != 0 else np.nan
-
-            # sma60_ratio 및 MACD는 누적 종가 시계열 사용 (PIT-safe: date_idx+1까지만)
-            hist_close = pd.Series(close_history[ticker][: date_idx + 1])
-            hist_close = hist_close.dropna()
-
-            sma60_ratio = _compute_sma60_ratio(hist_close)
-            macd_val, macd_signal_val = _compute_macd(hist_close)
-
-            # ── MLF-lite ──
-            return_60d = _compute_return_60d(hist_close)
-
-            # period_agreement_score: 5d, 20d, 60d 수익률 부호 일치 비율
-            signs = []
-            for r in [return_5d, return_20d, return_60d]:
-                if not (r is None or (isinstance(r, float) and np.isnan(r))):
-                    signs.append(np.sign(float(r)))
-            if len(signs) >= 2:
-                dominant_sign = np.sign(np.sum(signs))
-                agree_count = sum(1 for s in signs if s == dominant_sign)
-                period_agreement_score = agree_count / len(signs)
-            else:
-                period_agreement_score = np.nan
-
-            # ── UMI-lite ──
-            # stock_sync_score: 해당 종목 ret_5d와 유니버스 평균 ret_5d의 부호 일치 여부
-            if (
-                return_5d is not None
-                and not np.isnan(float(return_5d))
-                and not np.isnan(universe_mean_ret5)
-            ):
-                stock_sync_score = 1.0 if np.sign(float(return_5d)) == np.sign(universe_mean_ret5) else 0.0
-            else:
-                stock_sync_score = np.nan
-
-            # market_synchronism: breadth 가중 유니버스 동행 지수 (market_breadth 활용)
-            # breadth가 없으면 단순 universe_mean_ret5 사용
-            if not np.isnan(universe_mean_ret5):
-                breadth_w = float(market_breadth) if not np.isnan(market_breadth) else 0.5
-                market_synchronism = breadth_w * universe_mean_ret5
-            else:
-                market_synchronism = np.nan
-
-            # rational_price_gap: 섹터 평균 close/sma20 대비 해당 종목 편차
-            sec = sector_map.get(ticker, "Unknown")
-            tick_ratio = (close / sma_20 - 1.0) if sma_20 and sma_20 != 0 else np.nan
-            sec_mean = sector_mean_ratio.get(sec, np.nan)
-            if not (isinstance(tick_ratio, float) and np.isnan(tick_ratio)) and not np.isnan(sec_mean):
-                rational_price_gap = tick_ratio - sec_mean
-            else:
-                rational_price_gap = np.nan
-
-            # forward 수익률 (레이블 생성 전용, 5거래일 후)
             fwd_close_idx = date_idx + 5
             if fwd_close_idx < len(valid_dates):
                 fwd_date = valid_dates[fwd_close_idx]
@@ -303,35 +258,12 @@ def build_feature_matrix(dates: list[str], dmp_dir: Path | None = None) -> pd.Da
             else:
                 fwd_ret_5d = np.nan
 
-            rows.append({
-                "date": date,
-                "ticker": ticker,
-                # Manual
-                "return_5d": float(return_5d) if return_5d is not None else np.nan,
-                "return_20d": float(return_20d) if return_20d is not None else np.nan,
-                "rsi_14": float(rsi_14) if rsi_14 is not None else np.nan,
-                "volume_ratio_20": float(volume_ratio_20) if volume_ratio_20 is not None else np.nan,
-                "macd": float(macd_val) if not (isinstance(macd_val, float) and np.isnan(macd_val)) else np.nan,
-                "macd_signal": float(macd_signal_val) if not (isinstance(macd_signal_val, float) and np.isnan(macd_signal_val)) else np.nan,
-                "atr_14": float(atr_14) if atr_14 is not None else np.nan,
-                "sma5_ratio": float(sma5_ratio) if sma5_ratio is not None else np.nan,
-                "sma20_ratio": float(sma20_ratio) if sma20_ratio is not None else np.nan,
-                "sma60_ratio": float(sma60_ratio),
-                # MLF-lite
-                "return_60d": float(return_60d),
-                "period_agreement_score": float(period_agreement_score) if not (isinstance(period_agreement_score, float) and np.isnan(period_agreement_score)) else np.nan,
-                # UMI-lite
-                "stock_sync_score": float(stock_sync_score) if not (isinstance(stock_sync_score, float) and np.isnan(stock_sync_score)) else np.nan,
-                "market_synchronism": float(market_synchronism) if not (isinstance(market_synchronism, float) and np.isnan(market_synchronism)) else np.nan,
-                "rational_price_gap": float(rational_price_gap) if not (isinstance(rational_price_gap, float) and np.isnan(rational_price_gap)) else np.nan,
-                # 매크로 (보조)
-                "vix_proxy": float(vix_proxy),
-                "market_breadth": float(market_breadth),
-                "base_rate": float(base_rate),
-                "usd_krw": float(usd_krw),
-                # 레이블 전용
-                "fwd_ret_5d": float(fwd_ret_5d),
-            })
+            row = {"date": date, "ticker": ticker}
+            row.update(feats)
+            row["fwd_ret_5d"] = float(fwd_ret_5d)
+            row["fwd_overnight_ret"] = float(fwd_overnight_ret)
+            row["fwd_intraday_ret"] = float(fwd_intraday_ret)
+            rows.append(row)
 
     df = pd.DataFrame(rows)
     print(f"[LGBMRanker] 피처 행렬 완성: {len(df)}행 ({df['date'].nunique()}일 × 종목)")
@@ -376,14 +308,26 @@ def _build_labels(df: pd.DataFrame, top_quantile: float = 0.25, use_sector_neutr
         threshold = group[rank_col].quantile(1.0 - top_quantile)
         group["label"] = (group[rank_col] >= threshold).astype(int)
 
+        # ordinal label: bottom 50% → 0, 50~75% → 1, top 25% → 2
+        pct = group[rank_col].rank(pct=True)
+        group["ordinal_label"] = 0
+        group.loc[pct >= 0.50, "ordinal_label"] = 1
+        group.loc[pct >= 0.75, "ordinal_label"] = 2
+
         # ranking relevance label (0~4): LambdaMART용
         # 상위 10% → 4, 상위 25% → 3, 상위 50% → 2, 상위 75% → 1, 하위 → 0
-        pct = group[rank_col].rank(pct=True)
         group["rank_label"] = 0
         group.loc[pct >= 0.25, "rank_label"] = 1
         group.loc[pct >= 0.50, "rank_label"] = 2
         group.loc[pct >= 0.75, "rank_label"] = 3
         group.loc[pct >= 0.90, "rank_label"] = 4
+
+        # O-I Decoupling v1: overnight/intraday direction labels
+        # Momentum: overnight continuation (상승 지속), intraday follow-through (장중 유지)
+        if "fwd_overnight_ret" in group.columns:
+            group["overnight_direction"] = (group["fwd_overnight_ret"] > 0).astype(int)
+        if "fwd_intraday_ret" in group.columns:
+            group["intraday_direction"] = (group["fwd_intraday_ret"] > 0).astype(int)
 
         # cleanup
         group.drop(columns=["_sector", "_excess"], errors="ignore", inplace=True)
@@ -406,7 +350,7 @@ def _get_feature_cols(config: dict) -> list[str]:
     feat_cfg = config.get("features", {})
     cols: list[str] = []
     seen: set[str] = set()
-    for group in ["manual", "mlf_lite", "umi_lite"]:
+    for group in ["manual", "mlf_lite", "umi_lite", "cross_sectional_pct", "ohlcv_micro"]:
         for col in feat_cfg.get(group, []):
             if col not in seen:
                 cols.append(col)
@@ -595,10 +539,101 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
                 val_auc = float(roc_auc_score(y_val, val_scores))
             except Exception:
                 val_auc = np.nan
-            val_p5, val_ric = 0.0, 0.0
+
+            # Binary mode에서도 P@5 + RankIC 계산 (Gemini Pro 피드백)
+            val_df_eval_bin = val_df[["date", "ticker"]].copy()
+            val_df_eval_bin["score"] = val_scores
+            val_df_eval_bin["fwd_ret"] = val_df["fwd_ret_5d"].values
+
+            p5_list_bin, ric_list_bin = [], []
+            for _, g in val_df_eval_bin.groupby("date"):
+                if len(g) >= 5:
+                    top5 = g.nlargest(5, "score")
+                    p5 = (top5["fwd_ret"] > g["fwd_ret"].median()).mean()
+                    p5_list_bin.append(p5)
+                if len(g) > 2:
+                    ric_list_bin.append(float(g["score"].corr(g["fwd_ret"], method="spearman")))
+            val_p5 = float(np.mean(p5_list_bin)) if p5_list_bin else 0.0
+            val_ric = float(np.nanmean(ric_list_bin)) if ric_list_bin else 0.0
 
         # 피처 중요도
         importance = dict(zip(available_cols, model.feature_importances_.tolist()))
+
+        # ordinal 모델 학습 (multiclass, num_class=3)
+        ordinal_model = None
+        ordinal_val_auc = np.nan
+        if "ordinal_label" in train_df.columns and len(train_df["ordinal_label"].unique()) >= 2:
+            try:
+                y_train_ord = train_df["ordinal_label"].values
+                y_val_ord = val_df["ordinal_label"].values
+                ord_params = {
+                    "objective": "multiclass",
+                    "metric": "multi_logloss",
+                    "num_class": 3,
+                    "num_leaves": lgbm_cfg.get("num_leaves", 31),
+                    "learning_rate": lgbm_cfg.get("learning_rate", 0.05),
+                    "min_child_samples": lgbm_cfg.get("min_child_samples", 10),
+                    "subsample": lgbm_cfg.get("subsample", 0.8),
+                    "colsample_bytree": lgbm_cfg.get("colsample_bytree", 0.8),
+                    "reg_alpha": lgbm_cfg.get("reg_alpha", 0.1),
+                    "reg_lambda": lgbm_cfg.get("reg_lambda", 0.1),
+                    "verbose": -1,
+                    "n_jobs": -1,
+                }
+                ordinal_model = lgb.LGBMClassifier(n_estimators=n_estimators, **ord_params)
+                ordinal_model.fit(
+                    X_train, y_train_ord,
+                    eval_set=[(X_val, y_val_ord)],
+                    callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+                )
+                # one-vs-rest AUC: class2(top) 확률 기준
+                ord_proba = ordinal_model.predict_proba(X_val)
+                try:
+                    from sklearn.metrics import roc_auc_score as _auc
+                    # one-vs-rest: 각 클래스 binary AUC 평균
+                    auc_list = []
+                    for cls_idx in range(3):
+                        y_bin = (y_val_ord == cls_idx).astype(int)
+                        if y_bin.sum() > 0 and y_bin.sum() < len(y_bin):
+                            auc_list.append(float(_auc(y_bin, ord_proba[:, cls_idx])))
+                    ordinal_val_auc = float(np.mean(auc_list)) if auc_list else np.nan
+                except Exception:
+                    ordinal_val_auc = np.nan
+                print(f"[LGBMRanker] Fold {fold_idx:02d} ordinal AUC(OVR)={ordinal_val_auc:.4f}")
+            except Exception as e:
+                print(f"[LGBMRanker] ordinal 모델 학습 실패: {e}")
+                ordinal_model = None
+                ordinal_val_auc = np.nan
+
+        # O-I Decoupling v1: overnight/intraday direction 보조 모델 학습
+        oi_models = {}
+        oi_aucs = {}
+        for oi_target in ["overnight_direction", "intraday_direction"]:
+            if oi_target not in df_labeled.columns:
+                continue
+            oi_train = df_labeled[df_labeled["date"].isin(set(train_dates))][oi_target].dropna()
+            oi_val = df_labeled[df_labeled["date"].isin(set(val_dates))][oi_target].dropna()
+            if len(oi_train) < 50 or len(np.unique(oi_train)) < 2:
+                continue
+            try:
+                oi_X_train = X_train.loc[oi_train.index]
+                oi_X_val = X_val.loc[oi_val.index] if len(oi_val) > 0 else oi_X_train[:10]
+                oi_y_val = oi_val.values if len(oi_val) > 0 else oi_train.values[:10]
+
+                oi_mdl = lgb.LGBMClassifier(
+                    n_estimators=min(n_estimators, 100), objective="binary",
+                    num_leaves=15, learning_rate=0.05, verbose=-1, n_jobs=-1,
+                )
+                oi_mdl.fit(oi_X_train, oi_train.values,
+                           eval_set=[(oi_X_val, oi_y_val)],
+                           callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)])
+                oi_pred = oi_mdl.predict_proba(oi_X_val)[:, 1]
+                oi_auc = float(roc_auc_score(oi_y_val, oi_pred)) if len(np.unique(oi_y_val)) >= 2 else 0.5
+                oi_models[oi_target] = oi_mdl
+                oi_aucs[oi_target] = oi_auc
+                print(f"[LGBMRanker] O-I {oi_target} AUC={oi_auc:.4f}")
+            except Exception as e:
+                print(f"[LGBMRanker] O-I {oi_target} 학습 실패: {e}")
 
         fold_result: dict[str, Any] = {
             "fold": fold_idx,
@@ -609,11 +644,15 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
             "n_train": len(train_df),
             "n_val": len(val_df),
             "val_auc": val_auc,
+            "ordinal_val_auc": ordinal_val_auc,
             "val_precision_at_5": val_p5,
             "val_rank_ic": val_ric,
             "objective": objective,
             "feature_importance": importance,
             "model": model,
+            "ordinal_model": ordinal_model,
+            "oi_models": oi_models,
+            "oi_aucs": oi_aucs,
             "feature_cols": available_cols,
             "col_means": col_means.to_dict(),
         }
@@ -640,25 +679,45 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
 # 예측
 # ──────────────────────────────────────────────────────────────────────────────
 
-def predict(model: Any, features: pd.DataFrame, feature_cols: list[str], col_means: dict) -> pd.Series:
+def predict(
+    model: Any,
+    features: pd.DataFrame,
+    feature_cols: list[str],
+    col_means: dict,
+    ordinal_model: Any = None,
+) -> pd.Series:
     """
     학습된 모델로 예측 확률을 반환한다.
 
     Args:
-        model: 학습된 LGBMClassifier 인스턴스.
+        model: 학습된 LGBMClassifier(binary) 인스턴스.
         features: 피처 DataFrame (date, ticker 포함 가능).
         feature_cols: 학습 시 사용된 피처 컬럼 목록.
         col_means: 결측 대치에 사용할 학습셋 평균값 dict.
+        ordinal_model: ordinal(multiclass) 모델. 있으면 class2 확률을 0.4 가중 혼합.
 
     Returns:
-        pd.Series: y=1(상위 quartile) 확률값. index는 features의 index.
+        pd.Series: 최종 score. index는 features의 index.
     """
     available = [c for c in feature_cols if c in features.columns]
     X = features[available].copy()
     means_series = pd.Series(col_means)
     X = X.fillna(means_series)
-    proba = model.predict_proba(X)[:, 1]
-    return pd.Series(proba, index=features.index, name="score")
+    binary_proba = model.predict_proba(X)[:, 1]
+
+    if ordinal_model is not None:
+        try:
+            ord_proba = ordinal_model.predict_proba(X)
+            # class2(top 25%) 확률을 보조 점수로 사용
+            ord_top_proba = ord_proba[:, 2]
+            final_score = 0.6 * binary_proba + 0.4 * ord_top_proba
+        except Exception as e:
+            print(f"[LGBMRanker] ordinal 예측 실패, binary만 사용: {e}")
+            final_score = binary_proba
+    else:
+        final_score = binary_proba
+
+    return pd.Series(final_score, index=features.index, name="score")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -677,6 +736,8 @@ def _save_model(fold_results: list[dict], run_id: str) -> None:
         pickle.dump(
             {
                 "model": last_fold["model"],
+                "ordinal_model": last_fold.get("ordinal_model"),
+                "oi_models": last_fold.get("oi_models", {}),
                 "feature_cols": last_fold["feature_cols"],
                 "col_means": last_fold["col_means"],
             },
@@ -833,6 +894,7 @@ def main():
             today_feat,
             bundle["feature_cols"],
             bundle["col_means"],
+            ordinal_model=bundle.get("ordinal_model"),
         )
         today_feat = today_feat.copy()
         today_feat["score"] = scores.values

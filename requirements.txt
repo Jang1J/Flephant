@@ -1,28 +1,10 @@
-# === Data ===
-requests>=2.31
-pandas>=2.2
-numpy>=1.26
-
-# === API Clients ===
-pykrx>=1.0           # KRX 주식 데이터
-dart-fss>=0.4        # OpenDART 공시
-python-dotenv>=1.0   # 환경변수 (.env)
-
-# === ML (Phase 1 + CNN) ===
-lightgbm>=4.3
-scikit-learn>=1.4
-torch                # KR-Rebound-CNN 모델
-Pillow               # build_strategy_card_rebound.py 이미지 처리
-
-# === LLM ===
-openai>=1.30         # GPT-4o fallback
-httpx>=0.27          # Kanana-o API 호출
-
-# === Visualization / Notebook ===
-matplotlib>=3.8
-jupyter>=1.0
-
-# === Utils ===
-tqdm>=4.66
-pyyaml>=6.0
-jsonschema           # SC/RC/FDC 스키마 검증
+numpy>=1.24
+pandas>=2.0
+pykrx>=1.0
+PyYAML>=6.0
+requests>=2.28
+scikit-learn>=1.3
+lightgbm>=4.0
+torch>=2.0
+jsonschema>=4.17
+python-dotenv>=1.0

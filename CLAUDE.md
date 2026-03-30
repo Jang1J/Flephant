@@ -156,5 +156,6 @@ claude --agent gpt-feedback-tracker # GPT Pro 피드백 추적
 
 ## Phase 구분
 
-- **Phase 1 (현재)**: Mock StrategyCard, UQ synthetic data, deterministic FDA rules
-- **Phase 2**: 실제 StrategyCard(AI #2), live HourlyPatch, UQ 실데이터, Backtest Agent
+- **Phase 1 (완료)**: Mock StrategyCard, UQ synthetic data, deterministic FDA rules
+- **Phase 1.5 (현재)**: 실제 StrategyCard(AI #2) 생성 완료, LightGBM AUC 0.750 + CNN AUC 0.765, 거래세/슬리피지 반영 백테스트, Multi-Agent Debate 구현 예정
+- **Phase 2**: live HourlyPatch, UQ 실데이터(OOF residual), K-OPEN Pulse(교수님 미팅 후), Preference Resolver

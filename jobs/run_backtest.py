@@ -50,8 +50,17 @@ FCC_SCHEMA_PATH  = _BASE_DIR / "schemas" / "failure_case_card.json"
 
 KST = timezone(timedelta(hours=9))
 
-# 거래 비용 (편도)
-COST_PER_SIDE = 0.00015
+# 거래 비용 (편도) — Gemini Pro 피드백 반영
+# 매수: 브로커리지 0.015% = 0.00015
+# 매도: 브로커리지 0.015% + 증권거래세 0.18% + 농어촌특별세 0.15% = 0.00345
+# 편도 평균: (0.00015 + 0.00345) / 2 ≈ 0.0018
+COST_BUY_SIDE = 0.00015    # 매수 편도 (브로커리지만)
+COST_SELL_SIDE = 0.00345   # 매도 편도 (브로커리지 + 거래세 + 농특세)
+COST_PER_SIDE = 0.0018     # 레거시 호환용 평균값
+
+# 슬리피지 모델: 시가 체결 시 ±슬리피지 반영
+# 매수: open * (1 + SLIPPAGE_BPS), 매도: open * (1 - SLIPPAGE_BPS)
+SLIPPAGE_BPS = 0.001       # 0.10% (10bps) — KOSPI 대형주 평균 추정
 
 
 # ── 설정 로드 ─────────────────────────────────────────────────
@@ -369,10 +378,11 @@ class PortfolioSimulator:
         stop_turnover = 0.0
         for tk in to_stop:
             pos = self.positions.pop(tk)
-            sell_p = open_prices.get(tk, 0)
+            raw_p = open_prices.get(tk, 0)
+            sell_p = raw_p * (1 - SLIPPAGE_BPS)  # 매도 슬리피지 반영
             if sell_p > 0:
                 proceeds = pos["shares"] * sell_p
-                cost = proceeds * COST_PER_SIDE
+                cost = proceeds * COST_SELL_SIDE  # 매도 비용 (거래세 포함)
                 self.cash += proceeds - cost
                 stop_turnover += proceeds / max(pv_before, 1)
                 self.trade_history.append({
@@ -389,10 +399,11 @@ class PortfolioSimulator:
             if remaining_turn <= 0:
                 break
             pos = self.positions.pop(tk)
-            sell_p = open_prices.get(tk, 0)
+            raw_p = open_prices.get(tk, 0)
+            sell_p = raw_p * (1 - SLIPPAGE_BPS)  # 매도 슬리피지
             if sell_p > 0:
                 proceeds = pos["shares"] * sell_p
-                cost = proceeds * COST_PER_SIDE
+                cost = proceeds * COST_SELL_SIDE  # 매도 비용 (거래세 포함)
                 self.cash += proceeds - cost
                 sell_turnover += proceeds / max(pv_before, 1)
                 self.trade_history.append({
@@ -412,20 +423,21 @@ class PortfolioSimulator:
                 remaining_turn = self.turnover_cap - stop_turnover - sell_turnover - buy_turnover
                 if remaining_turn <= 0:
                     break
-                buy_p = open_prices.get(tk, 0)
-                if buy_p <= 0:
+                raw_p = open_prices.get(tk, 0)
+                if raw_p <= 0:
                     continue
+                buy_p = raw_p * (1 + SLIPPAGE_BPS)  # 매수 슬리피지
                 shares = int(per_stock / buy_p)
                 if shares <= 0:
                     continue
                 cost_amt   = shares * buy_p
-                trade_cost = cost_amt * COST_PER_SIDE
+                trade_cost = cost_amt * COST_BUY_SIDE  # 매수 비용 (브로커리지만)
                 if cost_amt + trade_cost > self.cash:
-                    shares = int(self.cash * 0.95 / buy_p / (1 + COST_PER_SIDE))
+                    shares = int(self.cash * 0.95 / buy_p / (1 + COST_BUY_SIDE))
                     if shares <= 0:
                         continue
                     cost_amt   = shares * buy_p
-                    trade_cost = cost_amt * COST_PER_SIDE
+                    trade_cost = cost_amt * COST_BUY_SIDE
                 self.cash -= cost_amt + trade_cost
                 self.positions[tk] = {"shares": shares, "entry_price": buy_p}
                 buy_turnover += cost_amt / max(pv_before, 1)
@@ -901,7 +913,10 @@ def main():
             "stop_loss_pct":      policy["core_rules"]["stop_loss"]["threshold"],
             "turnover_cap_pct":   policy["core_rules"]["turnover_cap"]["daily_max"],
             "min_cash_ratio_pct": policy["core_rules"]["min_cash_ratio"]["ratio"],
-            "cost_per_side":      COST_PER_SIDE,
+            "cost_buy_side":      COST_BUY_SIDE,
+            "cost_sell_side":     COST_SELL_SIDE,
+            "slippage_bps":       SLIPPAGE_BPS,
+            "cost_per_side_legacy": COST_PER_SIDE,
         },
         "aggregate_metrics": {
             **agg_metrics,

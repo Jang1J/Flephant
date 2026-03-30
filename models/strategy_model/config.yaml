@@ -45,6 +45,21 @@ features:
     - stock_sync_score
     - market_synchronism
     - rational_price_gap
+  cross_sectional_pct:
+    - ret_5d_pct
+    - ret_20d_pct
+    - rsi_14_pct
+    - volume_ratio_20_pct
+    - sma5_ratio_pct
+    - sma20_ratio_pct
+    - sma60_ratio_pct
+    - return_60d_pct
+  ohlcv_micro:
+    - overnight_gap
+    - intraday_range
+    - upper_shadow_ratio
+    - lower_shadow_ratio
+    - body_ratio
 
 label:
   forward_horizon: 5

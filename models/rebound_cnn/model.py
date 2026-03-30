@@ -3,9 +3,9 @@ KR-Rebound-CNN Model Architecture (v1.0)
 설계서 기준:
   - 3-channel 64x64 chart image 입력
   - Image Encoder: Conv(3→32)+BN+ReLU+MaxPool(2) → Conv(32→64)+BN+ReLU+MaxPool(2) → Conv(64→128)+BN+ReLU → AdaptiveAvgPool(1,1) → 128-d
-  - Context Encoder: 26-d context (§10.2) → Dense(64)+ReLU+Dropout(0.2) → Dense(32)+ReLU → 32-d
-  - Fusion Head: Concat(128+32=160) → Dense(64)+ReLU+Dropout(0.2) → Dense(1)+Sigmoid
-  - 5거래일 rebound probability 출력
+  - Context Encoder: 39-d context (23 base + 16 sectors) → Dense(64)+ReLU+Dropout(0.3) → Dense(32)+ReLU → 32-d
+  - Fusion Head: Concat(128+32=160) → BatchNorm1d(64)+Dense(64)+ReLU+Dropout(0.4) → Dense(1) → raw logit
+  - 5거래일 rebound logit 출력 (BCEWithLogitsLoss 사용; 추론 시 sigmoid 적용)
 
 Context Branch 피처 (설계서 §10.2):
   macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
@@ -67,7 +67,7 @@ class ImageEncoder(nn.Module):
 
 class ContextEncoder(nn.Module):
     """
-    26-d context features → 32-d 표현 벡터. (설계서 §10.2)
+    39-d context (23 base + n_sectors) features → 32-d 표현 벡터. (설계서 §10.2)
 
     context_features: macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
                       + sector_onehot(n_sectors) + market_cap_rank(1)
@@ -80,7 +80,7 @@ class ContextEncoder(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_context_features, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),  # Gemini Pro: 0.2→0.3
             nn.Linear(64, 32),
             nn.ReLU(),
         )
@@ -102,12 +102,12 @@ class KRReboundCNN(nn.Module):
       - context_features: (B, n_context_features)  26-d 통합 context 피처
 
     출력:
-      - rebound_prob: (B, 1)                   반등 확률 [0, 1]
+      - rebound_logit: (B, 1)                  반등 logit (raw, unbounded)
 
     아키텍처 (설계서 준수):
       ImageEncoder   → 128-d
       ContextEncoder → 32-d
-      Concat(128+32=160) → Dense(64)+ReLU+Dropout(0.2) → Dense(1)+Sigmoid
+      Concat(128+32=160) → Dense(64)+ReLU+Dropout(0.2) → Dense(1) (logit)
     """
 
     def __init__(self, n_context_features: int = 26):
@@ -117,12 +117,13 @@ class KRReboundCNN(nn.Module):
         self.context_encoder = ContextEncoder(n_context_features)
 
         # Fusion Head: 128 + 32 = 160
+        # Gemini Pro 피드백: Dropout 0.2→0.4 + BatchNorm1d (과적합 방지)
         self.fusion_head = nn.Sequential(
             nn.Linear(160, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.2),  # 설계서 §11.1: Dropout(0.2)
+            nn.Dropout(0.4),
             nn.Linear(64, 1),
-            nn.Sigmoid(),
         )
 
     def forward(
@@ -133,7 +134,7 @@ class KRReboundCNN(nn.Module):
         """
         chart_tensor: (B, 3, H, W)
         context_features: (B, n_context_features)
-        반환: (B, 1) rebound probability [0, 1]
+        반환: (B, 1) rebound logit (raw, unbounded)
         """
         img_vec = self.image_encoder(chart_tensor)          # (B, 128)
         ctx_vec = self.context_encoder(context_features)    # (B, 32)
@@ -145,7 +146,7 @@ def build_model(
     n_context_features: int = 26,
     device: torch.device = None,
 ) -> KRReboundCNN:
-    """모델 인스턴스 생성 및 device 이동."""
+    """모델 인스턴스 생성 및 device 이동. 출력은 raw logit (BCEWithLogitsLoss 사용)."""
     if device is None:
         device = DEVICE
     model = KRReboundCNN(n_context_features)
@@ -161,13 +162,12 @@ if __name__ == "__main__":
 
     # 설계서 §11.1 아키텍처 확인
     # ImageEncoder: Conv32+BN+ReLU+MaxPool(2) → Conv64+BN+ReLU+MaxPool(2) → Conv128+BN+ReLU → AdaptiveAvgPool(1,1)
-    # FusionHead: Dense(64)+ReLU+Dropout(0.2) → Dense(1)+Sigmoid
+    # FusionHead: Dense(64)+ReLU+Dropout(0.2) → Dense(1) [logit, no Sigmoid]
     B = 4
     chart = torch.randn(B, 3, 64, 64, device=device)
     context = torch.randn(B, n_ctx, device=device)
 
-    prob = model(chart, context)
-    print(f"[Modeler] forward 테스트 통과: 입력 {chart.shape}, context {context.shape} → 출력 {prob.shape}")
-    assert prob.shape == (B, 1), f"예상 출력 shape (B,1), 실제 {prob.shape}"
-    assert prob.min() >= 0.0 and prob.max() <= 1.0, "Sigmoid 범위 오류"
-    print(f"[Modeler] 모델 아키텍처 검증 완료 (n_context_features={n_ctx}, MaxPool 포함, Dropout=0.2)")
+    logit = model(chart, context)
+    print(f"[Modeler] forward 테스트 통과: 입력 {chart.shape}, context {context.shape} → 출력 {logit.shape}")
+    assert logit.shape == (B, 1), f"예상 출력 shape (B,1), 실제 {logit.shape}"
+    print(f"[Modeler] 모델 아키텍처 검증 완료 (n_context_features={n_ctx}, MaxPool 포함, Dropout=0.2, logit 출력)")

@@ -159,14 +159,15 @@ def build_context_vector(
     sector_map: dict,
     wics_sectors: list,
     mktcap_rank: float = 0.5,
+    prev_close: float = None,  # 전일 종가 (overnight_gap 계산용)
 ) -> list:
     """
-    26차원 context vector 조립 (설계서 §10.2 Context Branch).
+    34차원 context vector 조립 (설계서 §10.2 Context Branch).
 
     구성:
       macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
-      + sector_onehot(n_sectors) + market_cap_rank(1)
-      = 15 + n_sectors 차원
+      + confirmation(8) + sector_onehot(n_sectors) + market_cap_rank(1)
+      = 23 + n_sectors 차원  ← n_context_features_base: 15 → 23
 
     dataset.py _build_context_vector()와 동일 로직 (훈련-추론 일관성 보장).
     mktcap_rank: 유니버스 내 시가총액 percentile rank (0~1). 호출부에서 계산 후 전달.
@@ -180,6 +181,9 @@ def build_context_vector(
     close = float(ohlcv.get("close", 1.0))
     if close <= 0:
         close = 1.0
+    open_price = float(ohlcv.get("open", close))
+    high_price = float(ohlcv.get("high", close))
+    low_price = float(ohlcv.get("low", close))
 
     # macro (4)
     macro_vec = [
@@ -215,6 +219,47 @@ def build_context_vector(
         float(tech.get("volume_ratio_20_sector_pct", 0.5)),
     ]
 
+    # confirmation (8): candlestick structure + sector ranking features
+    hl_range = high_price - low_price + 1e-8
+
+    # 1. ret_5d_rank_in_sector
+    ret_5d_rank_in_sector = float(tech.get("ret_5d_rank_in_sector", 0.5))
+
+    # 2. close_sma20_ratio_sector_rank
+    close_sma20_ratio_sector_rank = float(tech.get("close_sma20_ratio_sector_rank", 0.5))
+
+    # 3. bb_pos
+    bb_pos = float(tech.get("bb_pos", 0.5))
+
+    # 4. overnight_gap: (open - prev_close) / prev_close
+    if prev_close is not None and prev_close > 0:
+        overnight_gap = (open_price - prev_close) / prev_close
+    else:
+        overnight_gap = 0.0
+
+    # 5. intraday_range: (high - low) / close
+    intraday_range = hl_range / close if close > 0 else 0.0
+
+    # 6. upper_shadow: (high - max(open, close)) / (high - low + 1e-8)
+    upper_shadow = (high_price - max(open_price, close)) / hl_range
+
+    # 7. lower_shadow: (min(open, close) - low) / (high - low + 1e-8)
+    lower_shadow = (min(open_price, close) - low_price) / hl_range
+
+    # 8. body_ratio: abs(close - open) / (high - low + 1e-8)
+    body_ratio = abs(close - open_price) / hl_range
+
+    confirm_vec = [
+        ret_5d_rank_in_sector,
+        close_sma20_ratio_sector_rank,
+        bb_pos,
+        overnight_gap,
+        intraday_range,
+        upper_shadow,
+        lower_shadow,
+        body_ratio,
+    ]
+
     # meta: sector_onehot (n_sectors 차원) + market_cap_rank (1)
     sector_name = sector_map.get(ticker, "Unknown")
     n_sectors = len(wics_sectors)
@@ -222,10 +267,7 @@ def build_context_vector(
     if sector_name in wics_sectors:
         sector_oh[wics_sectors.index(sector_name)] = 1.0
 
-    # market_cap_rank: 호출부에서 DMP mktcap percentile rank 계산 후 전달.
-    # mktcap 없는 경우 0.5 fallback (호출부에서 결정).
-
-    context = macro_vec + tech_vec + stretch_vec + sector_vec + sector_oh + [mktcap_rank]
+    context = macro_vec + tech_vec + stretch_vec + sector_vec + confirm_vec + sector_oh + [mktcap_rank]
     return context
 
 
@@ -418,14 +460,16 @@ def infer_batch(
     context_features: "np.ndarray",
 ) -> "np.ndarray":
     """
-    배치 추론 → raw probability 배열 반환.
+    배치 추론 → probability 배열 반환.
     model(chart, context_features) 2-입력 forward 호출 (설계서 §10.2).
+    모델 출력이 raw logit이므로 sigmoid 적용하여 확률로 변환.
     """
     import torch
     with torch.no_grad():
         chart = torch.tensor(chart_tensors, dtype=torch.float32)
         context = torch.tensor(context_features, dtype=torch.float32)
-        probs = model(chart, context)
+        logits = model(chart, context)
+        probs = torch.sigmoid(logits)  # logits → probs
     return probs.squeeze(1).numpy()
 
 
@@ -712,7 +756,7 @@ def main():
 
     # universe 섹터 정보 로드 (context vector 조립용)
     sector_map, wics_sectors = _load_universe_sector_info()
-    n_context_features = 15 + len(wics_sectors)
+    n_context_features = 23 + len(wics_sectors)  # base(23: macro4+tech5+stretch2+sector3+confirm8+mktcap1) + n_sectors
     print(f"[SCEmitter] n_context_features={n_context_features} (n_sectors={len(wics_sectors)})")
 
     # context_scaler 로드 (train fold 기준 StandardScaler)
@@ -780,6 +824,9 @@ def main():
             tf["close_sma20_ratio"] = sf.get("close_sma20_ratio", tf.get("close_sma20_ratio", 0.0))
             tf["bb_pos"] = sf.get("bb_pos", tf.get("bb_pos", 0.5))
             tf["ret_5d_rank_in_sector"] = sf.get("ret_5d_rank_in_sector", tf.get("ret_5d_rank_in_sector", 0.5))
+            tf["close_sma20_ratio_sector_rank"] = sf.get(
+                "close_sma20_ratio_sector_rank", tf.get("close_sma20_ratio_sector_rank", 0.5)
+            )
             tf["volume_ratio_20_sector_pct"] = sf.get(
                 "volume_ratio_20_sector_pct", tf.get("volume_ratio_20_sector_pct", 0.5)
             )
@@ -907,9 +954,16 @@ def main():
             chart_torch = make_chart_tensor(window_snaps, size=(height, width))
             tensor = chart_torch.numpy()  # torch.Tensor → numpy (3, H, W)
 
+            # 전일 종가: ohlcv_hist[-2]가 있으면 사용 (overnight_gap 계산용, PIT-safe)
+            prev_close_val = None
+            if len(ohlcv_hist) >= 2:
+                _pc = ohlcv_hist[-2].get("close")
+                if _pc and float(_pc) > 0:
+                    prev_close_val = float(_pc)
             context_vec = build_context_vector(
                 dmp, ticker, sector_map, wics_sectors,
                 mktcap_rank=mktcap_rank_map.get(ticker, 0.5),
+                prev_close=prev_close_val,
             )
             chart_tensors.append(tensor)
             context_feat_list.append(context_vec)
@@ -970,7 +1024,7 @@ def main():
             print("[SCEmitter] calibrator.pkl 없음, raw prob 사용")
             cal_probs = raw_probs
 
-        # Committee v1.1: ElasticNet tabular 예측 → CNN 예측과 fusion
+        # Committee v1.1: Tree Core tabular 예측 → CNN 예측과 fusion
         committee_cfg = cfg.get("committee", {})
         committee_enabled = committee_cfg.get("enabled", False)
         tab_weight = float(committee_cfg.get("tab_weight", 0.65))
@@ -985,7 +1039,7 @@ def main():
                 if enet is not None:
                     p_tab_arr = enet.predict_proba(context_np)[:, 1]
                     print(
-                        f"[SCEmitter] Committee v1.1: ElasticNet 예측 완료 "
+                        f"[SCEmitter] Committee v1.1: Tree Core 예측 완료 "
                         f"(mean={p_tab_arr.mean():.3f})"
                     )
                 else:
@@ -1000,17 +1054,35 @@ def main():
             raw_p = float(raw_probs[i])
             cal_p = float(cal_probs[i])
 
-            # Committee fusion 적용 (enabled + ElasticNet 로드 성공 시만)
+            # Committee fusion 적용 (enabled + Tree Core 로드 성공 시만)
+            # cnn_role: "confirmatory" → CNN은 보조 확인 branch로만 사용
+            cnn_role = committee_cfg.get("cnn_role", "confirmatory")
             if committee_enabled and p_tab_arr is not None:
                 from models.rebound_cnn.committee import fuse_scores as _fuse_scores
+                p_tab = float(p_tab_arr[i])
+                p_cnn = cal_p
+
                 cal_p, agreement, committee_unc = _fuse_scores(
-                    float(p_tab_arr[i]),
-                    cal_p,
+                    p_tab,
+                    p_cnn,
                     tab_weight=tab_weight,
                     cnn_weight=cnn_weight,
                     agreement_threshold=agreement_threshold,
                 )
                 uncertainty = committee_unc
+
+                # R8: Agreement 강화 — CNN과 Tree Core 방향 불일치 시 hold 강제
+                # config.yaml committee.require_directional_agreement로 제어
+                require_dir_agree = committee_cfg.get("require_directional_agreement", True)
+                cnn_bullish = p_cnn >= 0.5
+                tab_bullish = p_tab >= 0.5
+                if require_dir_agree and cnn_bullish != tab_bullish:
+                    # 방향 불일치: confidence를 min(cal_p, 0.54)로 캡 → hold 강제
+                    cal_p = min(cal_p, 0.54)
+                    print(
+                        f"[SCEmitter] {ticker}: Agreement 불일치 "
+                        f"(CNN={p_cnn:.3f}, Tab={p_tab:.3f}) → confidence 캡: {cal_p:.3f}"
+                    )
             else:
                 uncertainty = float(variances[i]) if variances is not None else None
 
@@ -1046,6 +1118,17 @@ def main():
             )
             infer_cards.append(card)
             print(f"[SCEmitter] {ticker} ({name}): signal={signal}, direction={direction}, confidence={cal_p:.3f}")
+
+        # Top-N after gate: CNN score 상위 N개만 BUY 허용
+        top_n = int(gate_cfg.get("top_n_after_gate", 5))
+        if len(infer_cards) > top_n:
+            # cal_prob (confidence) 내림차순 정렬
+            infer_cards.sort(key=lambda c: c["confidence"], reverse=True)
+            for card in infer_cards[top_n:]:
+                if card["signal"] in ("buy", "strong_buy"):
+                    card["signal"] = "hold"
+                    card["direction"] = "neutral"
+            print(f"[SCEmitter] Top-{top_n} shortlist 적용: 상위 {top_n}종목만 BUY 허용")
 
         cards = infer_cards + hold_cards
 

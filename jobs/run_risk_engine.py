@@ -744,7 +744,8 @@ def run_risk_engine(target_date: str, use_mock: bool = False, prev_cop_path: str
         print(f"[RiskEngine] UQ tail cap: {'활성화' if uq_active else '비활성화'}")
         approved_orders = apply_uq_tail_cap(approved_orders, policy, audit_entries, uq_scores)
 
-    # 7. Turnover Check
+    # 7. Turnover Check — stop-loss sell은 예외 처리 (Gemini Pro 피드백)
+    # 폭락장에서 대량 stop-loss 발동 시 turnover cap이 정상 매매를 차단하는 것을 방지
     print("[7/7] Turnover Check...")
     prev_orders = []
     if prev_cop_path:
@@ -754,7 +755,18 @@ def run_risk_engine(target_date: str, use_mock: bool = False, prev_cop_path: str
                 prev_orders = prev_cop.get("orders", [])
         except Exception as e:
             print(f"[RiskEngine] prev_cop 로드 실패 (skip): {e}")
-    approved_orders = check_turnover(approved_orders, prev_orders, policy, audit_entries, portfolio_state)
+
+    # stop-loss sell 주문을 turnover 계산에서 분리
+    stop_loss_orders = [o for o in approved_orders if o.get("sell_reason") == "stop_loss"]
+    non_stop_orders = [o for o in approved_orders if o.get("sell_reason") != "stop_loss"]
+    if stop_loss_orders:
+        audit_entries.append({
+            "rule": "turnover_cap",
+            "action": "info",
+            "reason": f"stop-loss {len(stop_loss_orders)}건 turnover 계산 exempt 처리",
+        })
+    non_stop_orders = check_turnover(non_stop_orders, prev_orders, policy, audit_entries, portfolio_state)
+    approved_orders = non_stop_orders + stop_loss_orders  # stop-loss 주문 무조건 복원
 
     # Regime action 가져오기
     actions = policy.get("regime_gate", {}).get("actions", {})

@@ -61,8 +61,9 @@ def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
     else:
         # ElasticNet fallback
         from sklearn.linear_model import SGDClassifier
-        alpha = config.get("elasticnet", {}).get("alpha", 0.01)
-        l1_ratio = config.get("elasticnet", {}).get("l1_ratio", 0.5)
+        tc_cfg = config.get("tree_core", config.get("elasticnet", {}))
+        alpha = tc_cfg.get("alpha", 0.01)
+        l1_ratio = tc_cfg.get("l1_ratio", 0.5)
         print(f"[Committee] ElasticNet fallback: alpha={alpha}, l1_ratio={l1_ratio}")
         model = SGDClassifier(
             loss="log_loss", penalty="elasticnet",
@@ -96,17 +97,17 @@ def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
 def fuse_scores(
     p_tab: float,
     p_cnn: float,
-    tab_weight: float = 0.65,
-    cnn_weight: float = 0.35,
+    tab_weight: float = 0.70,
+    cnn_weight: float = 0.30,
     agreement_threshold: float = 0.55,
 ) -> tuple:
     """Committee score fusion.
 
-    p_tab: ElasticNet calibrated probability
-    p_cnn: CNN calibrated probability
+    p_tab: LightGBM tree core calibrated probability
+    p_cnn: CNN confirmatory branch probability
     반환: (p_final, agreement, uncertainty_score)
 
-    disagreement가 크고 점수도 애매하면 보수적으로 hold 수준(<=0.54)으로 억제.
+    CNN은 confirmatory branch: disagreement 시 hold 보수화.
     """
     agreement = 1.0 - abs(p_tab - p_cnn)
     p_final = tab_weight * p_tab + cnn_weight * p_cnn
@@ -119,29 +120,37 @@ def fuse_scores(
     return float(p_final), float(agreement), float(uncertainty_score)
 
 
-def save_elasticnet(enet, path: Path = None):
-    """ElasticNet 모델을 pickle로 저장."""
+def save_tree_core(model, path: Path = None):
+    """Tree core 모델을 pickle로 저장. 하위 호환: save_elasticnet()도 동일."""
     if path is None:
-        path = MODEL_DIR / "elasticnet.pkl"
+        path = MODEL_DIR / "elasticnet.pkl"  # 하위 호환 파일명 유지
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
-        pickle.dump(enet, f)
-    print(f"[Committee] ElasticNet 저장: {path}")
+        pickle.dump(model, f)
+    print(f"[Committee] Tree core 저장: {path}")
 
 
-def load_elasticnet(path: Path = None):
-    """ElasticNet 모델 로드. 파일 없으면 None 반환."""
+# 하위 호환 alias
+save_elasticnet = save_tree_core
+
+
+def load_tree_core(path: Path = None):
+    """Tree core 모델 로드. 파일 없으면 None 반환."""
     if path is None:
-        path = MODEL_DIR / "elasticnet.pkl"
+        path = MODEL_DIR / "elasticnet.pkl"  # 하위 호환 파일명 유지
     path = Path(path)
     if not path.exists():
-        print(f"[Committee] elasticnet.pkl 없음: {path}")
+        print(f"[Committee] tree_core.pkl 없음: {path}")
         return None
     with open(path, "rb") as f:
-        enet = pickle.load(f)
-    print(f"[Committee] ElasticNet 로드: {path}")
-    return enet
+        model = pickle.load(f)
+    print(f"[Committee] Tree core 로드: {path}")
+    return model
+
+
+# 하위 호환 alias
+load_elasticnet = load_tree_core
 
 
 def extract_context_arrays(dataset) -> tuple:

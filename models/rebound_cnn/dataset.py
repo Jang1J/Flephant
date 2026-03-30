@@ -167,6 +167,31 @@ def make_excess_return_label(
     return 1 if excess > threshold else 0
 
 
+def make_sector_neutral_label(
+    ticker_future_rets: list,
+    sector_future_rets: list,
+    threshold: float = 0.0,
+) -> int:
+    """
+    Sector-neutral excess return label.
+    sector_neutral_excess = r_i(t,t+5) - sector_mean(t,t+5)
+    y = 1 if sector_neutral_excess > threshold, else 0
+
+    PIT-safe: label은 t+1~t+5 데이터로만 계산.
+
+    ticker_future_rets: 해당 종목의 [ret_t+1, ..., ret_t+5] 기준가 대비 수익률
+    sector_future_rets: 같은 섹터 종목들의 t+5 기준 future return 리스트
+    threshold: sector-neutral excess return 기준 (기본 0.0%)
+    """
+    if not ticker_future_rets:
+        return 0
+
+    ticker_ret = ticker_future_rets[-1]
+    sector_mean = float(np.mean(sector_future_rets)) if sector_future_rets else 0.0
+    sector_neutral_excess = ticker_ret - sector_mean
+    return 1 if sector_neutral_excess > threshold else 0
+
+
 def apply_oversold_gate(
     ticker: str,
     sector_feats: dict,
@@ -293,7 +318,7 @@ class ReboundDataset(torch.utils.data.Dataset):
             str(row["ticker"]).zfill(6): row["wics_sector"]
             for _, row in universe.iterrows()
         }
-        self.n_context_features = 15 + len(wics_sectors)  # base(15) + n_sectors
+        self.n_context_features = 23 + len(wics_sectors)  # base(23) + n_sectors
 
         # 충분한 히스토리 확보를 위해 앞뒤로 추가 날짜 필요
         # dates: history 로드용 전체 날짜 (lookback용 과거 포함)
@@ -350,39 +375,65 @@ class ReboundDataset(torch.utils.data.Dataset):
                 history, universe_tickers, t_date, future_dates
             )
 
-            # Oversold Gate 1차 적용
-            gate_candidates = []
-            for ticker in universe_tickers:
-                if ticker not in history:
+            # 섹터별 종목 future return 사전 계산 (sector-neutral label 용, PIT-safe: t+1~t+5)
+            sector_future_rets_map: dict = {}  # {sector: [ret_t+5, ...]}
+            for _ticker in universe_tickers:
+                _td = history.get(_ticker)
+                if _td is None:
                     continue
-                sf = sector_feats_map.get(ticker, {})
-                if apply_oversold_gate(ticker, sf, gate_config):
-                    gate_candidates.append(ticker)
+                _base_close = _td.get(t_date, {}).get("ohlcv", {}).get("close")
+                if not _base_close or _base_close <= 0:
+                    continue
+                # horizon 마지막 날(t+5) 수익률만 사용 (make_sector_neutral_label과 동일 기준)
+                if future_dates and future_dates[-1] in _td:
+                    _fc = _td[future_dates[-1]]["ohlcv"]["close"]
+                    _ret = (_fc - _base_close) / _base_close
+                    _sector = sector_map.get(_ticker, "Unknown")
+                    if _sector not in sector_future_rets_map:
+                        sector_future_rets_map[_sector] = []
+                    sector_future_rets_map[_sector].append(_ret)
 
-            # Gate Relaxation: 후보 부족 시 RSI/sector 임계값 완화
-            # 기존 통과 종목은 보존하고, 미통과 종목에 대해서만 완화 조건 재평가
-            if relaxation_enabled and len(gate_candidates) < min_candidates:
-                relaxed_gate_config = dict(gate_config)
-                relaxed_gate_config["rsi_14_threshold"] = relaxation.get("rsi_relaxed", 48)
-                relaxed_gate_config["sector_bottom_pct"] = relaxation.get(
-                    "sector_bottom_pct_relaxed", 0.50
-                )
-                remaining = [t for t in universe_tickers if t not in gate_candidates]
-                added = []
-                for ticker in remaining:
+            # Oversold Gate — Gemini Pro 피드백: 학습 시 Gate 비활성화 옵션
+            # train_gate_filter=false: 전체 유니버스로 학습 (모델이 정상/과매도를 스스로 구분)
+            # train_gate_filter=true: 기존 동작 (Gate 통과 종목만)
+            train_gate_filter = gate_config.get("train_gate_filter", True)
+
+            if train_gate_filter:
+                # 기존 동작: Oversold Gate 1차 적용
+                gate_candidates = []
+                for ticker in universe_tickers:
                     if ticker not in history:
                         continue
                     sf = sector_feats_map.get(ticker, {})
-                    if apply_oversold_gate(ticker, sf, relaxed_gate_config):
+                    if apply_oversold_gate(ticker, sf, gate_config):
                         gate_candidates.append(ticker)
-                        added.append(ticker)
-                if added:
-                    print(
-                        f"[Modeler] {t_date} Gate relaxation 적용: "
-                        f"{len(gate_candidates)}종목 후보 (+{len(added)})"
-                    )
 
-            # gate 후보 종목에 대해 샘플 생성
+                # Gate Relaxation
+                if relaxation_enabled and len(gate_candidates) < min_candidates:
+                    relaxed_gate_config = dict(gate_config)
+                    relaxed_gate_config["rsi_14_threshold"] = relaxation.get("rsi_relaxed", 48)
+                    relaxed_gate_config["sector_bottom_pct"] = relaxation.get(
+                        "sector_bottom_pct_relaxed", 0.50
+                    )
+                    remaining = [t for t in universe_tickers if t not in gate_candidates]
+                    added = []
+                    for ticker in remaining:
+                        if ticker not in history:
+                            continue
+                        sf = sector_feats_map.get(ticker, {})
+                        if apply_oversold_gate(ticker, sf, relaxed_gate_config):
+                            gate_candidates.append(ticker)
+                            added.append(ticker)
+                    if added:
+                        print(
+                            f"[Modeler] {t_date} Gate relaxation 적용: "
+                            f"{len(gate_candidates)}종목 후보 (+{len(added)})"
+                        )
+            else:
+                # Gemini Pro: 학습 시 전체 유니버스 사용 (Gate는 추론 시에만 적용)
+                gate_candidates = [t for t in universe_tickers if t in history]
+
+            # gate 후보 (또는 전체) 종목에 대해 샘플 생성
             for ticker in gate_candidates:
                 td = history.get(ticker)
                 if td is None:
@@ -408,8 +459,12 @@ class ReboundDataset(torch.utils.data.Dataset):
                 if len(ticker_rets) < horizon:
                     continue
 
-                # Excess return label
-                label = make_excess_return_label(ticker_rets, ew_rets, threshold)
+                # Sector-neutral excess return label
+                ticker_sector = sector_map.get(ticker, "Unknown")
+                same_sector_rets = [
+                    r for r in sector_future_rets_map.get(ticker_sector, [])
+                ]
+                label = make_sector_neutral_label(ticker_rets, same_sector_rets, threshold)
 
                 chart_tensor = make_chart_tensor(
                     window_snaps,
@@ -419,11 +474,21 @@ class ReboundDataset(torch.utils.data.Dataset):
                     ),
                 )
 
-                # 26차원 context vector 조립 (설계서 §10.2)
+                # context vector 조립 (설계서 §10.2, confirmation 포함 23 + n_sectors 차원)
                 sf = sector_feats_map.get(ticker, {})
                 mktcap_rank = mktcap_ranks.get(ticker, 0.5)
+
+                # 전일 종가 계산 (overnight_gap용, PIT-safe: t일 이전 날짜)
+                prev_close_val: float = None
+                if t_idx > 0:
+                    prev_date = dates_sorted[t_idx - 1]
+                    prev_close_val = td.get(prev_date, {}).get("ohlcv", {}).get("close")
+                    if prev_close_val is not None:
+                        prev_close_val = float(prev_close_val) if prev_close_val > 0 else None
+
                 context_list = _build_context_vector(
-                    ticker, t_date, td, sf, sector_map, wics_sectors, mktcap_rank
+                    ticker, t_date, td, sf, sector_map, wics_sectors, mktcap_rank,
+                    prev_close=prev_close_val,
                 )
                 context_tensor = torch.tensor(context_list, dtype=torch.float32)
 

@@ -76,7 +76,8 @@ def _collect_model_outputs(model, loader, device):
         for chart, context, label in loader:
             chart = chart.to(device)
             context = context.to(device)
-            prob = model(chart, context)  # (B, 1), Sigmoid 출력
+            logit = model(chart, context)  # (B, 1), raw logit
+            prob = torch.sigmoid(logit)    # logit → prob
             all_probs.extend(prob.squeeze(1).cpu().numpy().tolist())
             all_labels.extend(label.numpy().tolist())
     return np.array(all_probs), np.array(all_labels)
@@ -125,15 +126,8 @@ def train_one_fold(
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Weighted BCE 수동 구현 (BCEWithLogitsLoss 대신 Sigmoid가 모델에 내장)
-    # label=1 샘플에 pos_weight 적용
-    def weighted_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """pred: (B,1) Sigmoid 출력, target: (B,1) 0/1 label."""
-        eps = 1e-7
-        pred_clamped = torch.clamp(pred, eps, 1.0 - eps)
-        bce = -(target * torch.log(pred_clamped) * pos_weight
-                + (1 - target) * torch.log(1 - pred_clamped))
-        return bce.mean()
+    # BCEWithLogitsLoss (모델 출력이 raw logit)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -161,8 +155,8 @@ def train_one_fold(
             label = label.to(device).unsqueeze(1)
 
             optimizer.zero_grad()
-            prob = model(chart, context)
-            loss = weighted_bce_loss(prob, label)
+            logit = model(chart, context)
+            loss = criterion(logit, label)
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"[Modeler] Fold {fold_idx} Epoch {epoch}: NaN/Inf loss 감지, 배치 스킵")
@@ -181,8 +175,8 @@ def train_one_fold(
                 chart = chart.to(device)
                 context = context.to(device)
                 label = label.to(device).unsqueeze(1)
-                prob = model(chart, context)
-                loss = weighted_bce_loss(prob, label)
+                logit = model(chart, context)
+                loss = criterion(logit, label)
                 if not (torch.isnan(loss) or torch.isinf(loss)):
                     val_losses.append(loss.item())
 
@@ -640,47 +634,45 @@ def run_training(config_path: Path):
         ],
     }
 
-    # Committee v1.1: ElasticNet 학습 (committee.enabled=true 시만 실행)
+    # Committee v1.1: Tree Core 학습 (committee.enabled=true 시만 실행)
     if config.get("committee", {}).get("enabled", False):
         try:
             from models.rebound_cnn.committee import (
                 extract_context_arrays,
-                train_elasticnet,
-                save_elasticnet,
+                train_elasticnet as train_tree_core,
+                save_elasticnet as save_tree_core,
             )
 
             if last_val_loader is not None and best_ensemble_result is not None:
-                # 마지막 fold의 train/val dataset을 재구성
                 last_fold_train_dates, last_fold_val_dates = folds[-1]
-                train_ds_enet = ReboundDataset(dmp_dir, last_fold_train_dates, config)
-                val_ds_enet = ReboundDataset(dmp_dir, last_fold_val_dates, config)
+                train_ds_tc = ReboundDataset(dmp_dir, last_fold_train_dates, config)
+                val_ds_tc = ReboundDataset(dmp_dir, last_fold_val_dates, config)
 
-                # train fold 기준 scaler 로드 후 적용
-                scaler_path_enet = MODEL_DIR / "context_scaler.pkl"
-                if scaler_path_enet.exists():
-                    with open(scaler_path_enet, "rb") as _f:
+                scaler_path_tc = MODEL_DIR / "context_scaler.pkl"
+                if scaler_path_tc.exists():
+                    with open(scaler_path_tc, "rb") as _f:
                         _scaler = pickle.load(_f)
-                    train_ds_enet.apply_scaler(_scaler)
-                    val_ds_enet.apply_scaler(_scaler)
+                    train_ds_tc.apply_scaler(_scaler)
+                    val_ds_tc.apply_scaler(_scaler)
 
-                X_train_e, y_train_e = extract_context_arrays(train_ds_enet)
-                X_val_e, y_val_e = extract_context_arrays(val_ds_enet)
+                X_train_e, y_train_e = extract_context_arrays(train_ds_tc)
+                X_val_e, y_val_e = extract_context_arrays(val_ds_tc)
 
-                enet, enet_log = train_elasticnet(
+                tc_model, tc_log = train_tree_core(
                     X_train_e, y_train_e, X_val_e, y_val_e, config
                 )
-                save_elasticnet(enet)
-                training_log["elasticnet"] = enet_log
+                save_tree_core(tc_model)
+                training_log["tree_core"] = tc_log
                 print(
-                    f"[Modeler] Committee v1.1 ElasticNet 학습 완료: "
-                    f"val_auc={enet_log['val_auc']}"
+                    f"[Modeler] Committee v1.1 Tree Core 학습 완료: "
+                    f"val_auc={tc_log['val_auc']}"
                 )
             else:
-                print("[Modeler] Committee: last_val_loader 없음, ElasticNet 학습 스킵")
+                print("[Modeler] Committee: last_val_loader 없음, Tree Core 학습 스킵")
         except Exception as e:
-            print(f"[Modeler] Committee ElasticNet 학습 실패: {e}")
+            print(f"[Modeler] Committee Tree Core 학습 실패: {e}")
     else:
-        print("[Modeler] Committee v1.1 비활성화 (committee.enabled=false). ElasticNet 학습 스킵.")
+        print("[Modeler] Committee v1.1 비활성화 (committee.enabled=false). Tree Core 학습 스킵.")
 
     # 학습 로그 저장
     log_path = MODEL_DIR / "training_log.json"

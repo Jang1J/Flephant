@@ -2,7 +2,7 @@
 KR-Rebound-CNN 공유 전처리 모듈
 - make_chart_tensor: 20일 OHLCV → 3-channel 64x64 tensor
 - compute_sector_relative_features: 섹터 상대 피처 계산
-- _build_context_vector: 26차원 context vector 조립
+- _build_context_vector: 34차원 context vector 조립 (23 base + n_sectors)
 - _build_wics_sector_list: WICS 섹터 목록 정렬
 
 dataset.py, SC emitter(build_strategy_card_rebound.py) 등에서 공통 사용.
@@ -272,21 +272,28 @@ def _build_context_vector(
     sector_map: dict,
     wics_sectors: list,
     mktcap_rank: float = 0.5,
+    prev_close: float = None,  # 전일 종가 (overnight_gap 계산용)
 ) -> list:
     """
-    26차원 context vector 조립 (설계서 S10.2 Context Branch).
+    Context vector 조립 (설계서 S10.2 Context Branch).
 
     구성:
       macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
-      + sector_onehot(n_sectors) + market_cap_rank(1)
-      = 15 + n_sectors 차원
+      + confirmation(8) + sector_onehot(n_sectors) + market_cap_rank(1)
+      = 23 + n_sectors 차원  ← n_context_features_base: 15 → 23
+
+    confirmation(8):
+      ret_5d_rank_in_sector, close_sma20_ratio_sector_rank,
+      bb_pos, overnight_gap, intraday_range,
+      upper_shadow, lower_shadow, body_ratio
 
     PIT-Safety: t일 이전 데이터(td[t_date])만 사용, 미래 데이터 참조 없음.
     """
     snap = td.get(t_date, {})
     macro_raw = snap.get("macro", {})
     tech = snap.get("tech_features", {})
-    close = snap.get("ohlcv", {}).get("close", 1.0)
+    ohlcv = snap.get("ohlcv", {})
+    close = ohlcv.get("close", 1.0)
     if close <= 0:
         close = 1.0
 
@@ -324,6 +331,51 @@ def _build_context_vector(
         float(sf.get("volume_ratio_20_sector_pct", 0.5)),
     ]
 
+    # confirmation (8): candlestick structure + sector ranking features
+    open_price = float(ohlcv.get("open", close))
+    high_price = float(ohlcv.get("high", close))
+    low_price = float(ohlcv.get("low", close))
+
+    hl_range = high_price - low_price + 1e-8
+
+    # 1. ret_5d_rank_in_sector: 섹터 내 5일 수익률 순위 percentile
+    ret_5d_rank_in_sector = float(sf.get("ret_5d_rank_in_sector", 0.5))
+
+    # 2. close_sma20_ratio_sector_rank: 섹터 내 close/sma20 비율 순위
+    close_sma20_ratio_sector_rank = float(sf.get("close_sma20_ratio_sector_rank", 0.5))
+
+    # 3. bb_pos: 볼린저 밴드 위치 (없으면 0.5)
+    bb_pos = float(sf.get("bb_pos", 0.5))
+
+    # 4. overnight_gap: (open - prev_close) / prev_close (PIT-safe: 전일 종가 사용)
+    if prev_close is not None and prev_close > 0:
+        overnight_gap = (open_price - prev_close) / prev_close
+    else:
+        overnight_gap = 0.0
+
+    # 5. intraday_range: (high - low) / close
+    intraday_range = hl_range / close if close > 0 else 0.0
+
+    # 6. upper_shadow: (high - max(open, close)) / (high - low + 1e-8)
+    upper_shadow = (high_price - max(open_price, close)) / hl_range
+
+    # 7. lower_shadow: (min(open, close) - low) / (high - low + 1e-8)
+    lower_shadow = (min(open_price, close) - low_price) / hl_range
+
+    # 8. body_ratio: abs(close - open) / (high - low + 1e-8)
+    body_ratio = abs(close - open_price) / hl_range
+
+    confirm_vec = [
+        ret_5d_rank_in_sector,
+        close_sma20_ratio_sector_rank,
+        bb_pos,
+        overnight_gap,
+        intraday_range,
+        upper_shadow,
+        lower_shadow,
+        body_ratio,
+    ]
+
     # meta: sector_onehot (n_sectors 차원) + market_cap_rank (1)
     sector_name = sector_map.get(ticker, "Unknown")
     n_sectors = len(wics_sectors)
@@ -331,5 +383,5 @@ def _build_context_vector(
     if sector_name in wics_sectors:
         sector_oh[wics_sectors.index(sector_name)] = 1.0
 
-    context = macro_vec + tech_vec + stretch_vec + sector_vec + sector_oh + [mktcap_rank]
+    context = macro_vec + tech_vec + stretch_vec + sector_vec + confirm_vec + sector_oh + [mktcap_rank]
     return context
