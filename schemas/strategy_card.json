@@ -47,8 +47,12 @@
       "description": "Quant Strategy 점수 (LightGBM ranker output)"
     },
     "news_signal": {
-      "type": "number",
-      "description": "News/Market Strategy 점수 (Kanana-o output)"
+      "type": ["number", "null"],
+      "description": "News/Market Strategy 점수 (Kanana-o output). 뉴스 0건이면 null."
+    },
+    "news_available": {
+      "type": "boolean",
+      "description": "true=뉴스 데이터 있음, false=뉴스 0건(masked_missing 패턴)"
     },
     "rationale": {
       "type": "string",

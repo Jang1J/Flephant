@@ -66,6 +66,10 @@
           "uncertainty_score": {
             "type": ["number", "null"],
             "description": "SC에서 전달된 uncertainty_score (0~1). 모델 없을 때 null."
+          },
+          "new_open_blocked": {
+            "type": "boolean",
+            "description": "Debate emergency_flag(consensus_score < 0.33) 감지 시 true. 신규 매수 차단 상태. 해당 없으면 필드 없음."
           }
         }
       }
@@ -133,6 +137,8 @@
               },
               "moderator_summary": { "type": "string" },
               "consensus_score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "moderator_confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "합의도 기반 신뢰도 (consensus_score와 동일)" },
+              "emergency_flag": { "type": "boolean", "description": "true=consensus_score < 0.33 (긴급 주의)" },
               "models_used": { "type": "array", "items": { "type": "string" } },
               "debate_triggered_by": { "type": "string" }
             }

@@ -473,6 +473,20 @@ def infer_batch(
     return probs.squeeze(1).numpy()
 
 
+def infer_batch_logit(
+    model,
+    chart_tensors: "np.ndarray",
+    context_features: "np.ndarray",
+) -> "np.ndarray":
+    """배치 추론 → raw logit 배열 반환 (sigmoid 미적용)."""
+    import torch
+    with torch.no_grad():
+        chart = torch.tensor(chart_tensors, dtype=torch.float32)
+        context = torch.tensor(context_features, dtype=torch.float32)
+        logits = model(chart, context)
+    return logits.squeeze(1).cpu().numpy()
+
+
 def infer_ensemble(
     model_paths: list,
     cfg: dict,
@@ -480,25 +494,30 @@ def infer_ensemble(
     context_features: "np.ndarray",
 ) -> tuple:
     """
-    Ensemble 추론: 각 seed 모델 추론 후 평균/분산 반환.
+    Ensemble 추론: 각 seed 모델의 logit을 평균한 뒤 sigmoid 적용.
     반환: (mean_probs: np.ndarray, variance: np.ndarray)
+    variance는 logit 평균 probs 기준 분산.
     """
-    all_probs = []
+    import torch
+    all_logits = []
     for pt_path in model_paths:
         try:
             model = load_torch_model(pt_path, cfg)
-            probs = infer_batch(model, chart_tensors, context_features)
-            all_probs.append(probs)
+            logits = infer_batch_logit(model, chart_tensors, context_features)
+            all_logits.append(logits)
             print(f"[SCEmitter] Ensemble 모델 로드 완료: {pt_path.name}")
         except Exception as e:
             print(f"[SCEmitter] Ensemble 모델 로드 실패 ({pt_path.name}): {e}")
 
-    if not all_probs:
+    if not all_logits:
         raise RuntimeError("[SCEmitter] 유효한 ensemble 모델이 없음")
 
-    stack = np.stack(all_probs, axis=0)  # (n_models, N)
-    mean_probs = stack.mean(axis=0)
-    variance = stack.var(axis=0)
+    logit_stack = np.stack(all_logits, axis=0)  # (n_models, N)
+    mean_logit = logit_stack.mean(axis=0)         # logit 평균
+    mean_probs = 1.0 / (1.0 + np.exp(-mean_logit))  # sigmoid
+    # variance는 각 모델의 prob 기준으로 계산 (불확실성 추정용)
+    prob_stack = 1.0 / (1.0 + np.exp(-logit_stack))
+    variance = prob_stack.var(axis=0)
     return mean_probs, variance
 
 

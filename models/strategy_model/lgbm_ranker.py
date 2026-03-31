@@ -372,7 +372,7 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
     """
     try:
         import lightgbm as lgb
-        from sklearn.metrics import roc_auc_score
+        from sklearn.metrics import roc_auc_score, average_precision_score
     except ImportError as e:
         print(f"[LGBMRanker] 의존성 미설치: {e}. pip install lightgbm scikit-learn")
         raise
@@ -507,6 +507,10 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
                 val_auc = float(roc_auc_score(y_val, val_scores))
             except Exception:
                 val_auc = np.nan
+            try:
+                val_pr_auc = float(average_precision_score(y_val, val_scores))
+            except Exception:
+                val_pr_auc = np.nan
 
         else:
             # Binary classifier fallback (기존 방식)
@@ -539,6 +543,10 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
                 val_auc = float(roc_auc_score(y_val, val_scores))
             except Exception:
                 val_auc = np.nan
+            try:
+                val_pr_auc = float(average_precision_score(y_val, val_scores))
+            except Exception:
+                val_pr_auc = np.nan
 
             # Binary mode에서도 P@5 + RankIC 계산 (Gemini Pro 피드백)
             val_df_eval_bin = val_df[["date", "ticker"]].copy()
@@ -644,6 +652,7 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
             "n_train": len(train_df),
             "n_val": len(val_df),
             "val_auc": val_auc,
+            "val_pr_auc": val_pr_auc,
             "ordinal_val_auc": ordinal_val_auc,
             "val_precision_at_5": val_p5,
             "val_rank_ic": val_ric,
@@ -660,7 +669,7 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
         }
         fold_results.append(fold_result)
 
-        metric_str = f"AUC={val_auc:.4f}"
+        metric_str = f"AUC={val_auc:.4f}, PR-AUC={val_pr_auc:.4f}"
         if use_ranker:
             metric_str += f", P@5={val_p5:.3f}, RankIC={val_ric:.3f}"
         print(
@@ -712,6 +721,24 @@ def predict(
             ord_proba = ordinal_model.predict_proba(X)
             # class2(top 25%) 확률을 보조 점수로 사용
             ord_top_proba = ord_proba[:, 2]
+            # Binary/Ordinal 상관계수 측정 후 저장
+            try:
+                from scipy.stats import pearsonr
+                corr, pval = pearsonr(binary_proba, ord_top_proba)
+                corr_result = {
+                    "pearson_r": round(float(corr), 6),
+                    "p_value": round(float(pval), 8),
+                    "n_samples": len(binary_proba),
+                    "note": "상관 > 0.95이면 Ordinal 삭제 고려",
+                }
+                corr_path = OUTPUT_DIR / "binary_ordinal_correlation.json"
+                with open(corr_path, "w", encoding="utf-8") as _f:
+                    json.dump(corr_result, _f, ensure_ascii=False, indent=2)
+                print(
+                    f"[LGBMRanker] Binary/Ordinal 상관계수: r={corr:.4f}, p={pval:.4e} → {corr_path}"
+                )
+            except Exception as e:
+                print(f"[LGBMRanker] 상관계수 계산 실패: {e}")
             final_score = 0.6 * binary_proba + 0.4 * ord_top_proba
         except Exception as e:
             print(f"[LGBMRanker] ordinal 예측 실패, binary만 사용: {e}")
@@ -815,6 +842,11 @@ def _save_model(fold_results: list[dict], run_id: str) -> None:
             None
             if isinstance(fold_meta.get("val_auc"), float) and np.isnan(fold_meta["val_auc"])
             else fold_meta.get("val_auc")
+        )
+        fold_meta["val_pr_auc"] = (
+            None
+            if isinstance(fold_meta.get("val_pr_auc"), float) and np.isnan(fold_meta["val_pr_auc"])
+            else fold_meta.get("val_pr_auc")
         )
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -966,6 +998,14 @@ def main():
                 f"평균: {np.mean(aucs):.4f}, "
                 f"최소: {np.min(aucs):.4f}, "
                 f"최대: {np.max(aucs):.4f}"
+            )
+        pr_aucs = [f["val_pr_auc"] for f in fold_results if f.get("val_pr_auc") is not None and not np.isnan(f["val_pr_auc"])]
+        if pr_aucs:
+            print(
+                f"[LGBMRanker] 검증 PR-AUC 요약 — "
+                f"평균: {np.mean(pr_aucs):.4f}, "
+                f"최소: {np.min(pr_aucs):.4f}, "
+                f"최대: {np.max(pr_aucs):.4f}"
             )
         print(f"[LGBMRanker] 학습 완료. run_id={run_id}")
 

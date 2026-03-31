@@ -202,6 +202,13 @@ class FinalDecisionAgent:
                         )
                         conflict["debate_log"] = debate_log
                         print(f"  [FDA] [{ticker}] Debate 완료 (consensus={debate_log.get('consensus_score')})")
+
+                        # emergency_flag == true → 해당 종목 신규 매수 차단 기록
+                        if debate_log.get("emergency_flag"):
+                            for dec in decisions:
+                                if dec["ticker"] == ticker and dec.get("action") == "buy":
+                                    dec["new_open_blocked"] = True
+                                    print(f"  [FDA] emergency_flag 감지: {ticker} → 신규 매수 차단")
                     except Exception as e:
                         print(f"  [FDA] [{ticker}] Debate 실패 (skip): {e}")
 

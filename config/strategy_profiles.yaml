@@ -18,6 +18,8 @@ profiles:
 # default_profile: 운영 기본값 (Preference Resolver 미설정 시 fallback)
 # runtime default는 config/preference_resolver.yaml이 결정
 default_profile: "momentum"  # rebound에서 변경
+# official baseline (proposal) = momentum
+# runtime default = rebound (Gate-OFF/ON 특화)
 
 # 공통 설정 (모든 profile에 적용)
 common:

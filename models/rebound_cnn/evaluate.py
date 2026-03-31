@@ -152,10 +152,12 @@ def evaluate_signal_layer(
 
     # AUC
     auc = 0.5
+    pr_auc = float("nan")
     try:
-        from sklearn.metrics import roc_auc_score
+        from sklearn.metrics import roc_auc_score, average_precision_score
         if len(np.unique(labels)) >= 2:
             auc = float(roc_auc_score(labels, cal_probs))
+            pr_auc = float(average_precision_score(labels, cal_probs))
     except Exception:
         pass
 
@@ -173,6 +175,7 @@ def evaluate_signal_layer(
         "brier_score": round(brier, 6),
         "brier_score_raw": round(brier_raw, 6),
         "auc_roc": round(auc, 4),
+        "pr_auc": round(pr_auc, 4) if not (pr_auc != pr_auc) else None,
         "signal_counts": signal_counts,
         "calibration_curve": cal_curve,
         "uncertainty_buckets": unc_results,
@@ -948,6 +951,7 @@ def _write_eval_markdown(result: dict, path: Path):
         f"| Brier Score (calibrated) | {sig.get('brier_score')} |",
         f"| Brier Score (raw) | {sig.get('brier_score_raw')} |",
         f"| AUC-ROC | {sig.get('auc_roc')} |",
+        f"| PR-AUC | {sig.get('pr_auc')} |",
         f"| 양성 비율 | {sig.get('positive_rate')} |",
         f"",
         f"### 신호 분포",

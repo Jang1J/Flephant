@@ -82,6 +82,7 @@ class DebateAgent:
         # Moderator 종합
         moderator_result = self._moderate(ticker, order, arguments)
 
+        consensus_score = moderator_result.get("consensus_score", 0.0)
         return {
             "ticker": ticker,
             "personas": {
@@ -102,7 +103,9 @@ class DebateAgent:
                 },
             },
             "moderator_summary": moderator_result.get("summary", ""),
-            "consensus_score": moderator_result.get("consensus_score", 0.0),
+            "consensus_score": consensus_score,
+            "moderator_confidence": consensus_score,
+            "emergency_flag": consensus_score < 0.33,
             "models_used": models_used,
             "debate_triggered_by": debate_triggered_by,
         }

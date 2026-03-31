@@ -94,26 +94,31 @@ def load_dmp(target_date: str) -> dict:
     return dmp
 
 
-def load_ttp_news_signal(target_date: str, ticker: str) -> float:
+def load_ttp_news_signal(target_date: str, ticker: str) -> tuple:
     """
     TTP에서 ticker의 news_signal을 추출한다.
-    TTP 파일이 없거나 필드가 없으면 0.0 반환.
+    TTP 파일이 없거나 뉴스 0건이면 (None, False) 반환.
 
-    news_signal 계산: target_company_docs의 sentiment_score 평균 (없으면 0.0).
+    Returns:
+        (news_signal, news_available): news_available=False이면 뉴스 없음(masked).
+    news_signal 계산: target_company_docs의 sentiment_score 평균 (없으면 None).
     """
     ttp_path = TTP_DIR / f"TTP-{target_date}-{ticker}.json"
     if not ttp_path.exists():
-        return 0.0
+        return None, False
     try:
         with open(ttp_path, encoding="utf-8") as f:
             ttp = json.load(f)
     except Exception as e:
         print(f"[SCMomentum] TTP 로드 실패 ({ticker}): {e}")
-        return 0.0
+        return None, False
 
     # TTP에 news_signal 필드가 있으면 직접 사용
     if "news_signal" in ttp:
-        return float(ttp["news_signal"])
+        val = ttp["news_signal"]
+        if val is None:
+            return None, False
+        return float(val), True
 
     # target_company_docs의 sentiment_score 평균
     scores = []
@@ -125,7 +130,7 @@ def load_ttp_news_signal(target_date: str, ticker: str) -> float:
             except (TypeError, ValueError):
                 pass
     if scores:
-        return round(float(np.mean(scores)), 4)
+        return round(float(np.mean(scores)), 4), True
 
     # macro_docs에서 fallback 추출 시도
     macro_scores = []
@@ -137,9 +142,9 @@ def load_ttp_news_signal(target_date: str, ticker: str) -> float:
             except (TypeError, ValueError):
                 pass
     if macro_scores:
-        return round(float(np.mean(macro_scores)) * 0.5, 4)  # 매크로 신호는 절반 가중
+        return round(float(np.mean(macro_scores)) * 0.5, 4), True
 
-    return 0.0
+    return None, False
 
 
 # ── 피처 추출 ─────────────────────────────────────────────────
@@ -388,16 +393,19 @@ def make_strategy_card(
     ticker: str,
     name: str,
     quant_score: float,
-    news_signal: float,
+    news_signal,
     pre_risk_score: float,
     source_strategy: str,
     feature_names: list,
     min_confidence: float,
+    news_available: bool = True,
 ) -> dict:
     """단일 종목 StrategyCard dict 생성."""
     signal, direction, confidence = score_to_signal_direction(
         pre_risk_score, min_confidence
     )
+    news_signal_val = None if news_signal is None else round(float(news_signal), 4)
+    news_display = "N/A" if news_signal is None else f"{news_signal:.3f}"
     return {
         "card_id":          f"SC-{target_date}-{ticker}",
         "snapshot_dt":      make_snapshot_dt(target_date),
@@ -409,10 +417,11 @@ def make_strategy_card(
         "confidence":       confidence,
         "pre_risk_score":   round(pre_risk_score, 4),
         "quant_score":      round(quant_score, 4),
-        "news_signal":      round(news_signal, 4),
+        "news_signal":      news_signal_val,
+        "news_available":   news_available,
         "rationale":        (
             f"[Momentum] {name} — quant={quant_score:.3f}, "
-            f"news={news_signal:.3f}, pre_risk={pre_risk_score:.3f}, "
+            f"news={news_display}, pre_risk={pre_risk_score:.3f}, "
             f"signal={signal}, confidence={confidence:.2f}"
         ),
         "source_strategy":  source_strategy,
@@ -528,10 +537,13 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
     except Exception as e:
         print(f"[SCMomentum] Conformal predictor 없음, interval 생성 skip: {e}")
 
-    # TTP에서 news_signal 수집
+    # TTP에서 news_signal 수집 (뉴스 없으면 None + news_available=False)
     news_signals: dict = {}
+    news_available_map: dict = {}
     for ticker in tickers:
-        news_signals[ticker] = load_ttp_news_signal(target_date, ticker)
+        ns, na = load_ttp_news_signal(target_date, ticker)
+        news_signals[ticker] = ns
+        news_available_map[ticker] = na
 
     # 3-branch StrategyCard 생성
     momentum_cards = []
@@ -544,8 +556,12 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
     synth_scores = []
     for i in range(n):
         qs = float(quant_scores_arr[i])
-        ns = news_signals.get(tickers[i], 0.0)
-        synth_scores.append(synthesize_scores(qs, ns, quant_weight=0.7))
+        ns_raw = news_signals.get(tickers[i])
+        # news_available=False이면 quant only (quant_weight=1.0)
+        if ns_raw is None:
+            synth_scores.append(synthesize_scores(qs, 0.0, quant_weight=1.0))
+        else:
+            synth_scores.append(synthesize_scores(qs, float(ns_raw), quant_weight=0.7))
 
     # rank normalize: synth_scores를 유니버스 내 순위로 [-1, 1] 재매핑
     ranked = np.argsort(np.argsort(synth_scores)).astype(float)  # 0 ~ n-1
@@ -570,16 +586,22 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
         except Exception as e:
             print(f"[SCMomentum] Conformal interval 계산 실패 (skip): {e}")
 
+    # quant rank normalization 사전 계산 (루프 밖으로)
+    q_ranked = np.argsort(np.argsort(quant_scores_arr)).astype(float)
+    q_norm = q_ranked / max(n - 1, 1) * 2.0 - 1.0
+
     for i, ticker in enumerate(tickers):
         name = ticker_name_map.get(ticker, ticker)
         qs   = float(quant_scores_arr[i])
-        ns   = news_signals.get(ticker, 0.0)
+        ns   = news_signals.get(ticker)
+        na   = news_available_map.get(ticker, False)
 
         # Branch 1: synthesized — rank-normalized score 사용
         pre_synth = round(float(ranked_norm[i]), 4)
         card_synth = make_strategy_card(
             target_date, ticker, name, qs, ns,
-            pre_synth, "synthesized", feature_names, min_conf
+            pre_synth, "synthesized", feature_names, min_conf,
+            news_available=na,
         )
         if conformal_intervals and ticker in conformal_intervals:
             ci = conformal_intervals[ticker]
@@ -588,12 +610,11 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
             card_synth["uncertainty_score"] = round(min(max(interval_width, 0.0), 1.0), 4)
         momentum_cards.append(card_synth)
 
-        # Branch 2: quant only — quant rank-normalized
-        q_ranked = np.argsort(np.argsort(quant_scores_arr)).astype(float)
-        q_norm = q_ranked / max(n - 1, 1) * 2.0 - 1.0
+        # Branch 2: quant only — quant rank-normalized (news_available 무관하게 quant만)
         card_quant = make_strategy_card(
             target_date, ticker, name, qs, ns,
-            round(float(q_norm[i]), 4), "quant", feature_names, min_conf
+            round(float(q_norm[i]), 4), "quant", feature_names, min_conf,
+            news_available=na,
         )
         if conformal_intervals and ticker in conformal_intervals:
             ci = conformal_intervals[ticker]
@@ -602,10 +623,12 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
             card_quant["uncertainty_score"] = round(min(max(interval_width, 0.0), 1.0), 4)
         quant_only_cards.append(card_quant)
 
-        # Branch 3: news only
+        # Branch 3: news only (뉴스 없으면 pre_risk_score=0.0)
+        news_pre_score = round(float(ns), 4) if ns is not None else 0.0
         news_only_cards.append(make_strategy_card(
             target_date, ticker, name, qs, ns,
-            round(ns, 4), "news", feature_names, min_conf
+            news_pre_score, "news", feature_names, min_conf,
+            news_available=na,
         ))
 
     # Top-K shortlist: risk_policy max_position_count까지만 BUY 허용
