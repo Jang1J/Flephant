@@ -88,7 +88,7 @@ K-SHIFT 4개 patch를 데이터 소스 계층에 공식 추가. 종토방 데이
 
 | 소스 | 제공 데이터 | 비고 |
 |------|-----------|------|
-| 미국 지수 API (Yahoo Finance 등) | 나스닥/S&P500/다우 전일 OHLCV | OvernightSpilloverPatch 용도 |
+| 미국 지수 API | 나스닥/S&P500/반도체 ETF 전일 OHLCV | OvernightSpilloverPatch 용도. Provider는 구현 단계에서 결정 |
 | 종목토론방 (네이버 증권) | 게시글 수, 조회수 급증 종목 | RetailThemeGraph 용도 |
 
 **수정 후 추가 단락 (K-SHIFT 소개):**
@@ -204,8 +204,169 @@ K-OPEN Pulse, K-SHIFT, Preference Resolver를 결론에 명시하여 서비스 �
 
 ---
 
+---
+
+### 4. 전략 모델 상세 (AI #2) — delta v2 추가
+
+**현재 (v11) 핵심:**
+Strategy Agent가 StrategyCard를 생성한다는 개요만 존재.
+
+**수정 방향:**
+AI #2 전략의 구체적 모델 아키텍처와 KOSPI 특화 요소를 명시.
+
+**수정 후 추가 섹션:**
+
+#### 4-1. LightGBM Momentum Ranker
+
+KOSPI 대형주 26종목 유니버스 내 상대 매력도 ranking.
+- 28개 피처 (manual 10 + MLF-lite 2 + UMI-lite 3 + cross-sectional pct 8 + OHLCV micro 5)
+- sector-neutral excess return 레이블 (WICS 16섹터 기반 de-biasing)
+- Walk-forward expanding window (train 200일, val 20일, purge/embargo 5일)
+- Binary(0.6) + Ordinal(0.4) dual-supervision
+- 현재 성능: Binary AUC 0.742, Ordinal AUC 0.736, P@5 0.511
+
+#### 4-2. KR-Rebound-CNN + Committee
+
+oversold/reversal 반등 포착 보조 전략.
+- 3-channel 64x64 chart image + 39-dim context (23 base + 16 WICS sectors)
+- BCEWithLogitsLoss, AdamW(lr=3e-4), Dropout 0.3/0.4, BatchNorm
+- Gate-OFF train / Gate-ON infer (학습은 전체 유니버스, 추론은 과매도 종목만)
+- Committee: Tree Core(0.70) + CNN(0.30) confirmatory mode
+- 현재 성능: CNN AUC 0.766 (13-fold avg)
+
+#### 4-3. O-I Decoupling (Overnight-Intraday 분리)
+
+한국 시장 특화 novelty. 한국장은 전날 미국장의 영향으로 overnight과 intraday 수익률이 다르게 움직인다.
+- overnight_direction 보조 모델: AUC 0.616
+- intraday_direction 보조 모델: AUC 0.547
+- 학술 claim: "한국장에서 밤과 낮이 다르게 움직인다"
+
+#### 4-4. Conformal Prediction (불확실성 정량화)
+
+모델 예측의 신뢰 구간을 분포 가정 없이 산출.
+- Split Conformal Prediction (alpha=0.05, 95% coverage)
+- Walk-forward 마지막 fold validation으로 calibrate
+- StrategyCard에 conformal_interval 주입
+
+---
+
+### 7-1. 핵심 파이프라인 — FDA Multi-Agent Debate 추가
+
+**현재 (v11) 핵심:**
+Final Decision Agent가 COP를 받아 approve/veto 결정.
+
+**수정 방향:**
+FDA에 Multi-Agent Debate 구조를 명시. 단, explanation/audit layer로만 제한.
+
+**수정 후 추가 블록:**
+
+FDA는 3 페르소나 기반 Multi-Agent Debate를 수행한다.
+- **Foreigner Agent**: DMP macro (usd_krw, vix_proxy, treasury_3y)에 민감
+- **Institution Agent**: SC rationale (DART 공시 기반) + sector 집중도에 민감
+- **Retail Agent**: SC rationale (뉴스 헤드라인) + quant_score에 민감
+- **Moderator**: 3자 의견 종합 + consensus_score 산출
+
+핵심 제약:
+- Debate는 explanation/audit layer로만 동작. 판정(approve/veto)을 변경하지 않는다.
+- can_change_weight = false 유지.
+- debate_log는 FDC artifact에 기록되어 audit trail로 활용.
+
+Emergency Flag 메커니즘:
+- Debate가 극단적 의견 충돌(consensus_score < 0.33)을 감지하면 `emergency_flag`를 FDC에 기록한다.
+- Debate는 직접 판정을 변경하지 않는다. 미리 정의된 deterministic safety policy가 flag를 읽어 `new_open_blocked` 또는 `human_review_required` 상태를 발동한다.
+- 즉, Debate는 원인 제공(compliance/audit), 행동은 deterministic rule이 수행한다.
+
+---
+
+### 5-1. 데이터 결측치/fallback 정책 — delta v2 추가
+
+**수정 방향:**
+K-SHIFT 데이터 소스의 결측/장애 시 처리 원칙을 설계 원칙에 추가.
+
+**수정 후 추가 원칙:**
+
+| 원칙 | 적용 방식 | 근거 |
+|------|----------|------|
+| **결측 시 의사결정 carry-forward 금지** | 의사결정용(Strategy/Risk) 입력에는 이전 값을 이월하지 않고 masked_missing 처리. 표시용(display)에만 시간 감쇠(decay) 허용 | PIT-Safety + 백테스트-라이브 일관성 보장 |
+| **immutable snapshot** | 수집 시점 기준 원시값 불변 저장. 이후 정정(revision)이 들어와도 원본을 덮어쓰지 않음 | 재현 가능한 백테스트를 위해 수집 시점 데이터 보존 |
+
+---
+
+### 3-1. 설계 원칙 추가 — delta v2
+
+**수정 방향:**
+LLM 출력 신뢰도 통제 원칙과 데이터 승격 게이트를 설계 원칙에 추가.
+
+**수정 후 추가 행 (설계 원칙 표에 삽입):**
+
+| 원칙 | 적용 방식 | 근거 |
+|------|----------|------|
+| **LLM 출력 신뢰도 게이트** | LLM이 생성한 요약/압축 산출물에 confidence score를 부여하고, threshold 미달 시 Strategy/Risk에 전달하지 않고 결측 처리 | LLM hallucination 방지 + 의사결정 안전성 |
+| **데이터 승격 게이트 (Promotion Gate)** | 새 데이터 소스가 의사결정 파이프라인에 연결되려면 5개 조건(coverage >= 95%, missing <= 5%, PIT 검증, baseline 대비 개선, failure case 설명 가능)을 통과해야 함 | 검증 없는 피처 추가로 인한 과적합 방지 |
+
+---
+
+### 7-2. K-SHIFT 시간축 명확화
+
+**현재 (delta v1):**
+K-SHIFT 4개 patch를 단순 나열.
+
+**수정 방향:**
+DMP 전용 / HMP 전용을 명확히 분리.
+
+**수정 후:**
+
+| Patch | Cadence | 시간축 |
+|-------|---------|--------|
+| InvestorFlowPatch (IFP) | daily | DMP 전용 |
+| OvernightSpilloverPatch (OSP) | daily | DMP 전용 |
+| RetailThemeGraph (RTG) | hourly | HMP 전용 (요약만 DMP) |
+| OpenTrapRiskPatch (OTP) | hourly | **HMP 전용** (DMP에 넣지 않음) |
+
+OTP는 개장 직후(09:00~09:30) 발생하는 신호이므로 t일 18:00 DMP에 포함하지 않는다.
+
+---
+
+### 7-3. K-SHIFT 한국 특화 우선순위
+
+**수정 방향:**
+K-SHIFT 4개 patch의 구현 우선순위를 한국 고유 신호 순서로 명시.
+
+**수정 후:**
+
+| 순위 | Patch | 한국 특화성 | 근거 |
+|------|-------|-----------|------|
+| 1순위 | IFP | 외국인/기관/개인 투자주체 구조 | 한국 고유 |
+| 2순위 | RTG | 종토방/테마 전염 | 한국 고유 |
+| 3순위 | OTP | VI/갭상승/추격 위험 | 한국 고유 |
+| 4순위 | OSP | 미국장 번역 | 외부 충격 (한국 고유 아님) |
+
+한국 내부 구조를 먼저 구조화하고, 미국장 데이터는 검증과 보조 번역 계층으로 병렬 확보한다.
+
+---
+
+### 12-1. 평가 프로토콜 — 성능 수치 갱신
+
+**수정 후 현재 성능 표:**
+
+| 메트릭 | 값 | 비고 |
+|--------|-----|------|
+| LightGBM Binary AUC | 0.742 | 9-fold walk-forward |
+| LightGBM Ordinal AUC | 0.736 | 3-class ranking |
+| LightGBM P@5 | 0.511 | 상위 5종목 정밀도 |
+| CNN AUC | 0.766 | 13-fold avg (Gate OFF train) |
+| O-I Overnight AUC | 0.616 | 야간 수익 방향 |
+| O-I Intraday AUC | 0.547 | 주간 수익 방향 |
+| Conformal q_hat | 0.718 | 95% coverage |
+| Backtest Sharpe | 1.69 | 거래세+슬리피지 포함 |
+| Backtest MDD | -7.90% | |
+| Backtest 누적수익 | +10.42% | 2024-08 ~ 2026-03 |
+
+---
+
 ## 변경 이력
 
 | 버전 | 날짜 | 내용 |
 |------|------|------|
 | delta v1 | 2026-03-29 | v11 → v12 수정 방향 초안 작성 |
+| delta v2 | 2026-03-31 | AI #2 전략 상세 + Debate(+Emergency Flag) + O-I + Conformal + 시간축 + 우선순위 + 성능 수치 + 결측치 정책 + Provider Abstraction |

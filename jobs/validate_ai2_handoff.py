@@ -12,7 +12,6 @@ Usage:
 
 import sys
 import json
-import datetime
 from pathlib import Path
 
 _BASE_DIR = Path(__file__).resolve().parent.parent

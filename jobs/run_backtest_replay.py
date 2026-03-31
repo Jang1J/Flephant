@@ -12,7 +12,6 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_BASE_DIR))
