@@ -94,7 +94,7 @@ inference:
   confidence_threshold: 0.5  # signal 분류 기준
   signal_map:
     strong_buy: 0.70
-    buy: 0.55
+    buy: 0.45  # 3A-4: Committee tree core 우위 환경에서 CNN 0.0 → fused 0.4~0.5 → BUY 미달 방지
     hold: 0.0
 
 evaluation:
@@ -127,7 +127,7 @@ committee:
   cnn_weight: 0.30
   cnn_role: "confirmatory"  # "primary" | "confirmatory" — CNN은 확인용 branch
   agreement_threshold: 0.55
-  require_directional_agreement: true  # R8: CNN과 Tab 방향 일치 요구
+  require_directional_agreement: false  # 3A-4: CNN undershooting(0.0) 환경에서 방향 불일치 캡 해제
 
 # Tree core 하이퍼파라미터 (committee.enabled=true 시 사용)
 # LightGBM 주력, ElasticNet fallback (LightGBM 미설치 시)

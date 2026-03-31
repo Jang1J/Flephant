@@ -27,7 +27,7 @@ from connectors import now_kst
 _BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def run_e2e(target_date: str, disable_uq: bool = False, use_mock: bool = False):
+def run_e2e(target_date: str, disable_uq: bool = False, use_mock: bool = False, full_ttp: bool = False):
     print(f"\n{'='*60}")
     print(f"  E2E Pipeline: {target_date}")
     print(f"{'='*60}")
@@ -47,25 +47,37 @@ def run_e2e(target_date: str, disable_uq: bool = False, use_mock: bool = False):
         dmp = json.load(f)
     results["dmp"] = "OK"
 
-    # ── Step 2: TickerTextPack (샘플 3종목) ──
+    # ── Step 2: TickerTextPack ──
+    # 기본값: 샘플 3종목 (빠른 테스트용)
+    # --full-ttp 옵션: 유니버스 전체 26종목 (LLM 비용/시간 증가)
     # 전체 유니버스 TTP는 build_ticker_text_pack.py로 별도 실행:
     #   python jobs/build_ticker_text_pack.py YYYYMMDD
-    print(f"\n[Step 2/7] TickerTextPack 생성 (샘플 3종목)...")
-    sample_tickers = ["005930", "000660", "005380"]
     from jobs.build_ticker_text_pack import build_pack
     import pandas as pd
     uni = pd.read_csv(_BASE_DIR / "config" / "universe_v1.csv")
+    uni["ticker"] = uni["ticker"].astype(str).str.zfill(6)
+
+    if full_ttp:
+        ttp_tickers = uni["ticker"].tolist()
+        print(f"\n[Step 2/7] TickerTextPack 생성 (전체 {len(ttp_tickers)}종목, --full-ttp)...")
+    else:
+        ttp_tickers = ["005930", "000660", "005380"]
+        print(f"\n[Step 2/7] TickerTextPack 생성 (샘플 {len(ttp_tickers)}종목)...")
 
     ttp_dir = _BASE_DIR / "artifacts" / "ticker_text_pack"
     ttp_dir.mkdir(parents=True, exist_ok=True)
 
-    for ticker in sample_tickers:
+    for ticker in ttp_tickers:
         ticker = str(ticker).zfill(6)
         ttp_path = ttp_dir / f"TTP-{target_date}-{ticker}.json"
         if ttp_path.exists():
             print(f"  → {ticker} 기존 파일 사용")
             continue
-        row = uni[uni["ticker"].astype(str).str.zfill(6) == ticker].iloc[0]
+        row_df = uni[uni["ticker"] == ticker]
+        if row_df.empty:
+            print(f"  → {ticker} 유니버스 미포함, 건너뜀")
+            continue
+        row = row_df.iloc[0]
         pack = build_pack(ticker, row["name"], row["wics_sector"], target_date)
         with open(ttp_path, "w", encoding="utf-8") as f:
             json.dump(pack, f, ensure_ascii=False, indent=2)
@@ -223,5 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("date", nargs="?", default=now_kst().strftime("%Y%m%d"))
     parser.add_argument("--no-uq", action="store_true", help="UQ tail cap 비활성화 (ablation용)")
     parser.add_argument("--mock", action="store_true", help="mock StrategyCard 강제 사용")
+    parser.add_argument("--full-ttp", action="store_true", help="TTP를 유니버스 전체 26종목으로 생성 (기본: 샘플 3종목)")
     args = parser.parse_args()
-    run_e2e(args.date, disable_uq=args.no_uq, use_mock=args.mock)
+    run_e2e(args.date, disable_uq=args.no_uq, use_mock=args.mock, full_ttp=args.full_ttp)

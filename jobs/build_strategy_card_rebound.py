@@ -507,22 +507,31 @@ def calibrate_probs(raw_probs: "np.ndarray", calibrator) -> "np.ndarray":
     return calibrator.predict(raw_probs)
 
 
-def map_signal_and_direction(confidence: float, gate_pass: bool) -> tuple:
+def map_signal_and_direction(
+    confidence: float, gate_pass: bool, cfg: dict = None
+) -> tuple:
     """설계서 §13.2 signal/direction 매핑.
 
     v1 규칙:
     - gate 미통과: hold, neutral
-    - confidence >= 0.70: strong_buy, long
-    - confidence >= 0.55: buy, long
+    - confidence >= signal_map.strong_buy: strong_buy, long
+    - confidence >= signal_map.buy: buy, long
     - 그 외: hold, neutral
 
+    임계값은 config.yaml inference.signal_map에서 로드. 없으면 기본값 사용.
     sell/strong_sell은 v1에서 생성하지 않는다.
     """
+    signal_map = {}
+    if cfg is not None:
+        signal_map = cfg.get("inference", {}).get("signal_map", {})
+    strong_buy_thr = float(signal_map.get("strong_buy", 0.70))
+    buy_thr = float(signal_map.get("buy", 0.55))
+
     if not gate_pass:
         return "hold", "neutral"
-    if confidence >= 0.70:
+    if confidence >= strong_buy_thr:
         return "strong_buy", "long"
-    elif confidence >= 0.55:
+    elif confidence >= buy_thr:
         return "buy", "long"
     else:
         return "hold", "neutral"
@@ -1101,7 +1110,7 @@ def main():
                         f"(prev_conf={prev_conf}, prev_signal={prev_signal}) → confidence={cal_p:.3f}"
                     )
 
-            signal, direction = map_signal_and_direction(cal_p, gate_pass=True)
+            signal, direction = map_signal_and_direction(cal_p, gate_pass=True, cfg=cfg)
             name = ticker_name.get(ticker, ticker)
             gate_info = gate_passed_info.get(ticker)
 

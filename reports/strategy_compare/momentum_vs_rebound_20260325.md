@@ -13,7 +13,7 @@
 | Alpha family | Momentum (상승 추세 추종) | Reversal (과매도 반등) |
 | 입력 | DMP tech_features + TTP news | DMP OHLCV chart image + context |
 | SC Builder | jobs/build_strategy_card_momentum.py | jobs/build_strategy_card_rebound.py |
-| 변형 | quant_only / news_only / full | committee (ElasticNet+CNN) |
+| 변형 | quant_only / news_only / full | committee (Tree Core+CNN) |
 
 ## 2. 신호 분포 비교 (20260325)
 
@@ -21,9 +21,8 @@
 |--------|----------|---------|
 | strong_buy | 3 | 2 |
 | buy | 1 | 0 |
-| hold | 0 | 24 |
+| hold | 22 | 24 |
 | sell | 0 | 0 |
-| strong_sell | 22 | 0 |
 | **BUY 합계** | **4** | **2** |
 
 ## 3. BUY 종목 비교
@@ -64,6 +63,6 @@
 ## 7. 제한 사항
 
 - Momentum LightGBM은 아직 fallback heuristic으로 동작 (모델 학습 필요)
-- Rebound CNN은 model.pt 학습 완료 시에만 SC 생성 가능
+- Rebound는 Tree Core + CNN 2-Stage committee 구조 (v1.1). model.pt 학습 완료 시에만 SC 생성 가능
 - 두 전략의 실제 백테스트 성과 비교는 모델 학습 + 전체 기간 backtest 후 가능
 - 현재 비교는 단일 날짜(20260325) 기준 신호 분포 비교

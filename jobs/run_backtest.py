@@ -852,6 +852,22 @@ def main():
         dates, price_panel, tickers, policy, cfg
     )
 
+    # ── zero-fold guard ───────────────────────────────────────
+    if len(fold_results) == 0:
+        wf_cfg = cfg.get("walk_forward", {})
+        train_w = int(wf_cfg.get("train_window", 200))
+        val_w   = int(wf_cfg.get("val_window", 20))
+        purge   = int(wf_cfg.get("purge_days", 5))
+        embargo = int(wf_cfg.get("embargo_days", 5))
+        min_days = train_w + purge + embargo + val_w + 1
+        print(
+            f"[Backtest] 경고: fold 결과 0건 — 기간이 너무 짧습니다. "
+            f"최소 {min_days}거래일 필요 (현재: {len(dates)}일). "
+            f"train_window={train_w}, val_window={val_w}, purge={purge}, embargo={embargo}."
+        )
+        print("[Backtest] 빈 리포트를 저장하지 않고 종료합니다.")
+        sys.exit(0)
+
     # 전체 집계 성과
     main_navs = np.array([r["nav"] for r in simulator.nav_history])
     agg_metrics = compute_metrics(main_navs)

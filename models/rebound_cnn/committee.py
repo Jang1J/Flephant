@@ -9,9 +9,13 @@ v2.0: LightGBM tree core (한국 시장 data-constrained context에서 tree 우�
       SGDClassifier fallback 유지 (LightGBM 미설치 시)
 """
 
+import os
 import pickle
 import numpy as np
 from pathlib import Path
+
+# macOS: LightGBM pickle __setstate__ 시 OMP/MPS 충돌 → segfault 방지
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 MODEL_DIR = Path(__file__).resolve().parent
