@@ -157,5 +157,5 @@ claude --agent gpt-feedback-tracker # GPT Pro 피드백 추적
 ## Phase 구분
 
 - **Phase 1 (완료)**: Mock StrategyCard, UQ synthetic data, deterministic FDA rules
-- **Phase 1.5 (현재)**: 실제 StrategyCard(AI #2) 생성 완료, LightGBM AUC 0.750 + CNN AUC 0.765, 거래세/슬리피지 반영 백테스트, Multi-Agent Debate 구현 예정
-- **Phase 2**: live HourlyPatch, UQ 실데이터(OOF residual), K-OPEN Pulse(교수님 미팅 후), Preference Resolver
+- **Phase 1.5 (현재)**: 실제 StrategyCard(AI #2) 생성 완료, LightGBM AUC 0.742 + CNN AUC 0.766, Multi-Agent Debate 구현 완료, Conformal runtime 연결 완료, O-I Decoupling v1 (overnight 0.616), 거래세/슬리피지 반영 백테스트 (Sharpe 1.69), feature_flags.yaml 도입
+- **Phase 2**: K-OPEN Pulse(교수님 미팅 후), Preference Resolver, O-I v2 true MTL, UQ 실데이터(OOF residual), 유니버스 확장 26→50
