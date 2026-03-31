@@ -142,6 +142,7 @@ def run_e2e(target_date: str, disable_uq: bool = False, use_mock: bool = False):
         strategy_cards=strategy_cards,
         portfolio_state=pf_state,
         backtest_summary=backtest_summary,
+        dmp=dmp,
     )
     results["fdc"] = "OK"
 

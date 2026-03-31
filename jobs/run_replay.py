@@ -18,6 +18,7 @@ _BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_BASE_DIR))
 
 DMP_DIR = _BASE_DIR / "artifacts" / "daily_market_packet"
+SC_DIR = _BASE_DIR / "artifacts" / "strategy_card"
 
 
 def is_weekday(date_str: str) -> bool:
@@ -69,10 +70,9 @@ def run_replay(days: int = 5, disable_uq: bool = False):
             pf_state = pm.load_or_init(td)
 
             # Risk Engine 실행
-            sc_dir = _BASE_DIR / "artifacts" / "strategy_card"
-            has_real_sc = sc_dir.exists() and (
-                (sc_dir / f"SC-{td}.json").exists()
-                or any(sc_dir.glob(f"SC-{td}-*.json"))
+            has_real_sc = SC_DIR.exists() and (
+                (SC_DIR / f"SC-{td}.json").exists()
+                or any(SC_DIR.glob(f"SC-{td}-*.json"))
             )
 
             # prev_cop_path for turnover
@@ -86,11 +86,19 @@ def run_replay(days: int = 5, disable_uq: bool = False):
             rc, cop = run_risk_engine(td, use_mock=not has_real_sc, prev_cop_path=prev_cop_path,
                                      portfolio_state=pf_state, disable_uq=disable_uq)
 
+            # StrategyCard 로드 (real 또는 mock)
+            from jobs.strategy_loader import load_strategy_cards, generate_mock_strategy_cards
+            if has_real_sc:
+                strategy_cards = load_strategy_cards(td)
+            else:
+                strategy_cards = generate_mock_strategy_cards(td, dmp)
+
             # FDA 실행
             fdc = fda.run(
                 target_date=td,
                 cop=cop,
                 risk_card=rc,
+                strategy_cards=strategy_cards,
                 portfolio_state=pf_state,
                 backtest_summary={
                     "status": "phase1_placeholder",
@@ -103,6 +111,7 @@ def run_replay(days: int = 5, disable_uq: bool = False):
                     "last_updated": None,
                     "note": "Phase 1: Backtest Agent 미구현. W6에서 AI #2가 연결 예정.",
                 },
+                dmp=dmp,
             )
 
             # PortfolioState 업데이트

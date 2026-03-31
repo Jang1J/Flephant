@@ -259,6 +259,7 @@ def run_scenario(scenario_label: str, target_date: str, dmp: dict,
         strategy_cards=strategy_cards,
         portfolio_state=pf_state,
         backtest_summary=backtest_summary,
+        dmp=overridden_dmp,
     )
 
     # FDC 파일을 demo 전용 경로로 이동 (기존 아티팩트 덮어쓰기 방지)

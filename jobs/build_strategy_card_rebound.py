@@ -1034,16 +1034,16 @@ def main():
         p_tab_arr = None
         if committee_enabled:
             try:
-                from models.rebound_cnn.committee import load_elasticnet, fuse_scores as _fuse
-                enet = load_elasticnet()
-                if enet is not None:
-                    p_tab_arr = enet.predict_proba(context_np)[:, 1]
+                from models.rebound_cnn.committee import load_tree_core, fuse_scores as _fuse
+                tree_core = load_tree_core()
+                if tree_core is not None:
+                    p_tab_arr = tree_core.predict_proba(context_np)[:, 1]
                     print(
                         f"[SCEmitter] Committee v1.1: Tree Core 예측 완료 "
                         f"(mean={p_tab_arr.mean():.3f})"
                     )
                 else:
-                    print("[SCEmitter] Committee: elasticnet.pkl 없음, CNN 단독 사용")
+                    print("[SCEmitter] Committee: tree_core.pkl 없음, CNN 단독 사용")
             except Exception as e:
                 print(f"[SCEmitter] Committee fusion 실패 ({e}), CNN 단독 사용")
 

@@ -1,12 +1,12 @@
 """
 KR-Rebound-Committee v2.0 (GPT Pro #8)
-- Stage B1: LightGBM/ElasticNet on context features (tabular core)
+- Stage B1: LightGBM tree core on context features (tabular core)
 - Stage B2: CNN branch (existing KR-Rebound-CNN)
 - Stage C: score fusion + agreement-based uncertainty
 
 committee.enabled=false 기본값: 기존 동작 무변경.
-v2.0: ElasticNet → LightGBM tree core 전환 (한국 시장 data-constrained context에서 tree 우위)
-      ElasticNet fallback 유지 (LightGBM 미설치 시)
+v2.0: LightGBM tree core (한국 시장 data-constrained context에서 tree 우위)
+      SGDClassifier fallback 유지 (LightGBM 미설치 시)
 """
 
 import pickle
@@ -17,10 +17,10 @@ _BASE_DIR = Path(__file__).resolve().parent.parent.parent
 MODEL_DIR = Path(__file__).resolve().parent
 
 
-def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
-    """Tree core (LightGBM) 학습. LightGBM 미설치 시 ElasticNet fallback.
+def train_tree_core(X_train, y_train, X_val, y_val, config: dict) -> tuple:
+    """Tree core (LightGBM) 학습. LightGBM 미설치 시 SGDClassifier fallback.
 
-    GPT Pro #8: 한국 시장 data-constrained context에서 tree-based가 ElasticNet보다 안정적.
+    GPT Pro #8: 한국 시장 data-constrained context에서 tree-based가 안정적.
     반환: (model, metrics_dict)
     """
     from sklearn.metrics import roc_auc_score, brier_score_loss
@@ -59,18 +59,18 @@ def train_elasticnet(X_train, y_train, X_val, y_val, config: dict) -> tuple:
         )
         model_type = "LightGBM"
     else:
-        # ElasticNet fallback
+        # SGDClassifier fallback (LightGBM 미설치 시)
         from sklearn.linear_model import SGDClassifier
-        tc_cfg = config.get("tree_core", config.get("elasticnet", {}))
+        tc_cfg = config.get("tree_core", {})
         alpha = tc_cfg.get("alpha", 0.01)
         l1_ratio = tc_cfg.get("l1_ratio", 0.5)
-        print(f"[Committee] ElasticNet fallback: alpha={alpha}, l1_ratio={l1_ratio}")
+        print(f"[Committee] SGDClassifier fallback: alpha={alpha}, l1_ratio={l1_ratio}")
         model = SGDClassifier(
             loss="log_loss", penalty="elasticnet",
             alpha=alpha, l1_ratio=l1_ratio, max_iter=1000, random_state=42,
         )
         model.fit(X_train, y_train)
-        model_type = "ElasticNet"
+        model_type = "SGDClassifier"
 
     train_prob = model.predict_proba(X_train)[:, 1]
     train_auc = roc_auc_score(y_train, train_prob) if len(np.unique(y_train)) >= 2 else 0.5
@@ -121,9 +121,9 @@ def fuse_scores(
 
 
 def save_tree_core(model, path: Path = None):
-    """Tree core 모델을 pickle로 저장. 하위 호환: save_elasticnet()도 동일."""
+    """Tree core 모델을 pickle로 저장."""
     if path is None:
-        path = MODEL_DIR / "elasticnet.pkl"  # 하위 호환 파일명 유지
+        path = MODEL_DIR / "tree_core.pkl"
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
@@ -131,14 +131,10 @@ def save_tree_core(model, path: Path = None):
     print(f"[Committee] Tree core 저장: {path}")
 
 
-# 하위 호환 alias
-save_elasticnet = save_tree_core
-
-
 def load_tree_core(path: Path = None):
     """Tree core 모델 로드. 파일 없으면 None 반환."""
     if path is None:
-        path = MODEL_DIR / "elasticnet.pkl"  # 하위 호환 파일명 유지
+        path = MODEL_DIR / "tree_core.pkl"
     path = Path(path)
     if not path.exists():
         print(f"[Committee] tree_core.pkl 없음: {path}")
@@ -147,10 +143,6 @@ def load_tree_core(path: Path = None):
         model = pickle.load(f)
     print(f"[Committee] Tree core 로드: {path}")
     return model
-
-
-# 하위 호환 alias
-load_elasticnet = load_tree_core
 
 
 def extract_context_arrays(dataset) -> tuple:

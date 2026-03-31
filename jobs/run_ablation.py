@@ -142,6 +142,7 @@ def run_uq_ablation(target_date: str) -> dict:
         risk_card=rc_base,
         portfolio_state=copy.deepcopy(pfs_base),
         backtest_summary=_BACKTEST_PLACEHOLDER,
+        dmp=dmp,
     )
     pfs_base_updated = pm.apply_decisions(
         copy.deepcopy(pfs_base), fdc_base, cop_base, dmp
@@ -166,6 +167,7 @@ def run_uq_ablation(target_date: str) -> dict:
         risk_card=rc_var,
         portfolio_state=copy.deepcopy(pfs_var),
         backtest_summary=_BACKTEST_PLACEHOLDER,
+        dmp=dmp,
     )
     pfs_var_updated = pm.apply_decisions(
         copy.deepcopy(pfs_var), fdc_var, cop_var, dmp
@@ -232,6 +234,7 @@ def run_pfs_ablation(target_date: str) -> dict:
         risk_card=rc_sf,
         portfolio_state=copy.deepcopy(pfs_stateful),
         backtest_summary=_BACKTEST_PLACEHOLDER,
+        dmp=dmp,
     )
     pfs_sf_updated = pm.apply_decisions(
         copy.deepcopy(pfs_stateful), fdc_sf, cop_sf, dmp
@@ -261,6 +264,7 @@ def run_pfs_ablation(target_date: str) -> dict:
         risk_card=rc_sl,
         portfolio_state=copy.deepcopy(pfs_stateless),
         backtest_summary=_BACKTEST_PLACEHOLDER,
+        dmp=dmp,
     )
     pfs_sl_updated = pm.apply_decisions(
         copy.deepcopy(pfs_stateless), fdc_sl, cop_sl, dmp

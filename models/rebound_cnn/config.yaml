@@ -23,7 +23,7 @@ data:
   # 총 context 차원 = n_context_features_base(23) + n_sectors (동적)
   #   = macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
   #     + confirmation(8) + sector_onehot(n_sectors) + market_cap_rank(1)
-  # universe_v1.csv 기준 11개 고유 섹터 → 23 + 11 = 34차원
+  # universe_v1.csv 기준 16개 고유 WICS 섹터 → 23 + 16 = 39차원
   # n_sectors는 preprocess.py _build_wics_sector_list()에서 동적 계산
   context_features:
     macro:               # 4개
@@ -84,6 +84,7 @@ training:
   gradient_clip: 1.0
   seed: 42
   ensemble_seeds: [42, 123, 456]
+  max_pos_weight: 10.0       # pos_weight 상한 (fold별 label 쏠림 시 val_loss 폭발 방지)
 
 calibration:
   method: "isotonic"         # isotonic / platt

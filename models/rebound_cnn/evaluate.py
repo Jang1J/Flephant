@@ -739,7 +739,7 @@ def run_evaluation(eval_date: str = None):
         )
         print(
             f"[Modeler] Committee 평가 완료: "
-            f"tab_auc={committee_result.get('elasticnet_auc')}, "
+            f"tab_auc={committee_result.get('tree_core_auc')}, "
             f"fused_auc={committee_result.get('fused_auc')}"
         )
     else:
@@ -798,8 +798,8 @@ def evaluate_committee_layer(
 ) -> dict:
     """Committee v1.1 평가.
 
-    ElasticNet 단독 AUC, CNN 단독 AUC, Fusion AUC 비교.
-    elasticnet.pkl 없으면 ElasticNet 관련 지표는 None으로 처리.
+    Tree Core 단독 AUC, CNN 단독 AUC, Fusion AUC 비교.
+    tree_core.pkl 없으면 Tree Core 관련 지표는 None으로 처리.
     """
     from sklearn.metrics import roc_auc_score, brier_score_loss
 
@@ -828,7 +828,7 @@ def evaluate_committee_layer(
         except Exception:
             pass
 
-    # ElasticNet 단독 평가
+    # Tree Core 단독 평가
     tab_auc = None
     tab_brier = None
     fused_auc = None
@@ -837,10 +837,10 @@ def evaluate_committee_layer(
     mean_agreement = None
 
     try:
-        from models.rebound_cnn.committee import load_elasticnet, fuse_scores, extract_context_arrays
+        from models.rebound_cnn.committee import load_tree_core, fuse_scores, extract_context_arrays
 
-        enet = load_elasticnet()
-        if enet is not None and eval_ds is not None:
+        tree_core = load_tree_core()
+        if tree_core is not None and eval_ds is not None:
             X, y = extract_context_arrays(eval_ds)
 
             # context_scaler 로드 후 transform (PIT-safe)
@@ -854,7 +854,7 @@ def evaluate_committee_layer(
                 except Exception as _e:
                     print(f"[Modeler] committee scaler transform 실패: {_e}")
 
-            tab_probs = enet.predict_proba(X)[:, 1]
+            tab_probs = tree_core.predict_proba(X)[:, 1]
 
             if len(np.unique(y)) >= 2:
                 try:
@@ -900,7 +900,7 @@ def evaluate_committee_layer(
                 f"mean_agreement={mean_agreement}"
             )
         else:
-            print("[Modeler] Committee 평가: elasticnet.pkl 없음 또는 eval_ds 없음 → 스킵")
+            print("[Modeler] Committee 평가: tree_core.pkl 없음 또는 eval_ds 없음 → 스킵")
     except Exception as e:
         print(f"[Modeler] Committee 평가 실패: {e}")
 
@@ -908,8 +908,8 @@ def evaluate_committee_layer(
         "committee_enabled": config.get("committee", {}).get("enabled", False),
         "cnn_auc": round(cnn_auc, 4),
         "cnn_brier": round(cnn_brier, 6) if not (cnn_brier != cnn_brier) else None,
-        "elasticnet_auc": tab_auc,
-        "elasticnet_brier": tab_brier,
+        "tree_core_auc": tab_auc,
+        "tree_core_brier": tab_brier,
         "fused_auc": fused_auc,
         "fused_brier": fused_brier,
         "mean_agreement": mean_agreement,
@@ -1031,15 +1031,15 @@ def _write_eval_markdown(result: dict, path: Path):
         f"",
         f"---",
         f"",
-        f"## 5. Committee v1.1 (ElasticNet + CNN)",
+        f"## 5. Committee v1.1 (Tree Core + CNN)",
         f"",
         f"| 지표 | 값 |",
         f"|------|-----|",
         f"| Committee 활성화 | {comm.get('committee_enabled', False)} |",
         f"| CNN AUC | {comm.get('cnn_auc')} |",
         f"| CNN Brier | {comm.get('cnn_brier')} |",
-        f"| ElasticNet AUC | {comm.get('elasticnet_auc')} |",
-        f"| ElasticNet Brier | {comm.get('elasticnet_brier')} |",
+        f"| Tree Core AUC | {comm.get('tree_core_auc')} |",
+        f"| Tree Core Brier | {comm.get('tree_core_brier')} |",
         f"| Fused AUC | {comm.get('fused_auc')} |",
         f"| Fused Brier | {comm.get('fused_brier')} |",
         f"| 평균 Agreement | {comm.get('mean_agreement')} |",

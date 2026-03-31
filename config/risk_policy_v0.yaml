@@ -91,6 +91,7 @@ common_filters:
 fda_constraints:
   confidence_threshold: 0.4    # FDA 전용 confidence 임계값 (RiskEngine 0.3보다 보수적)
   low_conf_weight_cap: 10      # confidence < threshold 시 허용 최대 비중 (%)
+  debate_confidence_gap_threshold: 0.3  # confidence_gap 이 값 초과 시 Debate 트리거
   # Backtest 기반 Rule 6 임계값
   backtest_win_rate_warn: 0.35   # Rule 6a: 승률 이하 시 경고
   backtest_win_rate_veto: 0.4    # Rule 6c: 승률 이하 + 고비중 시 veto

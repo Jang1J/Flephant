@@ -29,7 +29,7 @@
     },
     "signal": {
       "type": "string",
-      "enum": ["strong_buy", "buy", "hold", "sell", "strong_sell"],
+      "enum": ["strong_buy", "buy", "hold"],
       "description": "투자 신호"
     },
     "confidence": {
@@ -74,6 +74,16 @@
       "minimum": 0,
       "maximum": 1,
       "description": "UQ 모델의 uncertainty 추정치 (Phase 1에서는 null, Phase 2+에서 활성화)"
+    },
+    "conformal_interval": {
+      "type": ["object", "null"],
+      "description": "Conformal Prediction interval (probability interval). Phase 2+에서 활성화.",
+      "properties": {
+        "lower": { "type": "number", "description": "예측 하한" },
+        "upper": { "type": "number", "description": "예측 상한" },
+        "q_hat": { "type": "number", "description": "nonconformity quantile threshold" },
+        "alpha": { "type": "number", "description": "유의수준 (0.05 = 95% coverage)" }
+      }
     }
   }
 }

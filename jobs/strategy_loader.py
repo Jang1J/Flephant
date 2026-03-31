@@ -131,18 +131,16 @@ def generate_mock_strategy_cards(target_date: str, dmp: dict) -> list:
     cards = []
     tickers = dmp.get("tickers", [])[:10]  # 상위 10종목만
 
-    signals = ["strong_buy", "buy", "hold", "sell", "strong_sell"]
-    signal_weights = [0.2, 0.4, 0.2, 0.15, 0.05]
+    signals = ["strong_buy", "buy", "hold"]
+    signal_weights = [0.2, 0.5, 0.3]
 
     for ticker in tickers:
         signal = random.choices(signals, weights=signal_weights, k=1)[0]
         confidence = round(random.uniform(0.2, 0.95), 2)
 
-        # signal에 따른 direction
+        # signal에 따른 direction (Long-bias: sell/strong_sell 미생성)
         if signal in ["strong_buy", "buy"]:
             direction = "long"
-        elif signal in ["strong_sell", "sell"]:
-            direction = "short"
         else:
             direction = "neutral"
 

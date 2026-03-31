@@ -72,10 +72,10 @@ class ContextEncoder(nn.Module):
     context_features: macro(4) + technical(5) + price_stretch(2) + sector_relative(3)
                       + sector_onehot(n_sectors) + market_cap_rank(1)
 
-    Dense(n_context_features→64)+ReLU+Dropout(0.2) → Dense(64→32)+ReLU → 32-d
+    Dense(n_context_features→64)+ReLU+Dropout(0.3) → Dense(64→32)+ReLU → 32-d
     """
 
-    def __init__(self, n_context_features: int = 26):
+    def __init__(self, n_context_features: int = 39):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_context_features, 64),
@@ -107,10 +107,10 @@ class KRReboundCNN(nn.Module):
     아키텍처 (설계서 준수):
       ImageEncoder   → 128-d
       ContextEncoder → 32-d
-      Concat(128+32=160) → Dense(64)+ReLU+Dropout(0.2) → Dense(1) (logit)
+      Concat(128+32=160) → Dense(64)+BatchNorm+ReLU+Dropout(0.4) → Dense(1) (logit)
     """
 
-    def __init__(self, n_context_features: int = 26):
+    def __init__(self, n_context_features: int = 39):
         super().__init__()
 
         self.image_encoder = ImageEncoder()
@@ -143,7 +143,7 @@ class KRReboundCNN(nn.Module):
 
 
 def build_model(
-    n_context_features: int = 26,
+    n_context_features: int = 39,
     device: torch.device = None,
 ) -> KRReboundCNN:
     """모델 인스턴스 생성 및 device 이동. 출력은 raw logit (BCEWithLogitsLoss 사용)."""
@@ -157,12 +157,12 @@ def build_model(
 
 if __name__ == "__main__":
     device = _get_device()
-    n_ctx = 26
+    n_ctx = 39
     model = build_model(n_context_features=n_ctx, device=device)
 
     # 설계서 §11.1 아키텍처 확인
     # ImageEncoder: Conv32+BN+ReLU+MaxPool(2) → Conv64+BN+ReLU+MaxPool(2) → Conv128+BN+ReLU → AdaptiveAvgPool(1,1)
-    # FusionHead: Dense(64)+ReLU+Dropout(0.2) → Dense(1) [logit, no Sigmoid]
+    # FusionHead: Dense(64)+BatchNorm+ReLU+Dropout(0.4) → Dense(1) [logit, no Sigmoid]
     B = 4
     chart = torch.randn(B, 3, 64, 64, device=device)
     context = torch.randn(B, n_ctx, device=device)

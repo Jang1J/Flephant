@@ -79,6 +79,7 @@ class FinalDecisionAgent:
         portfolio_state: dict | None = None,
         backtest_summary: dict | None = None,
         snapshot_hour: int = 18,
+        dmp: dict | None = None,
     ) -> dict:
         """
         FDA 실행: COP의 각 order에 대해 approve/veto 판정
@@ -140,11 +141,16 @@ class FinalDecisionAgent:
                 else:
                     conflict_type = "confidence_weight_conflict"
 
+                sc = sc_map.get(ticker, {})
+                _fda_conf = self._policy.get("fda_constraints", {}).get("confidence_threshold", 0.4)
+                _order_conf = order.get("confidence", 0.0)
+                _confidence_gap = max(0.0, float(_fda_conf) - float(_order_conf))
                 conflicts.append({
                     "ticker": ticker,
                     "conflict_type": conflict_type,
                     "description": veto_reason,
                     "resolution": f"veto 처리 ({conflict_type})",
+                    "confidence_gap": round(_confidence_gap, 4),
                 })
 
             # SC의 uncertainty_score를 FDC에 전달 (SC → COP order에 있거나 SC map에서 추출)
@@ -172,6 +178,32 @@ class FinalDecisionAgent:
         # conflict 항목별 LLM 갈등 분석 추가
         if conflicts and self.use_llm:
             conflicts = self._analyze_conflicts(conflicts, sc_map)
+
+        # Multi-Agent Debate 트리거 (explanation/audit only — 판정 불변)
+        if conflicts and dmp:
+            from agents.debate_agent import DebateAgent
+            debate_agent = DebateAgent()
+            dmp_macro = dmp.get("macro_snapshot", {})
+            # COP order를 ticker로 인덱싱
+            order_map = {o["ticker"]: o for o in cop.get("orders", [])}
+            for conflict in conflicts:
+                if self._should_debate(conflict):
+                    ticker = conflict.get("ticker", "")
+                    order = order_map.get(ticker, {"ticker": ticker})
+                    try:
+                        debate_log = debate_agent.run_debate(
+                            ticker=ticker,
+                            order=order,
+                            sc_map=sc_map,
+                            risk_card=risk_card,
+                            dmp_macro=dmp_macro,
+                            portfolio_state=portfolio_state,
+                            debate_triggered_by=conflict.get("conflict_type", "confidence_gap"),
+                        )
+                        conflict["debate_log"] = debate_log
+                        print(f"  [FDA] [{ticker}] Debate 완료 (consensus={debate_log.get('consensus_score')})")
+                    except Exception as e:
+                        print(f"  [FDA] [{ticker}] Debate 실패 (skip): {e}")
 
         # LLM explanation 생성
         explanation = self._generate_explanation(
@@ -327,13 +359,28 @@ class FinalDecisionAgent:
 
         return "approve", None, False
 
+    def _should_debate(self, conflict: dict) -> bool:
+        """Debate 트리거 조건: regime_conflict 또는 confidence_gap > threshold."""
+        conflict_type = conflict.get("conflict_type", "")
+
+        # regime_conflict는 항상 Debate
+        if conflict_type == "regime_conflict":
+            return True
+
+        # confidence_gap 직접 읽기
+        confidence_gap = conflict.get("confidence_gap", 0.0)
+        threshold = self._policy.get("fda_constraints", {}).get("debate_confidence_gap_threshold", 0.3)
+        if confidence_gap > threshold:
+            return True
+
+        return False
+
     def _analyze_conflicts(self, conflicts: list, sc_map: dict) -> list:
         """
         conflict 항목별 Kanana-o LLM 갈등 분석 추가
         각 conflict 항목에 llm_conflict_analysis 필드를 추가한다.
         LLM 실패 시 null.
         """
-        import re
         try:
             from connectors.llm_router import call_llm
         except Exception as e:

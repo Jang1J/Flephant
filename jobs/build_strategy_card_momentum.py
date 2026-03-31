@@ -99,7 +99,7 @@ def load_ttp_news_signal(target_date: str, ticker: str) -> float:
     TTP에서 ticker의 news_signal을 추출한다.
     TTP 파일이 없거나 필드가 없으면 0.0 반환.
 
-    news_signal 계산: ticker_docs의 sentiment_score 평균 (없으면 0.0).
+    news_signal 계산: target_company_docs의 sentiment_score 평균 (없으면 0.0).
     """
     ttp_path = TTP_DIR / f"TTP-{target_date}-{ticker}.json"
     if not ttp_path.exists():
@@ -115,9 +115,9 @@ def load_ttp_news_signal(target_date: str, ticker: str) -> float:
     if "news_signal" in ttp:
         return float(ttp["news_signal"])
 
-    # ticker_docs의 sentiment_score 평균
+    # target_company_docs의 sentiment_score 평균
     scores = []
-    for doc in ttp.get("ticker_docs", []):
+    for doc in ttp.get("target_company_docs", []):
         s = doc.get("sentiment_score")
         if s is not None:
             try:
@@ -422,6 +422,7 @@ def make_strategy_card(
         ],
         "features_used":    feature_names,
         "uncertainty_score": None,
+        "conformal_interval": None,
     }
 
 
@@ -518,6 +519,15 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
     quant_scores_arr = predict_quant_scores(model, X)
     print(f"[SCMomentum] Quant scores 예측 완료")
 
+    # Conformal Predictor 로드 (한 번만, 없으면 graceful skip)
+    conformal_predictor = None
+    try:
+        from models.strategy_model.conformal import ConformalPredictor
+        conformal_predictor = ConformalPredictor.load()
+        print("[SCMomentum] Conformal predictor 로드 완료")
+    except Exception as e:
+        print(f"[SCMomentum] Conformal predictor 없음, interval 생성 skip: {e}")
+
     # TTP에서 news_signal 수집
     news_signals: dict = {}
     for ticker in tickers:
@@ -541,6 +551,25 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
     ranked = np.argsort(np.argsort(synth_scores)).astype(float)  # 0 ~ n-1
     ranked_norm = ranked / max(n - 1, 1) * 2.0 - 1.0  # [-1, 1]
 
+    # Conformal interval 사전 계산 (전체 quant_scores 벡터에 일괄 적용)
+    conformal_intervals = None
+    if conformal_predictor is not None and conformal_predictor.q_hat is not None:
+        try:
+            lower_arr, upper_arr, q_hat_val = conformal_predictor.predict_interval(
+                np.array(quant_scores_arr, dtype=np.float64)
+            )
+            conformal_intervals = {
+                tickers[i]: {
+                    "lower": round(float(lower_arr[i]), 4),
+                    "upper": round(float(upper_arr[i]), 4),
+                    "q_hat": round(float(q_hat_val), 4),
+                    "alpha": conformal_predictor.alpha,
+                }
+                for i in range(n)
+            }
+        except Exception as e:
+            print(f"[SCMomentum] Conformal interval 계산 실패 (skip): {e}")
+
     for i, ticker in enumerate(tickers):
         name = ticker_name_map.get(ticker, ticker)
         qs   = float(quant_scores_arr[i])
@@ -548,18 +577,30 @@ def build_momentum_strategy_cards(target_date: str) -> dict:
 
         # Branch 1: synthesized — rank-normalized score 사용
         pre_synth = round(float(ranked_norm[i]), 4)
-        momentum_cards.append(make_strategy_card(
+        card_synth = make_strategy_card(
             target_date, ticker, name, qs, ns,
             pre_synth, "synthesized", feature_names, min_conf
-        ))
+        )
+        if conformal_intervals and ticker in conformal_intervals:
+            ci = conformal_intervals[ticker]
+            card_synth["conformal_interval"] = ci
+            interval_width = ci["upper"] - ci["lower"]
+            card_synth["uncertainty_score"] = round(min(max(interval_width, 0.0), 1.0), 4)
+        momentum_cards.append(card_synth)
 
         # Branch 2: quant only — quant rank-normalized
         q_ranked = np.argsort(np.argsort(quant_scores_arr)).astype(float)
         q_norm = q_ranked / max(n - 1, 1) * 2.0 - 1.0
-        quant_only_cards.append(make_strategy_card(
+        card_quant = make_strategy_card(
             target_date, ticker, name, qs, ns,
             round(float(q_norm[i]), 4), "quant", feature_names, min_conf
-        ))
+        )
+        if conformal_intervals and ticker in conformal_intervals:
+            ci = conformal_intervals[ticker]
+            card_quant["conformal_interval"] = ci
+            interval_width = ci["upper"] - ci["lower"]
+            card_quant["uncertainty_score"] = round(min(max(interval_width, 0.0), 1.0), 4)
+        quant_only_cards.append(card_quant)
 
         # Branch 3: news only
         news_only_cards.append(make_strategy_card(

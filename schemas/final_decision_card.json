@@ -13,6 +13,10 @@
       "type": "string",
       "format": "date-time"
     },
+    "generated_at": {
+      "type": "string",
+      "description": "FDC 생성 시각 (ISO 8601)"
+    },
     "artifact_version": {
       "type": "string",
       "description": "스키마 버전 (e.g., v1.0)"
@@ -91,6 +95,46 @@
               },
               "reasoning": { "type": "string", "description": "근거 요약 1문장" },
               "model_used": { "type": "string", "description": "사용된 LLM 모델명" }
+            }
+          },
+          "debate_log": {
+            "type": "object",
+            "description": "Multi-Agent Debate 로그 (audit only, 판정 불변). Debate 미트리거 시 필드 없음.",
+            "properties": {
+              "ticker": { "type": "string" },
+              "personas": {
+                "type": "object",
+                "properties": {
+                  "foreigner": {
+                    "type": "object",
+                    "properties": {
+                      "argument": { "type": "string" },
+                      "stance": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                      "key_factors": { "type": "array", "items": { "type": "string" } }
+                    }
+                  },
+                  "institution": {
+                    "type": "object",
+                    "properties": {
+                      "argument": { "type": "string" },
+                      "stance": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                      "key_factors": { "type": "array", "items": { "type": "string" } }
+                    }
+                  },
+                  "retail": {
+                    "type": "object",
+                    "properties": {
+                      "argument": { "type": "string" },
+                      "stance": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                      "key_factors": { "type": "array", "items": { "type": "string" } }
+                    }
+                  }
+                }
+              },
+              "moderator_summary": { "type": "string" },
+              "consensus_score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "models_used": { "type": "array", "items": { "type": "string" } },
+              "debate_triggered_by": { "type": "string" }
             }
           }
         }

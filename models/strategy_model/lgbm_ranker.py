@@ -655,6 +655,8 @@ def train_walk_forward(df: pd.DataFrame, config: dict) -> list[dict[str, Any]]:
             "oi_aucs": oi_aucs,
             "feature_cols": available_cols,
             "col_means": col_means.to_dict(),
+            "val_predictions": val_scores,
+            "val_labels": y_val,
         }
         fold_results.append(fold_result)
 
@@ -751,6 +753,26 @@ def _save_model(fold_results: list[dict], run_id: str) -> None:
     _shutil.copy2(model_path, latest_path)
     print(f"[LGBMRanker] Latest 모델 복사: {latest_path}")
 
+    # Conformal Predictor 교정 (마지막 fold의 validation predictions 사용)
+    try:
+        from models.strategy_model.conformal import ConformalPredictor
+
+        val_preds = last_fold.get("val_predictions")
+        val_labels = last_fold.get("val_labels")
+
+        if val_preds is not None and val_labels is not None and len(val_preds) > 0:
+            cp = ConformalPredictor(alpha=0.05)
+            cal_metrics = cp.calibrate(
+                np.array(val_preds, dtype=np.float64),
+                np.array(val_labels, dtype=np.float64),
+            )
+            cp.save()
+            print(f"[LGBMRanker] Conformal 교정 완료: q_hat={cal_metrics['q_hat']:.4f}")
+        else:
+            print("[LGBMRanker] Conformal 교정 skip: val_predictions/val_labels 없음")
+    except Exception as e:
+        print(f"[LGBMRanker] Conformal 교정 skip: {e}")
+
     # 피처 중요도 (전체 fold 평균)
     importance_accum: dict[str, list[float]] = {}
     for fold in fold_results:
@@ -780,7 +802,7 @@ def _save_model(fold_results: list[dict], run_id: str) -> None:
     # fold 메타 (모델 객체 제외)
     meta_path = OUTPUT_DIR / f"fold_meta_{run_id}.json"
     meta = [
-        {k: v for k, v in fold.items() if k not in ("model",)}
+        {k: v for k, v in fold.items() if k not in ("model", "ordinal_model", "oi_models", "val_predictions", "val_labels")}
         for fold in fold_results
     ]
     # col_means의 NaN 처리

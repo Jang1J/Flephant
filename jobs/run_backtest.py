@@ -391,6 +391,13 @@ class PortfolioSimulator:
                     "cost": round(cost, 2), "ret": round(sell_p / pos["entry_price"] - 1, 4),
                 })
 
+        # 손절 자체가 turnover_cap을 초과한 경우 경고 (손절은 리스크 관리상 강제 실행)
+        if stop_turnover > self.turnover_cap:
+            print(
+                f"[Backtest] 경고: {t1_date} 손절 turnover {stop_turnover:.2%} > cap {self.turnover_cap:.2%}. "
+                "일반 매도/매수는 전량 차단."
+            )
+
         # ── 매도 (보유 중이나 대상 아닌 종목) ──────────────────
         sell_candidates = [tk for tk in list(self.positions.keys()) if tk not in selected_tickers]
         sell_turnover = 0.0

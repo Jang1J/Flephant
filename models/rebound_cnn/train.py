@@ -53,17 +53,25 @@ def _get_device():
         return None
 
 
-def _compute_pos_weight(dataset) -> float:
+def _compute_pos_weight(dataset, max_pos_weight: float = 10.0) -> float:
     """
     Weighted BCE를 위한 pos_weight 계산.
     pos_weight = n_neg / n_pos (설계서 기준)
+    max_pos_weight: 폴드별 label 분포 쏠림 시 val_loss 폭발 방지를 위한 상한.
     """
     labels = [float(s["label"]) for s in dataset.samples]
     n_pos = sum(labels)
     n_neg = len(labels) - n_pos
     if n_pos == 0:
         return 1.0
-    return n_neg / n_pos
+    raw = n_neg / n_pos
+    if raw > max_pos_weight:
+        print(
+            f"[Modeler] pos_weight 상한 적용: {raw:.2f} → {max_pos_weight:.2f} "
+            f"(n_pos={int(n_pos)}, n_neg={int(n_neg)})"
+        )
+        return max_pos_weight
+    return raw
 
 
 def _collect_model_outputs(model, loader, device):
@@ -532,9 +540,10 @@ def run_training(config_path: Path):
             print(f"[Modeler] Fold {fold_idx} val 샘플 0개 → train 샘플을 val로 겸용")
             val_ds = train_ds
 
-        # pos_weight 계산 (n_neg / n_pos)
-        pos_weight = _compute_pos_weight(train_ds)
-        print(f"[Modeler] Fold {fold_idx} pos_weight={pos_weight:.4f}")
+        # pos_weight 계산 (n_neg / n_pos), config의 max_pos_weight로 상한 적용
+        max_pw = float(config["training"].get("max_pos_weight", 10.0))
+        pos_weight = _compute_pos_weight(train_ds, max_pos_weight=max_pw)
+        print(f"[Modeler] Fold {fold_idx} pos_weight={pos_weight:.4f} (max={max_pw})")
 
         train_loader = td_utils.DataLoader(
             train_ds, batch_size=batch_size, shuffle=True, drop_last=False
@@ -639,14 +648,23 @@ def run_training(config_path: Path):
         try:
             from models.rebound_cnn.committee import (
                 extract_context_arrays,
-                train_elasticnet as train_tree_core,
-                save_elasticnet as save_tree_core,
+                train_tree_core,
+                save_tree_core,
             )
 
             if last_val_loader is not None and best_ensemble_result is not None:
                 last_fold_train_dates, last_fold_val_dates = folds[-1]
                 train_ds_tc = ReboundDataset(dmp_dir, last_fold_train_dates, config)
-                val_ds_tc = ReboundDataset(dmp_dir, last_fold_val_dates, config)
+                # val_context_dates: lookback 확보를 위해 train_dates를 history로 포함하고
+                # sample_dates는 val_dates만 사용 (CNN fold loop와 동일 패턴)
+                val_context_dates_tc = last_fold_train_dates + last_fold_val_dates
+                val_ds_tc = ReboundDataset(
+                    dmp_dir, val_context_dates_tc, config,
+                    sample_dates=last_fold_val_dates if last_fold_val_dates else None,
+                )
+                if len(val_ds_tc) == 0:
+                    print("[Modeler] Committee: val 샘플 0개 → train 샘플을 val로 겸용")
+                    val_ds_tc = train_ds_tc
 
                 scaler_path_tc = MODEL_DIR / "context_scaler.pkl"
                 if scaler_path_tc.exists():

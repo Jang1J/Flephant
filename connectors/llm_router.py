@@ -117,6 +117,24 @@ def call_gpt4o(
     }
 
 
+_IGNORE_PATTERNS = [
+    "카카오에서 만든",
+    "AI 어시스턴트",
+    "무엇을 도와드릴까요",
+    "어떤 도움이 필요하신가요",
+]
+
+
+def _is_valid_response(response_text: str) -> bool:
+    """LLM 응답이 시스템 프롬프트를 이행했는지 검증."""
+    if not response_text or len(response_text.strip()) < 5:
+        return False
+    for pattern in _IGNORE_PATTERNS:
+        if pattern in response_text:
+            return False
+    return True
+
+
 def call_llm(
     messages: list[dict],
     temperature: float = 0.0,
@@ -136,6 +154,12 @@ def call_llm(
         for attempt in range(2):
             try:
                 result = call_kanana(messages, temperature=temperature, max_tokens=max_tokens)
+                if not _is_valid_response(result["content"]):
+                    err_msg = "Kanana 응답 품질 검증 실패 (자기소개/무관 응답)"
+                    errors.append(err_msg)
+                    _record_kanana_failure()
+                    print(f"[LLM Router] 응답 품질 검증 실패, fallback 전환")
+                    break
                 _record_kanana_success()
                 result["kanana_errors"] = []
                 print(f"[LLM Router] Kanana-o 성공 (model={result['model']}, attempt={attempt+1})")
