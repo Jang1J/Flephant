@@ -237,8 +237,9 @@ oversold/reversal 반등 포착 보조 전략.
 #### 4-3. O-I Decoupling (Overnight-Intraday 분리)
 
 한국 시장 특화 novelty. 한국장은 전날 미국장의 영향으로 overnight과 intraday 수익률이 다르게 움직인다.
-- overnight_direction 보조 모델: AUC 0.616
-- intraday_direction 보조 모델: AUC 0.547
+- overnight_direction 보조 모델: 9-fold avg AUC 0.527 (max 0.616, min 0.438)
+- intraday_direction 보조 모델: 9-fold avg AUC 0.513 (max 0.554, min 0.459)
+- 현재 피처셋으로는 O-I 분리 신호가 약함. K-SHIFT OSP 데이터 추가 시 개선 기대
 - 학술 claim: "한국장에서 밤과 낮이 다르게 움직인다"
 
 #### 4-4. Conformal Prediction (불확실성 정량화)
@@ -355,8 +356,8 @@ K-SHIFT 4개 patch의 구현 우선순위를 한국 고유 신호 순서로 명�
 | LightGBM Ordinal AUC | 0.736 | 3-class ranking |
 | LightGBM P@5 | 0.511 | 상위 5종목 정밀도 |
 | CNN AUC | 0.766 | 13-fold avg (Gate OFF train) |
-| O-I Overnight AUC | 0.616 | 야간 수익 방향 |
-| O-I Intraday AUC | 0.547 | 주간 수익 방향 |
+| O-I Overnight AUC | 0.527 (9-fold avg, max 0.616) | 야간 수익 방향. 현재 피처셋 한계 |
+| O-I Intraday AUC | 0.513 (9-fold avg, max 0.554) | 주간 수익 방향. K-SHIFT 추가 시 개선 기대 |
 | Conformal q_hat | 0.718 | 95% coverage |
 | Backtest Sharpe | 1.69 | 거래세+슬리피지 포함 |
 | Backtest MDD | -7.90% | |
