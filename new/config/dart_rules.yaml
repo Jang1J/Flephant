@@ -1,0 +1,44 @@
+# KOSPI Decision OS v2.1 — DART 공시 분류 규칙
+# Mode B에서 GPT-4o가 매일 밤 갱신.
+
+version: "1.0.0"
+last_updated: "2026-04-06"
+updated_by: "initial"
+
+critical:  # 즉시 Kanana-o 분석
+  - "영업이익"
+  - "순이익"
+  - "실적"
+  - "하향"
+  - "상향"
+  - "대표이사"
+  - "합병"
+  - "분할"
+  - "유상증자"
+  - "감사의견"
+  - "상장폐지"
+  - "공개매수"
+
+important:  # Kanana-o 분석
+  - "수주"
+  - "계약"
+  - "자사주"
+  - "배당"
+  - "신규사업"
+  - "투자"
+
+low:  # 무시 (Kanana-o 안 부름)
+  - "임원 보수"
+  - "주주총회"
+  - "사업보고서"
+  - "분기보고서"
+  - "정관 변경"
+
+skip:  # 완전 무시
+  - "공시 정정 (경미)"
+  - "단순 참고"
+
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"
+  method: "llm_review"

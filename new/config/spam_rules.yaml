@@ -1,0 +1,19 @@
+# KOSPI Decision OS v2.1 — 커뮤니티 스팸 필터 규칙
+# Mode B에서 GPT-4o가 매일 밤 갱신.
+
+version: "1.0.0"
+last_updated: "2026-04-06"
+
+filters:
+  - type: "length_filter"
+    condition: "length < 10"
+  - type: "url_spam"
+    condition: "contains_url AND length < 50"
+  - type: "keyword_spam"
+    keywords: ["리딩방", "VIP방", "수익인증", "텔레그램", "무료 체험", "카톡 문의"]
+  - type: "repeat_detector"
+    condition: "same_user_same_ticker > 3 in 10min"
+
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"

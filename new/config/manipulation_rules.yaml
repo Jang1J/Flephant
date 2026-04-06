@@ -1,0 +1,20 @@
+# KOSPI Decision OS v2.1 — 커뮤니티 조작 탐지 규칙
+# Mode B에서 GPT-4o가 매일 밤 갱신.
+
+version: "1.0.0"
+last_updated: "2026-04-06"
+
+rules:
+  - name: "repeat_pump"
+    condition: "같은 종목 + 극단 긍정 + 5분 내 10건+"
+    action: "manipulation_flag = true"
+  - name: "coordinated_timing"
+    condition: "3개+ 계정이 1분 내 동시 게시"
+    action: "manipulation_flag = true"
+  - name: "extreme_sentiment"
+    condition: "sentiment > 0.95 AND spike_ratio > 5.0"
+    action: "manipulation_flag = true"
+
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"

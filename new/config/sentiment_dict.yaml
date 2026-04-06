@@ -1,0 +1,24 @@
+# KOSPI Decision OS v2.1 — 커뮤니티 감성 사전
+# Mode B에서 GPT-4o가 매일 밤 갱신.
+
+version: "1.0.0"
+last_updated: "2026-04-06"
+
+positive:
+  strong: ["떡상", "상한가", "대박", "수주 확정", "역대 최고"]
+  medium: ["기대", "매수", "반등", "외국인 매수", "실적 호조"]
+  weak: ["괜찮", "버틸만", "존버", "홀드"]
+
+negative:
+  strong: ["폭락", "하한가", "상폐", "실적 쇼크", "파산"]
+  medium: ["손절", "물타기", "외국인 매도", "공매도", "하락"]
+  weak: ["불안", "관망", "갈아타자", "고민"]
+
+weights:
+  strong: 1.0
+  medium: 0.5
+  weak: 0.2
+
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"

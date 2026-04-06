@@ -1,0 +1,45 @@
+# KOSPI Decision OS v2.1 — News Filter Configuration
+# 이 키워드 목록은 Mode B에서 LLM이 매일 밤 갱신한다.
+# 정적 목록이 아닌 진화하는 필터.
+# last_updated는 Mode B 실행 시 자동 갱신.
+
+last_updated: "2026-04-06"
+version: "1.0.0"
+
+# Level 1: 종목명 매칭 (확실한 관련)
+ticker_keywords:
+  "005930": ["삼성전자", "삼전", "Samsung Electronics", "SEC"]
+  "000660": ["SK하이닉스", "하이닉스", "SK Hynix", "HBM"]
+  "006400": ["삼성SDI", "SDI"]
+  "051910": ["LG화학", "LG에너지솔루션", "LGES"]
+  # ... 나머지 종목은 구현 시 universe_config에서 자동 생성
+
+# Level 2: 섹터 키워드 (높은 관련)
+sector_keywords:
+  반도체: ["반도체", "메모리", "HBM", "파운드리", "낸드", "D램", "TSMC", "ASML", "EUV", "전력반도체"]
+  조선: ["조선", "LNG선", "수주", "선박", "해양플랜트", "HD현대", "한화오션"]
+  2차전지: ["배터리", "양극재", "음극재", "리튬", "전고체", "LFP", "NCM", "전해질"]
+  방산: ["방산", "K-방산", "무기", "미사일", "KF-21", "수출 계약"]
+  # 나머지 2섹터는 유니버스 확정 후 추가
+
+# Level 3: 시장 전체 키워드 (간접 영향)
+market_keywords:
+  거시: ["금리", "환율", "인플레이션", "GDP", "고용"]
+  지정학: ["무역전쟁", "제재", "관세", "미중", "러시아", "중동"]
+  수급: ["외국인", "기관", "공매도", "프로그램매매", "순매수", "순매도"]
+  시장: ["KOSPI", "코스피", "상한가", "하한가", "VI발동", "서킷브레이커"]
+
+# 필터 규칙
+filter_rules:
+  match_in: ["title", "summary"]    # 제목+요약에서만 검색 (속도 위해 본문 제외)
+  match_any: true                    # 하나라도 매칭이면 2차(Kanana-o)로 전달
+  case_sensitive: false
+
+# Mode B 자동 갱신 설정
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"          # 매일 장마감 후 실행
+  method: "llm_review"               # LLM이 오늘 놓친 뉴스 분석 → 키워드 추가/제거 제안
+  max_keywords_per_category: 30      # 카테고리당 최대 키워드 수 (무한 증식 방지)
+  decay_unused_days: 30              # 30일 매칭 0건인 키워드 → 제거 후보
+  human_approval: false              # 자동 반영 (true로 변경하면 사람 승인 후 반영)
