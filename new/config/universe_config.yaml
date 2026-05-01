@@ -1,6 +1,26 @@
-# KOSPI Decision OS v2.1 — Universe Configuration
-# 30종목 SSOT. 모든 모듈이 이 파일을 참조.
+# KOSPI Decision OS v3 — Universe Configuration
+# 30종목 Trade Universe SSOT. Hot Path/Backtest/배포 대상은 이 파일을 따른다.
 # news_filter.yaml 키워드 자동 생성의 기반.
+# Sprint 5의 KOSPI200 감시는 별도 watch_universe_kospi200.yaml로 분리한다.
+#
+# v2.2 변경: mode_b_metadata + backtest_universe_mode 섹션 추가
+
+mode_b_metadata:
+  schema_version: "1.0.0"
+  data_version: "1.0.0"
+  last_updated: "2026-04-06"
+  updated_by: "initial"
+  mode_b_editable: false          # universe는 Mode B가 자동 수정 금지 (수동 업데이트만)
+  human_approval_required: true   # 종목 추가/제거는 operator 승인 필수
+  backup_retention_days: 365      # universe는 장기 보관
+  update_trigger: "manual_only"
+  rationale: "universe는 실거래 대상이므로 Mode B가 자동으로 종목을 추가/제거하지 않는다. pending 10종목 확정도 operator가 수동 승인."
+
+backtest_universe_mode:            # v2.2 — Backtest Agent universe 정책
+  default: "active_only"           # Backtest는 확정 20종목만 사용
+  allow_pending: false             # pending 10종목 제외
+  rationale: "pending 종목은 데이터 검증 미완. Backtest 결과 신뢰도를 위해 active 20만 사용."
+  override_flag: "backtest_config.include_pending"  # Sprint 4에서 overrideable
 
 version: "1.0.0"
 last_updated: "2026-04-06"
@@ -63,3 +83,9 @@ filter_rules:
   min_market_cap: null          # 추후 설정 (억원)
   min_daily_volume: null        # 추후 설정
   active_only: true             # active 종목만 사용
+
+
+watch_universe_note:
+  separate_from_trade_universe: true
+  sprint5_ref: "watch_universe_kospi200.yaml"
+  rationale: "trade universe(active 20 + pending 10)와 event watch universe를 분리해 SSOT 충돌 방지"

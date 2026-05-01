@@ -1,0 +1,103 @@
+# KOSPI Decision OS v3 — FailureCaseCard + RegressionCase Schema
+# Backtest Agent (C12) 출력 산출물 2종의 스키마 정의.
+# v3 신규. 팀원안의 FailureCaseCard 아이디어 + Claude regression_case 분리.
+#
+# 용도:
+#   - FailureCaseCard: 일반 실패/교훈 카드 (발표/심사/팀 공유)
+#   - RegressionCase: 회귀 위험 전용 증거 (Mode B 배포 게이트 근거)
+
+FailureCaseCard:
+  description: "Backtest Agent가 발견한 일반 실패/교훈 사례를 카드 형태로 기록. 교수님/팀 공유/발표용."
+  id_format: "FCC-{yyyymmdd}-{seq}"
+  fields:
+    case_id:
+      type: string
+      format: "FCC-{yyyymmdd}-{seq}"
+      description: "고유 식별자"
+    regime:
+      type: string
+      enum: [bull, bear, sideways, volatile]
+      description: "실패 시점의 시장 국면"
+    trade_id:
+      type: string
+      description: "관련 거래 ID (order_plan_id 참조)"
+    ticker:
+      type: string
+      description: "6자리 종목코드"
+    expected_pnl:
+      type: float
+      description: "예상 수익률"
+    actual_pnl:
+      type: float
+      description: "실현 수익률"
+    root_cause:
+      type: string
+      description: "실패 원인 분석 (GPT-4o diagnostic_notes 기반)"
+    severity:
+      type: string
+      enum: [low, medium, high]
+      description: "실패 심각도"
+    lesson:
+      type: string
+      description: "교훈 — 다음 날 어떤 constraint를 바꿀지"
+    created_at:
+      type: ISO8601
+    bundle_id:
+      type: string
+      description: "해당 candidate_bundle 참조"
+  storage:
+    location: "KB (Knowledge Base)"
+    ttl: "없음 (전체 이력 보존)"
+  used_by:
+    - "Backtest Agent (C12) output"
+    - "Mode B 에이전트 자기 개선 (§8.5)"
+    - "교수님 발표 / 팀 공유"
+
+RegressionCase:
+  description: "v2.2/v3 업데이트 후 성능 퇴화(회귀) 증거를 별도 기록. FailureCaseCard와 분리."
+  id_format: "RGC-{yyyymmdd}-{seq}"
+  fields:
+    case_id:
+      type: string
+      format: "RGC-{yyyymmdd}-{seq}"
+    baseline_sharpe:
+      type: float
+      description: "직전 배포 버전의 Sharpe ratio"
+    candidate_sharpe:
+      type: float
+      description: "후보 bundle의 Sharpe ratio"
+    delta_sharpe:
+      type: float
+      description: "candidate - baseline. 음수면 회귀"
+    baseline_mdd:
+      type: float
+    candidate_mdd:
+      type: float
+    delta_mdd:
+      type: float
+      description: "candidate - baseline. 양수(더 나쁜 MDD)면 회귀"
+    regime:
+      type: string
+      enum: [bull, bear, sideways, volatile]
+      description: "회귀가 특정 국면에서만 발생하는지"
+    root_cause:
+      type: string
+      description: "회귀 원인 (GPT-4o reasoning)"
+    severity:
+      type: string
+      enum: [low, medium, high]
+    ablation_component:
+      type: string
+      enum: [factor, model, allocator, null]
+      description: "회귀를 유발한 구성요소 (ablation 기반)"
+    created_at:
+      type: ISO8601
+    bundle_id:
+      type: string
+  storage:
+    location: "KB (Knowledge Base)"
+    ttl: "없음 (전체 이력 보존)"
+  used_by:
+    - "Backtest Agent (C12) deploy_decision_gate"
+    - "Mode B 22:00 배포 결정 근거"
+    - "Thompson Sampling posterior 업데이트"

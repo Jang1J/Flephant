@@ -1,0 +1,32 @@
+# KOSPI Decision OS Sprint 5 — Watch Universe (KOSPI200)
+# trade universe와 분리된 이벤트 감시 전용 universe
+
+version: "0.1.0"
+last_updated: "2026-04-10"
+status: "blueprint"
+
+mode_b_metadata:
+  schema_version: "0.1.0"
+  data_version: "0.1.0"
+  last_updated: "2026-04-10"
+  updated_by: "initial + s2_audit_phase_4 (2026-04-21)"
+  mode_b_editable: false
+  human_approval_required: true
+  backup_retention_days: 365
+  update_trigger: "manual_only"
+  rationale: "KOSPI200 전체 감시 universe. trade_universe 와 별도 SSOT. Sprint 5 동적 편입 정책 직결. 자동 변경 금지."
+
+source_of_truth:
+  market: "KOSPI200"
+  usage: "news/dart/community/krx_investor_flow/price_snapshot 감시 전용"
+  note: "실거래 대상은 universe_config.yaml의 active 20 + pending 10이며, 이 파일은 watch scope만 규정"
+
+watch_rules:
+  exclude_trade_universe: true
+  allow_dynamic_candidate_pool: true
+  candidate_pool_max: 10
+  holdings_max: 5
+
+generation:
+  method: "KRX constituent list import"
+  aliases_auto_generate: true

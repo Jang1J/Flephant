@@ -1,0 +1,42 @@
+# KOSPI Decision OS Sprint 5 — Dynamic Event Universe Configuration
+
+version: "0.1.0"
+last_updated: "2026-04-10"
+status: "blueprint"
+
+mode_b_metadata:
+  schema_version: "0.1.0"
+  data_version: "0.1.0"
+  last_updated: "2026-04-10"
+  updated_by: "initial"
+  mode_b_editable: false
+  human_approval_required: true
+  backup_retention_days: 365
+  update_trigger: "manual_only"
+  rationale: "동적 유니버스 정책은 리스크 직결. Mode B 자동 수정 금지."
+
+admission:
+  event_driven_only: true
+  candidate_pool_max: 10
+  holdings_max: 5
+  min_signal_strength: 2
+  cooldown_minutes: 30
+
+position_rules:
+  single_weight_max: 0.03
+  total_weight_max: 0.10
+  allocator: "fixed_rule_only"
+
+exit_rules:
+  market_close: true
+  ttl_minutes: 120
+  stop_loss_pct: 0.03
+  spike_resolved_threshold: 1.0
+
+feeds:
+  requires_price_snapshot_feed: true
+  snapshot_interval_sec: 60
+
+validation:
+  method: "post_hoc_evaluation"
+  backtest_overlay_separation: true

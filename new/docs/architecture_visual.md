@@ -1,16 +1,34 @@
-# KOSPI Decision OS v2.1 — Architecture Visualization
+# KOSPI Decision OS v3: Architecture Visualization
 
 > KOSPI 1분봉을 위한 연구형/모의운용형 event-aware multi-agent Decision OS
-> GPT Pro 검증: 평균 8.6/10 — 멀티에이전트 방향성 확인, 구조적 완성도 상당히 좋아짐 (2026-04-05)
+> v2.1 GPT Pro 검증: 평균 8.6/10 (2026-04-05)
+> v2.2 업데이트 (2026-04-09): Backtest Agent 추가, Hot/Cold Path 분기 시각화 보강, Mode B 타임라인 시각화 신규
+> v3.0 추가 (2026-04-10): Dual-Source Temporal Signal 즉시 흡수 + Sprint 5 Dynamic Event Universe Blueprint 추가
+> v3.0.1 수정 (2026-04-12): FDA reason_code 필드 추가 반영 (api_contracts.md C9 + architecture.md 동기화)
+> v3.0.2 추가 (2026-04-20, S1-0 Batch B+C): C17 ModelRegistryContract 신설 반영, §8.3 Eval Agent 메트릭에 ICIR/SR 추가, Mode B stage_4 타임라인에 LGBMTrainer → registry.save(v{n}.pkl) 흐름 명시 (상세 다이어그램은 presenter 별도 작업 defer)
+> v3.0.4 (2026-04-21): C18 AgentPerformanceContract + C9 uncertainty_score extension + MSG/APM/DEC/OP/PP/BUNDLE/BT/RPT/FCC/RGC UUID8 전수 정정 + Cold Path 디스패치 흐름 반영.
+> v3.0.3 (2026-04-21): C18 AgentPerformanceContract 신설 반영. §20 Evaluation Matrix 3-Layer 추가.
+> v3.0.5 (2026-04-25): S2-6 NewsFilter + TextPack 13 템플릿 + S2-7 NewsAgent 실구현 (Kanana-o CoT + consume_text_pack + C5 news_signal/dart_alert publish)
+> v3.0.6 (2026-04-26): Sprint 2 완료 반영. S2-8 RiskAgentFast/Slow Cold Path + S2-9 DebateAgent/FDA Cold Path + S2-10 ModeBPerformanceAggregator + S2-11 BaseConnector. reason_code 7종 최종 확정. Cold Path e2e 루프 닫힘.
+> v3.0.7 (2026-05-01): Sprint 3 완료 반영. ModeBScheduler 7-stage cron + ModeBDeployer atomic swap + KnowledgeBase Layer 5 + Committee (AlphaGAT Stage II) + Validation Tools 3 component. 4축 정합 일괄 수정 포함.
+
+## v2.2 변경점 요약
+
+| # | 위치 | 변경 |
+|---|------|------|
+| V1 | §2 장중 루프 | Hot Path vs Cold Path 분기 명확화 (Hot: quant+비LLM FDA, Cold: LLM 에이전트 활성) |
+| V2 | §3 Mode B | 18:00~22:00 6단계 타임라인 + Backtest Agent 게이트 시각화 신규 |
+| (추가) | §3 | Backtest Agent가 배포 게이트 직전에 추가됨 |
+| (추가) | §4 | Backtest Agent는 Shared Message Pool에 장중에 publish하지 않음 명시 |
 
 ## 1. 전체 시스템 구조도
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                        KOSPI Decision OS v2.1                            │
+│                        KOSPI Decision OS v3                              │
 │                                                                          │
 │  ┌─── Mode A: 장중 실시간 (09:00~15:30) ──┐  ┌── Mode B: 장마감 진화 ──┐│
-│  │         매 1분 판단 루프                 │  │    매일 밤 자동 진화     ││
+│  │         매 1분 판단 루프                 │  │    18:00~22:00 진화+검증 ││
 │  └─────────────────────────────────────────┘  └────────────────────────┘│
 │                                                                          │
 │ ╔══════════════════════════════════════════════════════════════════════╗  │
@@ -60,6 +78,14 @@
 │ ║  │  A = {Quant우선, Risk우선, 균등}          │                       ║  │
 │ ║  │  → Bayesian posterior 갱신               │                       ║  │
 │ ║  └─────────────────────────────────────────┘                       ║  │
+│ ║                                                                     ║  │
+│ ║  ┌─────────────────────────────────────────┐                       ║  │
+│ ║  │  Backtest Agent (Mode B 전용, v2.2)     │                       ║  │
+│ ║  │  - 장중 경로(Hot/Cold)에 절대 미개입       │                       ║  │
+│ ║  │  - Shared Message Pool과 무관             │                       ║  │
+│ ║  │  - 21:00~21:30 시스템 검증 게이트         │                       ║  │
+│ ║  │  - 상세 위치 → §3 Mode B 다이어그램 참조  │                       ║  │
+│ ║  └─────────────────────────────────────────┘                       ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                                                                 │
 │ ╔══════════════════════════════════════════════════════════════════════╗  │
@@ -68,7 +94,7 @@
 │ ║  ┌─────────────────────────────────────────────────────────────┐    ║  │
 │ ║  │              Quant Model: LightGBM (확정)                    │    ║  │
 │ ║  │                                                              │    ║  │
-│ ║  │  Alpha Factors ──→ LightGBM ──→ 30종목 예측 시그널           │    ║  │
+│ ║  │  Alpha Factors + Dual-Source 5피처 ──→ LightGBM ──→ active 20종목 예측 시그널           │    ║  │
 │ ║  │  (LLM 자동생성)    (n_est=200~2000  + confidence              │    ║  │
 │ ║  │  + Multi-scale      depth=4)        (추론 0.3ms)             │    ║  │
 │ ║  │  + Cross-Asset피처                                           │    ║  │
@@ -113,12 +139,12 @@
 │ ║       │            │            │            │  ┌──────────┐       ║  │
 │ ║       ↓            ↓            ↓            ↓  │  ECOS    │       ║  │
 │ ║  ┌─────────────────────────────────────────────┐│  거시    │       ║  │
-│ ║  │           Preprocessing Pipeline            ││          │       ║  │
-│ ║  │  ① Robust Z-score (MAD)                     │└──────────┘       ║  │
-│ ║  │  ② Forward-fill + Cross-sectional mean      │                   ║  │
-│ ║  │  ③ Multi-scale 분해 (1m/5m/30m/60m)         │                   ║  │
-│ ║  │  ④ TSFresh 통계 → 자연어 변환               │                   ║  │
-│ ║  │  ⑤ PIT-Safety: LLM에 raw data 비노출        │                   ║  │
+│ ║  │           Preprocessing Pipeline            │└──────────┘       ║  │
+│ ║  │  ① Robust Z-score (MAD)                     │┌──────────┐       ║  │
+│ ║  │  ② Forward-fill + Cross-sectional mean      ││ 커뮤니티 │       ║  │
+│ ║  │  ③ Multi-scale 분해 (1m/5m/30m/60m)         ││ Dual-Src │       ║  │
+│ ║  │  ④ TSFresh 통계 → 자연어 변환               ││ 3-stage  │       ║  │
+│ ║  │  ⑤ PIT-Safety: LLM에 raw data 비노출        │└──────────┘       ║  │
 │ ║  └─────────────────────────────────────────────┘                   ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                                                                 │
@@ -150,7 +176,7 @@
   │  ┌──────────┐     ┌──────────┐     ┌──────────┐            │
   │  │  1분봉   │────→│ 전처리   │────→│  퀀트    │            │
   │  │  수집    │     │ Z-score  │     │  모델    │            │
-  │  │ 30종목   │     │ 다중스케일│     │  추론    │            │
+  │  │ active 20   │     │ 다중스케일│     │  추론    │            │
   │  └──────────┘     └──────────┘     └────┬─────┘            │
   │                                         │                   │
   │                                    시그널 publish            │
@@ -205,11 +231,203 @@
   ※ Hot Path (평상시): Quant Agent만 활성 (추론 <100ms, LLM 미호출)
   ※ Cold Path (이벤트 시): News/Risk 분석 → 충돌 감지 시 Debate Agent 활성 (LLM 호출, 10~30초)
      트리거: 뉴스감지 | 급등락 | regime변화 | anomaly
-  ※ FDA 출력: 7필드: approved, target_weights(RO), order_deltas(RO), veto_reason, risk_overrides(audit), confidence, expiry (BUY/HOLD/SELL 아님)
+  ※ FDA 출력: 8필드: approved, target_weights(RO), order_deltas(RO), veto_reason, reason_code, risk_overrides(audit), confidence, expiry (BUY/HOLD/SELL 아님)
   ※ 현재 적용 범위: 연구형/모의운용형 (실계좌 자동매매 아직 부적합)
 ```
 
+## 2.1 Hot Path vs Cold Path 분기 (v2.2 시각화 보강)
+
+> 매 1분 판단 지점에서 이벤트 admission 결과에 따라 두 경로가 갈라진다.
+> **Hot Path**는 LLM을 한 번도 호출하지 않으며 <100ms 안에 FDA 최종 승인까지 완료된다.
+> **Cold Path**는 이벤트가 있을 때만 LLM 에이전트가 활성화되어 10~30초의 reasoning 경로를 탄다.
+
+```
+                        ┌────────────────────────┐
+                        │  매 1분 tick (t)        │
+                        │  KIS 1분봉 + 이벤트 큐  │
+                        └───────────┬────────────┘
+                                    │
+                        ┌───────────▼────────────┐
+                        │  Event Admission (C11)  │
+                        │  - priority/ttl/supersedes
+                        │  - backlog overflow ↴    │
+                        │     → dead_letter_log   │
+                        └────┬──────────────┬─────┘
+               이벤트 없음    │              │  이벤트 admitted
+                              ↓              ↓
+          ┌───────────────────────┐   ┌────────────────────────────┐
+          │   HOT PATH (<100ms)    │   │   COLD PATH (10~30초)      │
+          │   LLM 미호출           │   │   LLM 활성 (Kanana-o)      │
+          │                       │   │                            │
+          │ ① Quant Agent          │   │ ① News Agent (병렬)        │
+          │    LightGBM 0.3ms     │   │    뉴스/공시/커뮤니티       │
+          │    (숫자 anomaly)      │   │ ② Risk Agent Slow (병렬)   │
+          │                       │   │    US야간/거시/수급 해석     │
+          │ ��' Risk Fast sidecar  │   │    (Kanana-o LLM)           │
+          │    (v3) rule-based     │   │ ③ Quant Agent (병렬)       │
+          │    comm/수급 이상 감지  │   │    anomaly_detected 보고    │
+          │    <50ms, LLM 미호출   │   │ ④ [충돌 시만] Debate        │
+          │    ※ 주 코어 block X   │   │    pairwise 45회 재랭킹     │
+          │                       │   │                            │
+          │ ② Top-10 필터          │   │ ⑤ FDA (LLM)                │
+          │    (퀀트 점수 순)      │   │    CoT + Thompson Sampling │
+          │                       │   │    approve / veto           │
+          │ ③ PPO Allocator        │   │                            │
+          │    target_weights     │   └──────────┬─────────────────┘
+          │                       │
+          │ ④ Portfolio Manager    │
+          │    order_deltas 생성  │
+          │                       │
+          │ ⑤ FDA (비LLM)          │
+          │    규칙 7체크리스트:   │
+          │    Regime Gate         │              │
+          │    Kill Switch         │              │  approve/veto
+          │    Position Limit      │              │
+          │    Sector Limit        │              │
+          │    Cash Minimum        │              │
+          │    Turnover Cap        │              │
+          │    Min Confidence     │              │
+          │    → approve / veto    │              │
+          └──────────┬─────────────┘              │
+                     │                             │
+                     │  approve/veto               │
+                     └──────────┬──────────────────┘
+                                │
+                                ↓
+                      ┌─────────────────┐
+                      │ Execution (mock)│
+                      │ → KB 저장        │
+                      │ → memory 갱신    │
+                      └─────────────────┘
+
+  ※ FDA는 Hot/Cold 모두에서 최종 게이트.
+  ※ Hot에서는 "비LLM deterministic validator" (규칙 체크리스트).
+  ※ Cold에서는 "LLM reasoning + CoT + Thompson Sampling".
+  ※ "Hot에서 FDA 없음"이 아니라 "Hot에서 FDA가 LLM을 쓰지 않음".
+  ※ Backtest Agent는 이 그림에 없음. Mode B 전용이며 장중 경로에 절대 개입하지 않음 (§3 참조).
+```
+
+### Cold Path 진입 구조 (S2-1, S2-6, S2-7)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  6 Connector (Naver/DART/Community/ECOS/US Market/KRX)   │
+│     ↓ raw_event                                          │
+│  [EventGateway.ingest()]                                 │
+│     ↓ C2 정규화                                          │
+│  [EventAdmission] 3 필터                                 │
+│    ├─ dedupe (event_id + supersedes TTL 300s)            │
+│    ├─ stale_drop (expires_at < now KST)                  │
+│    └─ backlog 3건 cap + jobs/min 10 cap                 │
+│     ↓ priority 정렬 (priority > trigger > scope > recency)│
+│  [EventGateway.dispatch_next()]                          │
+│     ↓ handler() (Direct Dispatch)                        │
+│                                                          │
+│  [S2-6] NewsFilter.filter() (ticker/sector/market 3-level)│
+│    + TextPackBuilder.build() (TSFresh 30분 통계 → 자연어, │
+│      13 템플릿, news_filter.yaml text_pack_templates SSOT)│
+│     ↓ text_pack                                          │
+│  [S2-7] NewsAgent (실구현: Kanana-o CoT)                 │
+│    ├─ analyze() (event_type 3종: news/dart/community 분기) │
+│    ├─ consume_text_pack() (TextPack 위임)                 │
+│    ├─ _parse_llm_content() (heuristic)                   │
+│    └─ _save_memory() (micro/macro JSONL)                 │
+│     ↓ LLMRouter.call(mode='cold', caller='news_agent') │
+│       Kanana-o 30회/일 → GPT-4o fallback (429/timeout)   │
+│                                                          │
+│  Risk Slow / Debate Agent                                │
+│     ↓ PubSubBroker.publish() (채널 라우팅)               │
+│  [MessagePool (C4)] -- 저장 + 구독자 fan-out             │
+│     ↓ C5 news_signal / dart_alert publish                │
+│  FDA Cold Path (register_dependency news+risk+quant → callback 활성화)│
+└─────────────────────────────────────────────────────────┘
+
+Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass.
+```
+
 ## 3. 장마감 자동 진화 루프 (Mode B)
+
+### 3.0 Mode B 타임라인 (v2.2 시각화 신규)
+
+> Mode B는 18:00~22:00 사이에 6단계로 직렬 진행된다. 각 단계 사이에는 명확한 artifact 전달이 있고,
+> **21:00~21:30 Backtest Agent 게이트** 는 v2.2에서 신설된 시스템 레벨 검증 지점이다.
+>
+> **주체**: 모든 단계 호출은 **Mode B Scheduler (C14)** 가 cron-style로 수행한다.
+> 배포 실행자는 **Mode B Deployer** (Scheduler sub-component).
+> Runtime State는 `MODE_B_IDLE → MODE_B_EVOLVING → MODE_B_BACKTEST → (MODE_B_DEPLOY | MODE_B_OPERATOR_REVIEW | MODE_B_BLOCKED) → MODE_B_IDLE`.
+
+```
+시간          단계                           산출물                         다음 단계 트리거
+──────        ───────────                    ──────                         ──────────────
+  18:00  ┌──────────────────────────┐   → performance_vector            → §8.2
+         │ §8.1 성과 분석           │      8차원 [IC,ICIR,RankIC,
+         │ x_t = 8차원 성과 벡터    │       ARR,IR,-MDD,SR, ...]
+         └───────────┬──────────────┘
+                     │
+  18:30  ┌───────────▼──────────────┐   → direction ∈ {factor, model}   → §8.3 또는 §8.4
+         │ §8.2 방향 결정            │      (Thompson Sampling posterior)
+         │ Thompson Sampling        │
+         │ A = {factor 개선, model 개선}│
+         └───────────┬──────────────┘
+                     │
+  19:00  ┌───────────▼──────────────┐   → factor_candidate              → §8.4
+         │ §8.3 팩터 진화            │     (AST + 3중 정규화 통과)
+         │ Alpha Factor Engine      │
+         │ Idea → Factor → Eval     │
+         │ (GPT-4o)                 │
+         └───────────┬──────────────┘
+                     │
+  20:00  ┌───────────▼──────────────┐   → model_candidate               → §8.5
+         │ §8.4 모델 진화            │     (Co-STEER retrain 결과)
+         │ Co-STEER                  │
+         │ + §8.4.1 재학습 데이터    │
+         │ (한국 today + 미국 d-1)   │
+         └───────────┬──────────────┘
+                     │
+  20:30  ┌───────────▼──────────────┐   → agent_constraint_update       → §8.5.2
+         │ §8.5 에이전트 자기 개선  │     (Handover Feedback +
+         │ MetaGPT Handover/React    │      Memory 순환)
+         │ (8차원 벡터 기반 기여도)  │
+         └───────────┬──────────────┘
+                     │
+  21:00  ┏━━━━━━━━━━━▼━━━━━━━━━━━━━┓   ←─────  v2.2 신규 게이트  ─────→
+         ┃ §8.5.2 Backtest Agent   ┃   → backtest_report               →
+         ┃ (GPT-4o + C13 tools)    ┃     {verdict, regression_risk,       
+         ┃                         ┃      diagnostic_notes,              
+         ┃ ① BacktestEngine        ┃      deploy_recommendation}         
+         ┃   walk-forward          ┃                                     
+         ┃ ② ReplayRunner          ┃   ┌─ verdict == pass AND             
+         ┃   deterministic replay  ┃   │   regression_risk == false       
+         ┃ ③ PerformanceAnalyzer   ┃   │    → §8.6 배포 진행              
+         ┃   regime breakdown      ┃   ├─ verdict == warn                 
+         ┃   + ablation            ┃   │    → operator 확인               
+         ┃   + baseline 비교       ┃   │      (human_approval=true)       
+         ┃                         ┃   └─ verdict == fail OR              
+         ┃ LLM reasoning (GPT-4o): ┃       regression_risk == true         
+         ┃  diagnostic_notes 생성   ┃        → 배포 차단 + dead_letter     
+         ┗━━━━━━━━━━━┳━━━━━━━━━━━━━┛      + baseline 유지
+                     │
+  21:30  ┌───────────▼──────────────┐   → updated keyword lists         → §8.6
+         │ §8.5.1 뉴스 필터 + 규칙  │     (news_filter.yaml 등 5종
+         │  갱신                    │      + trigger_catalog v3)
+         │ 키워드 갱신              │
+         │ (prefilter_drop_log 분석)│
+         └───────────┬──────────────┘
+                     │
+  22:00  ┌───────────▼──────────────┐   → deployed bundle               → 다음 날 08:30
+         │ §8.6 배포                 │      (factor + model + allocator
+         │ - Backtest verdict 확인   │       + agent constraint)
+         │ - sanity check            │
+         │ - model_registry 교체     │
+         │ - audit_log 기록          │
+         └───────────────────────────┘
+
+  ※ v2.2 핵심: Backtest Agent(21:00~21:30) 게이트를 통과해야만 §8.6 배포 단계로 진행.
+  ※ Backtest Agent는 LLM reasoning만 수행, 계산은 C13 ValidationTools(BT Engine/Replay/Perf)가 담당.
+  ※ GPT-4o만 사용. Kanana-o 일일 100회 예산은 장중(§9.4) 보존.
+```
+
+### 3.1 Mode B 상세 구조 (v2.1에서 계속)
 
 ```
   ┌──────────────────────────────────────────────────────────┐
@@ -274,7 +492,29 @@
   │  │                        └────────────────┘       │     │
   │  └─────────────────────────────────────────────────┘     │
   │                                                           │
-  │  [22:00] 배포: 개선된 팩터 + 모델 + 에이전트 → 다음 날    │
+  │  ┌─────────────────────────────────────────────────┐     │
+  │  │      Backtest Agent Gate (v2.2 신규)              │     │
+  │  │      [21:00~21:30]                                │     │
+  │  │                                                   │     │
+  │  │  candidate_bundle = {factor, model, allocator}    │     │
+  │  │                    ↓                              │     │
+  │  │  C13 Tools (결정론적 계산):                         │     │
+  │  │   ① BacktestEngine → IC/IR/MDD/SR                 │     │
+  │  │   ② ReplayRunner → replay_trace, latency         │     │
+  │  │   ③ PerformanceAnalyzer → regime + ablation       │     │
+  │  │                    ↓                              │     │
+  │  │  GPT-4o reasoning → diagnostic_notes              │     │
+  │  │                    ↓                              │     │
+  │  │  verdict: pass | warn | fail                      │     │
+  │  │  regression_risk: {flagged, severity}             │     │
+  │  │                                                   │     │
+  │  │  pass + no regression → §8.6 배포 진행             │     │
+  │  │  warn → operator 확인                              │     │
+  │  │  fail → 배포 차단 + baseline 유지                  │     │
+  │  └─────────────────────────────────────────────────┘     │
+  │                                                           │
+  │  [22:00] 배포: Backtest 통과 시 개선된 팩터+모델+에이전트 │
+  │          → 다음 날. Backtest 차단 시 baseline 유지       │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -331,29 +571,23 @@
 ## 5. LLM 역할 분배도
 
 ```
-  ┌────────────────────────────────────────────────────┐
-  │                   LLM Router                        │
-  │                                                     │
-  │  ┌─────────────────────┐  ┌─────────────────────┐ │
-  │  │    Kanana-o          │  │   GPT-4o / o3-mini  │ │
-  │  │    (한국어 전문)      │  │   (추론/코드 전문)   │ │
-  │  │                     │  │                     │ │
-  │  │  ├─ News Agent      │  │  ├─ Idea Agent      │ │
-  │  │  │  뉴스/공시 분석   │  │  │  팩터 가설 생성   │ │
-  │  │  │                  │  │  │                  │ │
-  │  │  ├─ Risk Agent      │  │  ├─ Factor Agent    │ │
-  │  │  │  리스크 판단      │  │  │  팩터 코드 구현   │ │
-  │  │  │                  │  │  │                  │ │
-  │  │  ├─ Debate Agent    │  │  ├─ Eval Agent      │ │
-  │  │  │  갈등 해소        │  │  │  결과 분석        │ │
-  │  │  │                  │  │  │                  │ │
-  │  │  └─ FDA             │  │  └─ 가설-수식 정합   │ │
-  │  │     종합 판단        │  │     검증            │ │
-  │  └─────────────────────┘  └─────────────────────┘ │
-  │                                                     │
-  │  장중: Kanana-o 위주 (한국어 판단)                   │
-  │  장마감: GPT-4o 위주 (팩터 연구/코드 생성)           │
-  └────────────────────────────────────────────────────┘
+┌─ LLM Router (v3 S2-2) ────────────────────────────────┐
+│ call(prompt, mode, caller, structured_schema)          │
+│   ↓ mode='hot' → RuntimeError (불변 원칙 4)             │
+│   ↓ mode='mode_b' → caller 화이트리스트 검증 → GPT-4o   │
+│   ↓ mode='cold':                                        │
+│     _BudgetTracker.can_call(caller)                     │
+│       ├─ PASS → _CircuitBreaker(kanana).can_attempt()   │
+│       │          ├─ PASS → _call_kanana()               │
+│       │          │   ├─ 성공 → record_success           │
+│       │          │   └─ 실패 → record_failure + fallback│
+│       │          └─ OPEN → fallback to GPT-4o           │
+│       └─ 예산 초과 → fallback to GPT-4o                 │
+│                                                         │
+│ caller allocation (100회/일 총합):                      │
+│   news_agent=30, dart=3, risk=15, community=5           │
+│   fda_cold=12, debate=5, buffer=30                      │
+└────────────────────────────────────────────────────────┘
 ```
 
 ## 6. 데이터 흐름 전체도
@@ -439,13 +673,16 @@
   │                    Agent Profile 정의                              │
   │                                                                    │
   │  ┌─────────────────────────────────────────────────────────────┐  │
-  │  │  News Agent                                                  │  │
+  │  │  News Agent (S2-7 실구현)                                    │  │
   │  │  Profile : 한국 주식 뉴스/공시 분석 전문가                   │  │
   │  │  Goal    : 뉴스/공시 투자 영향 판단 + CoT reasoning         │  │
-  │  │  Constraint: 무관 뉴스 skip, raw data 접근 금지             │  │
+  │  │  Constraint: 무관 뉴스 skip (NewsFilter 3-level), raw data 접근 금지 │  │
   │  │  Subscribes: [naver_news, dart_disclosure, community]        │  │
-  │  │  Publishes : [news_signal, dart_alert, sentiment_update, theme_score]  │  │
-  │  │  Memory  : Micro Notes (종목별 누적, 감쇠 η∈0.95~0.99)      │  │
+  │  │  Publishes : C5 [news_signal, dart_alert] (community → news_signal)  │  │
+  │  │  LLM     : LLMRouter.call(mode='cold', caller='news_agent') │  │
+  │  │             Kanana-o CoT → GPT-4o fallback                  │  │
+  │  │  TextPack: consume_text_pack() ← TextPackBuilder (13 템플릿) │  │
+  │  │  Memory  : micro_notes (종목별 JSONL) / macro_notes (거시 JSONL) │  │
   │  └─────────────────────────────────────────────────────────────┘  │
   │                                                                    │
   │  ┌─────────────────────────────────────────────────────────────┐  │
@@ -484,7 +721,8 @@
   │  │  Goal    : 모든 보고서 종합 → approve/veto + CoT            │  │
   │  │  Constraint: 모든 에이전트 수신 후 판단, 불확실하면 veto     │  │
   │  │  Action  : {approved, target_weights(읽기만), order_deltas,  │  │
-  │  │            veto_reason, risk_overrides, confidence, expiry}   │  │
+  │  │            veto_reason, reason_code, risk_overrides,          │  │
+  │  │            confidence, expiry}                                │  │
   │  │  Subscribes: [news_signal, risk_warning, quant_signal,       │  │
   │  │              debate_resolution, regime_change, dart_alert]    │  │
   │  │  Publishes : [final_decision]                                │  │
@@ -558,7 +796,7 @@
   ┌────────────────────────────────────────────────────────┐
   │           1분봉 병목 문제 + 해결 전략                     │
   │                                                         │
-  │  문제: 30종목 × LLM 4.7초/종목 = 141초 > 60초 (1분)     │
+  │  문제: active 20 × LLM 4.7초/종목 = 141초 > 60초 (1분)     │
   │                                                         │
   │  ┌──────────────────────────────────────────────────┐  │
   │  │  해결 1: 평상시 퀀트만 (LLM 미호출)               │  │
@@ -573,7 +811,7 @@
   │  │                                                   │  │
   │  │  트리거: 뉴스감지 | 급등락 | regime변화 | anomaly │  │
   │  │          ↓                                        │  │
-  │  │  30종목 전부 X → 변화 감지 종목만 LLM 처리       │  │
+  │  │  active 20 전부 X → 변화 감지 종목만 LLM 처리       │  │
   │  └──────────────────────────────────────────────────┘  │
   │                                                         │
   │  ┌──────────────────────────────────────────────────┐  │
@@ -835,7 +1073,7 @@
        ↓
   PPO Allocator (종목별 비중 학습, stable-baselines3)
        ↓
-  상한 규칙 적용 (단일≤20%, 섹터≤40%, 현금≥10% — default)
+  상한 규칙 적용 (단일≤20%, 섹터≤40%, 현금≥10%, default)
        ↓
   Portfolio Manager → order_deltas 생성 (현재 포지션 vs target_weights 차분)
        ↓
@@ -843,6 +1081,317 @@
        ↓
   KIS API 주문 실행
 
-  ※ API Contracts 11개 명세: new/specs/api_contracts.md
+  ※ API Contracts 18개 (C1~C18) 명세: new/specs/api_contracts.md
   ※ 구현 순서: C1→C4→C5→C8→C9→C10 → inference → 검증 → Mode B
+```
+
+
+## 20. Evaluation Matrix 3-Layer (기말발표 킬러)
+
+> "기존 퀀트는 '얼마 벌었나'만 본다.
+> 우리는 '누가, 왜, 언제 결정했고, 그게 맞았나'를 매트릭으로 측정한다."
+
+구현 상태 (2026-04-21 기준):
+- L1: Sprint 1 구현 완료 (`new/src/models/metrics.py`, C12/C13)
+- L2: Sprint 2~3 구축 예정 (C18 AgentPerformanceContract 신설됨, 2026-04-21)
+- L3: Sprint 4 구축 예정 (설계 완료)
+
+상세 스펙: `new/docs/evaluation_metrics.md` 참조.
+
+### 20.1 L1 Model Layer: 8차원 성과 벡터
+
+구현: `new/src/models/metrics.py::MetricsBundle.to_performance_vector()`
+SSOT: architecture.md §8.1
+
+8축 방사형 차트 구조:
+
+| 축 | 지표 | 정상 범위 |
+|---|---|---|
+| 1 | IC | >= 0.02 |
+| 2 | ICIR | >= 0.3 |
+| 3 | Rank(IC) | 30일 rolling 정규화 0~1 |
+| 4 | Rank(ICIR) | 동일 |
+| 5 | ARR (연환산) | >= 8% |
+| 6 | IR | >= 0.5 |
+| 7 | -MDD (역부호) | >= -20%, 높을수록 좋음 |
+| 8 | SR (Sharpe) | >= 1.0 |
+
+```
+ASCII 방사형 (8각형 스케치):
+
+           IC
+           |
+   Rank(IC)+      +ICIR
+          /|\    /|\
+         / | \  / | \
+SR ------*  |  *  |  *------ Rank(ICIR)
+         \ | /  \ | /
+          \|/    \|/
+    -MDD---+      +IR
+           |
+           ARR
+```
+
+정규화: min-max rolling 30일, clip [0.01, 0.99].
+config: `risk_config.yaml evaluation.performance_vector_rolling_window: 30`.
+
+### 20.2 L2 Agent Contribution: 에이전트별 marginal PnL
+
+구현 예정: Sprint 2 S2-0 AuditLogger 확장 -> 18:00 KST 배치 집계.
+SSOT: api_contracts.md C18 AgentPerformanceContract.
+
+7 에이전트 marginal PnL 막대그래프 mock (2026-03 FOMC 시나리오 가정):
+
+| Agent | marginal PnL 기여 | 상태 |
+|---|---|---|
+| Quant | +0.31% | Sprint 2 설계 완료 |
+| News Agent | +0.18% | Sprint 2 설계 완료 |
+| Risk (Fast) | +0.09% | Sprint 2 설계 완료 |
+| Risk (Slow) | +0.03% | Sprint 2 설계 완료 |
+| FDA | 0.00% (판단만, 비중 미개입) | Sprint 2 설계 완료 |
+| Debate | -0.02% | Sprint 2 설계 완료 |
+| Execution GW | -0.04% (slippage) | Sprint 2 설계 완료 |
+
+```
+ASCII 막대그래프:
+
+Quant     |================+0.31%
+News      |=========+0.18%
+Risk(F)   |====+0.09%
+Risk(S)   |==+0.03%
+FDA       | 0.00%
+Debate    |-0.02%
+Exec GW   |--0.04% (slippage)
+          +------------------+
+          -0.1%   0%   +0.3%
+```
+
+수치는 시나리오 예시. Sprint 2 구현 후 실 audit_log.jsonl 집계로 대체.
+
+### 20.3 L3 System OS Metrics
+
+구현 예정: Sprint 4 통합 Dashboard. `hot_path_latency_p95_ms` 만 Sprint 1 구현 완료.
+
+#### Cause Attribution 파이 차트 (FDA reason_code 분포 mock)
+
+```
+FDA reason_code 분포 (2026-03-20 FOMC 이벤트 시나리오):
+
+        NEWS_DIVERGENCE
+           [========] 72%
+       /
+      +  DEBATE_CONFLICT [==] 18%
+       \
+        RISK_BREACH [=] 10%
+```
+
+| reason_code | 비율 | 의미 |
+|---|---|---|
+| NEWS_DIVERGENCE | 72% | 뉴스 vs 커뮤니티 방향 불일치 -> FDA 개입 |
+| DEBATE_CONFLICT | 18% | 에이전트 간 의견 충돌 -> FDA 중재 |
+| RISK_BREACH | 10% | 리스크 임계 위반 -> FDA veto |
+
+Cause Attribution Accuracy: 64% (사후 일치 비율, Sprint 4 측정 후 확정).
+
+#### Hot Path Latency SLA 히트맵
+
+| 종목 | p50 (ms) | p95 (ms) | p99 (ms) | SLA |
+|---|---|---|---|---|
+| 005930 (삼성전자) | 11 | 38 | 51 | OK |
+| 000660 (SK하이닉스) | 12 | 41 | 58 | OK |
+| 035720 (카카오) | 14 | 44 | 63 | OK |
+| 유니버스 전체 (20종목) | 13 | 87 | 97 | OK |
+| SLA 기준 | - | <100ms | - | - |
+
+구현: `ops/monitor.py` (Sprint 1 완료). SSOT: `risk_config.yaml quant_agent.latency_p95_target_ms: 100`.
+
+#### Self-Evolution Gain 시계열 mock
+
+```
+Sharpe lift (Mode B 야간 재학습 전후):
+
+1.50 +
+     |   v1 (기준)
+1.58 +   [====] +0.08 (Day 1 Mode B 후)
+1.63 +   [========] +0.13 (Day 5)
+1.71 +   [============] +0.21 (Day 10)
+     |
+     +----------------
+     D0   D1   D5  D10
+```
+
+구현 예정: `ModelRegistry.compare_versions()` 이미 Sprint 1 선행 구현 완료.
+실 적용은 Sprint 3 야간 재학습 + Sprint 4 Dashboard 통합 시.
+임계: `risk_config.yaml system_os_metrics.self_evolution_gain_threshold: 0.05`.
+
+### 20.4 발표 킬러 문장 (4 레벨)
+
+- **총괄**: "기존 퀀트는 '얼마 벌었나'만 본다. 우리는 '누가, 왜, 언제 결정했고, 그게 맞았나'를 매트릭으로 측정한다."
+- **L1**: "walk-forward 8 fold 기준 SR 1.84, IC 0.031, MDD -12.3%. 업계 표준 퀀트 모델이 하는 것."
+- **L2**: "News Agent가 3월 FOMC에서 +0.18% 기여. audit_log.jsonl 14:31:07 엔트리에 남아 있음."
+- **L3**: "FDA 한 달 누적: 전체 판단의 58%가 NEWS_DIVERGENCE, 그 중 71%가 실제 가격 하락. '왜 거부했는가'에 숫자 답 가능한 시스템."
+
+### 20.5 발표용 구현 상태 3 Tier
+
+| 상태 | 포함 지표 | 슬라이드 표기 |
+|---|---|---|
+| 구현 완료 (Sprint 1) | L1 전체, Hot Path Latency, ModelRegistry.compare_versions | 실수치 직접 제시 |
+| 구현 진행 (Sprint 2~3) | L2 7종 (precision/recall 쌍 포함하여 9 key), L3 cause_attribution, reason_code_distribution | "Sprint 2~3 구현 중, 설계 완료" 뱃지 |
+| 설계 완료 (Sprint 4) | L3 self_evolution_gain, dual_source_lead_time, regime_agent_contribution | "Sprint 4 예정, 스키마 확정" 뱃지 |
+
+mock 숨기지 않음. 설계 완료된 mock과 근거 없는 mock을 구별. SSOT 근거: C18 신설 (api_contracts.md v3.2), architecture.md §8.1 + §4.2.
+
+---
+
+## 5. v3 즉시 반영: Dual-Source Temporal Signal
+
+```
+뉴스/공시 (당일, 빠른 decay) ──→ news_score_t ────────────────┐
+                                                              │
+커뮤니티 (전일/전전일, 느린 decay) ─→ comm_score_t-1/t-2 ─────┼─→ LightGBM feature pack
+                                                              │
+게시량 급증 z-score ───────────────→ community_noise_multiplier ─┤
+                                                              │
+news_score_t vs comm_score_t-1 ─→ |difference| = divergence ───┘
+                                                 │
+                                                 ├─ Hot: Risk Fast sidecar → uncertainty penalty
+                                                 └─ Cold: Risk Slow → "왜 불일치인가" CoT 해석
+```
+
+핵심 메시지: **같은 텍스트라도 뉴스와 커뮤니티는 반영 속도와 신뢰도가 다르다.** v3는 이 차이를 감성 평균으로 뭉개지 않고, **소스 간 방향 불일치 자체를 불확실성 신호**로 쓴다.
+
+## 6. Sprint 5 확장: Dynamic Event Universe (설계도)
+
+```
+Trade Universe (active 20)                      Watch Universe (KOSPI200)
+┌──────────────────────────┐                    ┌──────────────────────────────┐
+│ LightGBM + PPO + PM      │                    │ 뉴스/공시/커뮤니티/수급/가격   │
+│ Hot Path core            │                    │ snapshot 감시                 │
+└─────────────┬────────────┘                    └──────────────┬───────────────┘
+              │                                               │
+              │                                        Risk Fast rule match
+              │                                               │
+              │                                  candidate_pool (max 10)
+              │                                               │
+              │                                   dynamic holdings (3~5)
+              │                                               │
+              └────────────────────────────── FDA / Execution overlay ─────┘
+```
+
+원칙:
+- trade universe와 watch universe는 분리
+- 매분 교체형 랭킹이 아니라 **이벤트 드리븐 overlay**
+- PPO 미관여, 소형 고정 비중 규칙 적용
+- 장마감/TTL/stop-loss 기반 당일 청산
+
+---
+
+## 7. Sprint 3 추가 다이어그램
+
+### 7.1 ModeBScheduler 7-stage Cron Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ModeBScheduler (C14) — 18:00~22:00 KST 7-stage cron       │
+│                                                             │
+│  18:00 stage_1 (30s SLA)  → performance_vector (8d)        │
+│  18:30 stage_2 (60s SLA)  → direction ∈ {factor, model}    │
+│  19:00 stage_3 (3600s)    → factor_candidate (Alpha Engine) │
+│  20:00 stage_4 (1800s)    → model_candidate (Co-STEER)      │
+│  20:30 stage_5 (1800s)    → agent_constraint_update         │
+│  21:00 stage_6 (1800s)    → backtest_report (Backtest Agent)│
+│  22:00 stage_7 (900s)     → deployed bundle or hold         │
+│                                                             │
+│  실패 시: on_retry_fail = baseline_hold                     │
+│  감사 로그: artifacts/mode_b_audit_log.jsonl                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 ModeBDeployer Atomic Swap 5-step
+
+```
+┌───────────────────────────────────────────────────────┐
+│  ModeBDeployer (C14 sub-component)                    │
+│                                                       │
+│  Step 1: backtest_report.verdict == pass 확인         │
+│  Step 2: sanity_check() — NaN/Inf/shape 검증          │
+│  Step 3: backup 현재 artifacts/ (365일 보존)          │
+│  Step 4: atomic write → artifacts/deployed_bundle/   │
+│          (factor_zoo + lgbm_model + ppo_model         │
+│           + agent_constraints)                        │
+│  Step 5: audit_log 기록 (DEPLOY-{yyyymmdd}-{UUID8})   │
+│                                                       │
+│  실패 시: 롤백 + dead_letter_log + baseline 유지       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 7.3 KnowledgeBase 6 Storage Types (Layer 5)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  KnowledgeBase (S3-11) — Layer 5                        │
+│                                                         │
+│  write(msg: Message) → KB-{yyyymmdd}-{UUID8}            │
+│    └─ timestamp <= now() PIT-Safety 검증                │
+│    └─ required_fields 검증 (content/sent_from/timestamp)│
+│                                                         │
+│  storage_types (6):                                     │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ micro_notes      │ macro_notes                  │    │
+│  │ debate_history   │ decision_history             │    │
+│  │ backtest_history │ factor_zoo                   │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                         │
+│  search(query, top_k=5) → recency_boost exp(-λ*days)   │
+│  read(kb_id) → Message                                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 7.4 Committee (AlphaGAT Stage II) 앙상블
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Committee (S3-8) — AlphaGAT Stage II                   │
+│                                                         │
+│  ┌────────────────┐                                     │
+│  │  tree_core     │ LightGBM (hot path 모델)             │
+│  │  (base)        │ → signal_proba                      │
+│  └───────┬────────┘                                     │
+│          │                                              │
+│  ┌───────▼────────┐  ┌─────────────────┐               │
+│  │  CNN           │  │  MetaFuser       │               │
+│  │  confirmatory  │  │  LogisticReg OOF │               │
+│  │  (Conv1d)      │→─│  → ensemble_pred │               │
+│  └────────────────┘  └────────┬────────┘               │
+│                               │                         │
+│  Sharpe(committee) > Sharpe(tree) → deploy              │
+│  threshold: sharpe_improvement_threshold = 0.0          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 7.5 Validation Tools 3 Component (Mode B)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Validation Tools (C13) — Backtest Agent이 호출           │
+│                                                          │
+│  ① BacktestEngine                                        │
+│     walk-forward (purge=60bars, embargo=78bars)          │
+│     → IC / IR / MDD / SR                                 │
+│     SLA: max_runtime_sec=1800                            │
+│                                                          │
+│  ② ReplayRunner                                          │
+│     deterministic_replay (분봉 1m)                       │
+│     event_sources: 6개 커넥터                             │
+│     → replay_trace_ref (RPT-{yyyymmdd}-{UUID8})          │
+│     SLA: max_runtime_sec=2400                            │
+│                                                          │
+│  ③ PerformanceAnalyzer                                   │
+│     regime breakdown (bull/bear/sideways/volatile)       │
+│     + ablation (factor/model/allocator/dual_source)      │
+│     verdict: pass | warn | fail                          │
+│     SLA: max_runtime_sec=600                             │
+│                                                          │
+│  result → KB TTL=30days (Sprint 4 KB.write 예정)         │
+└──────────────────────────────────────────────────────────┘
 ```

@@ -1,0 +1,43 @@
+# KOSPI Decision OS v3.0 — Dual-Source Configuration
+# 뉴스와 커뮤니티를 동일 텍스트로 합치지 않고, 시간차와 신뢰도 차이를 분리 반영한다.
+
+version: "1.0.0"
+last_updated: "2026-04-10"
+
+mode_b_metadata:
+  schema_version: "1.0.0"
+  data_version: "1.0.0"
+  last_updated: "2026-04-21"
+  updated_by: "initial + s2_audit_phase_4 (2026-04-21)"
+  mode_b_editable: false
+  human_approval_required: true
+  backup_retention_days: 365
+  update_trigger: "manual_only"
+  rationale: "Dual-Source 임계값은 예측/리스크 동시 영향. 자동 조정보다 operator 검증 후 수동 반영"
+
+news:
+  scorer: "local_finbert_or_equivalent"
+  decay_lambda: 0.8
+  score_window_hours: 12
+
+community:
+  scorer: "spam_rules + manipulation_rules + sentiment_dict + optional_small_model"
+  decay_lambda: 0.4
+  peak_lag_days: 2
+  noise_zscore: 2.5
+
+divergence:
+  threshold: 0.5
+  penalty_multiplier: 0.85
+  formula: "abs(news_score_t - comm_score_t_1)"
+
+outputs:
+  - news_score_t
+  - comm_score_t_1
+  - comm_score_t_2
+  - news_comm_divergence
+  - community_noise_multiplier
+
+validation:
+  ablation_required: true
+  compare: [with_dual_source, without_dual_source]

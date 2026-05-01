@@ -1,9 +1,24 @@
-# KOSPI Decision OS v2.1 — News Filter Configuration
+# KOSPI Decision OS v3 — News Filter Configuration
 # 이 키워드 목록은 Mode B에서 LLM이 매일 밤 갱신한다.
 # 정적 목록이 아닌 진화하는 필터.
 # last_updated는 Mode B 실행 시 자동 갱신.
+#
+# v2.2 변경: mode_b_metadata 통일 블록 추가
 
-last_updated: "2026-04-06"
+mode_b_metadata:
+  schema_version: "1.1.0"
+  data_version: "1.0.0"
+  last_updated: "2026-04-27"
+  updated_by: "initial"
+  mode_b_editable: true            # Mode B Scheduler가 nightly로 갱신 가능
+  human_approval_required: false   # 자동 반영. operator가 원하면 true로 변경
+  backup_retention_days: 30        # rollback용 이전 버전 보관
+  update_trigger: "mode_b_nightly"
+  update_source: "prefilter_drop_log 분석 (architecture.md §8.5.1)"
+  scope: "architecture.md §8.5.1 + §8.7 ④"
+  rationale: "Cold Path 뉴스 1차 prefilter 키워드. LLM 호출 전 차단. Mode B nightly 갱신 (§8.5.1 키워드 진화, prefilter_drop_log 분석). 2026-04-23 text_pack_templates/settings 섹션 추가 (S2-6 TSFresh 자연어 변환 SSOT). 2026-04-23 TSFresh naming drift 수정 (volume__sum → sum_values, return_1min/5min 제거 → S2-7+ BarBuffer 확장 후 재추가). 2026-04-23 S2-7 text_pack_settings.narrative_max_chars 신설 (NewsAgent 하드코딩 제거, yaml SSOT)."
+
+last_updated: "2026-04-27"
 version: "1.0.0"
 
 # Level 1: 종목명 매칭 (확실한 관련)
@@ -43,3 +58,49 @@ evolution:
   max_keywords_per_category: 30      # 카테고리당 최대 키워드 수 (무한 증식 방지)
   decay_unused_days: 30              # 30일 매칭 0건인 키워드 → 제거 후보
   human_approval: false              # 자동 반영 (true로 변경하면 사람 승인 후 반영)
+
+
+# v3/Sprint 5 참고 — watch universe 확장 정책
+watch_universe_policy:
+  current_trade_scope: "active 20 only"
+  sprint5_watch_scope: "KOSPI200 (watch universe only, trade universe와 분리)"
+  keyword_generation: "watch_universe_kospi200.yaml 기반 자동 생성"
+  note: "현재는 active 20 기준 필터. Sprint 5에서 입력 스코프만 확장하고 필터 로직은 재사용"
+
+# ==================================================================
+# S2-6 text_pack_builder.py 용 TSFresh 통계 피처 자연어 템플릿
+# 2026-04-23 신설. Cold Path NewsAgent/DebateAgent 입력 생성.
+# key: TSFresh feature_name (extract_features minimal_feature 기준)
+# value: Python f-string (value 변수 치환)
+# ==================================================================
+text_pack_templates:
+  # 가격 통계 (5종)
+  "close__mean": "평균 종가 {value:,.0f}원"
+  "close__maximum": "고점 {value:,.0f}원"
+  "close__minimum": "저점 {value:,.0f}원"
+  "close__standard_deviation": "종가 변동성 {value:,.2f}"
+  "close__abs_energy": "에너지 {value:,.0f}"
+
+  # 거래량 통계 (3종)
+  "volume__sum_values": "30분 누적 거래량 {value:,.0f}주"
+  "volume__maximum": "최대 거래량 {value:,.0f}주"
+  "volume__mean": "평균 거래량 {value:,.0f}주"
+
+  # 모멘텀/추세 (3종)
+  "close__autocorrelation__lag_1": "1분 자기상관 {value:.2f}"
+  "close__autocorrelation__lag_5": "5분 자기상관 {value:.2f}"
+  "close__linear_trend__attr_slope": "선형 추세 슬로프 {value:.3f}"
+
+  # 변동 통계 (2종)
+  "close__count_above_mean": "평균 초과 카운트 {value:,.0f}"
+  "close__count_below_mean": "평균 이하 카운트 {value:,.0f}"
+
+  # 수익률: return_1min / return_5min 컬럼은 S2-7+ BarBuffer 확장 후 추가 예정
+
+text_pack_settings:
+  max_features_per_pack: 8                      # LLM token budget (Kanana-o context limit 고려)
+  separator: ", "                               # 문장 join 구분자
+  prefix_template: "{ticker_name} 30분 요약: "  # ticker_name은 ticker_keywords[zfilled][0]
+  missing_feature_policy: "skip"               # skip | error | log_warning
+  fallback_ticker_name: "종목코드 {ticker}"     # ticker_keywords에 없는 경우 fallback
+  narrative_max_chars: 200                      # S2-7 NewsAgent _parse_llm_content narrative 최대 길이 (2026-04-23 하드코딩 제거)

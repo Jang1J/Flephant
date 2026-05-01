@@ -18,6 +18,8 @@ Knowledge Base 저장 시:
 
 **효과**: 팩터 저장소와 독창성 검증이 하나로 통합. 유지보수 단순화.
 
+**Sprint**: Sprint 3 S3-11
+
 ## 2. AAPM 반복 정제 + TradeXpert 종목 비교 결합
 
 **출처**: AAPM(N-round refinement, +3.8% SR) × TradeXpert(Relaxed Sort, RankIC 0.12)
@@ -32,6 +34,8 @@ FDA 판단을 3라운드 정제 루프:
 ```
 
 **효과**: FDA의 판단 품질이 매 라운드 개선. 종목 선정과 판단 정제가 통합.
+
+**Sprint**: Sprint 2 S2-9 + Sprint 3 S3-3
 
 ## 3. MetaGPT 메시지 형식으로 RD-Agent 경험 저장
 
@@ -51,6 +55,8 @@ FDA 판단을 3라운드 정제 루프:
 
 **효과**: 에이전트 간 실시간 소통(Message Pool)과 장기 지식 축적(KB)이 같은 형식 → 통일된 데이터 구조로 검색/활용 용이.
 
+**Sprint**: Sprint 2 S2-1 (완료)
+
 ## 4. AlphaGAT Cross-Asset Attention × Multi-scale 계층화
 
 **출처**: AlphaGAT(Cross-Asset MHA) × AlphaGAT+MSNet(Multi-scale decomposition)
@@ -69,6 +75,8 @@ FDA 판단을 3라운드 정제 루프:
 ```
 
 **효과**: 단일 스케일보다 풍부한 종목 간 관계 포착. 1분봉의 노이즈를 다중 스케일에서 필터링.
+
+**Sprint**: Sprint 4+ (backlog, R4 STGNN과 연계)
 
 ## 5. 동적 LLM 라우팅 (TradeXpert MoE + RD-Agent Bandit)
 
@@ -91,3 +99,5 @@ Bayesian posterior로 각 선택지의 성과를 추적 → 점점 최적화
 ```
 
 **효과**: LLM 호출 비용 최적화 + 상황별 최적 LLM 자동 선택. on/off보다 세밀한 제어.
+
+**Sprint**: Sprint 2 S2-2 (완료)
