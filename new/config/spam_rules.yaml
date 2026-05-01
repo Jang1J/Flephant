@@ -1,0 +1,34 @@
+# KOSPI Decision OS v2.2 — 커뮤니티 스팸 필터 규칙
+# Mode B에서 GPT-4o가 매일 밤 갱신.
+#
+# v2.2 변경: mode_b_metadata 통일 블록 추가 (evolution 블록과 병기)
+
+mode_b_metadata:
+  schema_version: "1.0.0"
+  data_version: "1.0.0"
+  last_updated: "2026-04-06"
+  updated_by: "initial"
+  mode_b_editable: true            # Mode B Scheduler가 nightly로 갱신 가능
+  human_approval_required: false   # 자동 반영. operator가 원하면 true로 변경
+  backup_retention_days: 30        # rollback용 이전 버전 보관
+  update_trigger: "mode_b_nightly"
+  update_source: "새 스팸 패턴 추가 (architecture.md §8.7 ⑥)"
+  scope: "architecture.md §8.7 ⑥"
+  rationale: "Cold Path 커뮤니티 스팸 필터 규칙. Mode B nightly 갱신 대상 (§8.7 ⑥). rule 개별 갱신은 자동 허용. rule 구조 대규모 변경은 operator 승인."
+
+version: "1.0.0"
+last_updated: "2026-04-06"
+
+filters:
+  - type: "length_filter"
+    condition: "length < 10"
+  - type: "url_spam"
+    condition: "contains_url AND length < 50"
+  - type: "keyword_spam"
+    keywords: ["리딩방", "VIP방", "수익인증", "텔레그램", "무료 체험", "카톡 문의"]
+  - type: "repeat_detector"
+    condition: "same_user_same_ticker > 3 in 10min"
+
+evolution:
+  enabled: true
+  trigger: "mode_b_nightly"

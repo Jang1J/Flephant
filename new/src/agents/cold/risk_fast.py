@@ -1,0 +1,242 @@
+"""Cold Path Risk Fast Agent. trigger_catalog 기반 비LLM 규칙 평가.
+
+S2-8 실구현. Cold Path 이벤트 진입 시 즉시 규칙 매칭 (<50ms, LLM 미호출).
+결과: C5 risk_warning publish.
+
+역할 분리:
+  - hot/risk_fast.py: Hot Path bar_buffer 기반 가격/거래량 이상 탐지 sidecar
+  - cold/risk_fast.py (이 파일): Cold Path 이벤트 payload 기반 커뮤니티/수급/공시 규칙 평가
+
+trigger_catalog는 risk_config.yaml에서 로드 (하드코딩 금지, 불변 원칙 5).
+"""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from src.agents._base import AgentBase
+from src.utils.config_loader import load as config_load
+from src.utils.logger import get_logger
+
+logger = get_logger("risk_fast_cold")
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+class RiskAgentFast(AgentBase):
+    """Cold Path 규칙 기반 빠른 리스크 평가 에이전트.
+
+    trigger_catalog 6개 규칙 순차 평가. 비LLM, <50ms 목표.
+    임계값은 risk_config.yaml trigger_catalog / risk_fast 섹션 경유.
+    """
+
+    ALLOWED_PUBLISH_CHANNELS: frozenset[str] = frozenset(
+        {"risk_warning", "uncertainty_signal"}
+    )
+
+    def __init__(self, pubsub: Any | None = None) -> None:
+        """
+        pubsub: PubSubBroker (optional). None이면 publish skip.
+        """
+        self._pubsub = pubsub
+        self._rules = self._load_trigger_rules()
+        self._thresholds = self._load_thresholds()
+        # trigger id → risk_level / stance: yaml trigger_catalog에서 동적 로드
+        self._trigger_risk_level: dict[str, str] = {}
+        self._trigger_stance: dict[str, str] = {}
+        for rule in self._rules:
+            rid = rule.get("id", "")
+            self._trigger_risk_level[rid] = rule.get("risk_level", "medium")
+            self._trigger_stance[rid] = rule.get("stance", "neutral")
+        # SLA: risk_config.yaml risk_fast.sla_ms 경유 (불변 원칙 5)
+        self._sla_ms = self._load_sla_ms()
+
+    def _load_trigger_rules(self) -> list[dict[str, Any]]:
+        """risk_config.yaml trigger_catalog.rules 로드."""
+        try:
+            catalog = config_load("risk_config.yaml", "trigger_catalog")
+            return catalog.get("rules", [])
+        except Exception as e:
+            logger.warning("[risk_fast_cold] trigger_catalog 로드 실패: %s", e)
+            return []
+
+    def _load_sla_ms(self) -> float:
+        """risk_config.yaml risk_fast.sla_ms 로드 (불변 원칙 5)."""
+        try:
+            rf = config_load("risk_config.yaml", "risk_fast")
+            return float(rf.get("sla_ms", 50))
+        except Exception as e:
+            logger.warning("[risk_fast_cold] sla_ms 로드 실패, 기본값 50ms 사용: %s", e)
+            return 50.0
+
+    def _load_thresholds(self) -> dict[str, float]:
+        """risk_config.yaml risk_fast.cold_path 섹션에서 임계값 로드.
+
+        불변 원칙 5: 모든 수치는 yaml SSOT 경유. defaults는 yaml 파싱 실패 시 비상용.
+        foreign_net_sell_krw: 음수 컨벤션 (-100B 이하 = 대규모 순매도).
+        """
+        defaults = {
+            "comm_volume_zscore": 2.5,
+            "comm_sentiment_delta": 0.5,
+            "intraday_return_zscore": -3.0,
+            "foreign_net_sell_krw": -100_000_000_000.0,  # -100B KRW (음수 컨벤션)
+            "news_comm_divergence": 0.5,
+        }
+        try:
+            rf = config_load("risk_config.yaml", "risk_fast")
+            cold_cfg = rf.get("cold_path", {})
+            for key in defaults:
+                if key in cold_cfg:
+                    defaults[key] = float(cold_cfg[key])
+        except Exception as e:
+            logger.warning("[risk_fast_cold] cold_path 임계값 로드 실패, 비상 기본값 사용: %s", e)
+        return defaults
+
+    def evaluate(
+        self,
+        event: dict,
+        context: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Cold Path 이벤트 + 컨텍스트 수치에 대해 trigger_catalog 규칙 평가.
+
+        Args:
+            event: C2 EventNormalizeContract 이벤트
+                   (event_type, payload, ticker, occurred_at 등)
+            context: 부가 수치 딕셔너리 (선택).
+              - comm_volume_zscore: 커뮤니티 게시글 z-score
+              - comm_sentiment_delta: 감성 점수 30분 변화율
+              - intraday_return_zscore: 분봉 수익률 z-score
+              - foreign_net_sell_krw: 외국인 순매도 금액 (원)
+              - news_comm_divergence: 뉴스-커뮤니티 방향 불일치
+
+        Returns:
+            C5 risk_warning 호환 딕셔너리:
+              risk_level, stance, fast_rule_match, triggered_rules,
+              recommended_action, latency_ms
+        """
+        t0 = time.perf_counter()
+        ctx = context or {}
+        triggered: list[dict[str, Any]] = []
+
+        event_type = event.get("event_type", "")
+        payload = event.get("payload", {})
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 규칙 1: 커뮤니티 게시글 급증
+        comm_z = ctx.get("comm_volume_zscore", 0.0)
+        if comm_z > self._thresholds["comm_volume_zscore"]:
+            triggered.append({"rule_id": "comm_volume_spike", "matched_at": now_iso})
+            logger.info(
+                "[risk_fast_cold] rule_comm_volume_spike 발동: zscore=%.2f", comm_z
+            )
+
+        # 규칙 2: 커뮤니티 감성 급변
+        sent_delta = ctx.get("comm_sentiment_delta", 0.0)
+        if abs(sent_delta) > self._thresholds["comm_sentiment_delta"]:
+            triggered.append({"rule_id": "comm_sentiment_delta", "matched_at": now_iso})
+            logger.info(
+                "[risk_fast_cold] rule_comm_sentiment_delta 발동: delta=%.2f", sent_delta
+            )
+
+        # 규칙 3: 분봉 급락 이상치
+        ret_z = ctx.get("intraday_return_zscore", 0.0)
+        if ret_z < self._thresholds["intraday_return_zscore"]:
+            triggered.append({"rule_id": "intraday_drop_anomaly", "matched_at": now_iso})
+            logger.info(
+                "[risk_fast_cold] rule_intraday_drop_anomaly 발동: zscore=%.2f", ret_z
+            )
+
+        # 규칙 4: 외국인 대규모 순매도 (음수 컨벤션: -100B 이하 = 대규모 순매도)
+        frg_sell = ctx.get("foreign_net_sell_krw", 0.0)
+        if frg_sell < self._thresholds["foreign_net_sell_krw"]:
+            triggered.append(
+                {"rule_id": "foreign_net_sell_critical", "matched_at": now_iso}
+            )
+            logger.info(
+                "[risk_fast_cold] rule_foreign_net_sell_critical 발동: sell=%.0f KRW", frg_sell
+            )
+
+        # 규칙 5: DART 중요 공시 (C2 event_type="dart" + priority 기반)
+        # C2 EventNormalizeContract event_type enum: news|dart|macro|us_market|community|regime|investor_flow
+        # "dart_alert"는 C4 publish_channel 이름이지 C2 event_type이 아님.
+        # priority는 event 최상위 필드 (payload 내부가 아님).
+        if (
+            event_type == "dart"
+            and event.get("priority", "") in ("critical", "urgent")
+        ):
+            triggered.append(
+                {"rule_id": "dart_critical_disclosure", "matched_at": now_iso}
+            )
+            logger.info("[risk_fast_cold] rule_dart_critical_disclosure 발동")
+
+        # 규칙 6: 뉴스-커뮤니티 방향 불일치
+        divergence = ctx.get("news_comm_divergence", 0.0)
+        if abs(divergence) > self._thresholds["news_comm_divergence"]:
+            triggered.append(
+                {"rule_id": "news_comm_divergence_strong", "matched_at": now_iso}
+            )
+            logger.info(
+                "[risk_fast_cold] rule_news_comm_divergence_strong 발동: div=%.2f",
+                divergence,
+            )
+            # uncertainty_signal publish (Dual-Source divergence → FDA 연계)
+            self.publish(
+                "uncertainty_signal",
+                {
+                    "source": "risk_fast_cold",
+                    "trigger": "news_comm_divergence_strong",
+                    "ts": datetime.now(_KST).isoformat(),
+                },
+            )
+
+        # risk_level / stance 결정
+        if not triggered:
+            risk_level = "low"
+            stance = "neutral"
+            recommended_action = "pass"
+        else:
+            # 가장 높은 risk_level 선택 (high > medium > low)
+            levels = [self._trigger_risk_level.get(t["rule_id"], "low") for t in triggered]
+            risk_level = "high" if "high" in levels else "medium"
+            # 가장 강한 stance 선택
+            stances = [self._trigger_stance.get(t["rule_id"], "neutral") for t in triggered]
+            if "veto_recommendation" in stances:
+                stance = "veto_recommendation"
+                recommended_action = "halt"
+            elif "risk_reduce" in stances:
+                stance = "risk_reduce"
+                recommended_action = "reduce"
+            else:
+                stance = "neutral"
+                recommended_action = "pass"
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        if latency_ms > self._sla_ms:
+            logger.warning(
+                "[risk_fast_cold] SLA 초과: %.2fms > %.0fms", latency_ms, self._sla_ms
+            )
+
+        return {
+            "risk_level": risk_level,
+            "stance": stance,
+            "fast_rule_match": triggered if triggered else None,
+            "triggered_rules": [t["rule_id"] for t in triggered],
+            "recommended_action": recommended_action,
+            "fast_rule_count": len(triggered),
+            "latency_ms": round(latency_ms, 2),
+        }
+
+    def report(self, report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """C5 risk_warning 리포트 생성."""
+        if report_type != "risk_warning":
+            raise ValueError(
+                f"[risk_fast_cold] report_type={report_type} 미지원. "
+                "RiskAgentFast(Cold)는 risk_warning만 발행."
+            )
+        msg = self.publish("risk_warning", payload)
+        msg["report_type"] = report_type
+        msg["ts"] = datetime.now(timezone.utc).isoformat()
+        return msg

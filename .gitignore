@@ -1,0 +1,58 @@
+# === Secrets ===
+.env
+
+# === Virtual Environment ===
+.venv/
+
+# === macOS ===
+.DS_Store
+__MACOSX/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Model Artifacts (재학습으로 재생성 가능) ===
+*.pkl
+*.pt
+models/rebound_cnn/training_log.json
+models/rebound_cnn/calibrator_meta.json
+
+# === Runtime artifacts (AuditLogger dead_letter, ModelRegistry 등) ===
+artifacts/
+
+# === Claude Code 하네스 (개인 작업 환경) ===
+.claude/
+
+# === 개인 작업 로그 / 트래킹 ===
+claude-progress.md
+feature_list.json
+
+# === 시각화 / 임시 산출물 ===
+feedback_/
+
+# === 학술 논문 PDF (저작권) ===
+논문/
+
+# === 발표 자료 ===
+*.pdf
+
+# === 발표 보조 (시각자료/docx) — 코드 외부 자료는 별도 채널 ===
+new/GPT/*.svg
+new/GPT/*.docx
+new/docs/*.docx
+new/presentations/*.pdf
+
+# === macOS Finder 자동 duplicate 차단 (예: "filename 2.ext", "filename 12.ext") ===
+* [0-9].*
+* [0-9][0-9].*

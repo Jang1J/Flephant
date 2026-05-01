@@ -1,0 +1,450 @@
+openapi: 3.1.0
+info:
+  title: KOSPI Decision OS AI-BE Integration API
+  version: 1.0.1-mvp-reviewed
+  summary: MVP mock/paper integration spec for AI-BE handoff
+  description: |
+    SSOT는 api_contracts.md(C4/C5/C8/C9/C10)이다.
+    이 OpenAPI는 BE 연습용 REST/YAML 표현이며,
+    Shared Message Pool(C4)의 진짜 pub/sub semantics는 OpenAPI보다 AsyncAPI에 더 가깝다.
+servers:
+  - url: https://internal.example.local
+    description: Internal integration gateway
+
+tags:
+  - name: ai-to-be
+  - name: be-to-ai
+  - name: internal-reference
+
+paths:
+  /v1/portfolio-patches:
+    post:
+      tags: [ai-to-be]
+      operationId: receivePortfolioPatch
+      summary: Receive portfolio patch from Portfolio Manager
+      description: |
+        Source of truth: Portfolio Manager.
+        FDA는 이 payload를 수정할 수 없다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PortfolioPatch'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+
+  /v1/final-decisions:
+    post:
+      tags: [ai-to-be]
+      operationId: receiveFinalDecision
+      summary: Receive FDA final decision
+      description: |
+        final_decision이 approved=true인 경우에만 주문 제출 가능.
+        target_weights/order_deltas는 read-only echo다.
+        reasoning은 현재 payload 고정 필드가 아니라 message/report trail 참조일 수 있다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FinalDecision'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+
+  /v1/execution-feedback:
+    post:
+      tags: [be-to-ai]
+      operationId: submitExecutionFeedback
+      summary: Submit execution feedback back to AI
+      description: |
+        Execution Gateway 결과를 AI memory/KB에 반영하기 위한 envelope.
+        execution_report와 feedback_record를 함께 전달한다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionFeedbackEnvelope'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+
+  /v1/internal/messages:
+    post:
+      tags: [internal-reference]
+      operationId: publishSharedMessage
+      summary: Shared message pool reference payload
+      description: |
+        내부 message bus 참조용 schema.
+        실제 pub/sub 보장은 OpenAPI가 아니라 internal broker/queue 설정에 따른다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SharedMessage'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+
+  /v1/internal/agent-reports:
+    post:
+      tags: [internal-reference]
+      operationId: publishAgentReport
+      summary: Agent report reference payload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentReport'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+
+components:
+  schemas:
+    Ack:
+      type: object
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        received_at:
+          type: string
+          format: date-time
+        ref_id:
+          type: string
+      required: [accepted, received_at]
+
+    OrderDelta:
+      type: object
+      additionalProperties: false
+      properties:
+        ticker:
+          type: string
+          pattern: '^\d{6}$'
+        side:
+          type: string
+          enum: [buy, sell]
+        qty:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          enum: [rebalance, exit, risk_reduce, cash_raise]
+      required: [ticker, side, qty, reason]
+
+    PortfolioPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        portfolio_patch_id:
+          type: string
+          pattern: '^PP-\d{8}-\d+$'
+        based_on_ts:
+          type: string
+          format: date-time
+        target_weights:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        order_deltas:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderDelta'
+      required: [portfolio_patch_id, based_on_ts, target_weights, order_deltas]
+      examples:
+        default:
+          value:
+            portfolio_patch_id: PP-20260410-001
+            based_on_ts: '2026-04-10T09:01:00+09:00'
+            target_weights:
+              '005930': 0.08
+              '000660': 0.06
+            order_deltas:
+              - ticker: '005930'
+                side: buy
+                qty: 12
+                reason: rebalance
+              - ticker: '000660'
+                side: sell
+                qty: 5
+                reason: risk_reduce
+
+    FinalDecision:
+      type: object
+      additionalProperties: false
+      description: |
+        must_include_reasoning=true 규칙이 있으나, 현재 payload 고정 필드에는 reasoning 자체가 없다.
+        reasoning 본문은 상위 message/report trail 또는 내부 로그 참조로 관리될 수 있다.
+      properties:
+        decision_id:
+          type: string
+          pattern: '^DEC-\d{8}-\d{4}-\d+$'
+        approved:
+          type: boolean
+        target_weights:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+        order_deltas:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderDelta'
+        veto_reason:
+          type: [string, 'null']
+        risk_overrides:
+          type: array
+          description: Audit metadata only. Not a rule mutation path.
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              rule:
+                type: string
+              original:
+                type: string
+              override:
+                type: string
+              justification:
+                type: string
+            required: [rule, original, override, justification]
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        expiry:
+          type: string
+          format: date-time
+      required: [decision_id, approved, target_weights, order_deltas, veto_reason, risk_overrides, confidence, expiry]
+      examples:
+        approved:
+          value:
+            decision_id: DEC-20260410-0901-001
+            approved: true
+            target_weights:
+              '005930': 0.08
+              '000660': 0.06
+            order_deltas:
+              - ticker: '005930'
+                side: buy
+                qty: 12
+                reason: rebalance
+              - ticker: '000660'
+                side: sell
+                qty: 5
+                reason: risk_reduce
+            veto_reason: null
+            risk_overrides: []
+            confidence: 0.77
+            expiry: '2026-04-10T09:02:00+09:00'
+
+    Fill:
+      type: object
+      additionalProperties: false
+      properties:
+        ticker:
+          type: string
+          pattern: '^\d{6}$'
+        side:
+          type: string
+          enum: [buy, sell]
+        qty:
+          type: integer
+          minimum: 1
+        avg_fill_price:
+          type: number
+          exclusiveMinimum: 0
+        fill_ts:
+          type: string
+          format: date-time
+      required: [ticker, side, qty, avg_fill_price, fill_ts]
+
+    ExecutionReport:
+      type: object
+      additionalProperties: false
+      properties:
+        order_plan_id:
+          type: string
+          pattern: '^OP-\d{8}-\d{4}-\d+$'
+        submitted_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [submitted, rejected, filled, partial_filled, cancelled]
+        fills:
+          type: array
+          items:
+            $ref: '#/components/schemas/Fill'
+        estimated_cost:
+          type: number
+        realized_slippage:
+          type: number
+      required: [order_plan_id, submitted_at, status, fills, estimated_cost, realized_slippage]
+
+    FeedbackRecord:
+      type: object
+      additionalProperties: false
+      properties:
+        kb_message_id:
+          type: string
+          pattern: '^MSG-\d{8}-[A-Z0-9\-]+$'
+        pnl_contribution:
+          type: number
+        execution_shortfall:
+          type: number
+        lesson_stub:
+          type: [string, 'null']
+      required: [kb_message_id, pnl_contribution, execution_shortfall, lesson_stub]
+
+    ExecutionFeedbackEnvelope:
+      type: object
+      additionalProperties: false
+      properties:
+        final_decision_ref:
+          type: string
+          pattern: '^DEC-\d{8}-\d{4}-\d+$'
+        approved:
+          type: boolean
+        execution_mode:
+          type: string
+          enum: [mock, paper, live]
+        live_enabled:
+          type: boolean
+        execution_report:
+          $ref: '#/components/schemas/ExecutionReport'
+        feedback_record:
+          $ref: '#/components/schemas/FeedbackRecord'
+      required: [final_decision_ref, approved, execution_mode, live_enabled, execution_report, feedback_record]
+      examples:
+        partial_fill:
+          value:
+            final_decision_ref: DEC-20260410-0901-001
+            approved: true
+            execution_mode: mock
+            live_enabled: false
+            execution_report:
+              order_plan_id: OP-20260410-0901-001
+              submitted_at: '2026-04-10T09:01:05+09:00'
+              status: partial_filled
+              fills:
+                - ticker: '005930'
+                  side: buy
+                  qty: 10
+                  avg_fill_price: 81200.0
+                  fill_ts: '2026-04-10T09:01:06+09:00'
+              estimated_cost: 1350.5
+              realized_slippage: 8.2
+            feedback_record:
+              kb_message_id: MSG-20260410-EXEC-001
+              pnl_contribution: 152340.0
+              execution_shortfall: -8100.0
+              lesson_stub: partial fill로 execution_shortfall 발생
+
+    SharedMessage:
+      type: object
+      additionalProperties: false
+      properties:
+        message_id:
+          type: string
+          pattern: '^MSG-\d{8}-\d{4}-\d+$'
+        content:
+          type: string
+        cause_by:
+          type: string
+        sent_from:
+          type: string
+        send_to:
+          oneOf:
+            - type: 'null'
+            - type: string
+            - type: array
+              items:
+                type: string
+        priority:
+          type: string
+          enum: [urgent, normal, low]
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        reasoning:
+          type: string
+        evidence_ids:
+          type: array
+          items:
+            type: string
+        uncertainty:
+          type: string
+        prediction:
+          type: [string, 'null']
+        risk_level:
+          oneOf:
+            - type: 'null'
+            - type: string
+              enum: [low, medium, high]
+        timestamp:
+          type: string
+          format: date-time
+        ttl:
+          type: integer
+          minimum: 0
+        expires_at:
+          type: string
+          format: date-time
+        scope:
+          type: string
+        event_id:
+          type: [string, 'null']
+        supersedes:
+          type: [string, 'null']
+        action_type:
+          type: string
+          enum: [signal, alert, veto_recommendation, regime_change, resolution]
+        portfolio_patch_id:
+          type: [string, 'null']
+      required:
+        [message_id, content, cause_by, sent_from, send_to, priority, confidence, reasoning,
+         evidence_ids, uncertainty, prediction, risk_level, timestamp, ttl, expires_at,
+         scope, event_id, supersedes, action_type, portfolio_patch_id]
+
+    AgentReport:
+      type: object
+      additionalProperties: false
+      properties:
+        report_type:
+          type: string
+          enum: [news_signal, risk_warning, quant_signal, investor_flow_alert, theme_score]
+        payload:
+          type: object
+      required: [report_type, payload]

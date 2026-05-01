@@ -1,0 +1,261 @@
+"""S1-3 Portfolio Manager unit tests."""
+from __future__ import annotations
+
+import pytest
+
+from src.portfolio.portfolio_manager import PortfolioManager
+
+
+@pytest.fixture
+def pm() -> PortfolioManager:
+    return PortfolioManager()
+
+
+# ====================================================================== #
+# 1. 초기화 + 불변 원칙 2
+# ====================================================================== #
+
+
+def test_can_fda_edit_false(pm: PortfolioManager) -> None:
+    """불변 원칙 2: FDA는 PM 결과 수정 못 한다."""
+    assert pm.can_fda_edit is False
+
+
+def test_init_loads_config(pm: PortfolioManager) -> None:
+    assert pm._max_names == 10
+    assert pm._max_single_name == pytest.approx(0.20)
+    assert pm._daily_turnover_max == pytest.approx(0.30)
+
+
+# ====================================================================== #
+# 2. Empty input
+# ====================================================================== #
+
+
+def test_plan_empty_target_no_positions(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={},
+        current_positions=[],
+        latest_prices={},
+        portfolio_value=1_000_000.0,
+        based_on_ts="2026-04-20T10:00:00+09:00",
+    )
+    assert result["n_orders"] == 0
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["portfolio_patch"]["portfolio_patch_id"].startswith("PP-")
+
+
+def test_plan_all_exits(pm: PortfolioManager) -> None:
+    """보유 전부 exit: target=empty, current=전체 포지션 → sell deltas."""
+    result = pm.plan(
+        target_weights={},
+        current_positions=[
+            {"ticker": "005930", "qty": 10, "weight": 0.2},
+            {"ticker": "000660", "qty": 20, "weight": 0.3},
+        ],
+        latest_prices={"005930": 70000.0, "000660": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    assert result["n_orders"] >= 1
+    # 전부 sell + reason=exit
+    for od in result["portfolio_patch"]["order_deltas"]:
+        assert od["side"] == "sell"
+        assert od["reason"] in ("exit", "risk_reduce")
+
+
+# ====================================================================== #
+# 3. Happy path (rebalance)
+# ====================================================================== #
+
+
+def test_plan_rebalance_new_positions(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.15, "000660": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 70000.0, "000660": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    assert result["n_orders"] == 2
+    # 전부 buy + rebalance
+    for od in result["portfolio_patch"]["order_deltas"]:
+        assert od["side"] == "buy"
+        assert od["reason"] == "rebalance"
+        assert od["qty"] > 0
+
+
+def test_plan_order_qty_calculation(pm: PortfolioManager) -> None:
+    """qty = delta_weight × portfolio_value / price 계산."""
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    od = result["portfolio_patch"]["order_deltas"][0]
+    # delta_weight=0.10, value=10M × 0.10 = 1M, qty=1M/50K=20
+    assert od["qty"] == 20
+    assert od["side"] == "buy"
+
+
+# ====================================================================== #
+# 4. Turnover cap
+# ====================================================================== #
+
+
+def test_turnover_under_cap(pm: PortfolioManager) -> None:
+    # turnover=0.10 (target 0.10 신규 진입)
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    assert result["turnover_exceeded"] is False
+    assert result["scale_factor"] == pytest.approx(1.0)
+
+
+def test_turnover_over_cap_scales_down(pm: PortfolioManager) -> None:
+    # 5 종목 × 0.2 신규 = turnover 1.0 → cap 0.30 → scale_factor ~0.3
+    result = pm.plan(
+        target_weights={
+            "005930": 0.20, "000660": 0.20, "035420": 0.20,
+            "051910": 0.20, "005380": 0.20,
+        },
+        current_positions=[],
+        latest_prices={
+            "005930": 50000.0, "000660": 50000.0, "035420": 50000.0,
+            "051910": 50000.0, "005380": 50000.0,
+        },
+        portfolio_value=10_000_000.0,
+    )
+    assert result["turnover_exceeded"] is True
+    assert result["scale_factor"] < 1.0
+    assert result["scale_factor"] > 0.0
+    # 실제 주문 qty는 축소된 delta 기준
+    for od in result["portfolio_patch"]["order_deltas"]:
+        # scale 0.3 × 0.20 × 10M / 50K = 12주 (원래 40주)
+        assert od["qty"] < 40
+
+
+# ====================================================================== #
+# 5. Error 처리
+# ====================================================================== #
+
+
+def test_price_unavailable_error(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={},  # 가격 없음
+        portfolio_value=1_000_000.0,
+    )
+    assert result["n_errors"] >= 1
+    assert any(e["error"] == "PRICE_UNAVAILABLE" for e in result["errors"])
+    assert result["n_orders"] == 0
+
+
+def test_lot_size_error_tiny_weight(pm: PortfolioManager) -> None:
+    """너무 작은 delta → qty=0 → LOT_SIZE_ERROR."""
+    result = pm.plan(
+        target_weights={"005930": 0.000001},  # 1 microweight
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=1_000_000.0,
+    )
+    assert result["n_errors"] >= 1
+    assert any(e["error"] == "LOT_SIZE_ERROR" for e in result["errors"])
+
+
+def test_zero_price_treated_as_unavailable(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 0.0},
+        portfolio_value=1_000_000.0,
+    )
+    assert result["n_errors"] >= 1
+    assert any(e["error"] == "PRICE_UNAVAILABLE" for e in result["errors"])
+
+
+# ====================================================================== #
+# 6. Cold path exit 처리
+# ====================================================================== #
+
+
+def test_cold_path_exit_sets_risk_reduce_reason(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={},
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": 0.2}],
+        latest_prices={"005930": 70000.0},
+        portfolio_value=10_000_000.0,
+        cold_path_exits=["005930"],
+    )
+    od = result["portfolio_patch"]["order_deltas"][0]
+    assert od["reason"] == "risk_reduce"
+    assert od["side"] == "sell"
+
+
+# ====================================================================== #
+# 7. Output schema (C8)
+# ====================================================================== #
+
+
+def test_output_schema_c8_fields(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        based_on_ts="2026-04-20T10:00:00+09:00",
+    )
+    patch = result["portfolio_patch"]
+    assert "portfolio_patch_id" in patch
+    assert "based_on_ts" in patch
+    assert "target_weights" in patch
+    assert "order_deltas" in patch
+    assert patch["based_on_ts"] == "2026-04-20T10:00:00+09:00"
+
+
+def test_target_weights_echo_readonly(pm: PortfolioManager) -> None:
+    """C8: target_weights는 read-only echo. PM이 덮어쓰지 않음."""
+    tw = {"005930": 0.10, "000660": 0.05}
+    result = pm.plan(
+        target_weights=tw,
+        current_positions=[],
+        latest_prices={"005930": 50000.0, "000660": 40000.0},
+        portfolio_value=10_000_000.0,
+    )
+    assert result["portfolio_patch"]["target_weights"] == tw
+
+
+def test_order_delta_fields(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    od = result["portfolio_patch"]["order_deltas"][0]
+    assert "ticker" in od
+    assert od["side"] in ("buy", "sell")
+    assert "qty" in od and od["qty"] > 0
+    assert od["reason"] in ("rebalance", "exit", "risk_reduce", "cash_raise")
+
+
+# ====================================================================== #
+# 8. Turnover 계산
+# ====================================================================== #
+
+
+def test_compute_turnover_basic() -> None:
+    current = {"005930": 0.2, "000660": 0.1}
+    target = {"005930": 0.1, "035420": 0.15}
+    # delta: 005930 -0.1, 000660 -0.1, 035420 +0.15 → abs sum=0.35 / 2 = 0.175
+    t = PortfolioManager._compute_turnover(current, target)
+    assert t == pytest.approx(0.175, abs=1e-6)
+
+
+def test_compute_turnover_zero_no_change() -> None:
+    w = {"005930": 0.15}
+    t = PortfolioManager._compute_turnover(w, w)
+    assert t == 0.0

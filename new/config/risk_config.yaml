@@ -1,0 +1,1208 @@
+# KOSPI Decision OS v3 — Risk Configuration
+# 이 값들은 default이며 final freeze 전.
+# Freeze 조건: 1분봉 백테스트 50거래일 + walk-forward 검증 후 재조정.
+# 코드에서 이 파일을 로드하라. 하드코딩 금지.
+#
+# v2.2 변경점 (2026-04-09):
+#   - mode_b_metadata 통일 블록 추가 (Mode B 자동 수정 금지)
+#   - backtest_agent 섹션 신규 (C12 BacktestAgentContract SLA + deploy gate)
+#   - validation_tools 섹션 신규 (C13 ValidationToolsContract SLA)
+#   - execution_cost_model 섹션 신규 (BacktestEngine 거래비용 모델)
+#
+# v3 변경점 (2026-04-20, S1-0 Batch B+C):
+#   - validation_tools.backtest_engine.purge_bars 390→60, embargo_bars 390→78 (Prado 1% rule)
+#   - lightgbm 섹션 신규 (LightGBM LambdaRank 하이퍼파라미터)
+#   - walk_forward 섹션 신규 (fold/window 파라미터)
+#   - label 섹션 신규 (horizon_bars=5, target_col=label_5m_ret)
+#   - evaluation 섹션 신규 (annualization_factor, top_k_fraction 등 C12/C13 정렬)
+#   - model_registry 섹션 신규 (C17 ModelRegistryContract 구현 지원)
+#   - preprocessor 섹션 확장 (feature_cols, rolling_min_periods)
+#   - 신규 5개 섹션에 mode_b_metadata 블록 추가 (Part B 2026-04-20)
+
+mode_b_metadata:
+  schema_version: "1.0.0"
+  data_version: "1.0.0"
+  last_updated: "2026-04-09"
+  updated_by: "initial"
+  mode_b_editable: false           # risk_config는 Mode B가 자동 수정 금지 (수동 업데이트만)
+  human_approval_required: true    # 리스크 정책 변경은 operator 승인 필수
+  backup_retention_days: 365       # 리스크 정책은 장기 보관
+  update_trigger: "manual_only"
+  rationale: "리스크 정책은 사용자 안전 관련. Mode B가 자동으로 임계값을 조정하면 의도치 않은 리스크 노출 가능. 모든 변경은 operator가 백테스트 50거래일 + walk-forward 검증 후 수동으로 freeze."
+
+regime_gate:
+  vix_proxy:
+    red_gte: 90                # >= 90%: 위험 (극단적 변동성)
+    yellow_gte: 70             # >= 70%: 주의
+  market_breadth:
+    red_lt: 0.30               # < 30%: 위험
+    yellow_lt: 0.45            # < 45%: 주의
+  actions:
+    green:
+      new_entry_weight_multiplier: 1.0    # 정상 — 풀 투자
+    yellow:
+      new_entry_weight_multiplier: 0.5    # 주의 — 신규 진입 비중 50% 감축
+    red:
+      new_entry_weight_multiplier: 0.0    # 위험 — 신규 진입 금지
+
+turnover_cap:
+  daily_max: 0.30              # 일일 최대 회전율 30%
+
+position_limits:
+  max_names: 10                # trade universe 전용 최대 보유 종목 수. Sprint 5 동적 overlay는 dynamic_universe.holdings_max 별도 (=5). 총 최대 = 15.
+  max_single_name: 0.20        # 단일 종목 비중 상한 (20%)
+  max_sector: 0.40             # 섹터 비중 상한 (40%)
+  min_cash: 0.10               # 최소 현금 비율 (10%)
+  # min_confidence: softmax(quant_scores)[ticker] 기준. 20종목 평균 0.05.
+  # 2026-04-20 Phase 2: 0.30 → 0.03 재조정 (dead zone 방지).
+  # 0.30이면 20종목 softmax 평균(0.05)보다 6배 커서 Hot Path 전면 empty allocation 위험.
+  min_confidence: 0.03         # 0.03 = 20종목 평균 softmax의 60% 수준 (reasonable filter)
+
+kill_switch:
+  daily_loss_threshold: 0.05   # 일일 최대 손실 5% (양수 절대값, 부호 혼동 방지). 트리거: daily_pnl <= -daily_loss_threshold
+  action: "emergency_halt"     # 전량 시장가 청산 + 시스템 중단
+  # S1-7 추가 (2026-04-20): operator reset token (Sprint 4 전 RBAC 실 인증 교체 필수)
+  operator_reset_token: "OPERATOR_RESET"
+
+# S1-7 SafetyGuards + S1-0 Batch A 감사 반영 (2026-04-20 Phase 1 수정)
+# safety_guards.py 참조. S-3 Sanity Check + S-4 Reconciliation 임계값.
+safety_guards:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_audit_phase_1"
+    mode_b_editable: false           # 안전 가드 임계값은 Mode B 자동 변경 금지
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "Safety guard는 운영 안전 직결. operator 수동 승인만 허용."
+  sanity_max_change_pct: 0.10        # ±10% 초과 = 가격 이상치 (S-3)
+  reconciliation_tol_qty: 0          # system vs KIS positions qty 허용 오차 (기본: 정확 일치)
+
+# 장중 시간 정의 (KRX 정규장, 2026-04-20 Phase 1 추가)
+# backfill.py / event_normalizer.py가 참조. 하드코딩 금지 원칙.
+market_hours:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_audit_phase_1"
+    mode_b_editable: false           # KRX 정규장 시간은 거래소 정책. 자동 변경 불가.
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "장 시간 변경은 KRX 공식 공지 시에만. Mode B 자동 수정 금지."
+  open: "09:00:00"                   # KRX 정규장 개장
+  close: "15:30:00"                  # KRX 정규장 마감 (투자자별 수급 발표 기준 시각)
+  timezone: "Asia/Seoul"
+
+alpha_decay:
+  ic_warning_months: 3         # IC 연속 하락 경고 기간
+  ic_retire_months: 6          # IC 연속 하락 시 자동 은퇴
+
+execution:
+  mode: "mock"                 # mock | paper | live
+  live_enabled: false          # true면 실계좌 주문 가능
+
+bounded_execution:
+  news_agent_max_sec: 10
+  risk_agent_max_sec: 10
+  debate_agent_max_sec: 15
+  fda_max_sec: 30
+  max_refinement_rounds: 3
+
+investor_flow:
+  foreign_net_sell_warning: -50000000000    # 외국인 순매도 500억원 이상 → warning
+  foreign_net_sell_critical: -100000000000  # 외국인 순매도 1000억원 이상 → critical
+  institutional_net_sell_warning: -30000000000  # 기관 순매도 300억원 이상
+  scope: "ticker"                           # 종목별 감시 (market 전체도 가능)
+
+event_admission:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T11:00:00+09:00"
+    updated_by: "s2_0_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "S2-0 EventAdmission 실구현"
+    rationale: |
+      C11 EventAdmission 3 필터 임계값 (dedupe TTL / backlog / jobs_per_minute).
+      Cold Path 전체 처리량에 직결되며 변경 시 이벤트 drop 패턴 변화. Mode B 자동 수정 금지.
+  max_backlog: 3               # 동시 이벤트 최대 처리 수
+  stale_drop: true
+  max_cold_path_jobs_per_minute: 10   # 1분 내 최대 Cold Path 처리 수
+  jobs_per_minute_window_sec: 60      # jobs/min rolling window 크기 (초). 하드코딩 금지 대응.
+  comparator_sort_key: ["priority", "trigger_type", "scope", "recency"]
+  dedupe_ttl_sec: 300          # dedupe cache TTL (5분)
+  dead_letter_path: "artifacts/dead_letter.jsonl"   # C11 dead_letter_log 경로
+
+llm_budget:
+  kanana_daily_limit: 100        # Kanana-o 일일 호출 한도
+  overflow_to: "gpt-4o"          # 한도 초과 시 GPT-4o fallback
+  budget_allocation:
+    news_agent: 30
+    dart_analysis: 3
+    risk_agent: 15
+    community_anomaly: 5
+    fda_cold_path: 12
+    debate_agent: 5
+    buffer: 30
+  # S2-2 신설 (2026-04-21) — LLM Router 메타데이터
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T13:00:00+09:00"
+    updated_by: "s2_2_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "S2-2 LLM Router 실구현"
+    rationale: "LLM 예산 정책 변경은 장중 LLM 호출 한도 직결. 자동 수정 금지. Kanana-o 100회/일 한도는 API 계약과 직결되므로 operator 수동 승인만 허용."
+
+  # S2-2 신설 (2026-04-21) — circuit breaker 설정
+  circuit_breaker:
+    failure_threshold: 3       # 연속 실패 N회 → OPEN
+    open_duration_sec: 300     # OPEN 유지 시간 (5분). 경과 후 HALF_OPEN
+    # HALF_OPEN 1회 성공 시 CLOSED 복귀, 실패 시 즉시 OPEN 재차단
+
+  # S2-2 신설 (2026-04-21) — SLA
+  sla:
+    timeout_sec: 30.0          # LLM 호출 단일 요청 타임아웃 (초)
+    gpt4o_cost_placeholder_usd: 0.001   # Sprint 4 S4-6 실 API 통합 전 placeholder
+    kanana_cost_placeholder_usd: 0.0    # Kanana 비용 (현재 0)
+
+  # S2-2 신설 (2026-04-21) — Mode B GPT-4o 호출 허용 에이전트 화이트리스트
+  # 불변 원칙 3 강제: 이 목록에 없는 caller가 mode='mode_b' 호출 시 RuntimeError
+  mode_b_allowed_callers:
+    - backtest_reasoning     # C12 Backtest Agent
+    - factor_hypothesis      # S3-1 Idea Agent
+    - factor_implementation  # S3-2 Factor Agent
+    - factor_evaluation      # S3-3 Eval Agent
+    - mode_b_scheduler       # C14 Mode B Scheduler
+
+  # v2.2 추가 — Mode B용 GPT-4o는 별도 예산 (장중 100회와 무관)
+  mode_b_gpt4o:
+    factor_hypothesis: "unlimited"     # Idea Agent (§8.3)
+    factor_implementation: "unlimited" # Factor Agent (§8.3)
+    factor_evaluation: "unlimited"     # Eval Agent (§8.3)
+    backtest_reasoning: "unlimited"    # Backtest Agent diagnostic_notes (§8.5.2)
+    note: "장중 Kanana-o 예산(100회)과 분리. 장마감 18:00~22:00 전용"
+
+# v2.2 추가 — Backtest Agent (C12 BacktestAgentContract)
+backtest_agent:
+  mode: "mode_b_only"                  # 장중 경로 절대 미개입
+  llm: "gpt-4o"                        # Kanana-o 100회 예산 보존
+  sla:
+    max_runtime_sec: 3600              # 60분
+    deadline: "21:30"                  # KST, 22:00 배포 게이트 30분 전
+    retry_policy:
+      max_retries: 1
+      on_retry_fail: "baseline_hold"
+  deploy_decision_gate:
+    verdict_required: "pass"           # pass | warn | fail
+    regression_severity_block: "high"  # low | medium | high
+    on_pass:
+      human_approval_required: false
+      action: "deploy"
+    on_warn:
+      human_approval_required: true    # operator 수동 확인
+      action: "operator_review"
+    on_fail:
+      action: "block_deploy"
+      baseline_action: "hold"
+      log_to: "dead_letter_log"
+  forbidden_permissions:
+    - target_weights_modification
+    - order_deltas_generation
+    - fda_bypass
+    - hot_path_intervention
+    - shared_message_pool_publish_during_market_hours
+    - production_direct_write
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-01"
+    updated_by: "Sprint 3 SHIP (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: |
+      Backtest Agent 동작 설정. mode/llm/sla/forbidden_permissions 변경 시
+      불변 원칙 3 (Backtest Agent Mode B 전용) 위반 가능. 자동 변경 금지.
+
+# v2.2 추가 — Validation Tools (C13 ValidationToolsContract)
+validation_tools:
+  called_by: "backtest_agent"          # 유일한 consumer
+  backtest_engine:
+    sla:
+      max_runtime_sec: 1800            # 30분
+      max_concurrent: 1
+    replay_resolution: "1m"
+    # v3 추가 — 분봉 leakage control (S1-0 Batch B 2026-04-20 보정)
+    # 이전 값: 390/390 (1거래일 전부 버림, 과도 보수). Sprint 4 pilot 후 재조정 예정.
+    # 현재 값: Prado "Advances in Financial Machine Learning" 기준
+    #   - purge ≥ label horizon(5m) + feature max lookback(60m multi-scale) → 60
+    #   - embargo = test period 1% rule. test 20거래일 × 390분 × 1% ≈ 78
+    purge_bars: 60                     # 60 bars = 60분 buffer (label 5m + multi-scale 60m 커버)
+    embargo_bars: 78                   # 78 bars ≈ test window 1% (Prado rule of thumb)
+    replay_unit: "1m"                  # 분봉 기준. 일봉("1d")에서 전환
+    # S3 Critical 8 (2026-05-01): 하드코딩 제거 — _run_single_fold synthetic mock 파라미터
+    mock_data:
+      base_price: 50000.0              # synthetic 거래 기준가 (KRW)
+      price_noise_std: 1000.0          # 가격 노이즈 표준편차 (KRW)
+      signal_return_correlation: 0.05  # 예측 시그널과 실제 수익률 상관 계수
+      return_noise_std: 0.02           # 실제 수익률 노이즈 표준편차 (비율)
+    errors:
+      - BUNDLE_LOAD_FAILED
+      - DATA_UNAVAILABLE
+      - NAN_IN_METRICS
+      - LEAKAGE_DETECTED              # v3 추가 — purge/embargo 위반 시
+  replay_runner:
+    sla:
+      max_runtime_sec: 2400            # 40분
+    mode: "deterministic_replay"
+    replay_unit: "1m"                  # v3 추가 — 분봉 기준 replay
+    idempotent: true
+    event_sources:
+      - naver_news
+      - dart
+      - community
+      - us_market
+      - ecos
+      - krx_investor_flow
+  performance_analyzer:
+    sla:
+      max_runtime_sec: 600             # 10분
+    ablation_components:
+      - factor
+      - model
+      - allocator
+      - dual_source
+    regime_labels:
+      - bull
+      - bear
+      - sideways
+      - volatile
+    # verdict 임계값 (하드코딩 금지 — 코드에서 이 키 로드)
+    verdict_improve_sharpe_threshold: 0.1    # delta_sharpe >= +0.1 AND delta_mdd >= 0 → improved
+    verdict_degrade_sharpe_threshold: -0.1   # delta_sharpe <= -0.1 → degraded 후보
+    verdict_degrade_mdd_threshold: -0.05     # delta_mdd <= -0.05 → degraded 후보
+    # regression_risk 임계값
+    regression_sharpe_drop_threshold: -0.2   # delta_sharpe < -0.2 → flagged
+    regression_mdd_drop_threshold: -0.10     # delta_mdd < -0.10 → flagged
+    regression_bear_sharpe_floor: -1.0       # bear/volatile sharpe < -1.0 → flagged
+    regression_dual_source_counterproductive: 0.3  # dual_source ablation delta_sharpe > +0.3 → flagged
+  result_persistence:
+    storage: "kb"
+    ttl_days: 30
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-01"
+    updated_by: "Sprint 3 SHIP (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: |
+      Validation Tools (BacktestEngine/ReplayRunner/PerformanceAnalyzer) 설정.
+      purge_bars/embargo_bars/verdict 임계값 변경 시 C13 SLA 정합성 직결. 자동 변경 금지.
+
+# v2.2 추가 — BacktestEngine 거래비용 모델
+execution_cost_model:
+  name: "slippage_v1"                  # default. BacktestEngine.input.execution_cost_model 참조
+  components:
+    commission_bps: 5                  # 체결 수수료 (bps)
+    slippage_bps: 10                   # 슬리피지 (bps)
+    market_impact_coef: 0.0            # 시장 충격 계수 (현재 미적용)
+  note: "BacktestEngine이 walk-forward 시 reward에 반영. 실거래 전환 시 재측정 필수."
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-01"
+    updated_by: "Sprint 3 SHIP (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: |
+      BacktestEngine 거래비용 모델. commission_bps/slippage_bps 변경 시
+      walk-forward reward 함수 직접 영향. 실거래 전환 전 재측정 필수. 자동 변경 금지.
+
+# v3 추가 — dual_source (뉴스↔커뮤니티 분리 점수 + divergence)
+# 2026-04-21: divergence.tiers 3-tier 추가 (memory project_v3_universe_and_dual_source.md §2)
+dual_source:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T14:00:00+09:00"
+    updated_by: "s2_audit_phase_b (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "manual_only"
+    rationale: |
+      Dual-Source (뉴스↔커뮤니티) divergence 파라미터. Risk Fast sidecar 감지 임계값 +
+      FDA uncertainty 연계 계수. 불변 원칙 1~5 중 PIT-Safety + 하드코딩 금지 직결.
+  enabled: true
+  news_decay_lambda: 0.8
+  community_decay_lambda: 0.4
+  community_peak_lag_days: 2
+  divergence_threshold: 0.5          # 기존 hard threshold (penalty 발동 기준)
+  divergence_penalty_multiplier: 0.85
+  community_noise_zscore: 2.5
+  # divergence 3-tier 정책 (Sprint 2 Risk Fast sidecar 로드 대상)
+  # PIT-Safety: divergence는 장전 08:00~08:30 배치 점수 기반 → 실시간 미래 참조 없음
+  divergence:
+    formula: "abs(news_score_t - comm_score_t_1)"
+    tiers:
+      low:
+        max: 0.2
+        action: "no_penalty"
+        description: "방향 일치, penalty 없음"
+      medium:
+        min: 0.2
+        max: 0.5
+        action: "soft_warning"
+        description: "FDA audit log 에 warning 기록 (reason_code 후보)"
+      high:
+        min: 0.5
+        action: "uncertainty_penalty"
+        description: "강한 불일치 → total_score × penalty_multiplier + sizing 축소 + FDA uncertainty 신호"
+  score_build_window:
+    start: "08:00"
+    end: "08:30"
+  usage:
+    lightgbm_features: [news_score_t, comm_score_t_1, comm_score_t_2, news_comm_divergence, community_noise_multiplier]
+    risk_fast_rule: "divergence > threshold → uncertainty_penalty"
+    cold_path_reasoning: true
+  models:
+    news_classifier: "local_finbert_or_equivalent"
+    community_scorer: "spam_rules + manipulation_rules + sentiment_dict + optional_small_model"
+  ablation:
+    required_in_backtest: true
+    compare: [with_dual_source, without_dual_source]
+
+# v3 추가 — trigger_catalog (Risk Agent Fast Path + Event Admission 공용)
+# {trigger → action} 매핑. 단순 threshold가 아니라 조건 → 행동 구조.
+# Mode B 야간 갱신 대상 (§8.7 ⑨). 하드코딩 금지 원칙 — 이 섹션에서만 정의.
+trigger_catalog:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc_part_c"
+    mode_b_editable: true
+    human_approval_required: false
+    backup_retention_days: 30
+    update_trigger: "mode_b_nightly"
+    update_source: "어제 False Positive 높았던 rule 임계값 조정 (architecture.md §8.7 ⑨)"
+    rationale: "trigger_catalog 는 Risk Fast sidecar + EventAdmission 공용 규칙. rule id/action 신규 추가는 파이프라인 전체에 영향. update_source 는 Mode B §8.5.1 야간 키워드 진화로 자동 갱신 대상이나, rule 구조 변경은 operator 수동 승인."
+
+  rules:
+    - id: "comm_volume_spike"
+      condition: "comm_volume z-score > 2.5"
+      priority: "normal"
+      action: "review_risk"
+      risk_level: "medium"
+      stance: "risk_reduce"
+      description: "커뮤니티 게시글 급증 → Risk Agent에 리스크 검토 요청"
+
+    - id: "comm_sentiment_delta"
+      condition: "sentiment_score 30분 변화율 > 0.5"
+      priority: "normal"
+      action: "review_risk"
+      risk_level: "medium"
+      stance: "risk_reduce"
+      description: "커뮤니티 감성 급변 → Risk Agent에 감성 변화 원인 분석 요청"
+
+    - id: "intraday_drop_anomaly"
+      condition: "1min return < -3σ (rolling 60분 기준)"
+      priority: "urgent"
+      action: "tighten_stop"
+      risk_level: "high"
+      stance: "veto_recommendation"
+      description: "분봉 급락 이상치 → stop-loss 긴축 + Cold Path 진입"
+
+    - id: "foreign_net_sell_critical"
+      condition: "foreign_net_sell > 100B KRW (종목별 또는 시장 전체)"
+      priority: "urgent"
+      action: "reduce_new_entries"
+      risk_level: "high"
+      stance: "veto_recommendation"
+      description: "외국인 대규모 순매도 → 신규 진입 축소"
+
+    - id: "dart_critical_disclosure"
+      condition: "dart_rules.yaml critical 매칭"
+      priority: "urgent"
+      action: "cold_path_escalate"
+      risk_level: "high"
+      stance: "veto_recommendation"
+      description: "중요 공시 → 즉시 Cold Path 에스컬레이션"
+
+    # 2026-04-21 추가: memory project_v3_universe_and_dual_source.md §2
+    # PIT-Safety: divergence 계산은 장전 배치(08:00~08:30) 점수 기반 → 미래 참조 없음
+    - id: "news_comm_divergence_strong"
+      condition: "abs(news_score_t - comm_score_t_1) > 0.5"
+      priority: "normal"
+      action: "uncertainty_penalty"
+      risk_level: "medium"
+      stance: "risk_reduce"
+      description: "뉴스↔커뮤니티 방향 불일치 심각. position sizing 축소 + FDA uncertainty_score 상승 신호. memory project_v3_universe_and_dual_source.md §2."
+      publishes_to: "uncertainty_signal"
+
+
+# Sprint 5 초안 — Dynamic Event Universe (watch universe overlay)
+dynamic_universe:
+  enabled: false                   # Sprint 5 전까지 비활성
+  rationale: "trade universe(active 20)와 분리된 KOSPI200 watch universe에서 이벤트성 기회를 overlay로 처리"
+  watch_universe_ref: "watch_universe_kospi200.yaml"
+  dynamic_config_ref: "dynamic_universe_config.yaml"
+  candidate_pool_max: 10
+  holdings_max: 5
+  total_weight_max: 0.10
+  single_weight_max: 0.03
+  requires_price_snapshot_feed: true
+  post_hoc_evaluation_only: true
+  notes:
+    - "trade universe SSOT(universe_config.yaml) 변경 금지"
+    - "PPO 미사용, fixed sizing only"
+    - "당일 청산 / TTL / stop-loss / spike_resolved 중 하나로 퇴장"
+
+# S0-6 추가 — Rate Limiter 소스별 Token bucket 파라미터
+# req_per_sec: 초당 토큰 보충량 (refill rate)
+# burst: 버킷 최대 용량 (최대 순간 요청 수)
+# 참조 출처: connector_design.md 방법론 3 + KIS/DART/Naver 공식 제한 문서
+rate_limits:
+  kis_rest:
+    req_per_sec: 20
+    burst: 50
+  kis_ws:
+    req_per_sec: 1        # WebSocket은 연결 단위
+    burst: 1
+  dart:
+    req_per_sec: 5
+    burst: 10
+  krx_investor_flow:
+    req_per_sec: 3
+    burst: 5
+  naver:
+    req_per_sec: 10
+    burst: 20
+  ecos:
+    req_per_sec: 2
+    burst: 5
+  community:
+    req_per_sec: 0.1      # 10초당 1회 (5분 폴링 대비 안전)
+    burst: 3
+  us_market:
+    req_per_sec: 1
+    burst: 2
+
+# 커넥터 공통 네트워크 정책 (dart/krx/naver/ecos/us_market 공통)
+# 불변 원칙 5 (하드코딩 금지): timeout/retry/backoff 수치는 반드시 여기서 로드.
+# 적용 파일: src/connectors/*_rest.py
+connector_defaults:
+  timeout_sec: 10       # HTTP 요청 timeout
+  max_retries: 3        # 네트워크 실패 재시도 횟수
+  backoff_base: 2       # 지수 백오프 base (2 ** attempt)
+
+# PIT-Safety snapshot policy (불변 원칙 1 enforcement)
+# pit_guard.py가 참조. 18:00 KST = snapshot cutoff
+pit_safety:
+  snapshot_hour: 18     # KST 기준 시(24시간제)
+  snapshot_minute: 0
+
+# Event Normalizer 정책 (C2 EventNormalizeContract 기본값)
+# event_normalizer.py가 참조. 각 source별 기본값.
+event_normalizer:
+  default_ttl:
+    dart: 3600            # 공시: 1시간
+    krx_investor_flow: 1800   # 수급: 30분 (SSOT 정렬)
+    naver_news: 1800
+    community: 900
+    ecos: 86400           # 거시지표: 1일
+    us_market: 3600
+  priority:
+    dart: urgent
+    krx_investor_flow: normal
+    naver_news: normal
+    community: low
+    ecos: normal
+    us_market: normal
+  llm_required:
+    dart: true
+    krx_investor_flow: false
+    naver_news: true
+    community: true
+    ecos: false
+    us_market: false
+
+# Auth Manager 정책 (KIS OAuth 재시도 + refresh)
+# auth.py가 참조. 불변 원칙 5 준수.
+auth_defaults:
+  retry_delays: [1, 2, 4]      # 지수 백오프 3회
+  refresh_margin_sec: 300       # 만료 5분 전 auto refresh
+
+# S1-0 추가 — BarBuffer ring buffer 설정
+# bar_buffer.py가 참조. 하드코딩 금지 원칙 (불변 원칙 5).
+bar_buffer:
+  max_bars_per_ticker: 60   # 최근 60분봉 보관 (multi-scale 60m 계산용)
+
+# S1-0 추가 — Preprocessor 설정 (C3 PreprocessingContract)
+# preprocessor.py + dataset_builder.py가 참조. architecture.md §2.3 ①②③ 단계 파라미터.
+preprocessor:
+  multi_scale_windows: [1, 5, 30, 60]
+  mad_constant: 1.4826          # MAD → 표준편차 근사 상수 (정규분포 가정)
+  outlier_cap_z: 5.0            # |z| > 5 clip
+  missing_policy: "forward_fill_then_cross_mean"
+  rolling_min_periods: 5        # rolling window 유효 bar 수 (30m 기준)
+  # S1-0 Batch C 추가 (2026-04-20): LGBMTrainer/DatasetBuilder 공용 피처 목록
+  # DatasetBuilder._compute_rolling_features 출력과 1:1 대응.
+  # 피처 추가/제거 시 이 목록 + dataset_builder 양쪽 동시 수정 필수.
+  feature_cols:
+    - feat_1m_close_robust_z
+    - feat_5m_ret
+    - feat_30m_vol
+    - feat_60m_trend
+
+# Sprint 2 확정 예정: FDA reason_code enum stub
+# 코드에서 이 목록 참조 필수 (불변 원칙 5 하드코딩 금지)
+# draft Sprint 2. S2-9 완료 시 stub: true 제거 + 최종 확정.
+reason_code_catalog:
+  status: "final"  # S2-9 완료 (2026-04-26). stub: true 제거. enum 최종 확정.
+  candidates:
+    - NEWS_DIVERGENCE
+    - RISK_FAST_TRIGGER
+    - DEBATE_CONFLICT
+    - NORMAL_APPROVE
+    - TIMEOUT
+    - QUANT_ANOMALY
+    - MISSING_PORTFOLIO_PATCH
+
+# S1-0 Batch B 추가 (2026-04-20) — LightGBM 학습 + walk-forward + evaluation + model registry
+# 불변 원칙 5: 아래 모든 수치는 코드에서 이 섹션을 로드. 하드코딩 금지.
+
+# LightGBM 학습 하이퍼파라미터 (S1-0 Batch C lgbm_trainer.py 참조)
+# 참고: LambdaRank objective. NDCG@K cross-sectional ranking.
+lightgbm:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc"
+    mode_b_editable: false           # 하이퍼파라미터 자동 변경 금지. S3-6 재학습은 기존 값 재사용.
+    human_approval_required: true    # 하이퍼파라미터 변경은 operator 수동 승인 필수
+    backup_retention_days: 180
+    update_trigger: "manual_only"
+    rationale: "LGBM 하이퍼파라미터 변경은 모델 동작 근본을 바꿈. Mode B 자동 tuning 미허용."
+  objective: "lambdarank"
+  metric: "ndcg"
+  ndcg_eval_at: [5]                 # Top-5 (K=5)
+  label_gain: [0, 1, 3, 7]          # relevance grade 0~3 가중치
+  num_leaves: 31
+  learning_rate: 0.05
+  n_estimators: 500
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+  early_stopping_rounds: 30
+  random_state: 42
+  n_relevance_grades: 4             # fwd_return을 4-quantile로 분할
+  feature_fraction_seed: 42
+
+# Walk-Forward Split 파라미터 (S1-0 Batch B splitter.py 참조)
+# 논문 근거: Prado "Advances in Financial Machine Learning" Ch. 7 + 8
+# 1거래일 = 390분. 1년 ≈ 252 거래일.
+walk_forward:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc"
+    mode_b_editable: false           # 검증 구조 변경 금지. Sprint 4 pilot 후 operator 승인 경유.
+    human_approval_required: true
+    backup_retention_days: 180
+    update_trigger: "manual_only"
+    rationale: "walk-forward 파라미터는 성과 평가 정합성 직결. 자동 수정 시 과거 성과 비교 불가."
+  n_splits: 8                       # fold 개수 (rolling window)
+  train_window_days: 60             # 60 거래일 (23,400 bars/종목)
+  test_window_days: 20              # 20 거래일 (7,800 bars/종목)
+  step_days: 20                     # fold 간 step = test window와 일치 (no-overlap)
+  trading_minutes_per_day: 390      # KRX 정규장 09:00~15:30
+
+# Label 생성 파라미터 (S1-0 Batch B dataset_builder.py 참조)
+# label = fwd_return_{horizon_bars}m. PIT-Safety 준수.
+label:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc"
+    mode_b_editable: false           # label 정의 변경은 모델 학습 목표 변경 = 프로젝트 근본
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "label horizon(5분) 변경은 전체 학습 재실행 필요. 자동 수정 금지."
+  horizon_bars: 5                   # 5분 후 수익률 (사용자 결정 2026-04-20)
+  target_col: "label_5m_ret"
+  rank_col: "cs_rank"
+  leakage_guard: true               # label 생성 시 미래 참조 검증 필수
+  drop_last_n_bars: 5               # 마지막 5 bars는 label 없음 (t+5 참조 불가)
+
+# Evaluation Metrics 파라미터 (S1-0 Batch B metrics.py 참조)
+# C12/C13 metrics 7종 (ic/icir/rank_ic/arr/ir/mdd/sr) 전부 계산.
+evaluation:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc"
+    mode_b_editable: false           # 평가 지표 정의 변경은 과거 성과 비교 불가 → 금지
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "annualization_factor/regime_labels 변경은 전체 backtest 재계산 필요. operator 승인 필수."
+  annualization_factor: 252         # 한국 거래일 기준 연율화
+  ic_significance_threshold: 0.02   # |IC| < 0.02 → 유의하지 않음
+  regime_labels: [bull, bear, sideways, volatile]   # C13 performance_analyzer와 일치
+  min_daily_pnl_std: 1.0e-8         # IR 분모 0 방지 (이 값 미만이면 np.inf clip)
+  mdd_sign: "negative"              # MDD 부호 규약 (음수 반환, C12 metrics 필드 일치)
+  # S1-0 Batch C 추가 (2026-04-20 Part A 수정): approx daily_pnl 산출 시 Top-K 비율
+  # LGBMTrainer._group_for_metrics에서 k = max(1, int(n * top_k_fraction)) 으로 사용.
+  # Portfolio Manager 완성 전 임시 지표. S1-3 PM 완성 시 실제 order_deltas 기반 PnL로 대체 예정.
+  top_k_fraction: 0.25              # Top quartile long strategy simulation
+  # to_performance_vector() 정규화 rolling window (architecture.md §8.1 SSOT)
+  # Rank(IC) / Rank(ICIR) 계산 시 사용. normalize_performance_vector() 참조.
+  performance_vector_rolling_window: 30   # 30일 rolling window (거래일 기준)
+  # 아래 3키 2026-04-21 이관 (architect + modeler MULTI-AGENT CONFIRMED)
+  performance_vector_clip_low: 0.01        # 8차원 벡터 min-max 정규화 하한 (api_contracts.md C18)
+  performance_vector_clip_high: 0.99       # 상한
+  performance_vector_neutral_fallback: 0.5 # history 부재/rng=0 시 neutral 값
+
+# S1-1 추가 (2026-04-20) — Quant Agent 런타임 파라미터
+# new/src/agents/hot/quant.py 참조. Hot Path <100ms.
+# 동기 LLM 미호출. ModelRegistry.load_latest()로 booster 로드 후 추론.
+quant_agent:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_1"
+    mode_b_editable: false           # Hot Path 에이전트 파라미터. 수동 승인만.
+    human_approval_required: true
+    backup_retention_days: 180
+    update_trigger: "manual_only"
+    rationale: "Quant Agent threshold / warmup 변경은 Hot Path 레이턴시와 시그널 정확성 직결. Mode B 자동 조정 금지."
+  warmup_bars: 60                    # cross-sectional score 생성 전 필요한 최소 bar 수
+  anomaly_zscore_threshold: 3.0      # intraday drop anomaly 임계 (|z| > threshold → anomaly)
+  latency_window: 1000               # p50/p95/p99 측정 창 (최근 N개 기록)
+  latency_p95_target_ms: 100         # Hot Path SLA (경고/로그용, enforcement는 S1-9 Monitor)
+
+# Model Registry 파라미터 (S1-0 Batch B registry.py 참조)
+# artifacts/lgbm/ 하위 파일 관리. S3-6 야간 재학습이 동일 registry 재사용.
+model_registry:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-20"
+    updated_by: "s1_batch_bc"
+    # C17 명시와 일치: Mode B 야간 재학습이 save() 호출 허용, rollback은 C14 경유
+    mode_b_editable: true            # save()는 Mode B 재학습이 자동 호출
+    human_approval_required: false   # save 자체는 approval 불요 (C14 deploy gate가 별도 제어)
+    backup_retention_days: 90
+    update_trigger: "mode_b_nightly"
+    rationale: "C17 ModelRegistry save()는 S3-6 야간 재학습 표준 경로. rollback만 C14 ModeBDeployer 경유 필수."
+  schema_version: "1.0.0"           # C17 ModelRegistryContract registry_schema.schema_version
+  data_version: "1.0.0"
+  artifacts_dir: "artifacts/lgbm"
+  registry_file: "registry.json"
+  latest_symlink: "latest_model.pkl"
+  versioning_scheme: "v{n}"         # v1 / v2 / v3 ... (baseline.pkl 별도)
+  max_versions_keep: 20             # 오래된 버전 자동 제거 기준
+  metadata_required_fields:         # save() 시 필수 메타데이터 키
+    - version
+    - train_start
+    - train_end
+    - feature_cols
+    - metrics
+    - commit_hash
+    - data_version
+    - created_at
+    - label_horizon_bars
+
+# ============================================================
+# agent_performance: Layer 2 (Agent 기여도 지표) 임계값
+# api_contracts.md C18 AgentPerformanceContract SSOT 대응.
+# 2026-04-21 신설 (evaluation_metrics.md 3-Layer 문서와 동시 작성).
+# ============================================================
+agent_performance:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T09:00:00+09:00"
+    updated_by: "architect + coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "C18 AgentPerformanceContract 신설"
+    rationale: |
+      L2 Agent 기여도 지표 임계값. Sprint 2 AuditLogger 구축 후 실 데이터로 재조정하되
+      Mode B 자동 수정 금지. 에이전트 성과 평가에 직결되므로 operator 수동 승인만 허용.
+
+  # L2 7종 임계값. Sprint 2 AuditLogger 구축 후 실 데이터로 재조정.
+
+  # prediction_accuracy (Quant)
+  prediction_accuracy_min: 0.52                  # random baseline 0.50 대비 +2%p
+
+  # slippage_execution_shortfall (ExecutionGateway), 단위: bps
+  slippage_bps_max: 15                           # execution_cost_model.slippage_bps (10) + 5 margin
+
+  # anomaly_detection_precision_recall (Quant)
+  anomaly_precision_min: 0.60
+  anomaly_recall_min: 0.40
+  anomaly_threshold_pct: -0.01                   # label_t5_ret < -1% 이면 anomaly ground truth
+
+  # sector_exposure_tracking_error (PortfolioManager)
+  sector_tracking_error_max: 0.05                # 5% 이내
+
+  # veto_precision_recall (FDA)
+  veto_precision_min: 0.60
+  veto_recall_min: 0.40
+  veto_loss_threshold_pct: -0.005                # label_t5_ret < -0.5% 이면 veto 정답
+
+  # false_positive_event_trigger_rate (News, Risk)
+  false_positive_rate_max: 0.40                  # LLM 호출 대비 NORMAL_APPROVE 종결 비율 상한
+
+  # realized_pnl_contribution: ablation leave-one-out. 임계는 에이전트별 양수 (유연).
+  realized_pnl_min_positive_count: 5             # 최근 30일 중 양수 일수 최소 5일
+
+  # C18 AgentPerformanceContract SLA (api_contracts.md:1392~1394 SSOT 이관)
+  audit_log_append_latency_ms: 5                 # hot path 내 audit 기록 허용 latency
+  daily_rollup_duration_min: 10                  # 18:00 이후 집계 완료 소요 시간 (분)
+
+# ============================================================
+# system_os_metrics: Layer 3 (System OS 차별점) 임계값
+# api_contracts.md C9 (reason_code) + C17 (ModelRegistry) 연동.
+# Sprint 4 구축 예정 지표의 선행 threshold 정의.
+# ============================================================
+system_os_metrics:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T09:00:00+09:00"
+    updated_by: "architect + coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "evaluation_metrics.md L3 정의"
+    rationale: |
+      L3 System OS 차별점 임계값. Sprint 4 Dashboard 구축 전 선행 정의.
+      Cause Attribution / Self-Evolution Gain / Dual-Source Lead Time 은 발표 킬러 지표이므로
+      Mode B 자동 변경 금지, operator 수동 승인 필수.
+
+  # hot_path_latency_p95_ms: 중복 신설 금지.
+  # SSOT = quant_agent.latency_p95_target_ms (현재 100ms). 여기서는 재선언하지 않음.
+  # 참조: quant_agent.latency_p95_target_ms
+
+  # cause_attribution_accuracy (L3, Eval Agent Sprint 3~4)
+  cause_attribution_accuracy_min: 0.60           # FDA reason_code 사후 검증 정답률 하한
+
+  # cold_path_budget_efficiency (L3)
+  # kanana-o 100회/일 예산 대비 marginal PnL. SSOT = llm_budget.kanana_daily_limit (100).
+  cold_path_marginal_pnl_min_pct_per_call: 0.0001   # LLM 1회당 최소 +0.01% 기여 기대
+
+  # self_evolution_gain_sharpe (L3, Mode B 배포)
+  # C17 ModelRegistry 버전 비교 (v(n+1).sr - v(n).sr).
+  self_evolution_gain_threshold: 0.05            # Sharpe lift 최소 +0.05 (Mode B 배포 조건)
+
+  # dual_source_divergence_lead_time_min (L3, Sprint 4 S4-1)
+  # divergence 탐지 시각 ~ price break 시각. 목표: divergence 가 price 보다 먼저 발생.
+  dual_source_lead_time_target_min: 0            # 양수 = divergence 가 선행. Sprint 4 측정 후 재조정.
+
+  # reason_code_distribution (L3)
+  reason_code_top3_coverage_min: 0.80            # 상위 3 reason_code 가 전체의 80% 이상 커버
+
+  # regime_agent_contribution_matrix (L3, regime × agent 2D)
+  # risk_config.yaml evaluation.regime_labels 참조.
+  regime_breakdown_min_days_per_regime: 10       # 각 regime 최소 10 거래일 샘플
+
+  # Layer 1/2 와의 cross-reference
+  cross_reference:
+    l1_performance_vector: "MetricsBundle.to_performance_vector() (8-dim)"
+    l2_audit_log: "artifacts/audit_log.jsonl"
+    c17_registry: "artifacts/lgbm/registry.json"
+    c9_reason_code: "api_contracts.md C9 FDADecisionContract"
+
+# ============================================================
+# fda_uncertainty_link: Dual-Source divergence → FDA 연계 파라미터
+# 2026-04-21 신설 (memory project_v3_universe_and_dual_source.md §2 UQ↔FDA 연계)
+# api_contracts.md C9 FDADecisionContract input.uncertainty_score 와 연동.
+# Sprint 2 S2-9 FDA Cold Path 구현 시 이 섹션에서 로드 필수. 하드코딩 금지.
+# PIT-Safety: divergence는 장전 배치 점수 기반 → 실시간 publish 안전.
+# ============================================================
+fda_uncertainty_link:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T10:00:00+09:00"
+    updated_by: "architect + coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "Sprint 2 전 필수 아이디어 반영 (memory §2 UQ↔FDA 연계)"
+    rationale: |
+      C9 FDADecision input uncertainty_score 처리 파라미터 (threshold / veto_prior_boost).
+      불변 원칙 2 (FDA approve/veto) 직결. veto 확률 변경은 시스템 행동 크게 변경.
+      Mode B 자동 변경 금지, operator 수동 승인만 허용.
+
+  uncertainty_threshold: 0.5             # 이 값 이상이면 veto_prior boost (dual_source.divergence_threshold 와 일치)
+  veto_prior_boost: 0.15                 # 기본 veto prior 에 +15%p 가산
+  reason_code_on_boost: "NEWS_DIVERGENCE"  # C9 reason_code_catalog 후보 (Sprint 2 enum 확정)
+  source_channel: "uncertainty_signal"   # C4 SharedMessagePool channel (message_taxonomy.publish_channels 등록)
+
+# ============================================================
+# risk_fast: RiskFastAgent sidecar 임계값
+# S2-8 RiskFastAgent 실구현 대응. 하드코딩 금지 원칙 (불변 원칙 5).
+# 모든 수치는 이 섹션에서만 정의. 코드에서 직접 수치 사용 금지.
+# ============================================================
+# S2-9 실구현 대응: DebateAgent 설정
+# cold/debate.py가 이 섹션 참조. 불변 원칙 5: 하드코딩 금지.
+debate:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-26"
+    last_updated: "2026-04-26T00:00:00+09:00"
+    updated_by: "s2_9_coder (elephant-ops)"
+    mode_b_editable: true       # trigger 임계값은 Mode B 야간 갱신 대상
+    human_approval_required: false
+    backup_retention_days: 30
+    update_trigger: "mode_b_nightly"
+    rationale: "DebateAgent 설정. max_pairwise/uncertainty_threshold는 Mode B 야간 False Positive 분석 후 자동 갱신 가능."
+  max_pairwise: 45          # C6 SSOT: C(10,2)=45 쌍 (10 에이전트 기준)
+  uncertainty_threshold: 0.7  # uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
+  llm_caller: "debate"      # LLMRouter caller 식별자
+
+risk_fast:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-25"
+    last_updated: "2026-04-25T00:00:00+09:00"
+    updated_by: "s2_8_coder (elephant-ops)"
+    mode_b_editable: false          # 리스크 임계값은 Mode B 자동 변경 금지
+    human_approval_required: true   # 임계값 변경은 operator 수동 승인 필수
+    backup_retention_days: 180
+    update_trigger: "manual_only"
+    rationale: |
+      RiskFastAgent 비LLM 규칙 기반 임계값. Hot Path sidecar (<50ms).
+      임계값 변경 시 FP/FN 균형 직결. operator 수동 승인만 허용.
+  sla_ms: 50                        # Cold Path RiskAgentFast SLA (50ms 이내 완료 목표)
+  intraday_drop_pct: 0.05           # 5% 급락 임계값 (high 트리거)
+  volume_spike_multiplier: 3.0      # 거래량 평균 대비 N배 초과 (medium 트리거)
+  volatility_bp_threshold: 30       # 1분 return std > 30bp (medium 트리거)
+  top10_collapse_count: 3           # Top10 중 high 트리거 N개 이상 → critical
+  volume_lookback_bars: 20          # 거래량 평균 계산 기준 봉 수
+  min_bars_required: 2              # 규칙 평가 최소 bar 수
+  narrative_max_chars: 300          # RiskSlow LLM 응답 narrative 최대 길이
+
+  # Cold Path RiskAgentFast (cold/risk_fast.py) 전용 임계값
+  # Hot Path sidecar(위 섹션)와 별개. Cold Path 이벤트 기반 규칙.
+  cold_path:
+    comm_volume_zscore: 2.5         # 커뮤니티 게시글 z-score 초과 → comm_volume_spike
+    comm_sentiment_delta: 0.5       # 감성 점수 30분 변화율 절대값 초과 → comm_sentiment_delta
+    intraday_return_zscore: -3.0    # 분봉 수익률 z-score 이하 → intraday_drop_anomaly
+    foreign_net_sell_krw: -100000000000.0  # 외국인 순매도 음수 컨벤션 (-100B KRW 이하) → foreign_net_sell_critical
+    news_comm_divergence: 0.5       # 뉴스-커뮤니티 방향 불일치 절대값 초과 → news_comm_divergence_strong
+
+# ============================================================
+# message_pool: C4 SharedMessagePool 운영 파라미터
+# api_contracts.md C4 SSOT. 2026-04-21 S2-1 신설.
+# ============================================================
+message_pool:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-04-21"
+    last_updated: "2026-04-21T12:00:00+09:00"
+    updated_by: "s2_1_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 30
+    update_trigger: "S2-1 MessagePool 실구현"
+    rationale: "MessagePool TTL/pool_size 는 메모리 관리 직결. 자동 변경 금지."
+  default_ttl_sec: 300            # publish 시 ttl 미지정 시 5분 (300초)
+  max_pool_size: 10000            # 메모리 보호 상한. 초과 시 expire 후 재시도 → RuntimeError
+
+# ============================================================
+# Mode B Scheduler (C14 ModeBSchedulerContract)
+# S3-0 신설 (2026-04-27). 7단계 오케스트레이션 SLA + 감사 로그 경로.
+# ============================================================
+mode_b_scheduler:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-27"
+    updated_by: "s3_0_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "manual"
+    rationale: |
+      Mode B Scheduler stage timeout 은 C14 SLA 직결.
+      자동 수정 시 stage 완료 판정 기준이 바뀌어 배포 게이트 오동작 가능.
+      stage_timeouts 변경은 operator 수동 확인 후 commit.
+  stage_timeouts:
+    stage_1: 30          # 18:00 성과 분석
+    stage_2: 60          # 18:30 방향 결정
+    stage_3: 3600        # 19:00 Alpha Factor Engine
+    stage_4: 1800        # 20:00 모델 재학습
+    stage_5: 1800        # 20:30 에이전트 자기 개선
+    stage_6: 1800        # 21:00 Backtest 검증
+    stage_7: 900         # 22:00 배포
+  audit_log_path: "artifacts/mode_b_audit_log.jsonl"
+  weekdays: ["MON", "TUE", "WED", "THU", "FRI"]
+
+# ============================================================
+# Alpha Factor Engine (S3-1/S3-2/S3-3)
+# ============================================================
+alpha_factor:
+  hypothesis_path: "artifacts/alpha_factor/hypotheses.jsonl"
+  factor_zoo_path: "artifacts/alpha_factor/factor_zoo.jsonl"
+  max_hypotheses_per_round: 3
+  max_ast_complexity: 10          # SL(f) 상한 (AlphaAgent 3중 정규화)
+  max_retries: 3                  # S3-2 FactorAgent 구현 실패 시 재시도 횟수
+  ic_duplicate_threshold: 0.99   # IC_max >= 0.99 → 중복 제거
+  alpha_decay_warning_months: 3  # IC 3개월 연속 하락 → decay 경고
+  alpha_decay_retire_months: 6   # IC 6개월 연속 하락 → 자동 은퇴
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-27"
+    updated_by: "s3_1_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+    rationale: |
+      Alpha Factor Engine 경로/임계값. hypothesis_path/factor_zoo_path는 Mode B
+      IdeaAgent/FactorAgent가 append하는 JSONL 경로. max_ast_complexity/ic_duplicate_threshold 등
+      정규화 파라미터는 AlphaAgent 3중 정규화(SL+PC+ER) 직결. 자동 변경 금지.
+
+# ============================================================
+# eval_agent: S3-3 EvalAgent 3중 정규화 파라미터
+# AlphaAgent 논문 기반. R_g(f,h) = α₁·SL(f) + α₂·PC(f) + α₃·ER(f,h)
+# R_g < r_g_threshold이면 채택 (낮을수록 좋음).
+# 하드코딩 금지: eval_agent.py는 이 섹션에서만 수치 로드.
+# ============================================================
+eval_agent:
+  # 3중 정규화 가중치 (합산 = 1.0)
+  alpha_1: 0.3    # SL weight (AST 복잡도 페널티)
+  alpha_2: 0.2    # PC weight (파라미터 수 페널티)
+  alpha_3: 0.5    # ER weight (경제적 관련성)
+  # ER 내부 가중치 (beta 합산 = 1.0)
+  beta_1: 0.4     # S(f): 기존 zoo와의 IC 유사도 페널티
+  beta_2: 0.4     # C(h,d,f): 가설↔수식 정합 페널티
+  beta_3: 0.2     # feature count 정규화 페널티
+  # 임계값
+  r_g_threshold: 0.7       # R_g < threshold이면 채택
+  ic_min_threshold: 0.02   # |IC| 하한 (경제적 의미 있음)
+  alignment_threshold: 0.7 # C(h,d,f) 상한 (가설↔수식 정합)
+  max_pc: 5                # 최대 파라미터 수 (윈도우 개수 기준)
+  log_scale: 3.0           # ER beta_3 정규화 스케일 (log(1+n)/log_scale)
+  sl_clip_max: 2.0         # SL 클립 상한 (1.0 초과 = complexity_violation 허용)
+  synthetic_bars: 50       # IC 계산용 synthetic DataFrame bar 수
+  min_valid_samples: 5     # IC 계산 최소 유효 샘플 수
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-28"
+    updated_by: "s3_3_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "manual"
+    rationale: |
+      EvalAgent 3중 정규화 가중치 및 임계값. AlphaAgent 논문 §3 기반.
+      alpha/beta 가중치 변경 시 팩터 채택 기준 전면 재조정 필요.
+      r_g_threshold/ic_min_threshold는 factor zoo 품질 직결. 자동 변경 금지.
+
+# ============================================================
+# co_steer: S3-5 Co-STEER Orchestrator (RD-Agent 논문 §8.2 Thompson Sampling)
+# ThompsonSampler Beta(α, β) Multi-Armed Bandit 상태 지속 경로.
+# 하드코딩 금지: co_steer.py는 이 섹션에서만 수치 로드.
+# ============================================================
+co_steer:
+  actions: ["factor_evolution", "model_evolution"]
+  alpha_init: 1.0
+  beta_init: 1.0
+  state_path: "artifacts/co_steer/thompson_state.json"
+  history_path: "artifacts/co_steer/co_steer_history.jsonl"
+  complexity_delta: 0.1
+  min_ic_reward: 0.02
+  model_evolution_stub_reward: 0.5  # S3-6 실구현 전 model_evolution stub reward
+  # S3 알고리즘 수정 (2026-05-01): ThompsonSampler global RNG → 격리 Generator.
+  # null(기본): 비결정적 (운영 환경). 정수 지정 시 결정적 (테스트/재현성용).
+  thompson_seed: null
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-29"
+    updated_by: "Sprint 3 SHIP (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+
+# ============================================================
+# nightly_retrainer: S3-6 NightlyLGBMRetrainer 파라미터
+# nightly_lgbm_retrainer.py가 이 섹션에서 로드 (불변 원칙 5 하드코딩 금지).
+# ============================================================
+nightly_retrainer:
+  lookback_days: 30        # 재학습 데이터 기간 (일). sliding window 크기.
+  max_alpha_factors: 5     # 사용할 최대 alpha factor 수 (FactorZoo active 상위 N개)
+  tickers: []              # 빈 리스트 = DatasetBuilder 기본값 (20 KOSPI 종목)
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-27"
+    updated_by: "s3_6_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+    rationale: |
+      NightlyLGBMRetrainer sliding window 파라미터.
+      lookback_days 변경은 학습 데이터량 직결 (단축 시 과적합 위험).
+      max_alpha_factors 변경은 feature 수 변화 → 모델 구조 영향.
+      tickers 빈 리스트 = DatasetBuilder 내부 KOSPI 20 기본값 사용.
+      자동 변경 금지 (operator 수동 검토 필요).
+
+# ============================================================
+# nightly_ppo_retrainer: S3-7 NightlyPPORetrainer 파라미터
+# AllocationEnv + stable-baselines3 PPO 야간 재학습.
+# 하드코딩 금지: nightly_ppo_retrainer.py는 이 섹션에서만 수치 로드.
+# ============================================================
+nightly_ppo_retrainer:
+  n_stocks: 20                   # 대상 종목 수 (KOSPI active universe)
+  lookback_days: 30              # synthetic data 생성 기간 (일)
+  total_timesteps: 10000         # PPO 학습 스텝 수 (빠른 수렴용. Sprint 4에서 증가)
+  episode_length: 390            # 에피소드 길이 (1거래일 = 390 분봉)
+  turnover_penalty: 0.001        # 거래비용 페널티 (per unit turnover)
+  constraint_penalty: 0.5        # max_single_name 위반 페널티 계수
+  n_envs: 1                      # 병렬 환경 수 (nightly 단독 실행)
+  artifacts_path: "artifacts/ppo"
+  ppo_n_steps: 2048              # PPO n_steps (학습 배치 수집 스텝 수)
+  ppo_batch_size: 64             # PPO mini-batch 크기
+  ppo_n_epochs: 10               # PPO 업데이트 epoch 수
+  ppo_seed: 42                   # PPO 학습 재현성 seed
+  synthetic_seed: 42             # synthetic data 생성 seed
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-30"
+    updated_by: "s3_7_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+    rationale: |
+      NightlyPPORetrainer 학습 파라미터. stable-baselines3 PPO + AllocationEnv.
+      total_timesteps: 빠른 야간 수렴 목표 (Sprint 4에서 100000+로 증가 예정).
+      episode_length: 1거래일 1분봉 수. 거래소 정책 변경 시만 수동 조정.
+      turnover_penalty/constraint_penalty: reward shaping 핵심. 자동 변경 금지.
+
+# ============================================================
+# committee: S3-8 Committee (AlphaGAT Stage II) 앙상블 파라미터
+# tree_core(LightGBM) + CNN confirmatory + MetaFuser(LogisticRegression OOF)
+# 하드코딩 금지: committee.py는 이 섹션에서만 수치 로드.
+# ============================================================
+committee:
+  # CNN confirmatory branch
+  cnn_lookback: 1                # feature dimension을 시계열로 처리하는 window (현재 1 = point-wise)
+  cnn_hidden_channels: 32        # Conv1d hidden channels
+  cnn_learning_rate: 0.001       # CNN 학습률
+  cnn_epochs: 10                 # CNN 학습 epoch 수 (빠른 nightly 수렴용)
+  cnn_batch_size: 64             # CNN mini-batch 크기
+  cnn_seed: 42                   # CNN 학습 재현성 seed
+  # MetaFuser
+  meta_fuser_max_iter: 100       # LogisticRegression max_iter
+  meta_fuser_C: 1.0              # LogisticRegression regularization C
+  # Sharpe 비교 검증
+  sharpe_improvement_threshold: 0.0  # committee_sr - tree_sr > threshold이면 improved
+  artifacts_path: "artifacts/committee"
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-04-30"
+    updated_by: "s3_8_coder (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+    rationale: |
+      Committee 앙상블 파라미터. AlphaGAT Stage II 기반.
+      cnn_epochs/cnn_hidden_channels 변경은 학습 품질에 직결. 자동 변경 금지.
+      sharpe_improvement_threshold: committee가 tree_only보다 나은지 판단 기준.
+      메타파라미터 변경 전 ablation 검증 필수.
+
+# ============================================================
+# knowledge_base: S3-11 KnowledgeBase Layer 5 파라미터
+# new/src/knowledge/kb.py가 이 섹션에서 로드 (불변 원칙 5 하드코딩 금지).
+# 6 storage_type: micro_notes/macro_notes/debate_history/decision_history/backtest_history/factor_zoo
+# PIT-Safety: timestamp <= now() 강제. data_versions/ 스냅샷으로 PIT replay 지원.
+# ============================================================
+knowledge_base:
+  storage_root: "artifacts/knowledge_base"
+  storage_types:
+    - micro_notes
+    - macro_notes
+    - debate_history
+    - decision_history
+    - backtest_history
+    - factor_zoo
+  search_default_top_k: 5
+  search_recency_boost_lambda: 0.1   # exp(-lambda * days_old)
+  required_fields:
+    - content
+    - sent_from
+    - timestamp
+  pit_safety_check: true
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-01"
+    updated_by: "s3_11_modeler (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "mode_b_nightly"
+    rationale: |
+      KB Layer 5 설정. storage_root/storage_types 변경 시 기존 JSONL 경로 불일치 발생.
+      required_fields 변경 시 write validation 기준 바뀜. 자동 변경 금지.
+      pit_safety_check: timestamp 미래 참조 차단 (불변 원칙 1 직결).
+
+# ============================================================
+# backtest: BacktestEngine ARR 계산용 초기 자본 (S3 알고리즘 수정 2026-05-01)
+# daily_pnl(dollar) → 수익률 비율 변환 기준. 단위 혼용 방지.
+# 하드코딩 금지: validation_tools.py는 이 섹션에서 로드.
+# ============================================================
+backtest:
+  # initial_capital: ARR 연율화 시 dollar PnL을 수익률 비율로 변환하는 기준 자본.
+  # 1억 KRW = mock 백테스트 기본값. Sprint 4 실계좌 연동 시 실제 운용 자본으로 대체.
+  initial_capital: 100000000.0   # 1억 KRW (mock 기본값)
+
+# ============================================================
+# alpha_decay_monitor: FactorZoo decay 비가역 방지 opt-in 설정 (S3 알고리즘 수정 2026-05-01)
+# factor_zoo.py가 이 섹션에서 로드. 기본값: 비가역 보존 (allow_decayed_revival: false).
+# ============================================================
+alpha_decay_monitor:
+  # allow_decayed_revival: decayed 팩터가 IC 회복 시 active로 복귀 허용 여부.
+  # false(기본): 기존 단방향 (active → decayed → retired) 보존.
+  # true: IC 회복 시 decayed → active 복귀 가능. retired는 여전히 불가.
+  allow_decayed_revival: false
+  # revival_threshold: |IC| 최근 warn_months 평균이 이 값 초과 시 복귀.
+  # alpha_factor.alpha_decay_warning_months 개월 기준.
+  revival_threshold: 0.02

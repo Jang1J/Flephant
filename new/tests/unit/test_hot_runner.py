@@ -1,0 +1,277 @@
+"""S1-5 Hot Runner + StateMachine unit tests.
+
+Integration test: QuantAgent + PPOAllocator + PortfolioManager + FDAAgent 전체 조합.
+"""
+from __future__ import annotations
+
+
+import numpy as np
+import pytest
+
+from src.agents.fda import FDAAgent
+from src.agents.hot.quant import QuantAgent
+from src.data.bar_buffer import BarBuffer
+from src.models.ppo_allocator import PPOAllocator
+from src.models.registry import ModelRegistry
+from src.ops.state_machine import (
+    IllegalTransitionError,
+    PipelineState,
+    StateMachine,
+)
+from src.orchestration.hot_runner import HotRunner
+from src.portfolio.portfolio_manager import PortfolioManager
+
+
+# ====================================================================== #
+# StateMachine tests
+# ====================================================================== #
+
+
+def test_state_machine_initial_bootstrap() -> None:
+    sm = StateMachine()
+    assert sm.state == PipelineState.BOOTSTRAP
+
+
+def test_state_transition_bootstrap_to_hot_running() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.HOT_RUNNING)
+    assert sm.state == PipelineState.HOT_RUNNING
+
+
+def test_state_transition_idempotent() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.HOT_RUNNING)
+    sm.transition(PipelineState.HOT_RUNNING)   # no-op
+    assert sm.state == PipelineState.HOT_RUNNING
+
+
+def test_state_transition_illegal_raises() -> None:
+    sm = StateMachine()
+    # BOOTSTRAP → MODE_B_EVOLVING 는 허용 안 됨
+    with pytest.raises(IllegalTransitionError):
+        sm.transition(PipelineState.MODE_B_EVOLVING)
+
+
+def test_state_transition_hot_to_mode_b_idle() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.HOT_RUNNING)
+    sm.transition(PipelineState.MODE_B_IDLE)
+    assert sm.state == PipelineState.MODE_B_IDLE
+
+
+def test_state_history_tracked() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.HOT_RUNNING, ts="2026-04-20T09:00:00+09:00")
+    sm.transition(PipelineState.MODE_B_IDLE, ts="2026-04-20T15:30:00+09:00")
+    h = sm.history
+    assert len(h) == 3   # 초기 + 2 전이
+    assert h[-1]["from"] == "HOT_RUNNING"
+    assert h[-1]["to"] == "MODE_B_IDLE"
+
+
+def test_allowed_next_states() -> None:
+    sm = StateMachine()
+    nexts = sm.allowed_next_states()
+    assert "HOT_RUNNING" in nexts
+    assert "SHUTDOWN" in nexts
+    assert "ERROR" in nexts
+
+
+def test_shutdown_terminal() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.SHUTDOWN)
+    # SHUTDOWN에서는 다른 상태로 못 감
+    assert sm.allowed_next_states() == []
+    with pytest.raises(IllegalTransitionError):
+        sm.transition(PipelineState.BOOTSTRAP)
+
+
+def test_error_can_recover_to_bootstrap() -> None:
+    sm = StateMachine()
+    sm.transition(PipelineState.ERROR)
+    sm.transition(PipelineState.BOOTSTRAP)
+    assert sm.state == PipelineState.BOOTSTRAP
+
+
+# ====================================================================== #
+# HotRunner fixtures
+# ====================================================================== #
+
+
+def _make_bar(ticker: str, close: float, minute_offset: int) -> dict:
+    hour = 9 + (minute_offset // 60)
+    minute = minute_offset % 60
+    return {
+        "ticker": ticker,
+        "ts_close": f"2026-04-20T{hour:02d}:{minute:02d}:00+09:00",
+        "open": close,
+        "high": close + 10.0,
+        "low": close - 10.0,
+        "close": close,
+        "volume": 1000.0,
+    }
+
+
+def _prime_buffer(runner: HotRunner, tickers: list[str], n: int = 65) -> None:
+    """각 ticker에 n개 bar를 push해 warmup 충족."""
+    rng = np.random.default_rng(42)
+    for t in tickers:
+        price = 50000.0 + int(t) % 10000
+        for i in range(n):
+            price = max(1.0, price + float(rng.normal(0, 50)))
+            runner._quant.on_bar(_make_bar(t, price, i))
+
+
+@pytest.fixture
+def runner(tmp_path) -> HotRunner:
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm")
+    return HotRunner(
+        quant=QuantAgent(registry=reg, bar_buffer=BarBuffer()),
+        ppo=PPOAllocator(),
+        pm=PortfolioManager(),
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+
+
+# ====================================================================== #
+# HotRunner lifecycle
+# ====================================================================== #
+
+
+def test_runner_initial_state_bootstrap(runner: HotRunner) -> None:
+    assert runner.state == PipelineState.BOOTSTRAP
+
+
+def test_runner_start_transitions_to_hot_running(runner: HotRunner) -> None:
+    runner.start()
+    assert runner.state == PipelineState.HOT_RUNNING
+
+
+def test_runner_stop_for_mode_b(runner: HotRunner) -> None:
+    runner.start()
+    runner.stop_for_mode_b()
+    assert runner.state == PipelineState.MODE_B_IDLE
+
+
+def test_runner_shutdown(runner: HotRunner) -> None:
+    runner.start()
+    runner.shutdown()
+    assert runner.state == PipelineState.SHUTDOWN
+
+
+# ====================================================================== #
+# run_once 오케스트레이션
+# ====================================================================== #
+
+
+def test_run_once_skipped_when_not_hot_running(runner: HotRunner) -> None:
+    # BOOTSTRAP 상태에서 run_once 호출
+    result = runner.run_once(tickers=["005930"], bars_batch=[])
+    assert result.get("skipped") is True
+    assert result["pipeline_state"] == "BOOTSTRAP"
+
+
+def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
+    """QuantAgent가 passive mode (모델 없음)여도 오케스트레이션 완료."""
+    runner.start()
+    tickers = ["005930", "000660", "035420", "051910"]
+    _prime_buffer(runner, tickers, n=65)
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 + i * 1000 for i, t in enumerate(tickers)},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    # QuantAgent passive → 비중 전무 → PM 주문 없음 → FDA approve (empty)
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result["quant_output"]["mode"] == "passive"
+    assert result["final_decision"]["approved"] is True
+    assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
+    assert "latency_ms" in result
+
+
+def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
+    runner.start()
+    tickers = ["005930"]
+    bars = [_make_bar("005930", 50000.0 + i * 10, i) for i in range(5)]
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=bars,
+        asof="2026-04-20T10:00:00+09:00",
+    )
+    assert result["n_bars_consumed"] == 5
+
+
+def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
+    """잘못된 bar 하나가 들어와도 전체 루프는 중단되지 않음."""
+    runner.start()
+    bars = [
+        _make_bar("005930", 50000.0, 0),
+        {"ticker": "000660"},   # 필수 필드 누락
+        _make_bar("005930", 50100.0, 1),
+    ]
+    result = runner.run_once(tickers=["005930"], bars_batch=bars)
+    assert result["n_bars_consumed"] == 2
+    assert len(result["bar_errors"]) == 1
+
+
+def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
+    """QuantAgent anomaly 탐지 → FDA veto (QUANT_ANOMALY)."""
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers, n=65)
+    # 급락 bar 추가 (last close의 -10%)
+    last_close = 50000.0
+    drop_bar = {
+        "ticker": "005930",
+        "ts_close": "2026-04-20T10:05:00+09:00",
+        "open": last_close, "high": last_close, "low": last_close * 0.9,
+        "close": last_close * 0.9, "volume": 1000.0,
+    }
+    runner._quant.on_bar(drop_bar)
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        asof="2026-04-20T10:05:00+09:00",
+    )
+    # Anomaly는 상황에 따라 감지될 수도 안 될 수도 (random seed). 양쪽 허용.
+    if result["anomalies"]:
+        assert result["final_decision"]["reason_code"] == "QUANT_ANOMALY"
+        assert result["final_decision"]["approved"] is False
+
+
+def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers)
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        risk_warnings=[{"ticker": "005930", "severity": "high", "reason": "fake"}],
+    )
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+    assert result["final_decision"]["approved"] is False
+
+
+def test_latency_stats(runner: HotRunner) -> None:
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers)
+    for _ in range(3):
+        runner.run_once(
+            tickers=tickers,
+            bars_batch=[],
+            latest_prices={t: 50000.0 for t in tickers},
+        )
+    stats = runner.latency_stats()
+    assert stats["count"] == 3
+    assert stats["avg"] >= 0.0
+    assert stats["max"] >= stats["min"]

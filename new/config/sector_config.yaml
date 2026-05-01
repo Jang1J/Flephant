@@ -1,0 +1,70 @@
+# KOSPI Decision OS v3 — 종목별 섹터 매핑
+# L2 sector_exposure_tracking_error 계산 전제.
+# Sprint 2 S2-7 전 필수 (PortfolioManager 에서 로드).
+#
+# SSOT: universe_config.yaml 에 섹터별 종목 목록 있음.
+# 이 파일은 종목코드 → 섹터 ID 역방향 인덱스 (빠른 lookup 전용).
+# universe_config.yaml 종목 추가/제거 시 이 파일도 동기화 필수.
+
+mode_b_metadata:
+  schema_version: "1.0.0"
+  data_version: "2026-04-21"
+  last_updated: "2026-04-21"
+  updated_by: "s2_audit_phase_5"
+  mode_b_editable: false           # 종목 섹터 분류는 KRX 공식 기준. 자동 변경 불가.
+  human_approval_required: true
+  backup_retention_days: 365
+  update_trigger: "manual_only"
+  rationale: "KOSPI 종목 섹터 매핑. L2 sector_exposure_tracking_error 계산 전제. operator 수동 승인만."
+
+# 6 KOSPI 섹터 (universe_config.yaml 확정 4 + 미확정 2)
+sectors:
+  - id: "semiconductor"
+    name_ko: "반도체"
+    status: "confirmed"
+  - id: "shipbuilding"
+    name_ko: "조선"
+    status: "confirmed"
+  - id: "battery"
+    name_ko: "2차전지"
+    status: "confirmed"
+  - id: "defense"
+    name_ko: "방산"
+    status: "confirmed"
+  - id: "sector5_pending"
+    name_ko: "섹터5_미확정"
+    status: "pending"
+    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
+  - id: "sector6_pending"
+    name_ko: "섹터6_미확정"
+    status: "pending"
+    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
+
+# 종목별 섹터 매핑 (active 20, universe_config.yaml SSOT 기준)
+# 미확정 섹터 10종목은 ticker 확정 후 추가 예정.
+ticker_to_sector:
+  # 반도체 (5종목)
+  "005930": "semiconductor"    # 삼성전자
+  "000660": "semiconductor"    # SK하이닉스
+  "042700": "semiconductor"    # 한미반도체
+  "403870": "semiconductor"    # HPSP
+  "058470": "semiconductor"    # 리노공업
+  # 조선 (5종목)
+  "329180": "shipbuilding"     # HD현대중공업
+  "042660": "shipbuilding"     # 한화오션
+  "010620": "shipbuilding"     # HD현대미포
+  "009540": "shipbuilding"     # HD한국조선해양
+  "267250": "shipbuilding"     # HD현대인프라코어
+  # 2차전지 (5종목)
+  "006400": "battery"          # 삼성SDI
+  "051910": "battery"          # LG화학
+  "373220": "battery"          # LG에너지솔루션
+  "096770": "battery"          # SK이노베이션
+  "247540": "battery"          # 에코프로비엠
+  # 방산 (5종목)
+  "012450": "defense"          # 한화에어로스페이스
+  "047810": "defense"          # 한국항공우주
+  "079550": "defense"          # LIG넥스원
+  "298040": "defense"          # 효성중공업
+  "014880": "defense"          # 한라
+  # 미확정 섹터 10종목: universe_config.yaml 섹터5/6_미확정 확정 후 추가 예정.
