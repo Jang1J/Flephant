@@ -152,13 +152,13 @@ owner: Data Layer / Event Gateway
 transport: pull + webhook + crawler
 request:
   raw_event:
-    source: "naver_news|dart|community|us_market|ecos|krx_investor_flow"
+    source: "naver_news|dart|community|us_market|ecos|krx_investor_flow|price_snapshot"
     raw_payload_ref: string
 response:
   event:
     event_id: string
     source: string
-    event_type: "news|dart|macro|us_market|community|regime|investor_flow"
+    event_type: "news|dart|macro|us_market|community|regime|investor_flow|price_snapshot"
     scope: "ticker:{code}|sector:{name}|market"
     title: string
     summary: string

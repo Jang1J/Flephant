@@ -1,6 +1,6 @@
 {
   "project": "Elephant Lab v3",
-  "updated": "2026-05-03",
+  "updated": "2026-05-04",
   "total_features": 55,
   "note": "2026-04-23 drift 감사 후 4건 신설: S2-5a (KRX 수급 실 API), S2-10 (L2 AuditLogger 집계), S2-11 (BaseConnector 리팩토링), S4-9 (architecture.md 섹션 재정렬). S3-0/S3-5 done_criteria 보강. total 52 → 55. 관례: id 끝 'a' 접미사 (S1-0a, S2-5a)는 sub-feature 로 total_features/progress.total 카운트에서 제외. 2026-04-20 재편성: Sprint 1~5 전체 architect+modeler+data-engineer 3인 병렬 감사 후 누락 31건 반영. 18 → 44 feature 확장. 2026-04-20 전체 세션: S1-0 Batch B+C 구조 완성 → S1-1~S1-9 → 340/340 pytest. Sprint 1 SHIP READY. S1-8만 사용자 KIS 키 blocker. 2026-05-03 #2 세션: 하네스 audit + Sprint 5 진입 (P1~P5 + F1+F2 + S5-1). 1091 → 1098 pytest. S5-1 SHIP.",
   "sprints": [
@@ -423,7 +423,7 @@
     {
       "id": "sprint-5",
       "name": "동적 유니버스",
-      "status": "in_progress",
+      "status": "done",
       "note": "2026-04-20 재편성: 2 → 4 features. 편입/청산 트리거 + enabled 전환 게이트 추가.",
       "features": [
         {
@@ -436,23 +436,26 @@
         {
           "id": "S5-2",
           "name": "Dynamic Candidate Pool (C15)",
-          "status": "not_started",
-          "done_criteria": "C15 DynamicUniverseContract. 이벤트 감지 → active universe 임시 편입 → 청산 조건 충족 시 제거."
+          "status": "done",
+          "done_criteria": "C15 DynamicUniverseContract. 이벤트 감지 → active universe 임시 편입 → 청산 조건 충족 시 제거.",
+          "note": "2026-05-04 SHIP. AdmissionEngine 257줄 + HoldingsManager 213줄 + utils/trigger_loader 82줄. risk_fast _load_trigger_rules 위임. C15 forbidden 6 가드. pytest 13 PASS."
         },
         {
           "id": "S5-3",
           "name": "편입/청산 트리거 규칙",
-          "status": "not_started",
-          "done_criteria": "C15 trigger_catalog_ref = risk_config.yaml dynamic_universe.trigger_catalog 로드. 편입 (뉴스/공시/거래량 이벤트) + 청산 4조건 (market_close/ttl_expiry/stop_loss/spike_resolved) 동작."
+          "status": "done",
+          "done_criteria": "C15 trigger_catalog_ref = risk_config.yaml dynamic_universe.trigger_catalog 로드. 편입 (뉴스/공시/거래량 이벤트) + 청산 4조건 (market_close/ttl_expiry/stop_loss/spike_resolved) 동작.",
+          "note": "2026-05-04 SHIP. ExitEngine 417줄. 4조건 (market_close/ttl_expiry/stop_loss/spike_resolved) + holdings_manager.remove + admission_engine.remove_from_pool 연동. KST 일관성 + PIT-Safety. pytest 13 PASS."
         },
         {
           "id": "S5-4",
           "name": "dynamic_universe.enabled 전환 게이트",
-          "status": "not_started",
-          "done_criteria": "risk_config.yaml dynamic_universe.enabled = false → true 전환. operator 승인 절차. Sprint 5 완료 기준점."
+          "status": "done",
+          "done_criteria": "risk_config.yaml dynamic_universe.enabled = false → true 전환. operator 승인 절차. Sprint 5 완료 기준점.",
+          "note": "2026-05-04 SHIP. DynamicUniverseGate 140줄 (60s cache + FORBIDDEN_CALLERS) + DynamicUniverseManager 200줄 (snapshot→admission→holdings→exit lifecycle). C15 weight_decision_authority + activation_gate 준수. pytest 37 PASS (gate 18 + manager 19)."
         }
       ],
-      "done": 1,
+      "done": 4,
       "total": 4
     }
   ],

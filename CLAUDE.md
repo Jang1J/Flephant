@@ -81,6 +81,13 @@ Mode B 장마감 (18:00~22:00):
 | `new/src/dqr/dqr_runner.py` | DQR 일별 자동화 (S4-5, Mode B stage_0, 8 커넥터 5 메트릭) |
 | `new/src/cache/persistent_cache.py` | SQLite TTL 캐시 (S4-7, Cold Path 레이턴시 최적화) |
 | `new/src/agents/memory_restorer.py` | Bootstrap 에이전트 메모리 복원 (S4-8, KB 5종 storage → agent restore) |
+| `new/src/dynamic_universe/snapshot_fetcher.py` | C16 WatchSnapshotFetcher (Sprint 5 S5-1, KIS REST 60초 polling + PIT-Safety + PersistentCache + JSONL append) |
+| `new/src/dynamic_universe/admission_engine.py` | C15 AdmissionEngine (Sprint 5 S5-2, candidate_pool 편입 + trigger_loader 매칭 + cooldown + max=10 가드 + admission_event jsonl) |
+| `new/src/dynamic_universe/holdings_manager.py` | C15 HoldingsManager (Sprint 5 S5-2, fixed_rule_only sizing + per_stock_max 0.03 + total_max 0.10 + weight_decision_authority 분리) |
+| `new/src/dynamic_universe/exit_engine.py` | C15 ExitEngine (Sprint 5 S5-3, 청산 4조건 market_close/ttl_expiry/stop_loss/spike_resolved + KST 일관성) |
+| `new/src/dynamic_universe/gate.py` | C15 DynamicUniverseGate (Sprint 5 S5-4, enabled 60s cache + FORBIDDEN_CALLERS + transition jsonl) |
+| `new/src/dynamic_universe/manager.py` | C15 DynamicUniverseManager 오케스트레이터 (Sprint 5 S5-4, snapshot→admission→holdings→exit lifecycle 통합) |
+| `new/src/utils/trigger_loader.py` | trigger_catalog 공통 로더 (Sprint 5 S5-2, risk_fast _load_trigger_rules 추출 + filter_action 지원) |
 | `new/config/dynamic_universe_config.yaml` | C15 운영 파라미터 SSOT (Sprint 5 P3, ttl_sec/stop_loss_pct/cache_ttl/admission/holdings/forbidden_runtime_checks, mode_b_metadata 8필드) |
 | `new/config/watch_universe_kospi200.yaml` | C16 KOSPI200 watch universe (Sprint 5 P5, 200종목 + watch_rules + mode_b_editable=false) |
 | `new/scripts/generate_watch_universe.py` | KRX KOSPI200 종목 자동 생성 스크립트 (Sprint 5 P5, 658줄, --source krx/static, dry-run + diff) |

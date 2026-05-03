@@ -54,13 +54,13 @@ class RiskAgentFast(AgentBase):
         self._sla_ms = self._load_sla_ms()
 
     def _load_trigger_rules(self) -> list[dict[str, Any]]:
-        """risk_config.yaml trigger_catalog.rules 로드."""
-        try:
-            catalog = config_load("risk_config.yaml", "trigger_catalog")
-            return catalog.get("rules", [])
-        except Exception as e:
-            logger.warning("[risk_fast_cold] trigger_catalog 로드 실패: %s", e)
-            return []
+        """trigger_catalog.rules 로드. trigger_loader 에 위임 (S5-2 DRY refactor).
+
+        filter 없이 전체 rules 반환. admit_candidate action rule 은
+        evaluate loop 에서 action 필드 확인 후 skip.
+        """
+        from src.utils.trigger_loader import load_trigger_rules
+        return load_trigger_rules()
 
     def _load_sla_ms(self) -> float:
         """risk_config.yaml risk_fast.sla_ms 로드 (불변 원칙 5)."""
@@ -131,6 +131,11 @@ class RiskAgentFast(AgentBase):
         event_type = event.get("event_type", "")
         payload = event.get("payload", {})
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # admit_candidate action rule 은 AdmissionEngine 담당. risk_fast 는 skip.
+        # _load_trigger_rules() 가 전체 rule 을 반환하므로 action 필드 체크 필요.
+        # 아래 6개 규칙은 명시적 rule_id 기반 평가 (action=review_risk/tighten_stop 등).
+        # action=admit_candidate 인 rule 은 이 evaluate loop 에 진입하지 않음.
 
         # 규칙 1: 커뮤니티 게시글 급증
         comm_z = ctx.get("comm_volume_zscore", 0.0)

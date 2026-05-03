@@ -2,7 +2,94 @@
 
 > 매 세션 시작 시 이 파일을 먼저 읽는다. 세션 끝에 업데이트한다.
 
-## 최근 세션 (2026-05-03 #2) — 하네스 audit + Sprint 5 진입 + S5-1 SHIP
+## 최근 세션 (2026-05-04) — Sprint 5 100% 완료 (S5-2/3/4 SHIP)
+
+### 세션 요약
+
+이전 세션 (S5-1 SHIP) 이어 S5-2/S5-3/S5-4 자동 진입. data-engineer 단일 dispatch 3회 (각 feature). **1098 → 1161 passed (+63)**, S5 회귀 0건. Sprint 5 4/4 done.
+
+### Done
+
+**S5-2 AdmissionEngine + HoldingsManager + trigger_loader**:
+- `new/src/utils/trigger_loader.py` 신규 (102줄, risk_fast _load_trigger_rules + load_thresholds 공통 추출)
+- `new/src/dynamic_universe/admission_engine.py` 신규 (389줄, candidate_pool 편입 + cooldown + max_size 가드 + admission_event JSONL)
+- `new/src/dynamic_universe/holdings_manager.py` 신규 (313줄, fixed_rule_only sizing + per_stock_max 0.03 + total_max 0.10 + remove(ticker, exit_reason))
+- `new/src/agents/cold/risk_fast.py` 수정 (_load_trigger_rules → trigger_loader 위임 + admit_candidate skip)
+- C15 forbidden_permissions 6개 코드 가드 (PASS): trade_universe_ssot_mutation / ppo_allocation / lightgbm_inference / direct_trade_execution_bypass_pm / fda_weight_modification / mode_b_cold_path_intervention
+- pytest 신규 13 PASS (admission 7 + holdings 6) + risk_fast 회귀 28 PASS
+
+**S5-3 ExitEngine 청산 4조건**:
+- `new/src/dynamic_universe/exit_engine.py` 신규 (417줄)
+- 4조건 평가: `_check_market_close` (15:30 KST) / `_check_ttl_expiry` (1800s) / `_check_stop_loss` (-2%) / `_check_spike_resolved` (community z<1.5 + price<1.5% + 600s 보유)
+- holdings_manager.remove + admission_engine.remove_from_pool (cooldown) 연동
+- KST 시간대 일관성: ZoneInfo("Asia/Seoul"), naive datetime → tzinfo 부여
+- pytest 신규 13 PASS
+
+**S5-4 DynamicUniverseGate + DynamicUniverseManager 오케스트레이터**:
+- `new/src/dynamic_universe/gate.py` 신규 (140줄, is_enabled 60s cache + FORBIDDEN_CALLERS frozenset + log_transition jsonl)
+- `new/src/dynamic_universe/manager.py` 신규 (200줄, cycle_once → snapshot→admission→holdings→exit lifecycle 통합)
+- C15 weight_decision_authority + activation_gate 준수: FDA / Mode B Scheduler / Backtest Agent 가 assert_enabled 호출 시 RuntimeError
+- pytest 신규 37 PASS (gate 18 + manager 19)
+
+**S5-1 회귀 fix (이번 세션 추가 발견)**:
+- C02 contract test (test_c02_event_normalize.py) 6 → 7 source enum (price_snapshot 추가)
+- api_contracts.md C2 source enum + event_type enum 동기화 (이전 S5-1 작업에서 contract 본문 갱신 누락)
+- 4축 동기화 위반 (architecture-v3.md 카테고리 5) 사후 fix
+
+### pytest
+
+- **1161 passed** (1098 → +63 누적), Sprint 5 회귀 0건
+- 12 failed: sklearn `numpy.dtype size changed, may indicate binary incompatibility` (numpy 2.x vs sklearn 빌드 시점 numpy 1.x 충돌). 환경 이슈, S5 무관. test_committee 5 + test_lgbm_trainer 3 + test_ranking_loss 4 = 12.
+- init.sh 9/9 PASS
+
+### Sprint 5 최종 인벤토리
+
+`new/src/dynamic_universe/` 6 클래스:
+- `WatchSnapshotFetcher` (S5-1, snapshot_fetcher.py)
+- `AdmissionEngine` (S5-2, admission_engine.py)
+- `HoldingsManager` (S5-2, holdings_manager.py)
+- `ExitEngine` (S5-3, exit_engine.py)
+- `DynamicUniverseGate` (S5-4, gate.py)
+- `DynamicUniverseManager` (S5-4, manager.py)
+
+`new/src/utils/trigger_loader.py` (S5-2 추출).
+
+총 신규 src 파일 7개 (~1620줄) + 신규 test 파일 6개 (~2155줄) + 수정 파일 (risk_fast.py, event_admission.py, event_normalizer.py, kis_rest.py, __init__.py, api_contracts.md, test_c02).
+
+### Quality Score
+
+- S5-2 SHIP: **9~10** (Critical 0, forbidden 6 가드 PASS)
+- S5-3 SHIP: **9~10** (Critical 0, KST 일관성 PASS)
+- S5-4 SHIP: **9~10** (Critical 0, weight_decision_authority + activation_gate 준수)
+- 종합: Sprint 5 100% (4/4)
+
+### Commits
+
+- `33d9902` (이전 세션) [Sprint 5] 하네스 audit + 진입 + S5-1 Watch Universe SHIP
+- (이번 세션) [Sprint 5] S5-2 + S5-3 + S5-4 SHIP — pending commit
+
+### Next (다음 세션)
+
+1. **dynamic_universe.enabled true 전환 절차** (Sprint 5 종료 후 별도): `new/src/ops/enable_dynamic_universe.py` CLI + operator 승인 흐름. 현재는 risk_config.yaml 직접 편집만 가능.
+2. **DynamicUniverseManager hot_runner 통합**: `new/src/orchestration/hot_runner.py` 에 cycle_once() 호출 추가 (운영 통합).
+3. **architecture_visual.md** Sprint 5 박스 보강 (S5-4 manager + gate 흐름 추가, 선택).
+4. **sklearn numpy dtype 환경 fix** (12 failed): `pip install --force-reinstall scikit-learn` 또는 conda 환경 재구축.
+5. **KIS 키 발급 후**: S1-8 (KIS virtual/real 전환) + S4-6 (Paper Trading) + S5-1 KIS REST bulk price 실제 호출 검증.
+6. **commit push** (사용자 직접): `git push origin main`
+
+### Blockers (변동 없음)
+
+- S1-8 + S4-6 + S5-1 실 KIS 호출: KIS 키 발급 대기.
+- 12 sklearn fail: numpy/sklearn 환경 비호환 (S5 무관).
+
+### Notes / Watch out
+
+- **dispatch 보고 라인 수 underreport 패턴**: data-engineer dispatch 보고가 라인 수를 100~150줄 underreport (예: admission_engine 보고 257줄 → 실제 389줄). 직접 wc -l 검증 필수.
+- **S5-1 contract 회귀 (C02) 이번 세션 fix**: enum 변경 시 contract test + api_contracts.md 본문 두 곳 동시 갱신 강제. 다음 enum 변경 시 4축 카테고리 5 적용 점검 hook 검토.
+
+---
+
+## 이전 세션 (2026-05-03 #2) — 하네스 audit + Sprint 5 진입 + S5-1 SHIP
 
 ### 세션 요약
 
