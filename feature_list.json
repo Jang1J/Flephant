@@ -2,7 +2,7 @@
   "project": "Elephant Lab v3",
   "updated": "2026-05-04",
   "total_features": 55,
-  "note": "2026-04-23 drift 감사 후 4건 신설: S2-5a (KRX 수급 실 API), S2-10 (L2 AuditLogger 집계), S2-11 (BaseConnector 리팩토링), S4-9 (architecture.md 섹션 재정렬). S3-0/S3-5 done_criteria 보강. total 52 → 55. 관례: id 끝 'a' 접미사 (S1-0a, S2-5a)는 sub-feature 로 total_features/progress.total 카운트에서 제외. 2026-04-20 재편성: Sprint 1~5 전체 architect+modeler+data-engineer 3인 병렬 감사 후 누락 31건 반영. 18 → 44 feature 확장. 2026-04-20 전체 세션: S1-0 Batch B+C 구조 완성 → S1-1~S1-9 → 340/340 pytest. Sprint 1 SHIP READY. S1-8만 사용자 KIS 키 blocker. 2026-05-03 #2 세션: 하네스 audit + Sprint 5 진입 (P1~P5 + F1+F2 + S5-1). 1091 → 1098 pytest. S5-1 SHIP.",
+  "note": "2026-04-23 drift 감사 후 4건 신설: S2-5a (KRX 수급 실 API), S2-10 (L2 AuditLogger 집계), S2-11 (BaseConnector 리팩토링), S4-9 (architecture.md 섹션 재정렬). S3-0/S3-5 done_criteria 보강. total 52 → 55. 관례: id 끝 'a' 접미사 (S1-0a, S2-5a)는 sub-feature 로 total_features/progress.total 카운트에서 제외. 2026-04-20 재편성: Sprint 1~5 전체 architect+modeler+data-engineer 3인 병렬 감사 후 누락 31건 반영. 18 → 44 feature 확장. 2026-04-20 전체 세션: S1-0 Batch B+C 구조 완성 → S1-1~S1-9 → 340/340 pytest. Sprint 1 SHIP READY. S1-8만 사용자 KIS 키 blocker. 2026-05-03 #2 세션: 하네스 audit + Sprint 5 진입 (P1~P5 + F1+F2 + S5-1). 1091 → 1098 pytest. S5-1 SHIP. 2026-05-04 #2 세션: feature_list.json data drift 전수 동기화 (Sprint 1 in_progress / Sprint 2 done / Sprint 3 done / Sprint 4 features 9건 individual status 복구).",
   "sprints": [
     {
       "id": "sprint-0",
@@ -72,7 +72,7 @@
     {
       "id": "sprint-1",
       "name": "Hot Path",
-      "status": "done",
+      "status": "in_progress",
       "note": "2026-04-20 완료: S1-0 Batch B+C + S1-1~S1-7, S1-9 전 구현 (9/10). S1-8만 사용자 .env KIS 키 blocker. pytest 340/340 pass. Phase 1+2 17건 감사 반영 완료. Sprint 2 진입 READY.",
       "features": [
         {
@@ -159,7 +159,7 @@
     {
       "id": "sprint-2",
       "name": "Cold Path",
-      "status": "in_progress",
+      "status": "done",
       "note": "2026-04-21 S2-0~S2-5 완료 + 대규모 재정비 (5-agent fresh-eyes 감사). pytest 553/553. Quality 9.5+/10. 2026-04-23 drift 감사 후 S2-5a / S2-10 / S2-11 신설. 6/12 done.",
       "features": [
         {
@@ -260,7 +260,7 @@
     {
       "id": "sprint-3",
       "name": "Mode B",
-      "status": "not_started",
+      "status": "done",
       "note": "2026-04-20 재편성: 3 → 12 features. Mode B 6단계 전체 분해. AlphaAgent 3중 정규화, AlphaGAT Committee, Co-STEER 공동최적화 각각 별도 feature 분리.",
       "features": [
         {
@@ -354,70 +354,74 @@
     {
       "id": "sprint-4",
       "name": "통합 + 최적화",
-      "status": "done",
+      "status": "in_progress",
       "note": "2026-05-03 8/9 done (S4-6 defer). Sprint 4 단일 commit e506fae (+8623/-164). 빡센 audit 3차 (Critical 12 fix). pytest 920 → 1067. 환경변수 분기 패턴 (ELEPHANT_TEST_PIT_SKIP/FRESHNESS_SKIP) 정착. 12 신규 모듈 (dual_source/dqr/cache/memory_restorer/profiler/e2e_runner/event_injector/llm_parser).",
       "features": [
         {
           "id": "S4-1",
           "name": "Dual-Source 5피처 파이프라인 (FinBERT + Spam/Sentiment + Divergence + Decay)",
-          "status": "not_started",
+          "status": "done",
           "done_criteria": "C3A DualSourceScoreContract 실구현. news_score_t (FinBERT) + comm_score_t_1 (spam+sentiment+manipulation 3 yaml 연동) + comm_score_t_2 (peak_lag 2일) + news_comm_divergence + community_noise_multiplier (z-score 감쇠). 08:00~08:30 배치. Sub-task 5개.",
-          "note": "감사 Critical TOP 10. data-engineer 5건 sub-feature 통합. 현재 dual_source_scorer.py 버그 수정 완료 (velocity → community_noise_multiplier 필드명)."
+          "note": "2026-05-03 SHIP. Dual-Source 5피처 (FinBERT + comm 3-yaml + divergence + noise multiplier, dual_source_scorer +676 라인)."
         },
         {
           "id": "S4-2",
           "name": "Dual-Source → LightGBM 재학습 + Ablation",
-          "status": "not_started",
-          "done_criteria": "S4-1 5피처를 S1-0 baseline에 포함해 재학습. w/ vs w/o Dual-Source ablation Sharpe 비교. C13 PerformanceAnalyzer ablation_components에 'dual_source' 추가. architecture.md §8.5.3 검증."
+          "status": "done",
+          "done_criteria": "S4-1 5피처를 S1-0 baseline에 포함해 재학습. w/ vs w/o Dual-Source ablation Sharpe 비교. C13 PerformanceAnalyzer ablation_components에 'dual_source' 추가. architecture.md §8.5.3 검증.",
+          "note": "2026-05-03 SHIP. LGBM 재학습 + Ablation (dataset_builder dual_source join + run_dual_source_ablation CLI)."
         },
         {
           "id": "S4-3",
           "name": "E2E 통합 테스트",
-          "status": "not_started",
-          "done_criteria": "Mode A (Hot+Cold) + Mode B 전체 루프 1주일 시나리오 테스트. 이벤트 주입 → FDA 결정 → 주문 → fill → feedback → Mode B 재학습 → 배포. 시나리오 DAG."
+          "status": "done",
+          "done_criteria": "Mode A (Hot+Cold) + Mode B 전체 루프 1주일 시나리오 테스트. 이벤트 주입 → FDA 결정 → 주문 → fill → feedback → Mode B 재학습 → 배포. 시나리오 DAG.",
+          "note": "2026-05-03 SHIP. E2E 시나리오 (EventInjector + ScenarioRunner + week1_basic.yaml + 29 tests + run_e2e_scenario CLI)."
         },
         {
           "id": "S4-4",
           "name": "성능 최적화 (Hot Path <100ms 실측)",
-          "status": "not_started",
-          "done_criteria": "p50 <50ms / p95 <100ms / p99 <150ms 실측. Feature Store (multi-scale cache) in-memory/parquet 결정. Quant Agent 추론 profile. 병목 해소."
+          "status": "done",
+          "done_criteria": "p50 <50ms / p95 <100ms / p99 <150ms 실측. Feature Store (multi-scale cache) in-memory/parquet 결정. Quant Agent 추론 profile. 병목 해소.",
+          "note": "2026-05-03 SHIP. Hot Path Profiler (6 stage timer + p50/p95/p99 + SLA alert)."
         },
         {
           "id": "S4-5",
           "name": "DQR 일별 자동화",
-          "status": "not_started",
-          "done_criteria": "dqr.py 일별 자동 생성 (Mode B 18:00 연동). 커넥터별 누락률/지연/outlier 리포트. 임계값 초과 시 ops alert."
+          "status": "done",
+          "done_criteria": "dqr.py 일별 자동 생성 (Mode B 18:00 연동). 커넥터별 누락률/지연/outlier 리포트. 임계값 초과 시 ops alert.",
+          "note": "2026-05-03 SHIP. DQR 자동화 (Mode B stage_0 + 8 커넥터 5 메트릭 + 공휴일/주말 가드)."
         },
         {
           "id": "S4-6",
           "name": "Paper Trading (mock → paper 전환)",
-          "status": "not_started",
+          "status": "blocked",
           "done_criteria": "C10 execution_mode=paper. KIS 모의투자 서버 실 주문. 1주일 paper 운영 후 Sharpe/MDD 보고서. 실계좌 전 필수 단계.",
-          "note": "architecture.md §6.0.1 실거래 로드맵."
+          "note": "blocked. KIS 모의투자 키(.env KIS_APP_KEY/KIS_APP_SECRET) 발급 후 mock → paper 전환. S1-8과 동시 unblock 예정."
         },
         {
           "id": "S4-7",
           "name": "Persistent Cache (뉴스/에이전트 보고서)",
-          "status": "not_started",
+          "status": "done",
           "done_criteria": "뉴스 분석 결과 + 에이전트 보고서 캐싱. Cold Path 레이턴시 최적화. TTL 기반 만료.",
-          "note": "architecture.md §5.5."
+          "note": "2026-05-03 SHIP. Persistent Cache (SQLite TTL + News Agent 통합 + max_entries LRU eviction)."
         },
         {
           "id": "S4-8",
           "name": "Agent Memory 영속화",
-          "status": "not_started",
+          "status": "done",
           "done_criteria": "micro_notes / macro_notes / debate_history / decision_history / backtest_history JSON 저장. 재시작 시 restore. S3-11 KB와 통합.",
-          "note": "architecture.md §4.2."
+          "note": "2026-05-03 SHIP. Agent Memory 영속화 (5종 storage restorer + Hot Runner BOOTSTRAP 통합)."
         },
         {
           "id": "S4-9",
           "name": "architecture.md 섹션 재정렬 + 문서 통합",
-          "status": "not_started",
+          "status": "done",
           "done_criteria": "architecture.md §12→§9 비일관 순서 수정. 섹션 번호 1~12 순차 정렬. architecture_visual.md + api_contracts.md 교차 참조 재검증. Sprint 4 문서 통합 시 동시 진행.",
-          "note": "2026-04-23 신설 (drift 감사 발견). gpt-tracker FINDING 5 defer 항목."
+          "note": "2026-05-03 SHIP. architecture.md v3.7 + visual.md v3.0.9 + 4축 정합 (이후 v3.8 Sprint 5 진입에서 추가 갱신)."
         }
       ],
-      "done": 0,
+      "done": 8,
       "total": 9
     },
     {
