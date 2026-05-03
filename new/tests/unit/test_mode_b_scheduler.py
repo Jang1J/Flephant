@@ -184,7 +184,8 @@ def test_run_pipeline_all_stages_executed(scheduler, monkeypatch):
 
     scheduler.stage_3_factor_evolution = _s3_with_candidates
     result = scheduler.run_pipeline(date="2026-04-27")
-    assert len(result["stages"]) == 7
+    # S4-5: stage_0 DQR 추가로 전체 8단계 (stage_0~7)
+    assert len(result["stages"]) == 8
 
 
 # --------------------------------------------------------------------------- #
@@ -329,7 +330,8 @@ def test_backtest_skip_on_no_candidates(scheduler, monkeypatch):
 
     # stub은 candidates=[] 이므로 backtest_skip_condition 발동
     assert result["verdict"] == "skipped_no_candidates"
-    assert len(result["stages"]) == 5
+    # S4-5: stage_0 DQR 추가로 6개 (stage_0 + stage_1~5)
+    assert len(result["stages"]) == 6
 
 
 # --------------------------------------------------------------------------- #

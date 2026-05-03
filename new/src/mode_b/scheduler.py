@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -92,7 +93,12 @@ class ModeBScheduler:
 
     @mode_b_only
     def run_pipeline(self, date: str | None = None) -> dict[str, Any]:
-        """C14 7단계 Mode B 파이프라인 실행. bundle_id + stages 결과 반환."""
+        """C14 Mode B 파이프라인 실행 (S4-5: DQR stage_0 추가 → 총 8단계).
+
+        stage_0: DQR (데이터 품질 확인). critical 커넥터 CRITICAL alert 시 차단.
+        stage_1~7: 기존 7단계 (performance_analysis → deploy).
+        bundle_id + stages 결과 반환.
+        """
         date_str = date or datetime.now(_KST).strftime("%Y-%m-%d")
         logger.info("[mode_b_scheduler] Mode B 파이프라인 시작: %s", date_str)
 
@@ -100,6 +106,28 @@ class ModeBScheduler:
         self._transition(PipelineState.MODE_B_EVOLVING)
         self._bundle_id = None
         self._current_verdict = None
+
+        # Stage 0: DQR (S4-5). 데이터 품질 확인 후 나머지 진행.
+        # critical 커넥터에서 CRITICAL alert 발생 시 파이프라인 차단.
+        s0 = self._run_stage(
+            "stage_0",
+            lambda: self.stage_0_dqr(date_str),
+            self._stage_timeouts.get("stage_0", 120),
+        )
+        if s0.get("critical_alert"):
+            logger.error(
+                "[mode_b_scheduler] DQR CRITICAL alert 감지. Mode B 파이프라인 차단: %s",
+                s0.get("critical_connectors"),
+            )
+            self._transition(PipelineState.MODE_B_BLOCKED)
+            self._transition(PipelineState.MODE_B_IDLE)
+            return {
+                "bundle_id": self._bundle_id,
+                "date": date_str,
+                "stages": [s0],
+                "verdict": "blocked_dqr_critical",
+                "dqr_alerts": s0.get("alerts", []),
+            }
 
         # Stage 1~5 (EVOLVING phase)
         s1 = self._run_stage(
@@ -143,7 +171,7 @@ class ModeBScheduler:
             return {
                 "bundle_id": self._bundle_id,
                 "date": date_str,
-                "stages": [s1, s2, s3, s4, s5],
+                "stages": [s0, s1, s2, s3, s4, s5],
                 "verdict": "skipped_no_candidates",
             }
 
@@ -195,7 +223,7 @@ class ModeBScheduler:
         result = {
             "bundle_id": self._bundle_id,
             "date": date_str,
-            "stages": [s1, s2, s3, s4, s5, s6, s7],
+            "stages": [s0, s1, s2, s3, s4, s5, s6, s7],
             "verdict": verdict,
         }
         logger.info(
@@ -249,6 +277,119 @@ class ModeBScheduler:
     # ================================================================== #
     # Stage implementations (stub: 각 Sprint에서 실구현)
     # ================================================================== #
+
+    def _load_kospi_holidays(self, year: int) -> set:
+        """risk_config.yaml dqr.kospi_holidays_{year} 로드. 날짜 set 반환.
+
+        섹션 또는 year 키 없으면 빈 set.
+        skip_on_holiday=false이면 빈 set 반환.
+        """
+        try:
+            dqr_cfg = config_load("risk_config.yaml", "dqr")
+        except Exception as e:
+            logger.warning("[mode_b_scheduler] risk_config.yaml dqr 로드 실패: %s", e)
+            return set()
+
+        if not dqr_cfg.get("skip_on_holiday", True):
+            return set()
+
+        key = f"kospi_holidays_{year}"
+        raw: list[str] = dqr_cfg.get(key, [])
+        from datetime import date as _date_cls
+        holidays: set = set()
+        for s in raw:
+            try:
+                holidays.add(_date_cls.fromisoformat(s))
+            except ValueError as e:
+                logger.warning("[mode_b_scheduler] 공휴일 날짜 파싱 실패: %s error=%s", s, e)
+        return holidays
+
+    def stage_0_dqr(self, date: str) -> dict[str, Any]:
+        """S4-5 DQR (Data Quality Report). Mode B 첫 단계. 18:00 KST 이후 실행.
+
+        DQRRunner.run_daily()로 8 커넥터 품질 측정 → 리포트 저장.
+        critical 커넥터에서 CRITICAL severity alert 발생 시 critical_alert=True 반환.
+        호출자(run_pipeline)가 critical_alert=True 시 파이프라인 차단.
+
+        KRX 비거래일(주말/공휴일): DQR skip + critical_alert=False 반환.
+        인프라 오류(Exception): critical_alert=True 반환 → 파이프라인 차단 (데이터 품질 미검증 방지).
+
+        불변 원칙 5: 임계값은 DQRRunner가 risk_config.yaml dqr에서 로드.
+        """
+        logger.info("[mode_b_scheduler] stage_0 DQR 실행: date=%s", date)
+
+        # KRX 비거래일 체크 (주말 + 공휴일)
+        from datetime import date as _date_cls
+        try:
+            d = _date_cls.fromisoformat(date)
+        except ValueError as e:
+            logger.error("[mode_b_scheduler] DQR date 파싱 실패: %s error=%s", date, e)
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": f"date 파싱 실패: {e}",
+            }
+
+        # 토요일(5) / 일요일(6)
+        if d.weekday() >= 5:
+            logger.info("[mode_b_scheduler] stage_0 DQR skip: %s (주말)", date)
+            return {
+                "status": "skipped",
+                "reason": "weekend",
+                "dqr_date": date,
+                "critical_alert": False,
+                "alerts": [],
+            }
+
+        # KRX 공휴일
+        holidays = self._load_kospi_holidays(d.year)
+        if d in holidays:
+            logger.info("[mode_b_scheduler] stage_0 DQR skip: %s (공휴일)", date)
+            return {
+                "status": "skipped",
+                "reason": "holiday",
+                "dqr_date": date,
+                "critical_alert": False,
+                "alerts": [],
+            }
+
+        try:
+            from src.dqr.dqr_runner import DQRRunner
+
+            runner = DQRRunner()
+            _test_pit_skip = os.getenv("ELEPHANT_TEST_PIT_SKIP") == "1"
+            report = runner.run_daily(date=date, skip_pit_guard=_test_pit_skip)
+            output_path = runner.save_report(report)
+            alerts = report.get("alerts", [])
+            critical_alerts = [a for a in alerts if a.get("severity") == "CRITICAL"]
+            critical_connectors = list({a["connector"] for a in critical_alerts})
+            logger.info(
+                "[mode_b_scheduler] DQR 완료: alerts=%d critical=%d saved=%s",
+                len(alerts),
+                len(critical_alerts),
+                output_path,
+            )
+            return {
+                "status": "done",
+                "dqr_date": date,
+                "alert_count": len(alerts),
+                "critical_alert": bool(critical_alerts),
+                "critical_connectors": critical_connectors,
+                "alerts": alerts,
+                "report_path": str(output_path),
+            }
+        except Exception as e:
+            logger.error("[mode_b_scheduler] DQR stage_0 인프라 오류: %s", e)
+            # 인프라 오류 = 데이터 품질 검증 불가 → critical_alert=True로 파이프라인 차단
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": str(e),
+            }
 
     def stage_1_performance_analysis(self) -> dict[str, Any]:
         """§8.1 L2 성과 분석. ModeBPerformanceAggregator 연동은 S2-10에서 완비."""
@@ -528,6 +669,7 @@ class ModeBScheduler:
     # C14 stage별 사용 권한 매핑 (permitted 권한만 명시. 이 외 권한은 FORBIDDEN_PERMISSIONS 체크 대상)
     # 어떤 stage도 FORBIDDEN_PERMISSIONS 4개를 사용하지 않음을 런타임에 강제.
     _STAGE_REQUIRED_PERMISSIONS: dict[str, frozenset[str]] = {
+        "stage_0": frozenset({"read_connector_stats", "dqr_write"}),   # S4-5 DQR
         "stage_1": frozenset({"read_performance_history"}),
         "stage_2": frozenset({"read_thompson_posteriors", "write_thompson_posteriors"}),
         "stage_3": frozenset({"llm_call_mode_b", "factor_zoo_write"}),

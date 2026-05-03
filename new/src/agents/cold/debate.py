@@ -22,6 +22,7 @@ _KST = ZoneInfo("Asia/Seoul")
 
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
+from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 
 logger = get_logger("debate")
@@ -335,9 +336,8 @@ class DebateAgent(AgentBase):
         s2: dict[str, Any],
     ) -> dict[str, Any]:
         """LLM 비교 응답 파싱."""
-        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
         try:
-            parsed = json.loads(stripped)
+            parsed = parse_llm_json(content)
             winner_raw = str(parsed.get("winner", "tied"))
             # A_agent → s1 agent 이름으로 해석
             if winner_raw.startswith("A") or winner_raw == s1.get("agent"):

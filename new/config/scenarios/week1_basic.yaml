@@ -1,0 +1,109 @@
+# S4-3 E2E 1주일 시나리오 정의
+# 이 파일의 모든 임계값/수치는 yaml에서 로드. 하드코딩 금지 (불변 원칙 5).
+# PIT-Safety: 각 이벤트 ts는 해당 날의 장중 시각. snapshot_ts는 18:00 KST 고정.
+
+scenario_name: week1_basic
+description: "Mode A (Hot+Cold) + Mode B 1주일 시나리오. 5 거래일 × 390분 + 5일 Mode B."
+universe_tickers:
+  - "005930"  # 삼성전자
+  - "000660"  # SK하이닉스
+  - "035420"  # NAVER
+  - "005380"  # 현대차
+  - "051910"  # LG화학
+
+# 이벤트 없는 날 Hot Path tick 횟수 (390 = 09:00~15:30, 1분 단위)
+hot_path_ticks_per_day: 390
+# 통합 테스트용 단축 tick (전체 390 대신 5 tick만 실행)
+hot_path_ticks_short: 5
+
+days:
+  - date: "2026-05-04"
+    label: "Day 1 - 긍정 뉴스 + 거시 이벤트"
+    events:
+      - ts: "09:30:00"
+        type: news
+        ticker: "005930"
+        headline: "삼성전자 차세대 HBM4 독점 공급 계약 체결"
+        sentiment: positive
+        source: naver
+      - ts: "10:15:00"
+        type: macro
+        indicator: usd_krw
+        value: 1380.5
+      - ts: "13:00:00"
+        type: dart
+        ticker: "000660"
+        disclosure_type: "주요사항보고서"
+        title: "SK하이닉스 자사주 매입 결정"
+
+  - date: "2026-05-07"
+    label: "Day 2 - 커뮤니티 + 리스크 이벤트"
+    events:
+      - ts: "09:05:00"
+        type: community
+        ticker: "035420"
+        post_text: "네이버 AI 검색 점유율 80% 돌파 루머 확산"
+        score: 0.72
+      - ts: "11:30:00"
+        type: macro
+        indicator: interest_rate
+        value: 3.50
+      - ts: "14:00:00"
+        type: news
+        ticker: "005380"
+        headline: "현대차 전기차 리콜 조치 발표"
+        sentiment: negative
+        source: naver
+
+  - date: "2026-05-08"
+    label: "Day 3 - 정상 Hot Path 위주"
+    events:
+      - ts: "10:00:00"
+        type: news
+        ticker: "051910"
+        headline: "LG화학 배터리 소재 신규 수주 5000억"
+        sentiment: positive
+        source: naver
+
+  - date: "2026-05-12"
+    label: "Day 4 - 복합 이벤트 (veto 시나리오)"
+    events:
+      - ts: "09:10:00"
+        type: macro
+        indicator: usd_krw
+        value: 1420.0
+      - ts: "09:20:00"
+        type: news
+        ticker: "005930"
+        headline: "미중 반도체 규제 강화 우려"
+        sentiment: negative
+        source: naver
+      - ts: "10:00:00"
+        type: dart
+        ticker: "005930"
+        disclosure_type: "조회공시"
+        title: "이상 급등 관련 조회공시"
+
+  - date: "2026-05-13"
+    label: "Day 5 - 정상 마감 + Mode B 검증"
+    events:
+      - ts: "14:30:00"
+        type: news
+        ticker: "000660"
+        headline: "SK하이닉스 2분기 실적 전망 상향"
+        sentiment: positive
+        source: naver
+
+# Mode B 설정 (18:00 트리거 기준)
+mode_b:
+  trigger_hour_kst: 18
+  expected_stages:
+    - stage_0_dqr
+    - stage_1_performance_analysis
+    - stage_2_direction_selection
+    - stage_3_factor_evolution
+    - stage_4_model_evolution
+    - stage_5_agent_self_improvement
+    - stage_6_backtest_validation
+    - stage_7_deploy
+  expected_verdict: pass  # 테스트용 stub verdict

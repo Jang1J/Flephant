@@ -81,8 +81,14 @@ def synthetic_data(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def trainer_small(synthetic_data: Path) -> LGBMTrainer:
-    """테스트 전용 작은 fold 구성."""
+    """테스트 전용 작은 fold 구성.
+
+    S4-2: enabled_for_lgbm=False로 설정해 기존 4피처 경로 유지.
+    dual_source 5피처 join은 test_dual_source_ablation.py에서 별도 검증.
+    """
     builder = DatasetBuilder(artifacts_dir=synthetic_data)
+    # S4-2: 기존 4피처 테스트 경로 유지 (dual_source 비활성)
+    builder._ds_enabled_for_lgbm = False
     splitter = WalkForwardSplitter()
     # 테스트 데이터 규모에 맞게 조정
     splitter.train_window_days = 3
@@ -92,11 +98,17 @@ def trainer_small(synthetic_data: Path) -> LGBMTrainer:
     splitter.purge_bars = 0
     splitter.embargo_bars = 0
     registry = ModelRegistry(artifacts_dir=synthetic_data / "lgbm")
-    return LGBMTrainer(
+    trainer = LGBMTrainer(
         dataset_builder=builder,
         splitter=splitter,
         registry=registry,
     )
+    # S4-2: feature_cols를 4피처로 고정 (enabled_for_lgbm=False와 일치)
+    from src.utils.config_loader import load as _cfg_load
+    trainer.feature_cols = list(
+        _cfg_load("risk_config.yaml", "preprocessor")["feature_cols"]
+    )
+    return trainer
 
 
 # ====================================================================== #
@@ -166,12 +178,12 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     model, metadata = trainer_small.registry.load_latest()
     assert model is not None
     assert metadata["version"] == "baseline"
-    assert metadata["feature_cols"] == [
-        "feat_1m_close_robust_z",
-        "feat_5m_ret",
-        "feat_30m_vol",
-        "feat_60m_trend",
-    ]
+    # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
+    assert len(metadata["feature_cols"]) == 4
+    assert "feat_1m_close_robust_z" in metadata["feature_cols"]
+    assert "feat_5m_ret" in metadata["feature_cols"]
+    assert "feat_30m_vol" in metadata["feature_cols"]
+    assert "feat_60m_trend" in metadata["feature_cols"]
 
 
 def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:

@@ -11,6 +11,8 @@
 > v3.0.5 (2026-04-25): S2-6 NewsFilter + TextPack 13 템플릿 + S2-7 NewsAgent 실구현 (Kanana-o CoT + consume_text_pack + C5 news_signal/dart_alert publish)
 > v3.0.6 (2026-04-26): Sprint 2 완료 반영. S2-8 RiskAgentFast/Slow Cold Path + S2-9 DebateAgent/FDA Cold Path + S2-10 ModeBPerformanceAggregator + S2-11 BaseConnector. reason_code 7종 최종 확정. Cold Path e2e 루프 닫힘.
 > v3.0.7 (2026-05-01): Sprint 3 완료 반영. ModeBScheduler 7-stage cron + ModeBDeployer atomic swap + KnowledgeBase Layer 5 + Committee (AlphaGAT Stage II) + Validation Tools 3 component. 4축 정합 일괄 수정 포함.
+> v3.0.8 (2026-05-02): Sprint 4 문서 fix. §7.1 8-stage + stage_0 DQR 박스 추가 / Layer 5 Persistent Caching S4-7 SQLite 표기 / §7.6 Bootstrap 다이어그램 신설.
+> v3.0.9 (2026-05-02): 전수 리뷰 fix. §3.0 6단계→8단계 + stage_0 DQR 박스 추가 / §14 active 20 표기 / §19 active 20 표기 / §20.3 RISK_BREACH→RISK_FAST_TRIGGER / Layer 3 n_est=500 정정.
 
 ## v2.2 변경점 요약
 
@@ -44,6 +46,8 @@
 │ ║  ┌──────────┐           ┌──────────────┐  ┌──────────┐             ║  │
 │ ║  │Persistent│           │  Vector DB   │  │Factor Zoo│             ║  │
 │ ║  │ Caching  │           │(similarity)  │  │(AST 저장)│             ║  │
+│ ║  │(S4-7     │           │              │  │          │             ║  │
+│ ║  │ SQLite)  │           │              │  │          │             ║  │
 │ ║  └──────────┘           └──────────────┘  └──────────┘             ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                          ↑↓                    ↑↓               │
@@ -95,9 +99,9 @@
 │ ║  │              Quant Model: LightGBM (확정)                    │    ║  │
 │ ║  │                                                              │    ║  │
 │ ║  │  Alpha Factors + Dual-Source 5피처 ──→ LightGBM ──→ active 20종목 예측 시그널           │    ║  │
-│ ║  │  (LLM 자동생성)    (n_est=200~2000  + confidence              │    ║  │
-│ ║  │  + Multi-scale      depth=4)        (추론 0.3ms)             │    ║  │
-│ ║  │  + Cross-Asset피처                                           │    ║  │
+│ ║  │  (LLM 자동생성)    (n_est=500        + confidence              │    ║  │
+│ ║  │  + Multi-scale      depth=4,        (추론 0.3ms)             │    ║  │
+│ ║  │  + Cross-Asset피처  risk_config SSOT)                         │    ║  │
 │ ║  └─────────────────────────────────────────────────────────────┘    ║  │
 │ ║                                                                     ║  │
 │ ║  ┌─────────────────────────────────────────────────────────────┐    ║  │
@@ -349,7 +353,7 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 
 ### 3.0 Mode B 타임라인 (v2.2 시각화 신규)
 
-> Mode B는 18:00~22:00 사이에 6단계로 직렬 진행된다. 각 단계 사이에는 명확한 artifact 전달이 있고,
+> Mode B는 18:00~22:00 사이에 8단계 (stage_0 DQR + stage_1~7)로 직렬 진행된다. 각 단계 사이에는 명확한 artifact 전달이 있고,
 > **21:00~21:30 Backtest Agent 게이트** 는 v2.2에서 신설된 시스템 레벨 검증 지점이다.
 >
 > **주체**: 모든 단계 호출은 **Mode B Scheduler (C14)** 가 cron-style로 수행한다.
@@ -359,7 +363,13 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 ```
 시간          단계                           산출물                         다음 단계 트리거
 ──────        ───────────                    ──────                         ──────────────
-  18:00  ┌──────────────────────────┐   → performance_vector            → §8.2
+  18:00  ┌──────────────────────────┐   → dqr_report                    → §8.1 (CRITICAL 시 차단)
+         │ stage_0 DQR              │      (outlier_rate, null_rate,
+         │ Data Quality Review      │       ticker 커버리지)
+         │ (2분 SLA)                │
+         └───────────┬──────────────┘
+                     │
+  18:00  ┌───────────▼──────────────┐   → performance_vector            → §8.2
          │ §8.1 성과 분석           │      8차원 [IC,ICIR,RankIC,
          │ x_t = 8차원 성과 벡터    │       ARR,IR,-MDD,SR, ...]
          └───────────┬──────────────┘
@@ -908,7 +918,7 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
   ┌────────────────────────────────────────────────────────┐
   │        Multi-scale Cross-Asset Attention                 │
   │                                                         │
-  │  1분봉 Raw Data (30종목 × 8 features)                   │
+  │  1분봉 Raw Data (active 20 × 8 features)                 │
   │            ↓ Multi-scale Decomposition                   │
   │                                                         │
   │  ┌──────────────────────────────────────────────────┐  │
@@ -1065,7 +1075,7 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 ## 19. 확정 파이프라인 순서 (GPT Pro #2)
 
 ```
-  LightGBM (30종목 시그널, 0.3ms)
+  LightGBM (active 20 시그널, 0.3ms)
        ↓
   Top-10 필터링 (퀀트 점수 순)
        ↓
@@ -1182,14 +1192,14 @@ FDA reason_code 분포 (2026-03-20 FOMC 이벤트 시나리오):
        /
       +  DEBATE_CONFLICT [==] 18%
        \
-        RISK_BREACH [=] 10%
+        RISK_FAST_TRIGGER [=] 10%
 ```
 
 | reason_code | 비율 | 의미 |
 |---|---|---|
 | NEWS_DIVERGENCE | 72% | 뉴스 vs 커뮤니티 방향 불일치 -> FDA 개입 |
 | DEBATE_CONFLICT | 18% | 에이전트 간 의견 충돌 -> FDA 중재 |
-| RISK_BREACH | 10% | 리스크 임계 위반 -> FDA veto |
+| RISK_FAST_TRIGGER | 10% | 리스크 규칙 트리거 -> FDA veto |
 
 Cause Attribution Accuracy: 64% (사후 일치 비율, Sprint 4 측정 후 확정).
 
@@ -1288,13 +1298,14 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 
 ## 7. Sprint 3 추가 다이어그램
 
-### 7.1 ModeBScheduler 7-stage Cron Flow
+### 7.1 ModeBScheduler 8-stage Cron Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  ModeBScheduler (C14) — 18:00~22:00 KST 7-stage cron       │
+│  ModeBScheduler (C14) — 18:00~22:00 KST 8-stage cron       │
 │                                                             │
-│  18:00 stage_1 (30s SLA)  → performance_vector (8d)        │
+│  18:00 stage_0 (120s SLA) → DQR (CRITICAL alert 시 파이프라인 차단)│
+│  18:02 stage_1 (30s SLA)  → performance_vector (8d)        │
 │  18:30 stage_2 (60s SLA)  → direction ∈ {factor, model}    │
 │  19:00 stage_3 (3600s)    → factor_candidate (Alpha Engine) │
 │  20:00 stage_4 (1800s)    → model_candidate (Co-STEER)      │
@@ -1393,5 +1404,31 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 │     SLA: max_runtime_sec=600                             │
 │                                                          │
 │  result → KB TTL=30days (Sprint 4 KB.write 예정)         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 7.6 Bootstrap 단계 (시스템 시작 시 Memory 복원)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Bootstrap (시스템 시작 → HOT_RUNNING 진입 전)            │
+│                                                          │
+│  AgentMemoryRestorer.restore_all()   (S4-8)              │
+│    │                                                     │
+│    ├─ KB storage 읽기 (5종, factor_zoo 제외):             │
+│    │    micro_notes / macro_notes / debate_history       │
+│    │    decision_history / backtest_history              │
+│    │    (factor_zoo: Mode B Scheduler 전용, restorer 제외)  │
+│    │                                                     │
+│    ├─ 에이전트 인스턴스별 inject:                         │
+│    │    NewsAgent      ← micro_notes + macro_notes       │
+│    │    RiskAgent      ← macro_notes                     │
+│    │    DebateAgent    ← debate_history                  │
+│    │    FDA            ← decision_history                │
+│    │    BacktestAgent  ← backtest_history                │
+│    │                                                     │
+│    └─ 부트 완료 → HOT_RUNNING 진입                       │
+│                                                          │
+│  실패 시: 빈 memory로 cold start (warn 로그 출력)         │
 └──────────────────────────────────────────────────────────┘
 ```

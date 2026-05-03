@@ -85,6 +85,15 @@ class KnowledgeBase:
         self._recency_lambda: float = float(cfg.get("search_recency_boost_lambda", 0.1))
 
     # ─────────────────────────────────────────────────────────
+    # Public properties
+    # ─────────────────────────────────────────────────────────
+
+    @property
+    def storage_root(self) -> Path:
+        """KB 루트 디렉토리 경로 (외부 소비자용 public API)."""
+        return self._root
+
+    # ─────────────────────────────────────────────────────────
     # 내부 유틸
     # ─────────────────────────────────────────────────────────
 

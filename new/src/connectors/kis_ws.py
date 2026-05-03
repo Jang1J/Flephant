@@ -73,6 +73,16 @@ class KISWebSocketClient:
         else:
             self._rate_limiter = rate_limiter
 
+        # connector_mock 파라미터 로드 (불변 원칙 5: 하드코딩 금지)
+        mock_cfg = config_load("risk_config.yaml", "connector_mock")
+        kis_mock = mock_cfg.get("kis", {})
+        self._mock_volume_min: int = int(kis_mock.get("volume_min", 1000))
+        self._mock_volume_max: int = int(kis_mock.get("volume_max", 100000))
+        self._mock_change_min: int = int(kis_mock.get("change_min", 0))
+        self._mock_change_max: int = int(kis_mock.get("change_max", 100))
+        self._mock_bid_size_min: int = int(kis_mock.get("bid_size_min", 500))
+        self._mock_bid_size_max: int = int(kis_mock.get("bid_size_max", 10000))
+
         if self.mode == "mock":
             seed_str = os.getenv("KIS_MOCK_SEED", "42")
             self._rng = random.Random(int(seed_str))
@@ -103,15 +113,19 @@ class KISWebSocketClient:
             t: _MOCK_BASE_PRICE + (int(t) % _MOCK_PRICE_MODULO)
             for t in self.tickers
         }
-        # C1 required_features 8종 전부 포함 (vwap/turnover/change 추가, Sprint 1 감사 반영)
+        # C1 required_features: vwap/turnover/change/ingest_ts/completeness 포함
         for _ in range(n_bars):
             for ticker in self.tickers:
                 base = base_prices[ticker]
                 delta = self._rng.randint(-200, 200)
                 close_p = base + delta
-                high_p = max(base, close_p) + self._rng.randint(0, 100)
-                low_p = min(base, close_p) - self._rng.randint(0, 100)
-                volume = self._rng.randint(500, 10000)
+                high_p = max(base, close_p) + self._rng.randint(
+                    self._mock_change_min, self._mock_change_max
+                )
+                low_p = min(base, close_p) - self._rng.randint(
+                    self._mock_change_min, self._mock_change_max
+                )
+                volume = self._rng.randint(self._mock_bid_size_min, self._mock_bid_size_max)
                 vwap = (base + high_p + low_p + close_p) / 4.0
                 turnover = float(vwap * volume)
                 change = float(close_p - base)
@@ -128,6 +142,8 @@ class KISWebSocketClient:
                     "turnover": turnover,
                     "change": change,
                     "ts_close": now.isoformat(),
+                    "ingest_ts": now.isoformat(),
+                    "completeness": "full",
                     "_mode": "mock",
                 }
             if self.poll_interval_sec > 0:

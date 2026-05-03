@@ -23,12 +23,8 @@ logger = get_logger("preprocessor")
 
 
 def _load_preprocessor_cfg() -> dict:
-    """risk_config.yaml preprocessor 섹션 로드. 없으면 default dict 반환."""
-    try:
-        return config_load("risk_config.yaml", "preprocessor")
-    except (KeyError, TypeError) as e:
-        logger.warning("[preprocessor] config 로드 실패 (%s). default 사용", e)
-        return {}
+    """risk_config.yaml preprocessor 섹션 로드. 불변 원칙 5: 실패 시 에러 전파."""
+    return config_load("risk_config.yaml", "preprocessor")
 
 
 class Preprocessor:
@@ -40,13 +36,9 @@ class Preprocessor:
 
     def __init__(self) -> None:
         cfg = _load_preprocessor_cfg()
-        if not cfg:
-            logger.warning("[preprocessor] risk_config.yaml preprocessor 섹션 없음. 기본값 사용.")
-        self.multi_scale_windows: list[int] = cfg.get(
-            "multi_scale_windows", [1, 5, 30, 60]  # 기본값: yaml 로드 실패 시 임시
-        )
-        self.mad_constant: float = float(cfg.get("mad_constant", 1.4826))  # 기본값: yaml 로드 실패 시 임시
-        self.outlier_cap_z: float = float(cfg.get("outlier_cap_z", 5.0))  # 기본값: yaml 로드 실패 시 임시
+        self.multi_scale_windows: list[int] = cfg["multi_scale_windows"]
+        self.mad_constant: float = float(cfg["mad_constant"])
+        self.outlier_cap_z: float = float(cfg["outlier_cap_z"])
         logger.info(
             "[preprocessor] 초기화: windows=%s, mad_constant=%.4f, cap=%.1f",
             self.multi_scale_windows, self.mad_constant, self.outlier_cap_z,

@@ -74,25 +74,33 @@ class RiskAgentFast(AgentBase):
     def _load_thresholds(self) -> dict[str, float]:
         """risk_config.yaml risk_fast.cold_path 섹션에서 임계값 로드.
 
-        불변 원칙 5: 모든 수치는 yaml SSOT 경유. defaults는 yaml 파싱 실패 시 비상용.
+        불변 원칙 5: 모든 수치는 yaml SSOT 경유. 하드코딩 금지.
+        yaml 로드 실패 시 KeyError / RuntimeError 전파 (시스템 설정 오류 명확화).
         foreign_net_sell_krw: 음수 컨벤션 (-100B 이하 = 대규모 순매도).
         """
-        defaults = {
-            "comm_volume_zscore": 2.5,
-            "comm_sentiment_delta": 0.5,
-            "intraday_return_zscore": -3.0,
-            "foreign_net_sell_krw": -100_000_000_000.0,  # -100B KRW (음수 컨벤션)
-            "news_comm_divergence": 0.5,
-        }
-        try:
-            rf = config_load("risk_config.yaml", "risk_fast")
-            cold_cfg = rf.get("cold_path", {})
-            for key in defaults:
-                if key in cold_cfg:
-                    defaults[key] = float(cold_cfg[key])
-        except Exception as e:
-            logger.warning("[risk_fast_cold] cold_path 임계값 로드 실패, 비상 기본값 사용: %s", e)
-        return defaults
+        rf = config_load("risk_config.yaml", "risk_fast")
+        cold_cfg = rf.get("cold_path")
+        if cold_cfg is None:
+            raise KeyError(
+                "[risk_fast_cold] risk_config.yaml risk_fast.cold_path 섹션 없음. "
+                "설정 파일 점검 필요."
+            )
+        keys = [
+            "comm_volume_zscore",
+            "comm_sentiment_delta",
+            "intraday_return_zscore",
+            "foreign_net_sell_krw",
+            "news_comm_divergence",
+        ]
+        result: dict[str, float] = {}
+        for key in keys:
+            if key not in cold_cfg:
+                raise KeyError(
+                    f"[risk_fast_cold] risk_fast.cold_path.{key} 누락. "
+                    "risk_config.yaml 점검 필요."
+                )
+            result[key] = float(cold_cfg[key])
+        return result
 
     def evaluate(
         self,

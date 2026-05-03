@@ -463,3 +463,88 @@ def test_leakage_guard_extreme_raises(builder: DatasetBuilder) -> None:
     )
     with pytest.raises(LabelLeakageError, match="극단값"):
         builder._assert_no_leakage(panel)
+
+
+# ====================================================================== #
+# R1-W4: Dual-Source join 벡터화 결과 일치 검증
+# ====================================================================== #
+
+
+def test_dual_source_join_vectorized_result(tmp_path: Path) -> None:
+    """벡터화된 _join_dual_source_features: 점수 값이 정확히 join되는지 확인.
+
+    - 2종목 × 1일 더미 panel 생성
+    - mock load_latest_scores: 005930에만 scores 제공
+    - join 후 005930 행은 news_score_t = 0.5, 000660 행은 0.0 (default)
+    """
+    from unittest.mock import patch
+
+    from src.data.dataset_builder import DUAL_SOURCE_FEATURES
+
+    b = DatasetBuilder(artifacts_dir=tmp_path)
+    # 강제로 enabled_for_lgbm 활성화
+    b._ds_enabled_for_lgbm = True
+
+    # 더미 panel (MultiIndex ticker × ts_close)
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=4, freq="1min")
+    rows = {
+        "open": [100.0] * 8, "high": [101.0] * 8,
+        "low": [99.0] * 8, "close": [100.0] * 8,
+        "volume": [1000.0] * 8,
+        "label_5m_ret": [0.01] * 8, "cs_rank": [0.5] * 8, "relevance": [1.0] * 8,
+    }
+    idx = pd.MultiIndex.from_tuples(
+        [("005930", t) for t in ts] + [("000660", t) for t in ts],
+        names=["ticker", "ts_close"],
+    )
+    panel = pd.DataFrame(rows, index=idx)
+
+    # mock: 005930에 news_score_t=0.5 제공, 000660 없음
+    mock_scores = [
+        {
+            "ticker": "005930",
+            "news_score_t": 0.5,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.2,
+            "community_noise_multiplier": 0.9,
+        }
+    ]
+
+    with patch("src.data.dataset_builder.load_latest_scores", return_value=mock_scores):
+        result = b._join_dual_source_features(panel, "20260420", "20260420")
+
+    # 005930 행: news_score_t = 0.5
+    sel_005930 = result.loc["005930", "news_score_t"].to_numpy()
+    assert all(abs(v - 0.5) < 1e-6 for v in sel_005930), f"005930 news_score_t 불일치: {sel_005930}"
+
+    # 000660 행: news_score_t = 0.0 (default)
+    sel_000660 = result.loc["000660", "news_score_t"].to_numpy()
+    assert all(abs(v) < 1e-9 for v in sel_000660), f"000660 news_score_t 불일치: {sel_000660}"
+
+
+def test_dual_source_join_vectorized_no_scores(tmp_path: Path) -> None:
+    """load_latest_scores가 빈 리스트 반환 시 기본값 0.0 유지."""
+    from unittest.mock import patch
+
+    b = DatasetBuilder(artifacts_dir=tmp_path)
+    b._ds_enabled_for_lgbm = True
+
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=2, freq="1min")
+    rows = {
+        "open": [100.0] * 2, "high": [101.0] * 2,
+        "low": [99.0] * 2, "close": [100.0] * 2,
+        "volume": [1000.0] * 2,
+        "label_5m_ret": [0.01] * 2, "cs_rank": [0.5] * 2, "relevance": [1.0] * 2,
+    }
+    idx = pd.MultiIndex.from_tuples([("005930", t) for t in ts], names=["ticker", "ts_close"])
+    panel = pd.DataFrame(rows, index=idx)
+
+    with patch("src.data.dataset_builder.load_latest_scores", return_value=[]):
+        result = b._join_dual_source_features(panel, "20260420", "20260420")
+
+    from src.data.dataset_builder import DUAL_SOURCE_FEATURES
+    for feat in DUAL_SOURCE_FEATURES:
+        assert feat in result.columns
+        vals = result[feat].to_numpy()
+        assert all(abs(v) < 1e-9 for v in vals), f"{feat}: 0.0 기본값 불일치 {vals}"

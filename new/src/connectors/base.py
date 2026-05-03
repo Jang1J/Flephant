@@ -34,6 +34,8 @@ class BaseConnector:
         """risk_config.yaml connector_defaults 로드.
 
         설정: timeout_sec / max_retries / backoff_base
+        DQR 공통 속성: _request_count / _error_count / _delay_samples /
+                       _rate_limit_hit_count / _numeric_samples
         불변 원칙 5: 하드코딩 금지. yaml SSOT.
         """
         try:
@@ -48,6 +50,14 @@ class BaseConnector:
             self.timeout_sec = 10
             self.max_retries = 3
             self.backoff_base = 2
+
+        # DQR 공통 속성. DQRRunner._collect_stats_from_connector()가 getattr로 읽음.
+        # 하위 클래스가 override하지 않으면 이 기본값 사용.
+        self._request_count: int = 0
+        self._error_count: int = 0
+        self._delay_samples: list[float] = []
+        self._rate_limit_hit_count: int = 0
+        self._numeric_samples: list[float] = []
 
     def _http_get_json(
         self,

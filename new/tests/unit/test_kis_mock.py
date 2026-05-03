@@ -96,7 +96,13 @@ def test_kis_ws_mock_bar_fields(monkeypatch):
     bars = list(ws.subscribe(n_bars=1))
     assert len(bars) == 1
     bar = bars[0]
-    for field in ("ticker", "open", "high", "low", "close", "volume", "ts_close", "_mode"):
+    for field in (
+        "ticker", "open", "high", "low", "close", "volume", "ts_close", "_mode",
+        "vwap", "turnover", "change", "ingest_ts", "completeness",
+    ):
         assert field in bar, f"필드 누락: {field}"
     assert bar["high"] >= bar["low"]
     assert bar["_mode"] == "mock"
+    assert bar["completeness"] == "full"
+    assert isinstance(bar["vwap"], float)
+    assert isinstance(bar["turnover"], float)

@@ -56,7 +56,7 @@ class PortfolioManager:
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
-        self._max_sector: float = float(pos_cfg.get("max_sector", 0.40))
+        self._max_sector: float = float(pos_cfg["max_sector"])
         self._min_cash: float = float(pos_cfg["min_cash"])
 
         self._daily_turnover_max: float = float(turnover_cfg["daily_max"])

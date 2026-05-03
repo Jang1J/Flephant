@@ -9,6 +9,8 @@
 > v3.3 (2026-04-21): C9 input uncertainty_score non-breaking extension + uncertainty_signal channel
 > v3.4 (2026-04-21): MSG/APM/DEC/OP ID UUID8 정정 (seq 충돌 방지)
 > v3.5 (2026-04-21): PP/BUNDLE/BT/RPT/FCC/RGC ID UUID8 정정 (전수 통일). BT {tool} 컴포넌트 제거.
+> v3.6 (2026-05-02): Sprint 4 반영. dual_source 피처 표기 통일 (언더스코어) / Persistent Cache S4-7 SQLite 명시 / §5.6 prediction_history KB 범위 명확화 / DQR stage_0 / Memory Restorer Bootstrap / E2E Profiler.
+> v3.7 (2026-05-02): 전수 리뷰 fix. §8.0.1 타임라인 8단계 (stage_0 DQR) 명시 / §3.2 LightGBM n_estimators=500 (risk_config SSOT) 정정.
 > 근거: 교수님 피드백 + 6개 논문 분석 (AAPM, AlphaGAT, MetaGPT, RD-Agent, TradeXpert, AlphaAgent)
 > 외부 AI 검증 (v2.1): GPT Pro 평균 8.6/10 (멀티에이전트 정체성 9.1, RL 배치 8.9, 실시간성 8.7, 아키텍처 8.6, 명세 7.2, 실거래 7.1)
 > 위치: /Elephant_Lab/new/
@@ -149,8 +151,8 @@ Layer 1: Execution (실행 + 피드백)
 팀 병합 결과로, 뉴스와 커뮤니티를 **같은 텍스트로 합치지 않고 서로 다른 소스**로 취급한다.
 
 - **뉴스**: 신뢰도 높고 반영 속도 빠름 → `news_score_t`, 빠른 decay (`lambda_news = 0.8`)
-- **커뮤니티**: 노이즈 높고 개인 투자자 반응이 늦음 → `comm_score_t-1`, `comm_score_t-2`, 느린 decay (`lambda_comm = 0.4`, `peak_lag_days = 2`)
-- **소스 간 불일치**: `news_comm_divergence = |news_score_t - comm_score_t-1|`
+- **커뮤니티**: 노이즈 높고 개인 투자자 반응이 늦음 → `comm_score_t_1`, `comm_score_t_2`, 느린 decay (`lambda_comm = 0.4`, `peak_lag_days = 2`)
+- **소스 간 불일치**: `news_comm_divergence = |news_score_t - comm_score_t_1|`
 - **노이즈 제어**: `community_noise_multiplier` (게시량 z-score 기반 감쇠)
 
 핵심 의미는 **"뉴스는 긍정인데 커뮤니티는 부정" 같은 방향 불일치 자체를 불확실성(UQ) 신호로 본다**는 것이다. 이 divergence는 가격/거래량만으로 포착하기 어렵고, 현재 프로젝트의 핵심 철학인 **정량화 불가능한 리스크 공백**을 채우는 대표 사례다.
@@ -191,7 +193,7 @@ Raw 1분봉 (8 features × active 20종목)
    (AlphaGAT CATimeMixer)
     ↓
 ④ Dual-Source 점수 생성 (08:00 batch, v3)
-   news_score_t / comm_score_t-1 / comm_score_t-2 / news_comm_divergence / community_noise_multiplier
+   news_score_t / comm_score_t_1 / comm_score_t_2 / news_comm_divergence / community_noise_multiplier
    ※ 뉴스는 FinBERT/로컬 분류기, 커뮤니티는 spam/manipulation/sentiment_dict 기반 점수화
     ↓
 ⑤ TSFresh 통계 추출 → 자연어 변환 (에이전트용)
@@ -254,7 +256,7 @@ Raw 1분봉 (8 features × active 20종목)
 
 **v3 즉시 반영 — Dual-Source Feature Pack**
 - `news_score_t`: 당일 뉴스/공시 점수 (빠른 decay)
-- `comm_score_t-1`, `comm_score_t-2`: 전일/전전일 커뮤니티 점수 (지연 반영)
+- `comm_score_t_1`, `comm_score_t_2`: 전일/전전일 커뮤니티 점수 (지연 반영)
 - `news_comm_divergence`: 두 소스 간 방향 불일치 → uncertainty
 - `community_noise_multiplier`: 게시량 급증 시 커뮤니티 가중치 감쇠
 
@@ -273,7 +275,7 @@ Cross-Asset 피처 (종목 간 correlation, sector mean)
   → LightGBM 입력 피처로 포함. "어제 밤 미국 → 오늘 한국" 패턴 학습.
   → Risk Agent도 동일 피처 사용 (us_vix → Regime Gate 판단).
     ↓
-LightGBM (n_estimators=200~2000, depth=4, early_stop)
+LightGBM (n_estimators=500, depth=4, early_stop)  # risk_config.yaml SSOT
     ↓
 출력: active 20종목 예측 시그널 + confidence
 ```
@@ -1009,9 +1011,11 @@ failure_categories = {
 캐싱 대상:
   - 뉴스 분석 결과 (동일 뉴스 재분석 방지, TTL: 장중)
   - 팩터 IC 계산 결과 (매일 갱신)
-  - 에이전트 보고서 (TTL: 5분 or 이벤트까지)
+  - 에이전트 보고서 (TTL: risk_config.yaml `cache.agent_report_ttl_seconds`, 기본 1800초 = 30분)
   - Cross-Asset Attention 결과 (TTL: 1분)
 ```
+
+> S4-7 구현: backend=sqlite, storage_path=artifacts/cache/persistent_cache.db (risk_config.yaml cache 섹션 SSOT).
 
 ### 5.6 장중↔장마감 Memory 순환 연결 (GPT Pro 피드백 #6)
 
@@ -1021,7 +1025,7 @@ failure_categories = {
 │  에이전트별 memory 실시간 축적:                       │
 │  - News: micro_notes (종목별 이벤트 기록)             │
 │  - Risk: macro_notes (거시 상황 갱신)                 │
-│  - Quant: prediction_history (시그널 vs 실현)         │
+│  - Quant: prediction_history (시그널 vs 실현, Quant Agent 로컬 JSONL, KB storage_types 미포함)│
 │  - Debate: debate_history (pairwise 결과)             │
 │  - FDA: decision_history (승인/거부 + 결과)           │
 │                                                      │
@@ -1407,7 +1411,7 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 
 | 상태 | 설명 | 전이 조건 |
 |------|------|---------|
-| MODE_B_IDLE | 장 마감 직후, 18:00 Mode B Scheduler 대기 | 18:00 → MODE_B_EVOLVING |
+| MODE_B_IDLE | 장 마감 직후, 18:00 Mode B Scheduler 대기 | 18:00 → MODE_B_EVOLVING<br>stage_0 DQR CRITICAL alert → MODE_B_BLOCKED |
 | MODE_B_EVOLVING | Alpha Factor Engine + Co-STEER + 에이전트 자기 개선 실행 (18:00~21:00) | 21:00 → MODE_B_BACKTEST |
 | MODE_B_BACKTEST | Backtest Agent 검증 실행 (21:00~21:30, v2.2 게이트) | verdict==pass → MODE_B_DEPLOY<br>verdict==warn → MODE_B_OPERATOR_REVIEW<br>verdict==fail → MODE_B_BLOCKED |
 | MODE_B_OPERATOR_REVIEW | human_approval 대기 | 승인 → MODE_B_DEPLOY<br>거부 → MODE_B_BLOCKED |
@@ -1425,6 +1429,7 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 장 마감 전이 (v2.2 신규):
   HOT_RUNNING → MODE_B_IDLE (15:30 장 마감)
   MODE_B_IDLE → MODE_B_EVOLVING (18:00 Mode B Scheduler)
+  MODE_B_IDLE → MODE_B_BLOCKED (stage_0 DQR CRITICAL alert 시, 18:00 Scheduler 진입 전 차단)
   MODE_B_EVOLVING → MODE_B_BACKTEST (21:00)
   MODE_B_BACKTEST → MODE_B_DEPLOY (verdict==pass + no regression)
   MODE_B_BACKTEST → MODE_B_OPERATOR_REVIEW (verdict==warn)
@@ -1524,10 +1529,11 @@ Mode B Scheduler가 갱신하는 대상 yaml과 권한:
 
 ### 8.0.1 Mode B 타임라인 세분화
 
-> **v2.2 타임라인 세분화**: Mode B는 18:00~22:00 사이에 6단계로 진행된다.
+> **v2.2 타임라인 세분화**: Mode B는 18:00~22:00 사이에 8단계 (stage_0 DQR + stage_1~7)로 진행된다.
 > 각 단계는 직렬로 이어지며, Backtest Agent(§8.5.2)는 21:00~21:30의 시스템 검증 게이트이다.
 >
 > ```
+> 18:00       § stage_0  DQR (Data Quality Review, 2분 SLA)
 > 18:00       § 8.1  성과 분석 (8차원 벡터)
 > 18:30       § 8.2  방향 결정 (Thompson Sampling: factor vs model)
 > 19:00~20:00 § 8.3  팩터 진화 (Alpha Factor Engine: Idea/Factor/Eval)
@@ -1977,7 +1983,7 @@ Phase 5: 통합 + 최적화
 
 ---
 
-## §15 평가 매트릭스 & 성능 지표
+## 15. 평가 매트릭스 & 성능 지표
 
 평가 3-Layer (Sprint 2 S2-10 기준):
 - Layer 1: 모델 성능 (IC, ICIR, RankIC, AR, IR, MDD, SR)

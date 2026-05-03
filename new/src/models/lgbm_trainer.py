@@ -43,11 +43,23 @@ logger = get_logger("lgbm_trainer")
 def _load_feature_cols() -> list[str]:
     """risk_config.yaml preprocessor.feature_cols에서 로드 (불변 원칙 5).
 
-    DatasetBuilder._compute_rolling_features 출력과 1:1 대응.
-    피처 추가/제거 시 yaml + dataset_builder 동시 수정 필수.
+    S4-2: dual_source.enabled_for_lgbm=true 시 dual_source_feature_cols도 병합.
+    DatasetBuilder._compute_rolling_features 출력 + _join_dual_source_features 출력과 1:1 대응.
+    피처 추가/제거 시 yaml + dataset_builder 양쪽 동시 수정 필수.
     """
     cfg = config_load("risk_config.yaml", "preprocessor")
-    return list(cfg["feature_cols"])
+    base_cols: list[str] = list(cfg["feature_cols"])
+
+    # S4-2: Dual-Source 5피처 병합 (enabled_for_lgbm 플래그)
+    ds_cfg = config_load("risk_config.yaml", "dual_source") or {}
+    if ds_cfg.get("enabled_for_lgbm", False):
+        ds_cols: list[str] = list(cfg.get("dual_source_feature_cols", []))
+        # 중복 방지: base에 없는 피처만 추가
+        for col in ds_cols:
+            if col not in base_cols:
+                base_cols.append(col)
+
+    return base_cols
 
 
 class LGBMTrainer:

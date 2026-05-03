@@ -105,7 +105,10 @@ def test_ingest_admitted_event_goes_to_backlog(tmp_path: Path) -> None:
 # 3. 거부 이벤트 status = rejected
 # ------------------------------------------------------------------
 
-def test_ingest_rejected_event_status(tmp_path: Path) -> None:
+def test_ingest_rejected_event_status(tmp_path: Path, monkeypatch) -> None:
+    # STALE 동작 직접 검증. conftest의 ELEPHANT_TEST_FRESHNESS_SKIP=1 우회.
+    monkeypatch.delenv("ELEPHANT_TEST_FRESHNESS_SKIP", raising=False)
+
     gw = _gateway(tmp_path)
 
     # 만료된 이벤트: title+corp_name+disclosure_time 모두 존재 → normalize 성공.

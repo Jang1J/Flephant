@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from src.connectors.base import BaseConnector
+from src.data.filter_loader import load_spam_rules, load_manipulation_rules, load_sentiment_dict
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.rate_limiter import RateLimiter
@@ -107,16 +108,12 @@ class CommunityCrawler(BaseConnector):
         else:
             self._rate_limiter = RateLimiter("community")
 
-        # spam_rules / manipulation_rules / sentiment_dict yaml 로드
-        self._spam_rules = self._load_yaml_section(
-            _CONFIG_ROOT / "spam_rules.yaml", "filters"
-        )
-        self._manipulation_rules = self._load_yaml_section(
-            _CONFIG_ROOT / "manipulation_rules.yaml", "rules"
-        )
-        self._sentiment_dict = self._load_yaml_section(
-            _CONFIG_ROOT / "sentiment_dict.yaml", root=True
-        )
+        # spam_rules / manipulation_rules / sentiment_dict yaml 로드 (filter_loader 캐시 경유)
+        spam_data = load_spam_rules()
+        self._spam_rules = spam_data.get("filters", [])
+        manip_data = load_manipulation_rules()
+        self._manipulation_rules = manip_data.get("rules", [])
+        self._sentiment_dict = load_sentiment_dict()
         # yaml SSOT 엄수. weights 섹션 누락 시 KeyError 전파 (불변 원칙 5).
         if "weights" not in self._sentiment_dict:
             raise KeyError(
@@ -124,7 +121,7 @@ class CommunityCrawler(BaseConnector):
             )
         self._sentiment_weights = self._sentiment_dict["weights"]
 
-        # dual_source 설정 (dual_source.yaml 경유)
+        # dual_source 설정 (dual_source.yaml 경유 — filter_loader 미지원 파일이므로 직접 로드)
         self._dual_cfg = self._load_yaml_section(
             _CONFIG_ROOT / "dual_source.yaml", root=True
         )

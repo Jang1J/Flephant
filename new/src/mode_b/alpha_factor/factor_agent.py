@@ -71,9 +71,13 @@ class FactorCandidate:
 # 검증용 test_df 생성 헬퍼
 # ------------------------------------------------------------------ #
 
-def _make_test_df(n: int = 50) -> pd.DataFrame:
-    """factor 실행 검증용 dummy DataFrame (n 행)."""
-    rng = np.random.default_rng(seed=42)
+def _make_test_df(n: int = 50, seed: int = 42) -> pd.DataFrame:
+    """factor 실행 검증용 dummy DataFrame (n 행).
+
+    seed: risk_config.yaml alpha_factor.factor_agent_seed에서 로드 (불변 원칙 5).
+          FactorAgent.__init__에서 self._test_df_seed로 로드 후 implement() 호출 시 주입.
+    """
+    rng = np.random.default_rng(seed=seed)
     return pd.DataFrame({
         "close":                  np.abs(rng.standard_normal(n) * 100 + 1000),
         "open":                   np.abs(rng.standard_normal(n) * 100 + 1000),
@@ -112,12 +116,15 @@ class FactorAgent:
 
         self._max_retries: int = int(cfg.get("max_retries", 3))
         self._max_ast_complexity: int = int(cfg.get("max_ast_complexity", 10))
+        # W3 yaml화: test_df seed (불변 원칙 5)
+        self._test_df_seed: int = int(cfg.get("factor_agent_seed", 42))
         self._llm_router = llm_router
         logger.info(
-            "[factor_agent] 초기화. zoo=%s max_retries=%d max_ast=%d",
+            "[factor_agent] 초기화. zoo=%s max_retries=%d max_ast=%d test_df_seed=%d",
             self._factor_zoo_path,
             self._max_retries,
             self._max_ast_complexity,
+            self._test_df_seed,
         )
 
     # ------------------------------------------------------------------ #
@@ -140,7 +147,7 @@ class FactorAgent:
             FactorCandidate: status 중 하나 ("active"|"duplicate"|"failed").
         """
         retries = max_retries if max_retries is not None else self._max_retries
-        test_df = _make_test_df()
+        test_df = _make_test_df(seed=self._test_df_seed)
         attempt = 0
         previous_error: str | None = None
 

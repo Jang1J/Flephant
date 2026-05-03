@@ -62,6 +62,6 @@ def assert_pit_safe(
     if not is_pit_safe(data_ts, snapshot_ts):
         dt_data = _parse_ts(data_ts)
         dt_snap = _parse_ts(snapshot_ts) if snapshot_ts is not None else _default_snapshot()
-        raise ValueError(
+        raise PITViolationError(
             f"PIT-Safety 위반: data_ts={dt_data.isoformat()} > snapshot_ts={dt_snap.isoformat()}"
         )

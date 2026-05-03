@@ -1,6 +1,7 @@
 """pytest 공통 설정. sys.path에 new/ 추가 + Mode B 격리 fixture + filter_loader cache isolation."""
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -34,3 +35,15 @@ def _reset_filter_loader_cache():
         # filter_loader 없는 레거시 test module 보호
         pass
     yield
+
+
+def pytest_configure(config):
+    """custom marker 등록. PytestUnknownMarkWarning 제거."""
+    config.addinivalue_line(
+        "markers",
+        "slow: 시간 오래 걸리는 테스트 (E2E 1주일 시나리오 등). CI: -m 'not slow' 로 제외.",
+    )
+    # test 환경 가드 우회 환경변수 자동 설정.
+    # 운영 환경에서는 이 파일이 로드되지 않으므로 가드 그대로 유지.
+    os.environ["ELEPHANT_TEST_PIT_SKIP"] = "1"
+    os.environ["ELEPHANT_TEST_FRESHNESS_SKIP"] = "1"

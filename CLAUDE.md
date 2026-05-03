@@ -24,7 +24,7 @@ Mode B 장마감 (18:00~22:00):
 
 1. **PIT-Safety**: 미래 데이터 사용 금지. snapshot 기준 18:00 KST.
 2. **FDA can_change_weight = false**: FDA는 approve/veto만. 비중은 PPO Allocator, order_deltas는 Portfolio Manager.
-3. **Backtest Agent Mode B 전용**: 장중 경로 절대 미개입. forbidden_permissions 6개.
+3. **Backtest Agent Mode B 전용**: 장중 경로 절대 미개입. C12 BacktestAgent forbidden_permissions 6개 + C14 Mode B Scheduler forbidden_permissions 4개.
 4. **Kanana-o 100회/일 예산**: 장중 LLM 한도. Mode B는 GPT-4o 전용.
 5. **하드코딩 금지**: 모든 수치/임계값은 `new/config/risk_config.yaml`에서 로드.
 
@@ -71,6 +71,16 @@ Mode B 장마감 (18:00~22:00):
 | `new/src/agents/cold/debate.py` | DebateAgent Cold Path (S2-9 실구현, C6 pairwise CoT 45회, debate_resolution/pairwise_ranking, debate_history JSONL) |
 | `new/src/connectors/base.py` | BaseConnector S2-11 (7개 커넥터 공통 기반: _load_defaults + _http_get_json + urllib fallback) |
 | `new/src/utils/pit_guard.py` | PIT-Safety SSOT (`is_pit_safe` + `PITViolationError`, snapshot_ts 18:00 KST) |
+| `new/src/data/dual_source_scorer.py` | C3A Dual-Source 5피처 배치 (S4-1, FinBERT + 3-yaml + decay + divergence + noise multiplier) |
+| `new/src/data/dual_source_runner.py` | 08:00 KST 장전 배치 실행기 (S4-1, artifacts/dual_source/YYYYMMDD.json) |
+| `new/src/jobs/run_dual_source_ablation.py` | Dual-Source ablation CLI (S4-2, w/ vs w/o LightGBM 재학습 비교) |
+| `new/src/runner/e2e_scenario_runner.py` | E2E 시나리오 오케스트레이터 (S4-3, 5일 Mode A + Mode B 시뮬) |
+| `new/src/runner/event_injector.py` | 합성 이벤트 주입기 (S4-3, news/dart/community/macro 4종) |
+| `new/src/jobs/run_e2e_scenario.py` | E2E 시나리오 CLI (S4-3, week1_basic.yaml) |
+| `new/src/ops/profiler.py` | Hot Path 6단계 레이턴시 측정 (S4-4, p50/p95/p99 + SLA alert) |
+| `new/src/dqr/dqr_runner.py` | DQR 일별 자동화 (S4-5, Mode B stage_0, 8 커넥터 5 메트릭) |
+| `new/src/cache/persistent_cache.py` | SQLite TTL 캐시 (S4-7, Cold Path 레이턴시 최적화) |
+| `new/src/agents/memory_restorer.py` | Bootstrap 에이전트 메모리 복원 (S4-8, KB 5종 storage → agent restore) |
 | `.env` | API 키 (DART, Naver, ECOS, KRX, Kanana, OpenAI) |
 
 ## LLM 구성

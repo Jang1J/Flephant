@@ -65,6 +65,16 @@ class KISRestClient(BaseConnector):
         self.rate_limiter = rate_limiter or RateLimiter("kis_rest")
         self.mode = os.getenv("KIS_MODE", "virtual").strip().lower()
 
+        # connector_mock 파라미터 로드 (불변 원칙 5: 하드코딩 금지)
+        mock_cfg = config_load("risk_config.yaml", "connector_mock")
+        kis_mock = mock_cfg.get("kis", {})
+        self._mock_volume_min: int = int(kis_mock.get("volume_min", 1000))
+        self._mock_volume_max: int = int(kis_mock.get("volume_max", 100000))
+        self._mock_change_min: int = int(kis_mock.get("change_min", 0))
+        self._mock_change_max: int = int(kis_mock.get("change_max", 100))
+        self._mock_bid_size_min: int = int(kis_mock.get("bid_size_min", 500))
+        self._mock_bid_size_max: int = int(kis_mock.get("bid_size_max", 10000))
+
         if self.mode == "mock":
             seed_str = os.getenv("KIS_MOCK_SEED", "42")
             self._rng = random.Random(int(seed_str))
@@ -146,8 +156,10 @@ class KISRestClient(BaseConnector):
         return {
             "ticker": ticker,
             "current_price": base_price + delta,
-            "volume": self._rng.randint(1000, 100000),
+            "volume": self._rng.randint(self._mock_volume_min, self._mock_volume_max),
             "ts_close": now_str,
+            "ingest_ts": now_str,
+            "completeness": "full",
             "_mode": "mock",
         }
 
@@ -163,13 +175,18 @@ class KISRestClient(BaseConnector):
             ts = now - timedelta(minutes=n_bars - 1 - i)
             open_p = price
             close_p = price + self._rng.randint(-200, 200)
-            high_p = max(open_p, close_p) + self._rng.randint(0, 100)
-            low_p = min(open_p, close_p) - self._rng.randint(0, 100)
-            volume = self._rng.randint(500, 10000)
-            # C1 required_features 8종 중 vwap / turnover / change 추가 (Sprint 1 감사 반영)
+            high_p = max(open_p, close_p) + self._rng.randint(
+                self._mock_change_min, self._mock_change_max
+            )
+            low_p = min(open_p, close_p) - self._rng.randint(
+                self._mock_change_min, self._mock_change_max
+            )
+            volume = self._rng.randint(self._mock_bid_size_min, self._mock_bid_size_max)
+            # C1 required_features: vwap / turnover / change / ingest_ts / completeness
             vwap = (open_p + high_p + low_p + close_p) / 4.0
             turnover = float(vwap * volume)
             change = float(close_p - prev_close)
+            ingest_ts = now.isoformat()
             bars.append({
                 "ticker": ticker,
                 "open": open_p,
@@ -181,6 +198,8 @@ class KISRestClient(BaseConnector):
                 "turnover": turnover,
                 "change": change,
                 "ts_close": ts.isoformat(),
+                "ingest_ts": ingest_ts,
+                "completeness": "full",
                 "_mode": "mock",
             })
             price = close_p

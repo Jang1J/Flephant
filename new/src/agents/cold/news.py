@@ -3,6 +3,7 @@
 이벤트(뉴스/공시/커뮤니티) → LLMRouter 분석 → C5 news_signal / dart_alert publish.
 memory: artifacts/agent_memory/news_agent/{ticker}/{YYYYMMDD}.jsonl (micro)
         artifacts/agent_memory/macro/{YYYYMMDD}.jsonl (macro)
+cache: S4-7 Persistent Cache. key=news:{ticker}:{event_id}. TTL=risk_config.yaml cache.news_ttl_seconds.
 """
 from __future__ import annotations
 
@@ -14,7 +15,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.agents._base import AgentBase
+from src.cache.persistent_cache import PersistentCache
 from src.data.filter_loader import load_news_filter
+from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 
 logger = get_logger("news_agent")
@@ -48,6 +51,7 @@ class NewsAgent(AgentBase):
         llm_router: Any,
         pubsub: Any | None = None,
         memory_root: Path | str | None = None,
+        cache: PersistentCache | None = None,
     ) -> None:
         """NewsAgent 생성자.
 
@@ -55,10 +59,13 @@ class NewsAgent(AgentBase):
             llm_router: LLMRouter 인스턴스 (DI).
             pubsub: PubSubBroker 인스턴스 (optional). None이면 publish skip.
             memory_root: memory JSONL 저장 루트 경로. None이면 기본 경로 사용.
+            cache: PersistentCache 인스턴스 (optional). None이면 캐시 미사용.
+                   TTL은 cache.news_ttl (risk_config.yaml cache.news_ttl_seconds).
         """
         self._llm_router = llm_router
         self._pubsub = pubsub
         self._memory_root = Path(memory_root) if memory_root else _DEFAULT_MEMORY_ROOT
+        self._cache = cache
         # narrative 최대 길이: news_filter.yaml text_pack_settings.narrative_max_chars SSOT (하드코딩 금지)
         _settings = load_news_filter().get("text_pack_settings", {})
         self._narrative_max_chars = int(_settings.get("narrative_max_chars", 200))
@@ -148,6 +155,18 @@ class NewsAgent(AgentBase):
         summary = event.get("summary", "")
         event_id = event.get("event_id", "")
 
+        # S4-7 캐시 조회 (event_id 있을 때만 키 생성)
+        cache_key = f"news:{ticker}:{event_id}" if event_id else None
+        if cache_key and self._cache is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.info(
+                    "[news_agent] 캐시 HIT. event_id=%s ticker=%s LLM 호출 skip.",
+                    event_id,
+                    ticker,
+                )
+                return cached
+
         # LLM 프롬프트 구성
         prompt = (
             f"[종목 {ticker}] 뉴스 분석 요청.\n"
@@ -155,7 +174,7 @@ class NewsAgent(AgentBase):
             f"내용: {summary}\n\n"
             "투자 관점에서 매수(buy)/매도(sell)/중립(neutral) 중 하나와 "
             "간단한 근거를 한국어로 답하세요.\n\n"
-            'Respond strictly in JSON: {"stance": "buy|sell|hold|neutral", '
+            'Respond strictly in JSON: {"stance": "buy|sell|neutral", '
             '"impacted_tickers": ["005930"], '
             '"impacted_sectors": ["반도체"], '
             '"narrative": "한국어 1~3문장"}'
@@ -207,7 +226,7 @@ class NewsAgent(AgentBase):
                 },
             )
 
-        return {
+        result = {
             "channel": publish_channel,
             "payload": rpt["payload"],
             "report_type": rpt["report_type"],
@@ -215,6 +234,18 @@ class NewsAgent(AgentBase):
             "ts": rpt["ts"],
             "llm_fallback": llm_fallback,
         }
+
+        # S4-7 캐시 저장 (LLM fallback이 아닌 정상 분석 결과만)
+        if cache_key and self._cache is not None and not llm_fallback:
+            self._cache.set(cache_key, result, ttl_seconds=self._cache.news_ttl)
+            logger.info(
+                "[news_agent] 캐시 SET. event_id=%s ticker=%s ttl=%ds",
+                event_id,
+                ticker,
+                self._cache.news_ttl,
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # TextPack 소비 인터페이스
@@ -282,12 +313,7 @@ class NewsAgent(AgentBase):
         """
         # 1차: JSON parse 시도
         try:
-            # LLM이 JSON 앞뒤에 markdown fence(```) 를 붙이는 경우 제거
-            stripped = content.strip()
-            if stripped.startswith("```"):
-                stripped = re.sub(r"^```[a-zA-Z]*\n?", "", stripped)
-                stripped = re.sub(r"\n?```$", "", stripped.strip())
-            parsed_json = json.loads(stripped)
+            parsed_json = parse_llm_json(content)
 
             raw_stance = str(parsed_json.get("stance", "neutral")).lower()
             # "hold" → VALID_STANCES에 없으므로 "neutral" 보정

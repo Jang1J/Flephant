@@ -1,5 +1,6 @@
 # KOSPI Decision OS v3 — API Contracts
 
+> v3.6 (2026-05-02). **Sprint 4 반영**: C13 ablation_components `dual_source` 추가 / C14 `stage_0_dqr` trigger 명시 + DQRRunner sub_component 추가 / sla.stage_timeouts.stage_0=120.
 > v3.5 (2026-04-21). **PP/BUNDLE/BT/RPT/FCC/RGC 6개 ID spec UUID8 정정** (id_factory 실 구현 반영). BT 의 {tool} 컴포넌트 제거.
 > v3.4 (2026-04-21). **MSG ID 포맷 정정**: MSG-{yyyymmdd}-{UUID8} (기존 {hhmm}-{seq} 대신 UUID8, seq 충돌 방지). APM ID 포맷도 동일 기준으로 정정 (APM-{yyyymmdd}-{UUID8}).
 > v3.3 (2026-04-21). **C9 input non-breaking extension**: uncertainty_score 필드 추가 (Risk Fast sidecar → FDA Dual-Source 연계). message_taxonomy.publish_channels 에 uncertainty_signal 등록.
@@ -245,7 +246,7 @@ output:
         - news_comm_divergence
         - community_noise_multiplier
         availability: "08:00~08:30 KST 장전 batch"
-        time_alignment: "news_score_t → 당일 / comm_score_t-1,t-2 → 지연 반영"
+        time_alignment: "news_score_t → 당일 / comm_score_t_1, comm_score_t_2 → 지연 반영"
         rationale: "뉴스와 커뮤니티를 동일 텍스트로 합치지 않고, divergence를 uncertainty로 사용"
 
       alpha_factors:  # LLM 생성 (Mode B에서 갱신)
@@ -1076,7 +1077,19 @@ tools:
       backtest_run_id: "string"
       baseline_run_id: "string"
       regime_labels: "[{date: ISO8601, regime: string}]"
-      ablation_components: ["factor", "model", "allocator", "dual_source"]   # v3.5: dual_source 추가 (S4-1 Dual-Source 5피처 핵심 자산)
+      ablation_components:                                                     # v3.5: dual_source 추가 (S4-1). S4-2: description 확장.
+        - name: factor
+          description: "Alpha Factor Engine 기여도 (on/off)"
+          measurement: "w/ vs w/o factor IC/Sharpe delta"
+        - name: model
+          description: "LightGBM 모델 구조 기여도"
+          measurement: "baseline vs LightGBM Sharpe delta"
+        - name: allocator
+          description: "PPO Allocator 비중 최적화 기여도"
+          measurement: "equal-weight vs PPO Sharpe delta"
+        - name: dual_source
+          description: "Dual-Source 5피처 (news_score_t + comm_score_t_1/t_2 + news_comm_divergence + community_noise_multiplier)"
+          measurement: "w/ vs w/o dual_source ablation, IC/Sharpe/MDD delta. S4-2 baseline_with_dual_source.pkl 생성."
     output:
       run_id: "string"
       regime_breakdown:
@@ -1135,7 +1148,10 @@ lifecycle: "BootStrap 시 기동, 시스템 생명주기 동안 상주"
 triggers:
   cron_based:
     - time: "18:00 KST"
-      action: "stage_1_performance_analysis"       # §8.1
+      action: "stage_0_dqr"
+      description: "DQR 일별 측정. CRITICAL alert 시 파이프라인 차단 (S4-5)"
+    - time: "18:02 KST"
+      action: "stage_1_performance_analysis"       # §8.1 (stage_0 완료 후)
     - time: "18:30 KST"
       action: "stage_2_direction_selection"        # §8.2
     - time: "19:00 KST"
@@ -1183,6 +1199,15 @@ responsibilities:
       action: "Backtest Agent 호출 건너뛰기 → 직접 MODE_B_IDLE 전이 (baseline 유지)"
 
 sub_components:
+  - name: DQRRunner
+    role: "stage_0 데이터 품질 측정 실행자 (S4-5)"
+    inputs:
+      - date_str
+      - "risk_config.yaml dqr 섹션"
+    outputs:
+      - "DQR report JSON"
+      - "alerts JSONL"
+    critical_block: true  # CRITICAL alert 시 파이프라인 차단
   - name: ModeBDeployer
     role: "배포 실행자 (22:00)"
     inputs:
@@ -1217,6 +1242,7 @@ errors:
 sla:
   total_window: "18:00~22:00 KST (4시간)"
   stage_timeouts:
+    stage_0: 120        # DQR (S4-5)
     stage_1: 30         # 성과 분석
     stage_2: 60         # 방향 결정
     stage_3: 3600       # 팩터 진화 (1시간)
