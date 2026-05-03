@@ -169,6 +169,8 @@ response:
     ttl: int
     expires_at: ISO8601
     supersedes: string|null
+    pit_safe: bool      # PIT-Safety 검증 결과 (불변 원칙 1, false 시 PITViolationError 발생)
+    payload: object     # source별 원본 데이터 (하위 구조는 source 종류에 따라 다름)
 constraints:
   dedupe_key: [source, occurred_at, scope, title]
   stale_drop: true

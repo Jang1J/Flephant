@@ -112,6 +112,14 @@ class EventNormalizer:
         self.default_ttl: dict[str, int] = cfg["default_ttl"]
         self.priority: dict[str, str] = cfg["priority"]
         self.llm_required: dict[str, bool] = cfg["llm_required"]
+        # market_hours.close 캐시: _market_close_time_str() 매 호출 yaml I/O 방지
+        self._market_close_str: str = self._load_market_close_str()
+
+    @staticmethod
+    def _load_market_close_str() -> str:
+        """risk_config.yaml market_hours.close 최초 로드 헬퍼 (캐시 초기화 전용)."""
+        mh = config_load("risk_config.yaml", "market_hours")
+        return str(mh["close"])
 
     def normalize(self, raw_event: dict[str, Any], source: str) -> dict[str, Any]:
         """raw_event를 C2 스키마로 정규화.
@@ -281,16 +289,9 @@ class EventNormalizer:
             },
         }
 
-    @staticmethod
-    def _market_close_time_str() -> str:
-        """risk_config.yaml market_hours.close (HH:MM:SS) 로드.
-
-        불변 원칙 5 엄격 적용 (2026-04-20 Phase 1+2 정리):
-          yaml 섹션 누락 시 KeyError 전파. silent fallback 금지.
-          backfill._load_market_hours와 동일한 정책.
-        """
-        mh = config_load("risk_config.yaml", "market_hours")
-        return str(mh["close"])
+    def _market_close_time_str(self) -> str:
+        """market_hours.close 문자열 반환. __init__ 에서 캐시된 값 사용 (yaml I/O 없음)."""
+        return self._market_close_str
 
     def _normalize_naver_news(self, raw: dict[str, Any]) -> dict[str, Any]:
         """네이버 뉴스 정규화.

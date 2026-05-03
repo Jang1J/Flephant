@@ -13,6 +13,7 @@
 > v3.0.7 (2026-05-01): Sprint 3 완료 반영. ModeBScheduler 7-stage cron + ModeBDeployer atomic swap + KnowledgeBase Layer 5 + Committee (AlphaGAT Stage II) + Validation Tools 3 component. 4축 정합 일괄 수정 포함.
 > v3.0.8 (2026-05-02): Sprint 4 문서 fix. §7.1 8-stage + stage_0 DQR 박스 추가 / Layer 5 Persistent Caching S4-7 SQLite 표기 / §7.6 Bootstrap 다이어그램 신설.
 > v3.0.9 (2026-05-02): 전수 리뷰 fix. §3.0 6단계→8단계 + stage_0 DQR 박스 추가 / §14 active 20 표기 / §19 active 20 표기 / §20.3 RISK_BREACH→RISK_FAST_TRIGGER / Layer 3 n_est=500 정정.
+> v3.1.0 cleanup (2026-05-04): Sprint 0 검증 사후 cleanup. §3.1 Backtest Agent C12 실구현 반영 + §6 S4 모듈 5건 추가 (DQR Runner/DualSourceScorer/PersistentCache/HotPathProfiler/Memory Restorer) + C2 pit_safe/payload 계약서 등재.
 
 ## v2.2 변경점 요약
 
@@ -23,6 +24,7 @@
 | (추가) | §3 | Backtest Agent가 배포 게이트 직전에 추가됨 |
 | (추가) | §4 | Backtest Agent는 Shared Message Pool에 장중에 publish하지 않음 명시 |
 | v3.8 | §1 Layer 2, §2.1 | Layer 2에 Watch Universe Feed 표기 + §2.1 Dynamic Overlay 진입 구조 도식 신규 (Sprint 5 진입, 2026-05-03) |
+| v3.1.0 cleanup (2026-05-04) | §3.1 Backtest Agent C12 실구현 반영 + §6 S4 모듈 5건 (DQR/DualSource/Cache/Profiler/MemoryRestorer) 추가 + C2 pit_safe/payload 계약서 등재 (S0 검증 사후 cleanup) |
 
 ## 1. 전체 시스템 구조도
 
@@ -440,8 +442,8 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
                      │
   21:00  ┏━━━━━━━━━━━▼━━━━━━━━━━━━━┓   ←─────  v2.2 신규 게이트  ─────→
          ┃ §8.5.2 Backtest Agent   ┃   → backtest_report               →
-         ┃ (GPT-4o + C13 tools)    ┃     {verdict, regression_risk,       
-         ┃                         ┃      diagnostic_notes,              
+         ┃ (C12, S3-9 실구현 SHIP) ┃     {verdict, regression_risk,       
+         ┃  GPT-4o + C13 tools    ┃      diagnostic_notes,              
          ┃ ① BacktestEngine        ┃      deploy_recommendation}         
          ┃   walk-forward          ┃                                     
          ┃ ② ReplayRunner          ┃   ┌─ verdict == pass AND             
@@ -541,8 +543,8 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
   │  └─────────────────────────────────────────────────┘     │
   │                                                           │
   │  ┌─────────────────────────────────────────────────┐     │
-  │  │      Backtest Agent Gate (v2.2 신규)              │     │
-  │  │      [21:00~21:30]                                │     │
+  │  │      Backtest Agent Gate (C12, S3-9 실구현 SHIP) │     │
+  │  │      [21:00~21:30] BacktestEngine 직접 호출       │     │
   │  │                                                   │     │
   │  │  candidate_bundle = {factor, model, allocator}    │     │
   │  │                    ↓                              │     │
@@ -686,6 +688,25 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
         │ 주문 실행  │result│ Knowledge │
         │ KIS API   │─────→│ Base 저장  │
         └───────────┘      └───────────┘
+
+  [Sprint 4 인프라 모듈 (Mode A/B 공통)]
+  ┌──────────────────────────────────────────────────────────┐
+  │  DQR Runner (S4-5, Mode B stage_0)                       │
+  │  8개 커넥터 × 5 메트릭 자동 품질 검사, CRITICAL 시 차단  │
+  ├──────────────────────────────────────────────────────────┤
+  │  DualSourceScorer (S4-1, FinBERT + 3-yaml + decay)       │
+  │  뉴스 / 커뮤니티 divergence 5피처 → uncertainty 신호      │
+  │  08:00 KST 배치 (dual_source_runner.py)                  │
+  ├──────────────────────────────────────────────────────────┤
+  │  PersistentCache (S4-7, SQLite TTL)                      │
+  │  Cold Path 레이턴시 최적화, key=prompt_hash, TTL=config  │
+  ├──────────────────────────────────────────────────────────┤
+  │  HotPathProfiler (S4-4, 6단계 레이턴시 측정)             │
+  │  p50/p95/p99 + SLA 100ms alert (ops/profiler.py)         │
+  ├──────────────────────────────────────────────────────────┤
+  │  Memory Restorer (S4-8, KB 5종 → agent 복원)             │
+  │  시스템 시작 시 Bootstrap (상세: §7.6)                    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ## 7. 논문 매핑도

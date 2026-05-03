@@ -31,10 +31,6 @@ logger = get_logger("kis_rest")
 
 _KST = ZoneInfo("Asia/Seoul")
 
-# Mock 기본 가격 산출용 modulo 상한 (하드코딩이 아닌 ticker hash offset)
-_MOCK_PRICE_MODULO = 100000
-_MOCK_BASE_PRICE = 50000
-
 
 class KISAPIError(Exception):
     """KIS API 오류."""
@@ -63,11 +59,13 @@ class KISRestClient(BaseConnector):
 
         self.auth = auth or AuthManager()
         self.rate_limiter = rate_limiter or RateLimiter("kis_rest")
-        self.mode = os.getenv("KIS_MODE", "virtual").strip().lower()
+        self.mode = self.auth.get_mode()
 
         # connector_mock 파라미터 로드 (불변 원칙 5: 하드코딩 금지)
         mock_cfg = config_load("risk_config.yaml", "connector_mock")
         kis_mock = mock_cfg.get("kis", {})
+        self._base_price: int = int(kis_mock.get("base_price", 50000))
+        self._price_modulo: int = int(kis_mock.get("price_modulo", 100000))
         self._mock_volume_min: int = int(kis_mock.get("volume_min", 1000))
         self._mock_volume_max: int = int(kis_mock.get("volume_max", 100000))
         self._mock_change_min: int = int(kis_mock.get("change_min", 0))
@@ -127,7 +125,7 @@ class KISRestClient(BaseConnector):
         now_str = datetime.now(_KST).isoformat()
         for ticker in tickers:
             padded = pad_ticker(ticker)
-            base_price = _MOCK_BASE_PRICE + (int(padded) % _MOCK_PRICE_MODULO)
+            base_price = self._base_price + (int(padded) % self._price_modulo)
             last_price = base_price + self._rng.randint(-500, 500)
             # ±2% 범위 변동률
             day_change_pct = round(self._rng.uniform(-0.02, 0.02), 6)
@@ -197,7 +195,7 @@ class KISRestClient(BaseConnector):
     # --------------------------------------------------------------------- #
 
     def _mock_inquire_price(self, ticker: str) -> dict[str, Any]:
-        base_price = _MOCK_BASE_PRICE + (int(ticker) % _MOCK_PRICE_MODULO)
+        base_price = self._base_price + (int(ticker) % self._price_modulo)
         delta = self._rng.randint(-500, 500)
         now_str = datetime.now(_KST).isoformat()
         return {
@@ -213,7 +211,7 @@ class KISRestClient(BaseConnector):
     def _mock_inquire_minute_bar(
         self, ticker: str, n_bars: int
     ) -> list[dict[str, Any]]:
-        base = _MOCK_BASE_PRICE + (int(ticker) % _MOCK_PRICE_MODULO)
+        base = self._base_price + (int(ticker) % self._price_modulo)
         now = datetime.now(_KST).replace(second=0, microsecond=0)
         bars: list[dict[str, Any]] = []
         price = base

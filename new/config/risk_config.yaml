@@ -1457,6 +1457,8 @@ dqr:
 # ============================================================
 connector_mock:
   kis:
+    base_price: 50000         # mock 가격 기준값 (S0 cleanup, 이전 _MOCK_BASE_PRICE 모듈 상수)
+    price_modulo: 100000      # ticker hash offset modulo (S0 cleanup, 이전 _MOCK_PRICE_MODULO)
     volume_min: 1000          # 분봉 거래량 하한 (주)
     volume_max: 100000        # 분봉 거래량 상한 (주)
     change_min: 0             # 가격 보정치 하한 (원)

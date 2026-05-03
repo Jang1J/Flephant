@@ -29,9 +29,6 @@ logger = get_logger("kis_ws")
 
 _KST = ZoneInfo("Asia/Seoul")
 
-_MOCK_PRICE_MODULO = 100000
-_MOCK_BASE_PRICE = 50000
-
 
 class KISWebSocketClient:
     """KIS 실시간 1분봉 WebSocket. Mock 모드 Sprint 0 S0-2.
@@ -61,7 +58,7 @@ class KISWebSocketClient:
             rate_limiter: RateLimiter 인스턴스. 미지정 시 rate_limits.kis_ws 로드.
         """
         self.auth = auth or AuthManager()
-        self.mode = os.getenv("KIS_MODE", "virtual").strip().lower()
+        self.mode = self.auth.get_mode()
         self.tickers = [pad_ticker(t) for t in (tickers or ["005930"])]
         self.poll_interval_sec = poll_interval_sec
 
@@ -76,6 +73,8 @@ class KISWebSocketClient:
         # connector_mock 파라미터 로드 (불변 원칙 5: 하드코딩 금지)
         mock_cfg = config_load("risk_config.yaml", "connector_mock")
         kis_mock = mock_cfg.get("kis", {})
+        self._base_price: int = int(kis_mock.get("base_price", 50000))
+        self._price_modulo: int = int(kis_mock.get("price_modulo", 100000))
         self._mock_volume_min: int = int(kis_mock.get("volume_min", 1000))
         self._mock_volume_max: int = int(kis_mock.get("volume_max", 100000))
         self._mock_change_min: int = int(kis_mock.get("change_min", 0))
@@ -110,7 +109,7 @@ class KISWebSocketClient:
             )
 
         base_prices = {
-            t: _MOCK_BASE_PRICE + (int(t) % _MOCK_PRICE_MODULO)
+            t: self._base_price + (int(t) % self._price_modulo)
             for t in self.tickers
         }
         # C1 required_features: vwap/turnover/change/ingest_ts/completeness 포함

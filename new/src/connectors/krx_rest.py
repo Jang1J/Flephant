@@ -419,8 +419,14 @@ class KRXRestClient(BaseConnector):
         로그에서 serviceKey 값은 "***"로 마스킹.
 
         Raises:
+            RuntimeError: mock 모드에서 직접 호출 시 (auth.get_krx_key() 실 호출 방지).
             ConnectionError: 3회 재시도 후 전부 실패.
         """
+        if self._is_mock:
+            raise RuntimeError(
+                "[krx_rest] _call_api는 mock 모드에서 호출 불가. "
+                "get_stock_price_info() / get_investor_info()의 mock 분기를 사용하라."
+            )
         self.rate_limiter.wait_and_acquire()
         key = self.auth.get_krx_key()
         full_params: dict[str, str] = {"serviceKey": key, **params}

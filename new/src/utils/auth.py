@@ -89,9 +89,13 @@ class AuthManager:
         """ECOS API 키. 환경변수 누락 시 EnvironmentError."""
         return self._require_env("ECOS_API_KEY")
 
+    def get_mode(self) -> str:
+        """KIS_MODE 환경변수 일원 read. 기본 'virtual' (mock/virtual/real)."""
+        return os.getenv("KIS_MODE", "virtual").strip().lower()
+
     def get_kis_base_url(self) -> str:
         """KIS_MODE 환경변수에 따라 모의(virtual) / 실계좌(real) base URL 반환."""
-        mode = os.getenv("KIS_MODE", "virtual").strip().lower()
+        mode = self.get_mode()
         if mode == "real":
             return _KIS_BASE_REAL
         return _KIS_BASE_VIRTUAL
