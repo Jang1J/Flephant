@@ -97,6 +97,53 @@ class KISRestClient(BaseConnector):
             "임시로는 KIS_MODE=mock 사용."
         )
 
+    def get_price_snapshot(self, tickers: list[str]) -> list[dict[str, Any]]:
+        """KOSPI200 watch universe N종목 일괄 현재가 조회 (S5-1, C16).
+
+        KIS REST는 단건 inquire_price 만 공식 제공. bulk endpoint 부재 시 N회 sequential 호출.
+        rate_limits.kis_rest = 20/sec, burst 50. KOSPI200 200종목 = 평균 3.3 req/s 사용 (안전).
+
+        Args:
+            tickers: 종목코드 리스트 (6자리 zero-padded 자동 적용).
+
+        Returns:
+            list of dict, each:
+                {ticker, ts (ISO8601 KST), last_price, day_change_pct, volume, turnover}
+        """
+        if self.mode == "mock":
+            return self._mock_get_price_snapshot(tickers)
+        raise NotImplementedError(
+            "KIS 키 발급 후 S1-8/S5-1 fix 단계에서 활성화. "
+            "임시로는 KIS_MODE=mock 사용."
+        )
+
+    def _mock_get_price_snapshot(self, tickers: list[str]) -> list[dict[str, Any]]:
+        """mock 모드: ticker별 fake 현재가 스냅샷 생성.
+
+        200종목 × {last_price=10000~50000 random, day_change_pct=±2% random,
+        volume=random, turnover=last_price*volume}.
+        """
+        results: list[dict[str, Any]] = []
+        now_str = datetime.now(_KST).isoformat()
+        for ticker in tickers:
+            padded = pad_ticker(ticker)
+            base_price = _MOCK_BASE_PRICE + (int(padded) % _MOCK_PRICE_MODULO)
+            last_price = base_price + self._rng.randint(-500, 500)
+            # ±2% 범위 변동률
+            day_change_pct = round(self._rng.uniform(-0.02, 0.02), 6)
+            volume = self._rng.randint(self._mock_volume_min, self._mock_volume_max)
+            turnover = float(last_price * volume)
+            results.append({
+                "ticker": padded,
+                "ts": now_str,
+                "last_price": last_price,
+                "day_change_pct": day_change_pct,
+                "volume": volume,
+                "turnover": turnover,
+                "_mode": "mock",
+            })
+        return results
+
     def inquire_minute_bar(
         self, ticker: str, n_bars: int = 60, date: str | None = None
     ) -> list[dict[str, Any]]:

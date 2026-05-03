@@ -22,6 +22,7 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # source → event_type 매핑 (C2 SSOT: news|dart|macro|us_market|community|regime|investor_flow)
 # enum 성격이므로 코드에 유지. kis_bar/kis_event는 C1 bypass이므로 포함하지 않음.
+# S5-1: price_snapshot 추가 (C16 WatchUniverseSnapshotContract, AdmissionEngine 편입 트리거 전용)
 _EVENT_TYPE_MAP: dict[str, str] = {
     "dart": "dart",
     "krx_investor_flow": "investor_flow",
@@ -29,6 +30,7 @@ _EVENT_TYPE_MAP: dict[str, str] = {
     "community": "community",
     "ecos": "macro",
     "us_market": "us_market",
+    "price_snapshot": "price_snapshot",
 }
 
 
@@ -101,6 +103,7 @@ class EventNormalizer:
     SUPPORTED_SOURCES: frozenset[str] = frozenset({
         "dart", "krx_investor_flow", "naver_news", "community",
         "ecos", "us_market",
+        "price_snapshot",  # S5-1 C16 WatchUniverseSnapshot
     })
 
     def __init__(self) -> None:
@@ -138,6 +141,7 @@ class EventNormalizer:
             "community": self._normalize_community,
             "ecos": self._normalize_ecos,
             "us_market": self._normalize_us_market,
+            "price_snapshot": self._normalize_price_snapshot,  # S5-1 C16
         }
 
         partial = dispatch[source](raw_event)
@@ -421,3 +425,35 @@ class EventNormalizer:
             },
         }
 
+    def _normalize_price_snapshot(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """C16 WatchUniverseSnapshot 정규화. S5-1.
+
+        필수: watch_snapshot_id, ts
+        선택: snapshots (종목별 현재가 list)
+
+        AdmissionEngine 편입 판정을 위해 EventGateway 를 경유해야 할 때만 이 경로를 사용한다.
+        snapshot 자체는 WatchSnapshotFetcher.fetch_once() 가 직접 저장하므로,
+        여기서는 이벤트 정규화 스키마만 구성한다.
+        """
+        watch_snapshot_id = _require(raw, "watch_snapshot_id", "price_snapshot")
+        ts_val = _require(raw, "ts", "price_snapshot")
+
+        occurred_at = _parse_ts_to_kst_str(ts_val, "ts", "price_snapshot")
+        snapshots = raw.get("snapshots", [])
+        ticker_count = len(snapshots) if isinstance(snapshots, list) else 0
+
+        return {
+            "event_type": "price_snapshot",
+            "scope": "market",
+            "title": f"Watch Universe 스냅샷: {ticker_count}종목",
+            "summary": f"watch_snapshot_id={watch_snapshot_id} ticker_count={ticker_count}",
+            "occurred_at": occurred_at,
+            "priority": "normal",
+            "llm_required": False,
+            "payload": {
+                "watch_snapshot_id": watch_snapshot_id,
+                "ticker_count": ticker_count,
+                **{k: v for k, v in raw.items()
+                   if k not in ("watch_snapshot_id", "ts", "snapshots")},
+            },
+        }

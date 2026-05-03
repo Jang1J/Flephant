@@ -398,9 +398,9 @@ dual_source:
 trigger_catalog:
   mode_b_metadata:
     schema_version: "1.0.0"
-    data_version: "1.0.0"
-    last_updated: "2026-04-20"
-    updated_by: "s1_batch_bc_part_c"
+    data_version: "1.1.0"
+    last_updated: "2026-05-03"
+    updated_by: "s5_p4_admission_rules"
     mode_b_editable: true
     human_approval_required: false
     backup_retention_days: 30
@@ -459,6 +459,26 @@ trigger_catalog:
       stance: "risk_reduce"
       description: "뉴스↔커뮤니티 방향 불일치 심각. position sizing 축소 + FDA uncertainty_score 상승 신호. memory project_v3_universe_and_dual_source.md §2."
       publishes_to: "uncertainty_signal"
+
+    # Sprint 5 — Dynamic Universe 편입 트리거
+    # action: admit_candidate 가 신규 행동. AdmissionEngine 이 처리.
+    - id: "price_spike_admission"
+      condition: "watch_universe ticker 1min return > +5% OR < -5%"
+      priority: "urgent"
+      action: "admit_candidate"
+      risk_level: "medium"
+      stance: "opportunity"
+      description: "watch universe (KOSPI200) 종목 ±5% 급변 → dynamic_candidate_pool 편입 후보. AdmissionEngine 이 max_size=10 가드 적용."
+      publishes_to: "admission_event"
+
+    - id: "dart_hot_ticker_admission"
+      condition: "dart 공시 + watch universe ticker AND dart_rules.yaml material 매칭"
+      priority: "urgent"
+      action: "admit_candidate"
+      risk_level: "medium"
+      stance: "opportunity"
+      description: "watch universe 종목의 중요 공시 → dynamic_candidate_pool 편입 후보. trade universe 종목은 별도 (Cold Path 처리)."
+      publishes_to: "admission_event"
 
 
 # Sprint 5 초안 — Dynamic Event Universe (watch universe overlay)
@@ -545,6 +565,7 @@ event_normalizer:
     community: 900
     ecos: 86400           # 거시지표: 1일
     us_market: 3600
+    price_snapshot: 60    # S5-1 C16: 60초 snapshot polling 주기와 일치
   priority:
     dart: urgent
     krx_investor_flow: normal
@@ -552,6 +573,7 @@ event_normalizer:
     community: low
     ecos: normal
     us_market: normal
+    price_snapshot: normal  # S5-1 C16 AdmissionEngine 편입 판정 트리거
   llm_required:
     dart: true
     krx_investor_flow: false
@@ -559,6 +581,7 @@ event_normalizer:
     community: true
     ecos: false
     us_market: false
+    price_snapshot: false   # S5-1 C16: 비LLM 규칙 기반 판정 전용
 
 # Auth Manager 정책 (KIS OAuth 재시도 + refresh)
 # auth.py가 참조. 불변 원칙 5 준수.

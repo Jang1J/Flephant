@@ -22,6 +22,7 @@
 | V2 | §3 Mode B | 18:00~22:00 6단계 타임라인 + Backtest Agent 게이트 시각화 신규 |
 | (추가) | §3 | Backtest Agent가 배포 게이트 직전에 추가됨 |
 | (추가) | §4 | Backtest Agent는 Shared Message Pool에 장중에 publish하지 않음 명시 |
+| v3.8 | §1 Layer 2, §2.1 | Layer 2에 Watch Universe Feed 표기 + §2.1 Dynamic Overlay 진입 구조 도식 신규 (Sprint 5 진입, 2026-05-03) |
 
 ## 1. 전체 시스템 구조도
 
@@ -150,6 +151,11 @@
 │ ║  │  ④ TSFresh 통계 → 자연어 변환               ││ 3-stage  │       ║  │
 │ ║  │  ⑤ PIT-Safety: LLM에 raw data 비노출        │└──────────┘       ║  │
 │ ║  └─────────────────────────────────────────────┘                   ║  │
+│ ║                                                                     ║  │
+│ ║  ─ Watch Universe Feed (Sprint 5, S5-1):                            ║  │
+│ ║    KOSPI200 200종목 × KIS REST get_price_snapshot() 60초 polling     ║  │
+│ ║    → SnapshotStore (artifacts/watch_snapshots/) → EventGateway      ║  │
+│ ║    forbidden: trade_universe_mutation, lightgbm_inference            ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                                                                 │
 │ ╔══════════════════════════════════════════════════════════════════════╗  │
@@ -347,6 +353,38 @@
 └─────────────────────────────────────────────────────────┘
 
 Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass.
+```
+
+### Dynamic Overlay 진입 구조 (Sprint 5, S5-1~S5-4)
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Watch Universe (KOSPI200 200종목)                                 │
+  │   └─ KIS REST get_price_snapshot() 60s polling                    │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ EventGateway → AdmissionEngine                                    │
+  │   trigger_catalog match: price_spike_admission ±5%                │
+  │                          dart_hot_ticker_admission                 │
+  │   → admission_event (ADM-yyyymmdd-UUID8)                          │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓ gate.is_enabled() == true 일 때만
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Candidate Pool (max 10)  →  Holdings Manager (max 5)              │
+  │   per_stock_max_weight: 0.03   total_max: 0.10                    │
+  │   allocator: fixed_rule_only (PPO 금지)                            │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Exit Engine (4조건)                                                │
+  │   market_close (15:30 KST) | ttl_expiry (1800s)                   │
+  │   stop_loss (-2%)          | spike_resolved                       │
+  │   → exit_event (EXT-yyyymmdd-UUID8)                                │
+  └──────────────────────────────────────────────────────────────────┘
+               ↓
+  비동기 채널 dynamic_overlay_update → PortfolioManager 다음 1분 틱 반영
+  Hot Path (LightGBM/PPO/PM/FDA) 격리 유지. trade universe 불변.
 ```
 
 ## 3. 장마감 자동 진화 루프 (Mode B)

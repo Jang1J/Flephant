@@ -48,7 +48,7 @@ Mode B 장마감 (18:00~22:00):
 |------|------|
 | `new/docs/architecture.md` | v3 상세 아키텍처 (**가장 중요**) |
 | `new/docs/architecture_visual.md` | v3 ASCII 시각화 (architecture.md 보조, Layer 별 박스 다이어그램) |
-| `new/specs/api_contracts.md` | C1~C18 API 계약서 (**SSOT**, v3.5 현행: PP/BUNDLE/BT/RPT/FCC/RGC UUID8 정정, v3.4: MSG/APM UUID8, v3.3: C9 uncertainty_score extension, v3.2: C18 AgentPerformance 신설) |
+| `new/specs/api_contracts.md` | C1~C18 API 계약서 (**SSOT**, v3.8 현행: C15/C16 정식화 + ADM/EXT/WS UUID8 등록 + weight_decision_authority + activation_gate + polling_authority, v3.5: PP/BUNDLE/BT/RPT/FCC/RGC UUID8 정정, v3.4: MSG/APM UUID8, v3.3: C9 uncertainty_score extension, v3.2: C18 AgentPerformance 신설) |
 | `new/config/risk_config.yaml` | 리스크 정책 + 임계값 |
 | `new/docs/connector_design.md` | 커넥터 방법론 10개 |
 | `new/docs/evaluation_metrics.md` | 3-레이어 평가 매트릭 (Layer 1 모델 / Layer 2 Agent / Layer 3 System Cause Attribution) |
@@ -81,6 +81,9 @@ Mode B 장마감 (18:00~22:00):
 | `new/src/dqr/dqr_runner.py` | DQR 일별 자동화 (S4-5, Mode B stage_0, 8 커넥터 5 메트릭) |
 | `new/src/cache/persistent_cache.py` | SQLite TTL 캐시 (S4-7, Cold Path 레이턴시 최적화) |
 | `new/src/agents/memory_restorer.py` | Bootstrap 에이전트 메모리 복원 (S4-8, KB 5종 storage → agent restore) |
+| `new/config/dynamic_universe_config.yaml` | C15 운영 파라미터 SSOT (Sprint 5 P3, ttl_sec/stop_loss_pct/cache_ttl/admission/holdings/forbidden_runtime_checks, mode_b_metadata 8필드) |
+| `new/config/watch_universe_kospi200.yaml` | C16 KOSPI200 watch universe (Sprint 5 P5, 200종목 + watch_rules + mode_b_editable=false) |
+| `new/scripts/generate_watch_universe.py` | KRX KOSPI200 종목 자동 생성 스크립트 (Sprint 5 P5, 658줄, --source krx/static, dry-run + diff) |
 | `.env` | API 키 (DART, Naver, ECOS, KRX, Kanana, OpenAI) |
 
 ## LLM 구성
@@ -90,31 +93,49 @@ Mode B 장마감 (18:00~22:00):
 - **Mode B**: GPT-4o 전용
 - **Fallback**: GPT-4o (429/timeout 시), Circuit breaker 3회→5분
 
-## 하네스 시스템 (v3, 2026-04-10)
+## 하네스 시스템 (v3, 2026-05-03 audit 후 = 10 에이전트 + 20 스킬)
 
 **에이전트 10개**: architect, reviewer, coder, runner, modeler, data-engineer, presenter, doc-writer, analyst, gpt-tracker
 
-**핵심 팀 스킬**:
-- `/code-review` (reviewer+architect) · `/code-fix` (coder+reviewer) · `/run-pipeline` (runner+reviewer)
-- `/validate` (reviewer+architect) · `/build-model` (modeler+data-engineer+runner) · `/team-merge` (architect+gpt-tracker)
+**스킬 20개 (4 카테고리)**:
 
-**전문가 스킬**:
-- `/arch-sync` · `/gpt` · `/smoke-test` · `/cleanup` · `/agent-research` · `/paper-trending` · `/worklog` · `/present`
+1. **핵심 팀 스킬 (6)**: 단일 작업 단위, 2명 이상 팀 디스패치
+   - `/code-review` (reviewer+architect) · `/code-fix` (coder+reviewer) · `/run-pipeline` (runner+reviewer)
+   - `/validate` (reviewer+architect) · `/build-model` (modeler+data-engineer+runner) · `/team-merge` (architect+gpt-tracker)
 
-**오케스트레이터**: `/elephant-ops [자연어]`
+2. **전문가 스킬 (8)**: 단일 에이전트 디스패치 또는 도구 호출
+   - `/arch-sync` (architect) · `/gpt` (gpt-tracker) · `/smoke-test` (runner) · `/cleanup` (architect+coder)
+   - `/agent-research` (analyst) · `/paper-trending` (analyst) · `/worklog` · `/present` (presenter+analyst)
 
-### Hooks
-- **PreToolUse**: `.env` 수정 차단
-- **PostToolUse**: 핵심 파일 수정 시 안내
-- **SessionStart**: 스킬/에이전트 목록 안내
+3. **세이프티/세션 (5)**: 운영 안전성 + 세션 컨텍스트 관리
+   - `/careful` · `/freeze` · `/guard` (careful+freeze 동시) · `/unfreeze` · `/checkpoint`
 
-### 경로별 규칙 (.claude/rules/)
-- `new/docs/*`, `new/specs/*`, `new/config/*` → v3 4축 동기화 (불변 원칙 5개)
+4. **오케스트레이터 (1)**: 복합 작업 자연어 호출
+   - `/elephant-ops [자연어]`
+
+### Hooks (.claude/settings.local.json)
+- **PreToolUse**: `.env` 파일 수정 차단 (Edit/Write 매처)
+- **PostToolUse**: `new/docs|specs|config/*` 수정 시 `/arch-sync` 또는 `/validate` 권장 출력
+- **Notification**: macOS osascript 알림 (작업 완료)
+- **SessionStart**: 스킬/에이전트 목록 + 세션 시작 시퀀스 안내
+
+### Preamble + Rules (.claude/preamble + .claude/rules)
+- `_elephant_preamble.md` 10 섹션: 불변 5원칙 / Ethos / AskUserQuestion / Completion Status / Escalation / Plan Mode / Self-Improvement / User Sovereignty / Voice / Context Recovery
+- 9 rule 파일: `agents-code` · `architecture-v3` · `composition` · `confidence_calibration` · `config-protection` · `connectors` · `jobs` · `schemas` · `voice`
+- 충돌 시 우선순위: Preamble > rule 파일 > 스킬 본문 > 에이전트 정의
+
+### bin (.claude/bin/)
+- `check-careful` · `check-freeze`: 세이프티 hook 보조 스크립트
+- `elephant-learnings-log` · `elephant-learnings-search`: calibration learning CLI
+
+### 외부 출처 스킬 정책
+v3 KOSPI 1분봉 OS 도메인 외 스킬은 보유하지 않는다 (2026-05-03 audit으로 a4-print-design / docx / project-spec-writer 삭제).
+docx 산출물은 사용자가 GPT 등 외부 도구로 처리한다 (memory `feedback_docx_quality.md`).
 
 ## v3 핵심 구조
 
 - **6 시스템 에이전트**: News, Risk(Fast/Slow), Quant, Debate, FDA, Backtest(Mode B)
-- **18 API Contracts**: C1~C18 (`new/specs/api_contracts.md` = SSOT, v3.5 현행: 6종 ID UUID8 전수 통일 + BT {tool} 제거)
+- **18 API Contracts**: C1~C18 (`new/specs/api_contracts.md` = SSOT, v3.8 현행: C15/C16 정식화 + ADM/EXT/WS UUID8 등록, v3.5: 6종 ID UUID8 전수 통일 + BT {tool} 제거)
 - **Blackboard 통신**: Shared Message Pool + Pub/Sub (MetaGPT 기반)
 - **Dual-Source**: 뉴스↔커뮤니티 divergence = uncertainty
 

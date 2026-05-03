@@ -1,42 +1,59 @@
-# KOSPI Decision OS Sprint 5 — Dynamic Event Universe Configuration
+# Elephant Lab v3 Sprint 5 — Dynamic Universe Config
+# C15 DynamicUniverseContract 의 dynamic_config_ref 가 이 파일을 참조한다.
+# 하드코딩 금지 원칙: ttl/stop_loss/cache 수치는 이 파일에서만 정의.
 
 version: "0.1.0"
-last_updated: "2026-04-10"
-status: "blueprint"
+last_updated: "2026-05-03"
+status: "active"
 
 mode_b_metadata:
   schema_version: "0.1.0"
   data_version: "0.1.0"
-  last_updated: "2026-04-10"
-  updated_by: "initial"
-  mode_b_editable: false
+  last_updated: "2026-05-03"
+  updated_by: "s5_p3_initial"
+  mode_b_editable: false  # 운영 파라미터, operator 승인만
   human_approval_required: true
   backup_retention_days: 365
   update_trigger: "manual_only"
-  rationale: "동적 유니버스 정책은 리스크 직결. Mode B 자동 수정 금지."
+  rationale: "S5 동적 유니버스 운영 파라미터. ttl/stop_loss 변경은 직접적 손익 영향. 야간 자동 변경 금지."
 
 admission:
-  event_driven_only: true
-  candidate_pool_max: 10
-  holdings_max: 5
-  min_signal_strength: 2
-  cooldown_minutes: 30
+  min_trigger_count: 1           # 편입 결정에 필요한 최소 매칭 trigger rule 수
+  cooldown_sec: 300              # 동일 ticker 청산 후 재편입 금지 기간
+  candidate_pool_max: 10         # C15 max_size, risk_config.yaml과 동일
+  scan_sources:                  # C15 scan_sources 와 동일
+    - naver_news
+    - dart
+    - community
+    - krx_investor_flow
+    - price_snapshot
 
-position_rules:
-  single_weight_max: 0.03
-  total_weight_max: 0.10
-  allocator: "fixed_rule_only"
+holdings:
+  max_size: 5                    # C15 dynamic_holdings.max_size 와 동일
+  per_stock_max_weight: 0.03     # risk_config.yaml dynamic_universe.single_weight_max 와 동일
+  total_max_weight: 0.10         # risk_config.yaml dynamic_universe.total_weight_max 와 동일
+  allocator_mode: "fixed_rule_only"  # PPO 사용 금지, C15 forbidden 준수
 
-exit_rules:
-  market_close: true
-  ttl_minutes: 120
-  stop_loss_pct: 0.03
-  spike_resolved_threshold: 1.0
+exit:
+  ttl_sec: 1800                  # 30분 후 자동 청산 (장중 단기 overlay)
+  stop_loss_pct: 0.02            # 진입가 대비 -2% 손실 시 청산
+  spike_resolved:
+    community_zscore_threshold: 1.5  # community z-score 가 이 값 이하로 회복 시 spike_resolved 판정
+    price_change_threshold: 0.015    # 가격 spike 가 ±1.5% 이내로 회복
+    min_holding_sec: 600              # 최소 10분 보유 후에만 spike_resolved 적용 (whipsaw 방지)
+  market_close_kst: "15:30"      # 장 마감 시각 (KST). 이 시각 이후 전종목 청산.
 
-feeds:
-  requires_price_snapshot_feed: true
-  snapshot_interval_sec: 60
+snapshot_cache:
+  ttl_sec: 55                    # PersistentCache TTL (snapshot polling 주기 60s 보다 짧게)
+  max_entries: 1000              # LRU 상한
 
-validation:
-  method: "post_hoc_evaluation"
-  backtest_overlay_separation: true
+monitoring:
+  artifacts_dir: "artifacts/dynamic_holdings"
+  exit_event_log: "artifacts/dynamic_holdings/exit_events.jsonl"
+  admission_event_log: "artifacts/dynamic_holdings/admission_events.jsonl"
+
+forbidden_runtime_checks:
+  trade_universe_path_blocklist:
+    - "new/config/universe_config.yaml"  # DynamicUniverseManager 가 이 경로를 read 하면 즉시 raise
+  ppo_module_blocklist:
+    - "new.src.models.ppo"               # import 금지 assert

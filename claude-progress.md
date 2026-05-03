@@ -2,7 +2,89 @@
 
 > 매 세션 시작 시 이 파일을 먼저 읽는다. 세션 끝에 업데이트한다.
 
-## 최근 세션 (2026-05-03) — Sprint 4 8/9 완료 + 빡센 audit + commit `e506fae`
+## 최근 세션 (2026-05-03 #2) — 하네스 audit + Sprint 5 진입 + S5-1 SHIP
+
+### 세션 요약
+
+`/harness` audit 풀 리팩토링 → `/elephant-ops` Sprint 5 plan + 선행 5건 + F1+F2 동기화 + S5-1 코드. **1091 → 1098 passed (+7)**, Critical 0.
+
+### Done
+
+**하네스 audit (Critical 5 + Warning 4 + Info 3)**:
+- 외부 스킬 3개 삭제 (a4-print-design / docx / project-spec-writer)
+- 인코딩 손상 6건 fix (한글 멀티바이트 절단)
+- C16 → C18 drift 7위치 일괄 정정 (architect/coder/doc-writer/code-review/present/validate/reviewer)
+- CLAUDE.md 하네스 시스템 섹션 재작성 (15 → 20 스킬 4 카테고리)
+- DRY refactor: `.claude/rules/preamble-load.md` 신설 + 20 스킬 위임
+- `paper-trending` 단독 `agent: analyst` 필드 표준화
+- settings.local.json 정리 (75 → 41 allow)
+- memory snapshot `project_session_20260503_harness_audit.md` 신설
+
+**Sprint 5 plan (architect + data-engineer 병렬 dispatch)**:
+- 의존성 DAG 도출 (선행 5 → S5-1 → S5-2 → S5-3 → S5-4)
+- Multi-Agent confirmed Critical 5건 (conf 10) 모두 코드 전 해소
+- 위험 4건 + 완화책
+
+**Sprint 5 선행 5건**:
+- P1: C15/C16 정식화 v3.8 (api_contracts.md +35/-6, "초안/보조" 마크 제거, weight_decision_authority + activation_gate + identity + forbidden_permissions + polling_authority)
+- P2: architecture.md §7.4 DYNAMIC_OVERLAY_* 2 상태 + §14 ID 3건 (ADM/EXT/WS UUID8) + 헤더 v3.8
+- P3: dynamic_universe_config.yaml 신규 (59줄, mode_b_metadata 8필드 + ttl_sec/stop_loss/cache + forbidden_runtime_checks)
+- P4: risk_config.yaml trigger_catalog admit_candidate rule 2건 (price_spike_admission ±5%, dart_hot_ticker_admission), data_version 1.1.0
+- P5: KOSPI200 200종목 (generate_watch_universe.py 658줄 + static fallback, 중복 0, zfill PASS, mode_b_editable false 보존)
+
+**4축 동기화 (F1+F2)**:
+- F1: architecture_visual.md +38줄 (Layer 2 Watch Universe Feed + §2.1 Dynamic Overlay 진입 구조 4단계 박스 + v3.8 변경점)
+- F2: CLAUDE.md 주요 파일 테이블 +3 항목 (dynamic_universe_config.yaml + watch_universe_kospi200.yaml + generate_watch_universe.py) + api_contracts.md v3.5 → v3.8
+
+**S5-1 Watch Universe (C16 구현)**:
+- KIS REST `get_price_snapshot(tickers: list[str])` + mock fallback (~50줄)
+- new/src/dynamic_universe/__init__.py + snapshot_fetcher.py 신규 (~120줄, WatchSnapshotFetcher)
+- EventGateway/EventNormalizer price_snapshot event_type 등록
+- tests/unit/test_s5_snapshot_fetcher.py 신규 (7 cases, 모두 PASS)
+- C16 forbidden_permissions 코드 가드 동작 (lightgbm import 금지 assert + universe_config.yaml read-only + submit_order 호출 없음)
+- PIT-Safety + ELEPHANT_TEST_PIT_SKIP 환경변수 패턴 재사용 (S4 fix 패턴)
+- import 일관성 fix (`from .snapshot_fetcher`로 cache/__init__.py 패턴 통일)
+
+### pytest
+
+- **1098 passed** (+7), 회귀 0건
+- 분리 실행 (unit + integration), torch + SB3 PPO segfault 이슈 (S3-7 부터 macOS arm64) 별도 추적 유지
+
+### Quality Score
+
+- 하네스 audit 후: **9~10** (Critical 0)
+- Sprint 5 선행 5건 + S5-1 SHIP: **9~10** (Critical 0, init 9/9 PASS)
+
+### Commits
+
+- `c936ca9` [Sprint 4 handoff] 이전 세션 마감
+- (이번 세션) 하네스 audit + Sprint 5 진입 + S5-1 SHIP — pending commit
+
+### Next (다음 세션)
+
+1. **S5-2 진입**: AdmissionEngine + HoldingsManager + utils/trigger_loader.py
+   - 신규 ~350줄 + 테스트 ~200줄
+   - PIT-Safety 가드 + FDA can_change_weight=false 검증 + Kanana-o 100/일 bypass 룰
+   - 팀: data-engineer + coder + reviewer
+2. **S5-3 청산 4조건**: ExitEngine (market_close/ttl_expiry/stop_loss/spike_resolved)
+3. **S5-4 enabled 게이트**: gate.py + operator 승인 절차
+4. **KIS API bulk price 스펙 확인** (R1, conf 6/10): KIS Developer 문서에서 FHKST01010100 vs FHKUP03500100 단건/배치 여부 결정. KIS 키 발급 후 진행.
+5. **commit push** (사용자 직접): `git push origin main`
+
+### Blockers (변동 없음)
+
+- **S1-8 + S4-6**: KIS 키 (.env) 미설정. 사용자 액션 대기.
+- **PPO segfault**: macOS arm64 + torch + SB3 환경 이슈. 분리 실행으로 회피.
+
+### Notes / Watch out (신규 추가)
+
+- **하네스 audit 후 settings.local.json 자체 변동**: linter 또는 자동 권한 갱신으로 정리 후 일회성 명령 다시 추가됨. 다음 audit 시 같은 패턴 발견하면 hook 또는 정책으로 차단 검토.
+- **Sprint 5 진입 시 4축 동기화 자동 hook 동작**: PostToolUse hook이 `new/docs|specs|config/*` 수정 시 `/arch-sync` 권장 알림 출력. 이번 세션에서 동작 확인.
+- **import 컨벤션**: `new/src/*/_init__.py` 는 상대 import (`from .module import X`) 통일 권장. cache/ 패턴이 표준.
+
+---
+
+## 이전 세션 (2026-05-03) — Sprint 4 8/9 완료 + 빡센 audit + commit `e506fae`
 
 ### 세션 요약
 

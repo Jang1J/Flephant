@@ -1,6 +1,7 @@
 # KOSPI Decision OS v3 — API Contracts
 
-> v3.6 (2026-05-02). **Sprint 4 반영**: C13 ablation_components `dual_source` 추가 / C14 `stage_0_dqr` trigger 명시 + DQRRunner sub_component 추가 / sla.stage_timeouts.stage_0=120.
+> v3.8 (2026-05-03): C15/C16 정식화 (Sprint 5 초안/보조 마크 제거 + forbidden_permissions + identity + activation_gate + weight_decision_authority + errors enum 확장 + watch_snapshot_id ID 등록 + polling_authority).
+> v3.7 (2026-05-02). **Sprint 4 반영**: C13 ablation_components `dual_source` 추가 / C14 `stage_0_dqr` trigger 명시 + DQRRunner sub_component 추가 / sla.stage_timeouts.stage_0=120.
 > v3.5 (2026-04-21). **PP/BUNDLE/BT/RPT/FCC/RGC 6개 ID spec UUID8 정정** (id_factory 실 구현 반영). BT 의 {tool} 컴포넌트 제거.
 > v3.4 (2026-04-21). **MSG ID 포맷 정정**: MSG-{yyyymmdd}-{UUID8} (기존 {hhmm}-{seq} 대신 UUID8, seq 충돌 방지). APM ID 포맷도 동일 기준으로 정정 (APM-{yyyymmdd}-{UUID8}).
 > v3.3 (2026-04-21). **C9 input non-breaking extension**: uncertainty_score 필드 추가 (Risk Fast sidecar → FDA Dual-Source 연계). message_taxonomy.publish_channels 에 uncertainty_signal 등록.
@@ -1291,14 +1292,15 @@ Alpha Factor Engine, Co-STEER, Thompson Sampling, 3중 정규화, Alpha Decay Mo
    C4/C8/C9/C10/C11에 대한 schema test, replay test, idempotency test를 구현 코드보다 먼저 작성.
 
 
-## C15. DynamicUniverseContract (Sprint 5 초안)
+## C15. DynamicUniverseContract
 
-> **Sprint 5 예정**. trade universe(active 20)와는 별도의 **watch universe(KOSPI200)** 를 감시하여, 이벤트 발생 시 dynamic overlay를 생성한다. Hot Path core와 PPO는 변경하지 않는다.
+> Sprint 5에서 활성화. trade universe(active 20)와는 별도의 **watch universe(KOSPI200)** 를 감시하여, 이벤트 발생 시 dynamic overlay를 생성한다. Hot Path core와 PPO는 변경하지 않는다.
 
 ```yaml
 name: DynamicUniverseContract
 owner: Risk Agent Fast Path + Event Layer
 mode: "event-driven intraday overlay"
+post_hoc_evaluation_only: true
 input:
   trade_universe_ref: "universe_config.yaml (active 20)"
   watch_universe_ref: "watch_universe_kospi200.yaml"
@@ -1320,15 +1322,31 @@ exit_policy:
   - ttl_expiry
   - stop_loss
   - spike_resolved
-forbidden:
+identity:
+  admission_event_id_prefix: "ADM"
+  exit_event_id_prefix: "EXT"
+  format: "{PREFIX}-{yyyymmdd}-{UUID8}"
+forbidden_permissions:
   - trade_universe_ssot_mutation
-  - lightgbm_inference_for_watch_universe
   - ppo_allocation_for_dynamic_overlay
+  - lightgbm_inference_for_watch_universe
+  - mode_b_cold_path_intervention
+  - fda_weight_modification
+  - direct_trade_execution_bypass_pm
+activation_gate:
+  requires_operator_approval: true
+  enabled_field: "risk_config.yaml dynamic_universe.enabled"
+  activation_command: "python -m new.src.ops.enable_dynamic_universe --approve"
+weight_decision_authority:
+  proposes: "DynamicUniverseManager (fixed_rule_only)"
+  final_executes: "PortfolioManager (order_deltas only)"
+  fda_role: "veto only on admission_event (no weight change)"
+  notes: "DynamicUniverseManager는 weight를 직접 적용하지 않는다. PM이 order_delta로 변환한다. FDA can_change_weight=false 원칙 유지."
 notes:
   rationale: "후보 10 / 실보유 3~5 구조로 운영하며, post-hoc evaluation으로 overlay 성과를 분리 검증"
 ```
 
-## C16. WatchUniverseSnapshotContract (Sprint 5 보조)
+## C16. WatchUniverseSnapshotContract
 
 ```yaml
 name: WatchUniverseSnapshotContract
@@ -1338,6 +1356,7 @@ input:
   universe_ref: "watch_universe_kospi200.yaml"
   interval_sec: 60
 output:
+  watch_snapshot_id: "WS-{yyyymmdd}-{UUID8}"
   snapshots:
     - ticker: string
       ts: ISO8601
@@ -1351,6 +1370,16 @@ use_cases:
 errors:
   - SNAPSHOT_MISSING
   - RATE_LIMIT_EXCEEDED
+  - TICKER_NOT_IN_WATCH_UNIVERSE
+  - STALE_SNAPSHOT  # interval_sec 2배 초과 시
+forbidden_permissions:
+  - direct_trade_execution
+  - trade_universe_mutation
+  - lightgbm_inference_for_watch_universe
+polling_authority:
+  subject: "WatchUniversePoller (Layer 2 Data, 신규)"
+  trigger: "장중 (09:00~15:30 KST) cron 60s interval"
+  mode_b_role: "post_hoc evaluation 데이터 read-only 사용"
 ```
 
 ## C17. ModelRegistryContract (S1-0 Batch B 신설, 2026-04-20)

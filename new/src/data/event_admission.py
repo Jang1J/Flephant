@@ -47,6 +47,7 @@ _EVENT_TYPE_TO_TRIGGER: dict[str, str] = {
     "macro": "regime_change",
     "us_market": "regime_change",
     "community": "anomaly",
+    "price_snapshot": "vol_spike",  # S5-1 C16 WatchUniverseSnapshot 편입 판정용
 }
 
 

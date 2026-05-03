@@ -11,6 +11,7 @@
 > v3.5 (2026-04-21): PP/BUNDLE/BT/RPT/FCC/RGC ID UUID8 정정 (전수 통일). BT {tool} 컴포넌트 제거.
 > v3.6 (2026-05-02): Sprint 4 반영. dual_source 피처 표기 통일 (언더스코어) / Persistent Cache S4-7 SQLite 명시 / §5.6 prediction_history KB 범위 명확화 / DQR stage_0 / Memory Restorer Bootstrap / E2E Profiler.
 > v3.7 (2026-05-02): 전수 리뷰 fix. §8.0.1 타임라인 8단계 (stage_0 DQR) 명시 / §3.2 LightGBM n_estimators=500 (risk_config SSOT) 정정.
+> v3.8 (2026-05-03): §7.4 DYNAMIC_OVERLAY_ACTIVE / DYNAMIC_OVERLAY_DISABLED 2 상태 추가 + §14 신규 3 ID (ADM/EXT/WS) 등록. Sprint 5 진입.
 > 근거: 교수님 피드백 + 6개 논문 분석 (AAPM, AlphaGAT, MetaGPT, RD-Agent, TradeXpert, AlphaAgent)
 > 외부 AI 검증 (v2.1): GPT Pro 평균 8.6/10 (멀티에이전트 정체성 9.1, RL 배치 8.9, 실시간성 8.7, 아키텍처 8.6, 명세 7.2, 실거래 7.1)
 > 위치: /Elephant_Lab/new/
@@ -1395,7 +1396,7 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 
 시스템은 아래 상태 중 하나에 있으며, 상태 전이는 명시적 이벤트로만 발생한다.
 
-**Mode A (장중) 상태 7개**
+**Mode A (장중) 상태 9개 (v3.8: DYNAMIC_OVERLAY_* 2개 추가)**
 
 | 상태 | 설명 | 전이 조건 |
 |------|------|---------|
@@ -1406,6 +1407,10 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 | EMERGENCY_HALT | 긴급 전량 청산 + 시스템 중단. kill switch 또는 manual_emergency_halt. | kill_switch/manual_emergency_halt/OAuth 실패/잔고 불일치 → EMERGENCY_HALT |
 | MANUAL_OVERRIDE | 수동 일시정지 (manual_pause). 신규 주문 중단, 기존 포지션 유지. | manual_pause 명령 → MANUAL_OVERRIDE |
 | RECOVERY | 긴급 중단 후 복구 중. 포지션 확인 + 잔고 대조 | 검증 완료 → HOT_RUNNING |
+| DYNAMIC_OVERLAY_ACTIVE | `risk_config.yaml dynamic_universe.enabled=true` AND `candidate_pool_count >= 1` | `candidate_pool_count == 0` OR `enabled=false` → HOT_RUNNING |
+| DYNAMIC_OVERLAY_DISABLED | `risk_config.yaml dynamic_universe.enabled=false` | `enabled=true` AND operator 승인 → HOT_RUNNING |
+
+> **DYNAMIC_OVERLAY_ACTIVE 비고 (Sprint 5)**: Hot Path (LightGBM/PPO/PM/FDA)는 변경 없이 동작한다. overlay는 별도 pub/sub 채널 (`dynamic_overlay_update`) 비동기 발행. trade universe는 기존 20종목과 격리 유지.
 
 **Mode B (장마감) 상태 6개 — v2.2 신규 5개 + v3 MODE_B_BACKTEST 추가**
 
@@ -1425,6 +1430,11 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
   HOT_RUNNING → DEGRADED → HOT_RUNNING
   ANY → EMERGENCY_HALT → RECOVERY → HOT_RUNNING
   ANY → MANUAL_OVERRIDE → HOT_RUNNING
+
+Sprint 5 Dynamic Overlay 전이:
+  HOT_RUNNING + dynamic_universe.enabled=true + candidate_pool_count >= 1 → DYNAMIC_OVERLAY_ACTIVE
+  DYNAMIC_OVERLAY_ACTIVE + (candidate_pool_count == 0 OR enabled=false) → HOT_RUNNING
+  enabled=false 상태에서는 DYNAMIC_OVERLAY_ACTIVE 전이 자체가 차단됨 (gate.py)
 
 장 마감 전이 (v2.2 신규):
   HOT_RUNNING → MODE_B_IDLE (15:30 장 마감)
@@ -1976,6 +1986,9 @@ Phase 5: 통합 + 최적화
 | **model_version** (v3.1) | **baseline \| v{n}** | **baseline / v2 / v3** | **C17 ModelRegistryContract (artifacts/lgbm/)** |
 | **agent_performance_id** (v3.2, v3.4 포맷 정정) | **APM-{yyyymmdd}-{UUID8}** | **APM-20260421-A1B2C3D4** | **C18 AgentPerformanceContract (daily L2 rollup)** |
 | **kb_message_id** (v3.6, 2026-05-01) | **KB-{yyyymmdd}-{UUID8}** | **KB-20260501-A1B2C3D4** | **S3-11 KnowledgeBase.write() 반환값 (Layer 5)** |
+| **admission_event_id** (v3.8, Sprint 5) | **ADM-{yyyymmdd}-{UUID8}** | **ADM-20260503-A1B2C3D4** | **C15 candidate_pool 편입 이벤트** |
+| **exit_event_id** (v3.8, Sprint 5) | **EXT-{yyyymmdd}-{UUID8}** | **EXT-20260503-E5F6G7H8** | **C15 dynamic_holdings 청산 이벤트** |
+| **watch_snapshot_id** (v3.8, Sprint 5) | **WS-{yyyymmdd}-{UUID8}** | **WS-20260503-I9J0K1L2** | **C16 KOSPI200 60초 snapshot** |
 
 > 상세 계약서: new/specs/api_contracts.md 참조
 

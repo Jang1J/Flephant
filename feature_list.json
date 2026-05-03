@@ -2,7 +2,7 @@
   "project": "Elephant Lab v3",
   "updated": "2026-05-03",
   "total_features": 55,
-  "note": "2026-04-23 drift 감사 후 4건 신설: S2-5a (KRX 수급 실 API), S2-10 (L2 AuditLogger 집계), S2-11 (BaseConnector 리팩토링), S4-9 (architecture.md 섹션 재정렬). S3-0/S3-5 done_criteria 보강. total 52 → 55. 관례: id 끝 'a' 접미사 (S1-0a, S2-5a)는 sub-feature 로 total_features/progress.total 카운트에서 제외. 2026-04-20 재편성: Sprint 1~5 전체 architect+modeler+data-engineer 3인 병렬 감사 후 누락 31건 반영. 18 → 44 feature 확장. 2026-04-20 전체 세션: S1-0 Batch B+C 구조 완성 → S1-1~S1-9 → 340/340 pytest. Sprint 1 SHIP READY. S1-8만 사용자 KIS 키 blocker.",
+  "note": "2026-04-23 drift 감사 후 4건 신설: S2-5a (KRX 수급 실 API), S2-10 (L2 AuditLogger 집계), S2-11 (BaseConnector 리팩토링), S4-9 (architecture.md 섹션 재정렬). S3-0/S3-5 done_criteria 보강. total 52 → 55. 관례: id 끝 'a' 접미사 (S1-0a, S2-5a)는 sub-feature 로 total_features/progress.total 카운트에서 제외. 2026-04-20 재편성: Sprint 1~5 전체 architect+modeler+data-engineer 3인 병렬 감사 후 누락 31건 반영. 18 → 44 feature 확장. 2026-04-20 전체 세션: S1-0 Batch B+C 구조 완성 → S1-1~S1-9 → 340/340 pytest. Sprint 1 SHIP READY. S1-8만 사용자 KIS 키 blocker. 2026-05-03 #2 세션: 하네스 audit + Sprint 5 진입 (P1~P5 + F1+F2 + S5-1). 1091 → 1098 pytest. S5-1 SHIP.",
   "sprints": [
     {
       "id": "sprint-0",
@@ -423,14 +423,15 @@
     {
       "id": "sprint-5",
       "name": "동적 유니버스",
-      "status": "not_started",
+      "status": "in_progress",
       "note": "2026-04-20 재편성: 2 → 4 features. 편입/청산 트리거 + enabled 전환 게이트 추가.",
       "features": [
         {
           "id": "S5-1",
           "name": "Watch Universe (KOSPI200, C16)",
-          "status": "not_started",
-          "done_criteria": "C16 WatchUniverseSnapshotContract. KOSPI200 일별 snapshot + 이벤트 감시."
+          "status": "done",
+          "done_criteria": "C16 WatchUniverseSnapshotContract. KOSPI200 일별 snapshot + 이벤트 감시.",
+          "note": "2026-05-03 SHIP. C16 WatchUniverseSnapshotContract 구현. snapshot_fetcher.py(~120줄) + KIS REST get_price_snapshot + EventGateway price_snapshot enum. mock fallback (KIS 키 부재). pytest 7건 PASS. forbidden_permissions 코드 가드 동작."
         },
         {
           "id": "S5-2",
@@ -451,7 +452,7 @@
           "done_criteria": "risk_config.yaml dynamic_universe.enabled = false → true 전환. operator 승인 절차. Sprint 5 완료 기준점."
         }
       ],
-      "done": 0,
+      "done": 1,
       "total": 4
     }
   ],
