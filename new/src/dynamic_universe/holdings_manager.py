@@ -29,7 +29,6 @@ SSOT: new/specs/api_contracts.md C15 DynamicUniverseContract
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from src.utils.id_factory import generate_exit_event_id, generate_promotion_id
 from src.utils.logger import get_logger
 
 logger = get_logger("holdings_manager")
@@ -200,7 +200,7 @@ class HoldingsManager:
 
         # holdings entry 생성
         now_kst = datetime.now(_KST)
-        promotion_id = f"PRM-{now_kst.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+        promotion_id = generate_promotion_id()
 
         entry: dict[str, Any] = {
             "ticker": ticker,
@@ -256,7 +256,7 @@ class HoldingsManager:
 
         entry = self._holdings.pop(ticker)
         now_kst = datetime.now(_KST)
-        exit_id = f"EXT-{now_kst.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+        exit_id = generate_exit_event_id()
 
         exit_event: dict[str, Any] = {
             "exit_event_id": exit_id,

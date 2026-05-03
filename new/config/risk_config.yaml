@@ -977,6 +977,16 @@ debate:
   max_pairwise: 45          # C6 SSOT: C(10,2)=45 쌍 (10 에이전트 기준)
   uncertainty_threshold: 0.7  # uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
   llm_caller: "debate"      # LLMRouter caller 식별자
+  conflict_criteria:        # C6 SSOT (debate.py _CONFLICT_PATTERNS 하드코딩 제거 → yaml 이동)
+    - signal_a: "quant_top10"
+      signal_b: "veto_recommendation"
+      reason: "Quant TOP-10 종목에 대한 Risk veto 충돌"
+    - signal_a: "quant_buy"
+      signal_b: "risk_high"
+      reason: "Quant 매수 신호 + Risk high 동시 발생"
+    - signal_a: "news_sell"
+      signal_b: "quant_top5"
+      reason: "News 매도 알림 + Quant TOP-5 동시 발생"
 
 risk_fast:
   mode_b_metadata:

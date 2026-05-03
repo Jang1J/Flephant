@@ -275,6 +275,27 @@ def test_verdict_pass_triggers_deploy(scheduler, monkeypatch):
     """stage_6 verdict=pass → result에 stage_7 포함 및 stage_7 deploy 결과 존재."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
+    # Mock BacktestAgent: 항상 verdict=pass 반환
+    class _MockBacktestAgent:
+        def run(self, bundle_id):
+            return {
+                "backtest_id": "BT-MOCK",
+                "bundle_id": bundle_id,
+                "metrics": {"sharpe_ratio": 1.5, "max_drawdown": -0.05, "win_rate": 0.55},
+                "verdict": "pass",
+                "regression_severity": "none",
+            }
+
+        def report(self, report_type, payload):
+            return {
+                "report_id": "RPT-MOCK",
+                "agent": "backtest",
+                "report_type": report_type,
+                "content": payload,
+            }
+
+    scheduler._backtest_agent = _MockBacktestAgent()
+
     original_s3 = scheduler.stage_3_factor_evolution
 
     def _s3_with_candidates():

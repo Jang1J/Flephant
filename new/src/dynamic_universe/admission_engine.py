@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from src.utils.id_factory import generate_admission_event_id
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 from src.utils.trigger_loader import load_trigger_rules
@@ -319,7 +319,7 @@ class AdmissionEngine:
         # admission_event 생성
         now_kst = datetime.now(_KST)
         now_iso = now_kst.isoformat()
-        admission_id = f"ADM-{now_kst.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+        admission_id = generate_admission_event_id()
 
         admission_event: dict[str, Any] = {
             "admission_event_id": admission_id,

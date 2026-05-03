@@ -45,13 +45,6 @@ class DebateAgent(AgentBase):
         {"debate_resolution", "pairwise_ranking"}
     )
 
-    # 충돌 패턴 (C6 conflict_criteria)
-    _CONFLICT_PATTERNS = [
-        ("quant_top10", "veto_recommendation"),
-        ("quant_buy", "risk_high"),
-        ("news_sell", "quant_top5"),
-    ]
-
     def __init__(
         self,
         llm_router: Any,
@@ -65,6 +58,7 @@ class DebateAgent(AgentBase):
         )
         self._max_pairwise = self._load_max_pairwise()
         self._uncertainty_threshold = self._load_uncertainty_threshold()
+        self._conflict_criteria = self._load_conflict_criteria()
 
     def _load_max_pairwise(self) -> int:
         """risk_config.yaml debate.max_pairwise 로드 (불변 원칙 5).
@@ -86,6 +80,27 @@ class DebateAgent(AgentBase):
         except Exception as e:
             logger.warning("[debate] uncertainty_threshold 로드 실패: %s. 기본값 사용", e)
             return 0.7
+
+    def _load_conflict_criteria(self) -> list[dict[str, str]]:
+        """risk_config.yaml debate.conflict_criteria 로드 (불변 원칙 5).
+
+        C6 SSOT: yaml에서만 정의. 코드 하드코딩 금지.
+
+        Raises:
+            KeyError: conflict_criteria 키가 yaml에 없는 경우 (설정 오류 명확화).
+        """
+        cfg = config_load("risk_config.yaml", "debate") or {}
+        if "conflict_criteria" not in cfg:
+            raise KeyError(
+                "[debate] risk_config.yaml debate.conflict_criteria 섹션 누락. "
+                "설정 오류. 시스템을 시작할 수 없음."
+            )
+        criteria = cfg["conflict_criteria"]
+        if not isinstance(criteria, list):
+            raise KeyError(
+                f"[debate] debate.conflict_criteria 형식 오류: list 기대, got {type(criteria).__name__}"
+            )
+        return criteria
 
     # ------------------------------------------------------------------
     # C5/C6 report 생성
@@ -247,8 +262,8 @@ class DebateAgent(AgentBase):
     def _detect_conflict(self, signals: list[dict[str, Any]]) -> dict[str, Any]:
         """에이전트 신호에서 충돌 패턴 감지.
 
-        C6 conflict_criteria 3개:
-          - quant_top10 vs agent veto_recommendation
+        C6 conflict_criteria (risk_config.yaml debate.conflict_criteria SSOT):
+          - quant_top10 vs veto_recommendation
           - quant_buy vs risk_high
           - news_sell vs quant_top5
         """

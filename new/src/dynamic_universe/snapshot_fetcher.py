@@ -38,6 +38,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from src.utils.id_factory import generate_watch_snapshot_id
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 
@@ -220,9 +221,13 @@ class WatchSnapshotFetcher:
                     f"[snapshot_fetcher] PIT-Safety 위반: ts={ts_str}"
                 )
 
-        watch_snapshot_id = (
-            f"{snapshot_id_prefix}-{now_kst.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
-        )
+        # snapshot_id_prefix="WS"이면 id_factory SSOT 사용, 그 외 prefix는 인라인 생성(fallback)
+        if snapshot_id_prefix == "WS":
+            watch_snapshot_id = generate_watch_snapshot_id()
+        else:
+            watch_snapshot_id = (
+                f"{snapshot_id_prefix}-{now_kst.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+            )
 
         snapshots: list[dict[str, Any]] = []
         kis_miss_tickers: list[str] = []

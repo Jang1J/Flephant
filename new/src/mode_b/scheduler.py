@@ -74,6 +74,7 @@ class ModeBScheduler:
         state_machine: StateMachine | None = None,
         deployer: Any = None,
         llm_router: Any = None,
+        backtest_agent: Any = None,
     ) -> None:
         cfg = config_load("risk_config.yaml", "mode_b_scheduler") or {}
         self._stage_timeouts: dict[str, int] = cfg.get("stage_timeouts", {})
@@ -83,6 +84,7 @@ class ModeBScheduler:
         self._state_machine = state_machine
         self._deployer = deployer
         self._llm_router = llm_router
+        self._backtest_agent = backtest_agent
         self._bundle_id: str | None = None
         self._current_verdict: str | None = None
         logger.info("[mode_b_scheduler] 초기화 완료. audit_log=%s", self._audit_log_path)
@@ -638,12 +640,66 @@ class ModeBScheduler:
         return {"status": "stub"}
 
     def stage_6_backtest_validation(self) -> dict[str, Any]:
-        """§8.5.2 Backtest Agent 검증 게이트. S3-9에서 실구현. 현재 stub verdict=pass."""
+        """§8.5.2 Backtest Agent 검증 게이트. BacktestAgent.run() 실호출."""
         logger.info("[mode_b_scheduler] stage_6 백테스트 검증 실행")
+
+        bundle_id = self._bundle_id or "BUNDLE-UNKNOWN"
+
+        # BacktestAgent 의존성: 미주입이면 기본 인스턴스 생성 (불변 원칙 3 준수)
+        agent = self._backtest_agent
+        if agent is None:
+            try:
+                from src.agents.mode_b.backtest import BacktestAgent
+                agent = BacktestAgent()
+            except Exception as e:
+                logger.error("[mode_b_scheduler] BacktestAgent 인스턴스 생성 실패: %s", e)
+                return {
+                    "status": "error",
+                    "verdict": "fail",
+                    "regression_severity": "high",
+                    "critical_alert": True,
+                    "error": str(e),
+                }
+
+        # deploy_decision_gate 임계값 로드 (불변 원칙 5: yaml SSOT)
+        gate_cfg = config_load("risk_config.yaml", "backtest_agent.deploy_decision_gate") or {}
+        severity_block = gate_cfg.get("regression_severity_block", "high")
+
+        try:
+            bt_result = agent.run(bundle_id)
+        except Exception as e:
+            logger.error("[mode_b_scheduler] BacktestAgent.run() 실패: %s", e)
+            return {
+                "status": "error",
+                "verdict": "fail",
+                "regression_severity": "high",
+                "critical_alert": True,
+                "error": str(e),
+                "bundle_id": bundle_id,
+            }
+
+        verdict = bt_result.get("verdict", "fail")
+        regression_severity = bt_result.get("regression_severity", "high")
+
+        # severity >= severity_block → critical_alert (stage_7 deploy 차단)
+        severity_order = {"none": 0, "low": 1, "medium": 2, "high": 3}
+        sev_level = severity_order.get(regression_severity, 3)
+        block_level = severity_order.get(severity_block, 2)
+        critical_alert = verdict == "fail" or sev_level >= block_level
+
+        logger.info(
+            "[mode_b_scheduler] stage_6 완료. bundle_id=%s verdict=%s severity=%s critical_alert=%s",
+            bundle_id, verdict, regression_severity, critical_alert,
+        )
+
         return {
-            "status": "stub",
-            "verdict": "pass",              # S3-9: 실 백테스트 결과로 교체
-            "regression_severity": "none",
+            "status": "ok",
+            "verdict": verdict,
+            "regression_severity": regression_severity,
+            "backtest_id": bt_result.get("backtest_id"),
+            "metrics": bt_result.get("metrics", {}),
+            "critical_alert": critical_alert,
+            "bundle_id": bundle_id,
         }
 
     def stage_7_deploy(self) -> dict[str, Any]:
