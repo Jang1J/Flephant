@@ -2,11 +2,124 @@
 
 > 매 세션 시작 시 이 파일을 먼저 읽는다. 세션 끝에 업데이트한다.
 
-## 최근 세션 (2026-05-04) — Sprint 5 100% 완료 (S5-2/3/4 SHIP)
+## 최근 세션 (2026-05-04) — Sprint 5 100% + SSOT Critical 4 fix + Sprint 0 cleanup
 
 ### 세션 요약
 
-이전 세션 (S5-1 SHIP) 이어 S5-2/S5-3/S5-4 자동 진입. data-engineer 단일 dispatch 3회 (각 feature). **1098 → 1161 passed (+63)**, S5 회귀 0건. Sprint 5 4/4 done.
+이전 세션 (S5-1 SHIP) 이어 (1) S5-2/S5-3/S5-4 자동 진입 → Sprint 5 4/4 완료. (2) feature_list data drift 전수 동기화. (3) SSOT cover audit (architect+reviewer) → Critical 4건 fix. (4) Sprint 0 audit (architect+reviewer+smoke) → Warning 9건 풀 cleanup. **1098 → 1124 passed**, 회귀 0건. commit 5건.
+
+### Done
+
+**Sprint 5 100% (commit `2b29e9d`)**:
+- S5-2 AdmissionEngine + HoldingsManager + utils/trigger_loader (admission_engine 389줄, holdings_manager 313줄, trigger_loader 102줄, risk_fast _load_trigger_rules 위임, C15 forbidden 6 가드, pytest 13)
+- S5-3 ExitEngine 4조건 (exit_engine 417줄, market_close/ttl_expiry/stop_loss/spike_resolved, KST 일관성, pytest 13)
+- S5-4 DynamicUniverseGate + DynamicUniverseManager (gate 140줄, manager 200줄, FORBIDDEN_CALLERS frozenset, pytest 37)
+- S5-1 회귀 fix: C02 contract test 6→7 source enum (price_snapshot) + api_contracts.md C2 source/event_type enum 동기화
+
+**feature_list data drift fix (commit `34147b7`)**:
+- Sprint 1 status: done → in_progress (S1-8 KIS 키 blocked)
+- Sprint 2 status: in_progress → done (13/13)
+- Sprint 3 status: not_started → done (12/12, 표기 오류 정정)
+- Sprint 4 status: done + features 9건 모두 not_started 표기 → 8/9 done + S4-6 blocked (data 손실 복구)
+
+**SSOT cover audit + Critical 4 fix (commit `35dd919`)**:
+- audit: architect (C1~C18 매핑) + reviewer (운영 ready)  병렬 dispatch
+- 결과: FULL 9/18 (50%), PARTIAL 9, STUB 1 (C12 BacktestAgent), 운영 P0 3건 (KIS 키)
+- Critical 4건 fix:
+  1. C12 BacktestAgent.run/report 실구현 (NotImplementedError → BacktestEngine 호출)
+  2. C14 stage_6_backtest_validation 실 BacktestAgent 호출 (stub status 제거)
+  3. C6 _CONFLICT_PATTERNS 하드코딩 → risk_config.yaml debate.conflict_criteria 이동 (불변 원칙 5 위반 해소)
+  4. id_factory 신규 4 함수 (generate_admission/exit_event/watch_snapshot/promotion_id) + 인라인 uuid4 교체
+- 회귀 fix 8건 (test_backtest_agent 7 + test_mode_b_scheduler 1) + test_id_factory.py 신규
+- SSOT cover: FULL 9 → 10, STUB 1 → 0
+
+**Sprint 0 검증 + cleanup (commit `0ae7adf`)**:
+- audit: architect (4축) + reviewer (코드 동작) 병렬 + smoke.sh 직접 실행
+- 결과: PASS 7 + PARTIAL 1 (S0-7) + smoke 13/13, Critical 0, Warning 7
+- Multi-Agent confirmed (conf 10): kis _MOCK_BASE_PRICE/_MOCK_PRICE_MODULO 하드코딩
+- Quality 8.3/10 → ~9.5/10
+- 9건 풀 cleanup:
+  - P1: dart/krx get_company mock guard (실 OSError 재현 해소) + kis _MOCK_ yaml 이동 + C2 pit_safe/payload SSOT 등재
+  - P2: KIS_MODE → AuthManager.get_mode() 일원화 + dart corpCode TODO 정정 + event_normalizer market_close 캐시
+  - P3: smoke.sh CLAUDE.md 250줄 임계값 + architecture_visual.md v3.1.0 cleanup (Backtest C12 SHIP 반영 + S4 인프라 5 모듈 박스)
+
+### 이번 세션 commit (5건)
+
+| commit | 내용 |
+|---|---|
+| `33d9902` | 하네스 audit + Sprint 5 진입 + S5-1 Watch Universe SHIP |
+| `2b29e9d` | S5-2 + S5-3 + S5-4 SHIP — Sprint 5 100% (4/4) |
+| `34147b7` | feature_list data drift 전수 동기화 (Sprint 1~4 status + S4 features 9건 복구) |
+| `35dd919` | SSOT Critical 4건 fix (C12 + C14 + C6 + id_factory ADM/EXT/WS/PRM) |
+| `0ae7adf` | Sprint 0 cleanup Warning 9건 (P1+P2+P3 풀 cleanup) |
+
+### pytest
+
+- **1124 passed** (회귀 0건)
+- 12 failed = sklearn `numpy.dtype size changed` (numpy 2.x vs sklearn 빌드 numpy 1.x 환경 비호환). S5/Sprint 0 무관.
+- 1 skipped
+- init.sh 9/9 PASS, smoke.sh 13/13 PASS
+
+### Quality Score
+
+- Sprint 5 (4/4): **9~10**
+- Critical 4 fix: **9~10** (Mode B 진화 루프 동작 회복)
+- Sprint 0 cleanup: **9.5/10** (audit 후 Warning 0건)
+
+### 종합 진척
+
+| Sprint | 진척 | 상태 |
+|---|---|---|
+| 0 인프라 | 8/8 | done (Quality 9.5/10) |
+| 1 Hot Path | 10/11 | in_progress (S1-8 KIS 키 대기) |
+| 2 Cold Path | 13/13 | done |
+| 3 Mode B | 12/12 | done |
+| 4 통합+최적화 | 8/9 | in_progress (S4-6 KIS 키 대기) |
+| 5 동적 유니버스 | 4/4 | done |
+| **전체** | **55/57** | **96.5%** |
+
+### SSOT cover
+
+- **FULL: 10/18** (C2 / C3A / C4 / C7 / C8 / C9 / C11 / C12 / C17 / C18)
+- PARTIAL 8: C1 / C3 / C5 / C6 / C10 / C13 / C14 / C15 / C16
+- STUB 0
+- C2 (S0 cleanup으로 pit_safe + payload 등재 → SSOT 100% sync)
+
+### Next (다음 세션)
+
+1. **사용자 push** (필수): `git push origin main` (이번 세션 commit 5건)
+2. **PARTIAL 8건 FULL 승격** (선택, KIS 키 무관 가능):
+   - C1 batch_id + KIS WS connect 실구현 (KIS 키 필요)
+   - C3 features_ref 필드명 통일 + dual_source/macro 통합
+   - C5 investor_flow_alert + theme_score report 타입 추가
+   - C6 conflict_criteria 다양화 (현재 3 패턴 → 더 많은 충돌 시나리오)
+   - C10 KB write_kb_entry/update_memory/reconciliation 구현
+   - C13 BacktestEngine SLA threshold yaml 일치 점검
+   - C14 deploy gate threshold 정합성 추가 검증
+   - C15 polling_authority WatchUniversePoller 구현
+   - C16 day_change_pct 필드 추가
+3. **운영 P1 5건** (KIS 키 무관):
+   - Slack webhook 1개 (외부 알림)
+   - operator_reset_token 평문 → .env 이동
+   - 24/7 launchd/systemd unit
+   - Kanana-o 실 API 키 검증
+4. **KIS 키 발급 (사용자)** → S1-8 + S4-6 + S5-1 KIS 실호출 동시 unblock
+
+### Blockers (변동 없음)
+
+- S1-8 + S4-6 + S5-1 실호출: KIS 키 (.env) 미설정
+- 12 sklearn fail: numpy/sklearn 환경 비호환 (S5/S0 무관)
+
+### Notes / Watch out
+
+- **dispatch 보고 라인 수 underreport 패턴 재확인**: 이번 세션에도 발견. 직접 wc -l 검증 필수.
+- **mock guard 부재 패턴**: dart/krx 외에도 다른 커넥터에 동일 패턴 가능성. naver_rest, ecos_rest, us_market 추가 audit 권장.
+- **test_factor_agent_implement_mode_a_rejected**: 단독 PASS, 묶음 fail. test isolation 이슈 (state leakage). 다음 세션 처리 권장.
+- **architecture_visual.md 버전 체계**: visual.md 자체 버전 (v3.0.x → v3.1.0)과 architecture.md 버전 (v3.8) 별도 운영 확인됨.
+
+---
+
+## 이전 세션 (2026-05-04) — Sprint 5 100% 완료 (초기 섹션)
 
 ### Done
 
