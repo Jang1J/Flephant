@@ -22,6 +22,7 @@ from datetime import date
 from typing import Any
 
 from src.connectors.base import BaseConnector
+from src.connectors.kis_rest import KISRestClient
 from src.data.event_normalizer import EventNormalizer
 from src.utils.auth import AuthManager
 from src.utils.logger import get_logger
@@ -51,11 +52,8 @@ class KRXRestClient(BaseConnector):
 
     # 공식 고정 endpoint (enum 성격 상수. 하드코딩 예외 허용)
     BASE_URL = "https://apis.data.go.kr/1160100/service/GetStockSecuritiesInfoService"
-    # S2-5a: 투자자별 수급 전용 엔드포인트 (별도 서비스)
-    INVESTOR_URL = (
-        "https://apis.data.go.kr/1160100/service"
-        "/GetStockInvestorInfoService/getStockInvestorInfoService"
-    )
+    # 투자자 수급은 KIS 공식 investor endpoint를 provider로 사용한다.
+    # C2 source enum은 기존 SSOT 호환을 위해 krx_investor_flow를 유지한다.
 
     def __init__(
         self,
@@ -264,10 +262,9 @@ class KRXRestClient(BaseConnector):
         """S1-0a: 투자자별 수급 (외국인/기관/개인 net buy). C3 investor_flow 3 피처.
 
         Sprint 1 MVP: mock_response 주입 시 정규화만 수행 (테스트/dev용).
-        실 API 연결은 Sprint 2 S2-5에서:
-          - 공공데이터포털 "KRX 투자자별 거래 실적" 엔드포인트 연결 or
-          - KRX 공식 웹 크롤링 (data.krx.co.kr)
-          - rate_limiter("krx_investor_flow") 재사용, timeout 10s
+        실 API는 KIS 공식 investor-trade-by-stock-daily endpoint로 조회한다.
+        KRX 공공데이터포털 투자자 endpoint는 서비스 경로/품질 drift로 404가
+        반복되어 운영 provider에서 제외했다.
 
         Args:
             ticker: 종목코드 (6자리)
@@ -280,8 +277,8 @@ class KRXRestClient(BaseConnector):
         ticker_padded = pad_ticker(str(ticker))
 
         if mock_response is None:
-            if self._is_mock:
-                # KRX_API_KEY 미설정: mock 데이터 반환
+            if self._is_mock and not self._has_kis_investor_provider():
+                # KRX/KIS 키 모두 미설정: mock 데이터 반환
                 logger.info(
                     "[krx_rest] get_investor_info Mock 모드. ticker=%s → mock 반환.",
                     ticker_padded,
@@ -419,8 +416,14 @@ class KRXRestClient(BaseConnector):
         로그에서 serviceKey 값은 "***"로 마스킹.
 
         Raises:
+            RuntimeError: mock 모드에서 직접 호출 시 (auth.get_krx_key() 실 호출 방지).
             ConnectionError: 3회 재시도 후 전부 실패.
         """
+        if self._is_mock:
+            raise RuntimeError(
+                "[krx_rest] _call_api는 mock 모드에서 호출 불가. "
+                "get_stock_price_info() / get_investor_info()의 mock 분기를 사용하라."
+            )
         self.rate_limiter.wait_and_acquire()
         key = self.auth.get_krx_key()
         full_params: dict[str, str] = {"serviceKey": key, **params}
@@ -466,51 +469,51 @@ class KRXRestClient(BaseConnector):
     def _fetch_investor_info(
         self, ticker: str, bgn_de: str, end_de: str
     ) -> list[dict[str, Any]]:
-        """공공데이터포털 getStockInvestorInfoService 실 API 호출.
+        """KIS investor-trade-by-stock-daily 실 API 호출.
 
-        bgn_de ~ end_de 각 날짜에 대해 단건 요청 (API 특성상 날짜 범위 미지원).
+        bgn_de ~ end_de 각 날짜에 대해 단건 요청한다. 반환 source는
+        EventNormalizeContract 호환을 위해 ``krx_investor_flow``를 유지한다.
         """
         from datetime import datetime as _dt, timedelta as _td  # noqa: PLC0415
 
         start = _dt.strptime(bgn_de, "%Y%m%d").date()
         end = _dt.strptime(end_de, "%Y%m%d").date()
         results: list[dict[str, Any]] = []
+        kis_client = KISRestClient(auth=self.auth, rate_limiter=self.rate_limiter)
 
         cur = start
         while cur <= end:
             if cur.weekday() < 5:  # 월~금 영업일
                 date_str = cur.strftime("%Y%m%d")
-                self.rate_limiter.wait_and_acquire()
-                params = {
-                    "serviceKey": self._api_key or "",
-                    "resultType": "json",
-                    "basDt": date_str,
-                    "likeSrtnCd": ticker,
-                    "numOfRows": "100",
-                    "pageNo": "1",
-                }
                 try:
-                    body = self._http_get_json(self.INVESTOR_URL, params)
-                    items = self._extract_investor_items(body)
-                    for item in items:
-                        raw = self._parse_investor_item(item, ticker, date_str)
-                        if raw:
-                            event = self.normalizer.normalize(
-                                raw, source="krx_investor_flow"
-                            )
-                            results.append(event)
+                    items = kis_client.investor_trade_by_stock_daily(ticker, date_str)
+                    for raw in items:
+                        if not self._raw_investor_date_matches(raw, date_str):
+                            continue
+                        event = self.normalizer.normalize(
+                            raw, source="krx_investor_flow"
+                        )
+                        results.append(event)
                 except Exception as e:
                     logger.warning(
-                        "[krx_rest] investor_info 실 API 실패. date=%s error=%s",
+                        "[krx_rest] KIS investor_info 실 API 실패. date=%s error=%s",
                         date_str, e,
                     )
             cur += _td(days=1)
 
         logger.info(
-            "[krx_rest] investor_info 실 API 완료. ticker=%s 건수=%d",
+            "[krx_rest] KIS investor_info 실 API 완료. ticker=%s 건수=%d",
             ticker, len(results),
         )
         return results
+
+    def _has_kis_investor_provider(self) -> bool:
+        """KIS 수급 provider 사용 가능 여부. 값은 로그에 남기지 않는다."""
+        try:
+            self.auth.get_kis_app_credentials()
+            return True
+        except (EnvironmentError, KeyError):
+            return False
 
     @staticmethod
     def _extract_investor_items(body: dict[str, Any]) -> list[dict[str, Any]]:
@@ -546,6 +549,12 @@ class KRXRestClient(BaseConnector):
         except (ValueError, TypeError) as e:
             logger.warning("[krx_rest] investor_item 파싱 실패: %s", e)
             return None
+
+    @staticmethod
+    def _raw_investor_date_matches(raw: dict[str, Any], yyyymmdd: str) -> bool:
+        """KIS daily endpoint가 주변 일자를 함께 줄 경우 요청일만 통과."""
+        date_val = str(raw.get("date", ""))
+        return date_val[:10].replace("-", "") == yyyymmdd
 
     def _mock_investor_info(
         self, ticker: str, bgn_de: str, end_de: str

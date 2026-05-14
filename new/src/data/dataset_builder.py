@@ -6,6 +6,8 @@
     → compute_rolling_features(multi-scale features per ticker)
     → generate_labels(PIT-safe forward return)
     → cross_sectional_rank(매 ts_close 내 20종목 pct rank → relevance grade)
+    → join_dual_source_features(S4-2: Dual-Source 5피처 날짜 기준 join)
+    → join_exogenous_features(C3: US overnight / investor flow / macro defaults)
     → 최종 panel DataFrame (MultiIndex ticker × ts_close)
 
 불변 원칙 준수:
@@ -14,20 +16,66 @@
     drop_last_n_bars로 마지막 horizon bar 제거.
   - 종목코드: pad_ticker() 6자리 zero-padded
 
+S4-2 Dual-Source 확장:
+  - dual_source.enabled_for_lgbm=true 시 5피처 join (날짜 기준 left join).
+  - 결측 시 per-feature neutral 기본값 사용
+    (community_noise_multiplier=1.0, 나머지=0.0).
+  - 5피처명: news_score_t, comm_score_t_1, comm_score_t_2,
+             news_comm_divergence, community_noise_multiplier.
+
+C3 외생 피처 확장:
+  - us_overnight / investor_flow / macro manifest 컬럼을 panel에 포함.
+  - historical connector artifact가 아직 없으면 risk_config neutral_defaults 사용.
+
 Batch C lgbm_trainer가 이 DataFrame을 소비.
 """
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from src.data.dual_source_runner import load_latest_scores
+from src.data.exogenous_feature_store import (
+    DEFAULT_EXOGENOUS_ARTIFACT_DIR,
+    is_non_neutral,
+    load_exogenous_scores,
+)
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.ticker_utils import pad_ticker
+
+# S4-2: Dual-Source 5피처 컬럼명 (SSOT). risk_config.yaml dual_source_feature_cols와 동기화.
+DUAL_SOURCE_FEATURES: tuple[str, ...] = (
+    "news_score_t",
+    "comm_score_t_1",
+    "comm_score_t_2",
+    "news_comm_divergence",
+    "community_noise_multiplier",
+)
+
+DUAL_SOURCE_DEFAULTS: dict[str, float] = {
+    "news_score_t": 0.0,
+    "comm_score_t_1": 0.0,
+    "comm_score_t_2": 0.0,
+    "news_comm_divergence": 0.0,
+    "community_noise_multiplier": 1.0,
+}
+
+EXOGENOUS_FEATURES: tuple[str, ...] = (
+    "us_sp500_change",
+    "us_nasdaq_change",
+    "us_vix",
+    "us_soxx_change",
+    "foreign_net_buy",
+    "institutional_net_buy",
+    "retail_net_buy",
+    "interest_rate",
+    "usd_krw",
+)
 
 logger = get_logger("dataset_builder")
 
@@ -82,19 +130,41 @@ class DatasetBuilder:
     def __init__(
         self,
         artifacts_dir: Path | None = None,
+        allow_synthetic_fallback: bool = False,
+        synthetic_seed: int | None = None,
     ) -> None:
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_ROOT
+        self._allow_synthetic_fallback = bool(allow_synthetic_fallback)
+        self._synthetic_seed = int(synthetic_seed or 0)
 
         # risk_config.yaml 로드 (불변 원칙 5)
         self._cfg_label: dict = config_load("risk_config.yaml", "label")
         self._cfg_preprocessor: dict = config_load("risk_config.yaml", "preprocessor")
         self._cfg_lgbm: dict = config_load("risk_config.yaml", "lightgbm")
+        self._cfg_mock: dict = (config_load("risk_config.yaml", "connector_mock") or {}).get("kis", {})
+        self._cfg_wf: dict = config_load("risk_config.yaml", "walk_forward") or {}
+        self._cfg_nightly: dict = config_load("risk_config.yaml", "nightly_retrainer") or {}
+        self._cfg_cost_model: dict = config_load("risk_config.yaml", "execution_cost_model") or {}
+        self._cfg_service_policy: dict = config_load("risk_config.yaml", "service_policy_replay") or {}
 
         self._horizon: int = int(self._cfg_label["horizon_bars"])
         self._target_col: str = str(self._cfg_label["target_col"])
         self._rank_col: str = str(self._cfg_label["rank_col"])
         self._leakage_guard: bool = bool(self._cfg_label["leakage_guard"])
         self._drop_last_n: int = int(self._cfg_label["drop_last_n_bars"])
+        self._label_generation_version: str = str(
+            self._cfg_label.get("generation_version", "")
+        )
+        self._label_session_scope: str = str(
+            self._cfg_label.get("session_scope", "")
+        )
+        cost_components = self._cfg_cost_model.get("components") or {}
+        self._label_total_cost_bps: float = float(
+            cost_components.get("commission_bps", 0.0)
+        ) + float(cost_components.get("slippage_bps", 0.0))
+        self._label_min_expected_net_bps: float = float(
+            self._cfg_service_policy.get("min_expected_net_alpha_bps", 0.0)
+        )
 
         self._multi_scale_windows: list[int] = list(
             self._cfg_preprocessor["multi_scale_windows"]
@@ -104,11 +174,29 @@ class DatasetBuilder:
 
         self._n_relevance_grades: int = int(self._cfg_lgbm["n_relevance_grades"])
 
+        # S4-2: Dual-Source 피처 주입 설정 (risk_config.yaml dual_source 섹션)
+        _cfg_ds: dict = config_load("risk_config.yaml", "dual_source") or {}
+        self._ds_enabled_for_lgbm: bool = bool(_cfg_ds.get("enabled_for_lgbm", False))
+        self._ds_feature_cols: list[str] = list(DUAL_SOURCE_FEATURES)
+        _cfg_exog: dict = config_load("risk_config.yaml", "exogenous_features") or {}
+        self._exog_enabled_for_lgbm: bool = bool(_cfg_exog.get("enabled_for_lgbm", False))
+        self._exog_feature_cols: list[str] = list(
+            self._cfg_preprocessor.get("exogenous_feature_cols", EXOGENOUS_FEATURES)
+        )
+        self._exog_defaults: dict[str, float] = {
+            col: float((_cfg_exog.get("neutral_defaults") or {}).get(col, 0.0))
+            for col in self._exog_feature_cols
+        }
+        self._neutral_feature_cols: list[str] = []
+
         logger.info(
             "[dataset_builder] 초기화 완료. horizon=%d bars, "
-            "target_col=%s, windows=%s, grades=%d",
+            "target_col=%s, windows=%s, grades=%d, ds_enabled_for_lgbm=%s, "
+            "exog_enabled_for_lgbm=%s",
             self._horizon, self._target_col,
             self._multi_scale_windows, self._n_relevance_grades,
+            self._ds_enabled_for_lgbm,
+            self._exog_enabled_for_lgbm,
         )
 
     # ================================================================== #
@@ -124,6 +212,16 @@ class DatasetBuilder:
     def target_col(self) -> str:
         """Label 컬럼명. yaml label.target_col 값."""
         return self._target_col
+
+    @property
+    def label_generation_version(self) -> str:
+        """Label 생성 알고리즘 버전. yaml label.generation_version 값."""
+        return self._label_generation_version
+
+    @property
+    def label_session_scope(self) -> str:
+        """Label session scope. yaml label.session_scope 값."""
+        return self._label_session_scope
 
     @property
     def multi_scale_windows(self) -> list[int]:
@@ -155,17 +253,34 @@ class DatasetBuilder:
 
         padded = [pad_ticker(t) for t in tickers]
         per_ticker_frames: list = []
+        synthetic_tickers: list[str] = []
+        loaded_tickers: list[str] = []
+        missing_tickers: list[str] = []
 
         for ticker in padded:
             raw = self._load_ticker_bars(ticker, start_date, end_date)
             if raw is None or raw.empty:
+                if not self._allow_synthetic_fallback:
+                    logger.warning(
+                        "[dataset_builder] %s: 데이터 없음, skip", ticker
+                    )
+                    missing_tickers.append(ticker)
+                    continue
                 logger.warning(
-                    "[dataset_builder] %s: 데이터 없음, skip", ticker
+                    "[dataset_builder] %s: 데이터 없음, synthetic fallback 생성", ticker
                 )
-                continue
+                raw = self._make_synthetic_bars(ticker, start_date, end_date)
+                synthetic_tickers.append(ticker)
 
             with_feats = self._compute_rolling_features(raw)
             with_label = self._generate_labels(with_feats)
+            if with_label.empty:
+                missing_tickers.append(ticker)
+                logger.warning(
+                    "[dataset_builder] %s: label 생성 후 데이터 없음, skip", ticker
+                )
+                continue
+            loaded_tickers.append(ticker)
             per_ticker_frames.append(with_label)
 
         if not per_ticker_frames:
@@ -174,12 +289,36 @@ class DatasetBuilder:
                 f"artifacts_dir={self._artifacts_dir} 확인."
             )
 
+        panel_attrs = {
+            "data_source": "synthetic_fallback" if synthetic_tickers else "artifact_bars",
+            "requested_tickers": list(padded),
+            "loaded_tickers": list(loaded_tickers),
+            "missing_tickers": sorted(set(missing_tickers)),
+            "synthetic_tickers": list(synthetic_tickers),
+            "synthetic_fallback": bool(synthetic_tickers),
+        }
         panel = pd.concat(per_ticker_frames, axis=0)
+        panel.attrs.update(panel_attrs)
         panel = self._cross_sectional_rank(panel)
+        panel.attrs.update(panel_attrs)
+
+        # S4-2: Dual-Source 5피처 join (enabled_for_lgbm=true 시)
+        if self._ds_enabled_for_lgbm:
+            panel = self._join_dual_source_features(panel, start_date, end_date)
+            panel.attrs.update(panel_attrs)
+
+        if self._exog_enabled_for_lgbm:
+            panel = self._join_exogenous_features(panel)
+            panel.attrs.update(panel_attrs)
+
+        if self._neutral_feature_cols:
+            panel = self._join_neutral_feature_columns(panel)
+            panel.attrs.update(panel_attrs)
 
         # label/rank NaN 행 drop
         before = len(panel)
         panel = panel.dropna(subset=[self._target_col, self._rank_col, "relevance"])
+        panel.attrs.update(panel_attrs)
         logger.info(
             "[dataset_builder] 최종 panel: %d rows (pre-drop %d, "
             "drop %d NaN label/rank 행)",
@@ -193,6 +332,142 @@ class DatasetBuilder:
         if self._leakage_guard:
             self._assert_no_leakage(panel)
 
+        return panel
+
+    def add_neutral_feature_columns(self, columns: list[str]) -> None:
+        """외부 재학습 오케스트레이터가 요구하는 후보 피처를 neutral 0.0으로 추가."""
+        for col in columns:
+            if col not in self._neutral_feature_cols:
+                self._neutral_feature_cols.append(str(col))
+
+    def relabel_panel_for_target(self, panel, target_col: str):
+        """기존 panel을 다른 label 컬럼 기준으로 재-rank한다.
+
+        Cost-aware 실험용. 기본 학습 타깃(label_5m_ret)은 건드리지 않고,
+        보조 라벨(label_session_close_net_ret 등)을 대상으로 cs_rank/relevance만
+        다시 계산한다.
+        """
+        target = str(target_col)
+        if target not in panel.columns:
+            raise KeyError(f"target_col='{target}' panel에 없음")
+
+        frame = panel.reset_index() if "ticker" in (panel.index.names or []) else panel.copy()
+        frame = frame.dropna(subset=[target]).copy()
+        frame[self._rank_col] = frame.groupby("ts_close")[target].rank(
+            method="average",
+            pct=True,
+        )
+        frame["relevance"] = self._to_relevance(frame[self._rank_col], self._n_relevance_grades)
+
+        group_sizes = frame.groupby("ts_close")["close"].transform("count")
+        frame = frame[group_sizes >= self._n_relevance_grades].copy()
+        return frame.set_index(["ticker", "ts_close"]).sort_index()
+
+    def _join_neutral_feature_columns(self, panel):
+        panel = panel.copy()
+        for col in self._neutral_feature_cols:
+            panel[col] = 0.0
+        logger.info(
+            "[dataset_builder] neutral feature join 완료: cols=%d",
+            len(self._neutral_feature_cols),
+        )
+        return panel
+
+    def _join_exogenous_features(self, panel):
+        """C3 외생 feature_manifest 컬럼을 panel에 추가.
+
+        daily exogenous artifact(new/artifacts/exogenous/YYYYMMDD.json)가 있으면
+        날짜/ticker 기준으로 join한다. 파일 또는 ticker별 값이 없으면
+        risk_config.yaml exogenous_features.neutral_defaults로 채운다.
+        """
+        panel = panel.copy()
+        for col in self._exog_feature_cols:
+            panel[col] = float(self._exog_defaults.get(col, 0.0))
+
+        if panel.empty:
+            panel.attrs["exogenous_join_stats"] = {
+                "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+                "dates_found": 0,
+                "dates_missing": 0,
+                "rows_total": 0,
+                "rows_non_neutral": 0,
+                "non_neutral_rate": 0.0,
+            }
+            return panel
+
+        panel_for_join = panel.drop(
+            columns=[
+                col for col in ("ticker", "ts_close")
+                if col in panel.columns and col in panel.index.names
+            ],
+            errors="ignore",
+        )
+        panel_flat = panel_for_join.reset_index()
+        panel_flat["date_str"] = panel_flat["ts_close"].dt.strftime("%Y%m%d")
+        date_keys = sorted(panel_flat["date_str"].unique().tolist())
+        date_score_maps: dict[str, dict[str, dict[str, float]]] = {}
+        dates_found = 0
+        dates_missing = 0
+
+        for date_key in date_keys:
+            score_map, stats = load_exogenous_scores(
+                date_key,
+                feature_cols=self._exog_feature_cols,
+                defaults=self._exog_defaults,
+                artifact_dir=DEFAULT_EXOGENOUS_ARTIFACT_DIR,
+            )
+            if stats["status"] == "found":
+                dates_found += 1
+                date_score_maps[date_key] = score_map
+            else:
+                dates_missing += 1
+
+        rows_non_neutral = 0
+        if date_score_maps:
+            for idx, row in panel_flat.iterrows():
+                score_map = date_score_maps.get(str(row["date_str"]), {})
+                global_values = score_map.get("*", {})
+                ticker_values = score_map.get(str(row["ticker"]).zfill(6), {})
+                applied = {
+                    col: float(
+                        ticker_values.get(
+                            col,
+                            global_values.get(col, self._exog_defaults.get(col, 0.0)),
+                        )
+                    )
+                    for col in self._exog_feature_cols
+                }
+                for col, value in applied.items():
+                    panel_flat.at[idx, col] = value
+                if is_non_neutral(applied, self._exog_defaults):
+                    rows_non_neutral += 1
+
+            panel = (
+                panel_flat.drop(columns=["date_str"])
+                .set_index(["ticker", "ts_close"])
+                .sort_index()
+            )
+        else:
+            rows_non_neutral = 0
+
+        rows_total = int(len(panel))
+        panel.attrs["exogenous_join_stats"] = {
+            "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+            "dates_found": dates_found,
+            "dates_missing": dates_missing,
+            "rows_total": rows_total,
+            "rows_non_neutral": rows_non_neutral,
+            "non_neutral_rate": rows_non_neutral / max(rows_total, 1),
+        }
+        logger.info(
+            "[dataset_builder] Exogenous feature join 완료: cols=%d dates_found=%d "
+            "dates_missing=%d non_neutral_rows=%d/%d",
+            len(self._exog_feature_cols),
+            dates_found,
+            dates_missing,
+            rows_non_neutral,
+            rows_total,
+        )
         return panel
 
     # ================================================================== #
@@ -250,6 +525,76 @@ class DatasetBuilder:
             combined[col] = combined[col].astype(float)
 
         return combined
+
+    def _make_synthetic_bars(self, ticker: str, start_date: str, end_date: str):
+        """KIS/backfill blocker 환경에서 학습용 mock 1분봉 생성."""
+        pd = _import_pandas()
+        start = _parse_yyyymmdd(start_date)
+        end = _parse_yyyymmdd(end_date)
+        trading_minutes = int(self._cfg_wf.get("trading_minutes_per_day", 390))
+        base_price = float(self._cfg_mock.get("base_price", 50000))
+        price_modulo = int(self._cfg_mock.get("price_modulo", 100000))
+        volume_min = int(self._cfg_mock.get("volume_min", 1000))
+        volume_max = int(self._cfg_mock.get("volume_max", 100000))
+        change_min = float(self._cfg_mock.get("change_min", 0))
+        change_max = float(self._cfg_mock.get("change_max", 100))
+        drift_scale = float(self._cfg_nightly.get("synthetic_drift_scale", 0.00005))
+        return_noise_std = float(
+            self._cfg_nightly.get("synthetic_return_noise_std", 0.0015)
+        )
+        min_price = float(self._cfg_nightly.get("synthetic_min_price", 1000.0))
+        session_start_raw = str(self._cfg_nightly.get("synthetic_session_start", "09:00"))
+        try:
+            session_hour, session_minute = [int(part) for part in session_start_raw.split(":", 1)]
+        except ValueError as e:
+            raise DatasetBuildError(
+                "nightly_retrainer.synthetic_session_start 형식 오류: "
+                f"{session_start_raw!r}, expected HH:MM"
+            ) from e
+
+        seed = self._synthetic_seed + sum(ord(ch) for ch in ticker)
+        rng = np.random.default_rng(seed)
+        ticker_offset = sum(ord(ch) for ch in ticker) % max(price_modulo, 1)
+        price = base_price + float(ticker_offset)
+        records: list[dict[str, object]] = []
+
+        current = start
+        while current <= end:
+            if current.weekday() >= 5:
+                current += timedelta(days=1)
+                continue
+            session_start = datetime(
+                current.year,
+                current.month,
+                current.day,
+                session_hour,
+                session_minute,
+                0,
+                tzinfo=_KST,
+            )
+            for minute in range(trading_minutes):
+                ts = session_start + timedelta(minutes=minute)
+                drift = (ticker_offset / max(price_modulo, 1) - 0.5) * drift_scale
+                shock = float(rng.normal(0.0, return_noise_std))
+                open_price = price
+                close = max(min_price, open_price * (1.0 + drift + shock))
+                spread = abs(float(rng.normal(change_min, max(change_max, 1.0))))
+                high = max(open_price, close) + spread
+                low = max(1.0, min(open_price, close) - spread)
+                volume = int(rng.integers(volume_min, volume_max + 1))
+                records.append({
+                    "ticker": ticker,
+                    "ts_close": ts,
+                    "open": float(open_price),
+                    "high": float(high),
+                    "low": float(low),
+                    "close": float(close),
+                    "volume": float(volume),
+                })
+                price = close
+            current += timedelta(days=1)
+
+        return pd.DataFrame(records)
 
     def _read_bar_file(self, file_path: Path):
         """parquet 또는 jsonl 읽기. 실패 시 None 반환 (한 파일 실패가 전체를 막지 않게)."""
@@ -366,35 +711,87 @@ class DatasetBuilder:
     # ================================================================== #
 
     def _generate_labels(self, df):
-        """close_{t+horizon} / close_t - 1 label. 마지막 horizon bars는 NaN 후 drop.
+        """거래일 내부에서만 close_{t+horizon} / close_t - 1 label 생성.
 
-        drop_last_n_bars (risk_config.yaml label.drop_last_n_bars) 적용.
-        leakage_guard는 최종 panel 단계에서 재검증 (_assert_no_leakage).
+        ticker × KST 거래일 단위로 마지막 drop_last_n_bars를 제거한다.
+        이렇게 해야 하루 마지막 bar가 다음 거래일 첫 bar를 label로 참조하지 않는다.
         """
         pd = _import_pandas()
 
-        h = self._horizon
-        closes = df["close"].to_numpy(dtype=float)
-        n = len(closes)
+        missing_cols = {"close", "ts_close"} - set(df.columns)
+        if missing_cols:
+            raise DatasetBuildError(
+                "label 생성 필수 컬럼 누락: "
+                f"{sorted(missing_cols)}"
+            )
 
-        labels = np.full(n, np.nan, dtype=float)
-        if n > h:
-            future = closes[h:]
-            now = closes[:-h]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ret = np.where(now > 1e-8, future / now - 1.0, np.nan)
-            labels[:-h] = ret
+        h = self._horizon
+        drop_count = max(h, self._drop_last_n)
 
         out = df.copy()
-        out[self._target_col] = labels
+        out["ts_close"] = self._normalize_ts_close_kst(out["ts_close"], pd)
+        sort_cols = ["ts_close"]
+        group_cols = ["_label_session"]
+        if "ticker" in out.columns:
+            sort_cols = ["ticker", "ts_close"]
+            group_cols = ["ticker", "_label_session"]
+        out = out.sort_values(sort_cols).reset_index(drop=True)
 
-        # 마지막 horizon bars + drop_last_n_bars (추가 safety) 만큼 drop.
-        # len(out) <= drop_count 이면 iloc[:-drop_count]는 empty → 그대로 반환.
-        drop_count = max(h, self._drop_last_n)
-        if drop_count > 0:
-            out = out.iloc[:-drop_count].copy()
+        out["_label_session"] = out["ts_close"].dt.date
+
+        labels = np.full(len(out), np.nan, dtype=float)
+        session_close_labels = np.full(len(out), np.nan, dtype=float)
+        close_values = out["close"].to_numpy(dtype=float)
+        grouped_positions = out.groupby(group_cols, sort=False).indices
+        for positions in grouped_positions.values():
+            positions = np.asarray(positions, dtype=np.int64)
+            valid_count = max(0, len(positions) - drop_count)
+            if valid_count <= 0:
+                continue
+            closes = close_values[positions]
+            now = closes[:valid_count]
+            future = closes[h:h + valid_count]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                labels[positions[:valid_count]] = np.where(
+                    now > 1e-8,
+                    future / now - 1.0,
+                    np.nan,
+                )
+            session_close = float(closes[-1])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                session_close_labels[positions[:valid_count]] = np.where(
+                    now > 1e-8,
+                    session_close / now - 1.0,
+                    np.nan,
+                )
+
+        out = out.drop(columns=["_label_session"])
+        out[self._target_col] = labels
+        active_net_col = f"label_{h}m_net_bps"
+        out[active_net_col] = out[self._target_col] * 10_000.0 - self._label_total_cost_bps
+        out[f"label_{h}m_net_ret"] = out[active_net_col] / 10_000.0
+        out[f"label_{h}m_tradeable"] = (
+            out[active_net_col] >= self._label_min_expected_net_bps
+        ).astype("Int64")
+        out["label_session_close_ret"] = session_close_labels
+        out["label_session_close_net_bps"] = (
+            out["label_session_close_ret"] * 10_000.0 - self._label_total_cost_bps
+        )
+        out["label_session_close_net_ret"] = out["label_session_close_net_bps"] / 10_000.0
+        out["label_session_close_tradeable"] = (
+            out["label_session_close_net_bps"] >= self._label_min_expected_net_bps
+        ).astype("Int64")
+        out = out.dropna(subset=[self._target_col]).copy()
 
         return out
+
+    @staticmethod
+    def _normalize_ts_close_kst(ts_close, pd):
+        """ts_close를 KST-aware pandas Series로 정규화."""
+        ts = pd.to_datetime(ts_close)
+        if ts.dt.tz is None:
+            return ts.dt.tz_localize(_KST)
+        return ts.dt.tz_convert(_KST)
 
     # ================================================================== #
     # Step 4: cross-sectional rank + relevance grade
@@ -463,6 +860,160 @@ class DatasetBuilder:
         )
         # Categorical → float (NaN 보존)
         return binned.astype(float).rename("relevance")
+
+    # ================================================================== #
+    # Step 4b: Dual-Source 5피처 join (S4-2)
+    # ================================================================== #
+
+    def _join_dual_source_features(self, panel, start_date: str, end_date: str):
+        """날짜 범위 내 Dual-Source 5피처를 panel에 left join.
+
+        - panel: MultiIndex (ticker, ts_close) DataFrame.
+        - dual_source_runner.load_latest_scores(date_str) → list[dict] 로드.
+          각 dict: {"ticker": str, "news_score_t": float, ..., "community_noise_multiplier": float}.
+        - 날짜 기준 join: ts_close.date() = 배치 날짜 매핑.
+        - 결측 시 per-feature neutral 기본값
+          (community_noise_multiplier=1.0, 나머지=0.0).
+
+        PIT-Safety:
+          - load_latest_scores는 YYYYMMDD 배치 파일(08:30 KST 생성)을 로드.
+          - ts_close는 장중 1분봉 → 당일 배치 점수와 join 시 미래 참조 없음.
+          - 단, 배치 파일 생성이 ts_close보다 이전임을 보장 (08:30 KST < 09:00 KST).
+
+        R1-W4 벡터화: 행 단위 iloc 루프 → reset_index + merge + set_index.
+        1년치 20종목 1분봉 (~700만 행) 기준 O(N) merge로 대폭 가속.
+        """
+        pd = _import_pandas()
+        start = _parse_yyyymmdd(start_date)
+        end = _parse_yyyymmdd(end_date)
+
+        # 날짜 범위 내 모든 날짜의 Dual-Source 점수를 미리 로드
+        # {date_str: {ticker: {feat: val}}}
+        date_ticker_scores: dict[str, dict[str, dict[str, float]]] = {}
+
+        current = start
+        while current <= end:
+            date_str = current.strftime("%Y%m%d")
+            scores_list: list[dict] = load_latest_scores(date_str)
+            if scores_list:
+                ticker_map: dict[str, dict[str, float]] = {}
+                for item in scores_list:
+                    t = str(item.get("ticker", "")).zfill(6)
+                    if not t or t == "000000":
+                        continue
+                    ticker_map[t] = {
+                        feat: float(item.get(feat, DUAL_SOURCE_DEFAULTS.get(feat, 0.0)))
+                        for feat in self._ds_feature_cols
+                    }
+                date_ticker_scores[date_str] = ticker_map
+            current = current + timedelta(days=1)
+
+        if not date_ticker_scores:
+            logger.warning(
+                "[dataset_builder] Dual-Source 점수 파일 없음 (%s~%s). "
+                "5피처 neutral 기본값 사용.",
+                start_date, end_date,
+            )
+
+        # panel에 5피처 컬럼 추가 (per-feature neutral defaults).
+        panel = panel.copy()
+        for feat in self._ds_feature_cols:
+            panel[feat] = float(DUAL_SOURCE_DEFAULTS.get(feat, 0.0))
+
+        if not date_ticker_scores:
+            panel.attrs["dual_source_join_stats"] = {
+                "dates_found": 0,
+                "dates_missing": (end - start).days + 1,
+                "rows_total": int(len(panel)),
+                "rows_non_neutral": 0,
+                "non_neutral_rate": 0.0,
+            }
+            logger.info("[dataset_builder] Dual-Source join 완료: neutral 기본값 (파일 없음)")
+            return panel
+
+        # date_ticker_scores → DataFrame 변환 후 벡터화 merge
+        # {date_str: {ticker: {feat: val}}} → flat records
+        ds_records = []
+        for date_str, ticker_map in date_ticker_scores.items():
+            for ticker, feats in ticker_map.items():
+                ds_records.append(
+                    {
+                        "date_str": date_str,
+                        "ticker": ticker,
+                        "_dual_source_matched": True,
+                        **{
+                            feat: float(feats.get(feat, DUAL_SOURCE_DEFAULTS.get(feat, 0.0)))
+                            for feat in self._ds_feature_cols
+                        },
+                    }
+                )
+
+        if not ds_records:
+            panel.attrs["dual_source_join_stats"] = {
+                "dates_found": len(date_ticker_scores),
+                "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
+                "rows_total": int(len(panel)),
+                "rows_join_hit": 0,
+                "rows_join_miss": int(len(panel)),
+                "rows_non_neutral": 0,
+                "non_neutral_rate": 0.0,
+            }
+            logger.info("[dataset_builder] Dual-Source join 완료: neutral 기본값 (레코드 없음)")
+            return panel
+
+        ds_df = pd.DataFrame(ds_records)
+
+        # panel을 flat으로 펼쳐 merge 후 다시 MultiIndex 복원
+        panel_flat = panel.reset_index()
+        panel_flat["date_str"] = panel_flat["ts_close"].dt.strftime("%Y%m%d")
+
+        # 5피처 컬럼을 left join 전에 제거 (merge 후 _x/_y 충돌 방지)
+        panel_flat_base = panel_flat.drop(columns=list(self._ds_feature_cols), errors="ignore")
+
+        merged = panel_flat_base.merge(
+            ds_df,
+            on=["date_str", "ticker"],
+            how="left",
+        )
+
+        matched_mask = merged["_dual_source_matched"].astype("boolean").fillna(False)
+
+        # 결측 → per-feature neutral defaults 채우기.
+        for feat in self._ds_feature_cols:
+            merged[feat] = merged[feat].fillna(float(DUAL_SOURCE_DEFAULTS.get(feat, 0.0)))
+
+        # join 통계 (hit = score file row matched, non-neutral = neutral default와 다름)
+        join_hit = int(matched_mask.sum())
+        join_miss = len(merged) - join_hit
+
+        neutral_cmp = (
+            ((merged["news_score_t"].astype(float) - DUAL_SOURCE_DEFAULTS["news_score_t"]).abs() > 1e-12)
+            | ((merged["comm_score_t_1"].astype(float) - DUAL_SOURCE_DEFAULTS["comm_score_t_1"]).abs() > 1e-12)
+            | ((merged["comm_score_t_2"].astype(float) - DUAL_SOURCE_DEFAULTS["comm_score_t_2"]).abs() > 1e-12)
+            | ((merged["news_comm_divergence"].astype(float) - DUAL_SOURCE_DEFAULTS["news_comm_divergence"]).abs() > 1e-12)
+            | ((merged["community_noise_multiplier"].astype(float) - DUAL_SOURCE_DEFAULTS["community_noise_multiplier"]).abs() > 1e-12)
+        )
+        non_neutral_rows = int(neutral_cmp.sum())
+
+        # date_str 컬럼 제거 후 MultiIndex 복원
+        merged = merged.drop(columns=["date_str", "_dual_source_matched"])
+        panel = merged.set_index(["ticker", "ts_close"]).sort_index()
+
+        total = join_hit + join_miss
+        panel.attrs["dual_source_join_stats"] = {
+            "dates_found": len(date_ticker_scores),
+            "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
+            "rows_total": int(len(panel)),
+            "rows_with_any_non_zero": join_hit,
+            "rows_non_neutral": non_neutral_rows,
+            "non_neutral_rate": non_neutral_rows / max(len(panel), 1),
+        }
+        logger.info(
+            "[dataset_builder] Dual-Source join 완료 (벡터화): hit=%d miss=%d (%.1f%% 적용)",
+            join_hit, join_miss,
+            100.0 * join_hit / max(total, 1),
+        )
+        return panel
 
     # ================================================================== #
     # PIT-safety re-assertion

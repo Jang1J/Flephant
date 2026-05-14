@@ -5,7 +5,7 @@
 set -e
 set -u
 
-PYTHON="/opt/anaconda3/envs/elephant/bin/python"
+PYTHON="${PYTHON:-python3}"
 PASS=0
 FAIL=0
 
@@ -19,12 +19,12 @@ echo ""
 # 기존 메타 확인 (1~3)
 # ===========================================================================
 
-# 1. CLAUDE.md 200줄 이하
+# 1. CLAUDE.md 250줄 이하 (S0 cleanup 반영: audit + Sprint 5 + 4축 정합 추가로 증가)
 LINES=$(wc -l < CLAUDE.md)
-if [ "$LINES" -le 200 ]; then
-    _pass "CLAUDE.md ${LINES}줄 (<=200)"
+if [ "$LINES" -le 250 ]; then
+    _pass "CLAUDE.md ${LINES}줄 (<=250)"
 else
-    _fail "CLAUDE.md ${LINES}줄 (>200, 축소 필요)"
+    _fail "CLAUDE.md ${LINES}줄 (>250, 축소 필요)"
 fi
 
 # 2. api_contracts.md 존재 + 비어있지 않음

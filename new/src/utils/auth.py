@@ -37,6 +37,9 @@ class AuthManager:
 
     _kis_token: str | None
     _kis_token_expires_at: datetime | None
+    _shared_kis_token: str | None = None
+    _shared_kis_token_expires_at: datetime | None = None
+    _shared_kis_token_scope: tuple[str, str] | None = None
 
     def __init__(self) -> None:
         self._kis_token = None
@@ -52,14 +55,20 @@ class AuthManager:
 
     def needs_refresh(self) -> bool:
         """토큰 갱신 필요 여부 public API (S1-7 SafetyGuards 등이 호출)."""
-        return self._need_refresh()
+        return self._need_refresh() and not self._load_shared_kis_token()
 
     def get_kis_token(self) -> str:
         """유효 KIS access_token. 만료 5분 전이면 auto refresh."""
         if self._need_refresh():
+            if self._load_shared_kis_token():
+                if self._kis_token is None:
+                    raise RuntimeError("[auth] 공유 KIS 토큰 로드 후에도 None. 내부 버그.")
+                return self._kis_token
+
             token, expires_at = self._fetch_kis_token()
             self._kis_token = token
             self._kis_token_expires_at = expires_at
+            self._store_shared_kis_token(token, expires_at)
             logger.info(
                 "KIS 토큰 발급 완료. 만료: %s, 마스킹: %s",
                 expires_at.isoformat(),
@@ -89,12 +98,30 @@ class AuthManager:
         """ECOS API 키. 환경변수 누락 시 EnvironmentError."""
         return self._require_env("ECOS_API_KEY")
 
+    def get_mode(self) -> str:
+        """KIS_MODE 환경변수 일원 read. 기본 'virtual' (mock/virtual/real)."""
+        return os.getenv("KIS_MODE", "virtual").strip().lower()
+
     def get_kis_base_url(self) -> str:
         """KIS_MODE 환경변수에 따라 모의(virtual) / 실계좌(real) base URL 반환."""
-        mode = os.getenv("KIS_MODE", "virtual").strip().lower()
+        mode = self.get_mode()
         if mode == "real":
             return _KIS_BASE_REAL
         return _KIS_BASE_VIRTUAL
+
+    def get_kis_app_credentials(self) -> tuple[str, str]:
+        """KIS REST 요청 헤더용 app key/secret. 값은 호출자 로그에 남기지 않는다."""
+        return (
+            self._require_first_env(self._mode_specific_kis_keys("APP_KEY")),
+            self._require_first_env(self._mode_specific_kis_keys("APP_SECRET")),
+        )
+
+    def get_kis_account_parts(self) -> tuple[str, str]:
+        """KIS 계좌번호/상품코드. mode-specific env를 generic env보다 우선한다."""
+        return (
+            self._require_first_env(self._mode_specific_kis_keys("ACCOUNT_NUMBER")),
+            self._require_first_env(self._mode_specific_kis_keys("ACCOUNT_PRODUCT_CODE")),
+        )
 
     def validate_env(self) -> dict[str, bool]:
         """각 환경변수 존재 여부 dict. 값은 출력 안 함.
@@ -106,6 +133,7 @@ class AuthManager:
             "KIS_APP_KEY",
             "KIS_APP_SECRET",
             "KIS_ACCOUNT_NUMBER",
+            "KIS_ACCOUNT_PRODUCT_CODE",
             "KIS_MODE",
             "DART_API_KEY",
             "KRX_API_KEY",
@@ -132,6 +160,37 @@ class AuthManager:
         now = datetime.now(tz=timezone.utc)
         return (self._kis_token_expires_at - now).total_seconds() < self.refresh_margin_sec
 
+    def _kis_token_scope(self) -> tuple[str, str]:
+        """프로세스 내 KIS 토큰 공유 범위. 값은 로그에 노출하지 않는다."""
+        try:
+            app_key, _ = self.get_kis_app_credentials()
+        except EnvironmentError:
+            app_key = ""
+        return (self.get_mode(), app_key)
+
+    def _load_shared_kis_token(self) -> bool:
+        """동일 프로세스의 다른 AuthManager가 발급한 KIS 토큰 재사용."""
+        cls = type(self)
+        token = cls._shared_kis_token
+        expires_at = cls._shared_kis_token_expires_at
+        if token is None or expires_at is None:
+            return False
+        if cls._shared_kis_token_scope != self._kis_token_scope():
+            return False
+        now = datetime.now(tz=timezone.utc)
+        if (expires_at - now).total_seconds() < self.refresh_margin_sec:
+            return False
+        self._kis_token = token
+        self._kis_token_expires_at = expires_at
+        return True
+
+    def _store_shared_kis_token(self, token: str, expires_at: datetime) -> None:
+        """KIS OAuth 재발급 제한 회피를 위한 프로세스 단위 메모리 캐시."""
+        cls = type(self)
+        cls._shared_kis_token = token
+        cls._shared_kis_token_expires_at = expires_at
+        cls._shared_kis_token_scope = self._kis_token_scope()
+
     def _fetch_kis_token(self) -> tuple[str, datetime]:
         """KIS OAuth POST /oauth2/tokenP 호출. 재시도 3회 포함.
 
@@ -142,8 +201,7 @@ class AuthManager:
             AuthenticationError: 401/403 응답
             ConnectionError: 재시도 소진
         """
-        app_key = self._require_env("KIS_APP_KEY")
-        app_secret = self._require_env("KIS_APP_SECRET")
+        app_key, app_secret = self.get_kis_app_credentials()
         base_url = self.get_kis_base_url()
         url = f"{base_url}{_KIS_TOKEN_PATH}"
 
@@ -161,8 +219,14 @@ class AuthManager:
                 status = response.get("_status_code", 200)
 
                 if status in (401, 403):
+                    msg_cd = str(response.get("msg_cd") or response.get("error_code") or "")
+                    msg = str(response.get("msg1") or response.get("msg") or response.get("error_description") or "")
+                    detail = (
+                        f" msg_cd={msg_cd} msg={msg}"
+                        if msg_cd or msg else ""
+                    )
                     raise AuthenticationError(
-                        f"KIS 인증 실패 (HTTP {status}). appkey/appsecret 확인 필요."
+                        f"KIS 인증 실패 (HTTP {status}). appkey/appsecret 확인 필요.{detail}"
                     )
                 if status != 200:
                     raise ConnectionError(f"KIS 토큰 API 오류 (HTTP {status})")
@@ -189,6 +253,23 @@ class AuthManager:
         raise ConnectionError(
             f"KIS 토큰 발급 {len(self.retry_delays)}회 재시도 소진: {last_exc}"
         )
+
+    def _mode_specific_kis_keys(self, suffix: str) -> list[str]:
+        """KIS_MODE별 env 후보. 명시적 paper/real 값을 generic 값보다 우선한다."""
+        mode = self.get_mode()
+        if mode == "virtual":
+            return [f"KIS_PAPER_{suffix}", f"KIS_{suffix}"]
+        if mode == "real":
+            return [f"KIS_REAL_{suffix}", f"KIS_{suffix}"]
+        return [f"KIS_{suffix}"]
+
+    def _require_first_env(self, keys: list[str]) -> str:
+        for key in keys:
+            value = os.getenv(key, "").strip()
+            if value:
+                return value
+        joined = "/".join(keys)
+        raise EnvironmentError(f"필수 환경변수 누락: {joined}")
 
     def _http_post(
         self,

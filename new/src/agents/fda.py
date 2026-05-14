@@ -25,11 +25,12 @@ from typing import Any
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
+from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 
 logger = get_logger("fda")
 
-_FDA_COLD_CALLER = "fda"
+_FDA_COLD_CALLER = "fda_cold_path"
 
 
 class MissingPortfolioPatchError(ValueError):
@@ -94,10 +95,11 @@ class FDAAgent(AgentBase):
                 {str(c) for c in candidates}
             )
         except (KeyError, TypeError):
-            # reason_code_catalog 없는 경우 최소 draft enum
+            # reason_code_catalog 없는 경우 7종 전체 enum (S2-9 최종 확정)
             self._valid_reason_codes = frozenset({
                 "NORMAL_APPROVE", "TIMEOUT", "RISK_FAST_TRIGGER",
                 "DEBATE_CONFLICT", "NEWS_DIVERGENCE",
+                "QUANT_ANOMALY", "MISSING_PORTFOLIO_PATCH",
             })
         # reason_code_catalog에 7종 전부 있는지 확인.
         # risk_config.yaml candidates에 QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH 포함 여부 점검.
@@ -562,9 +564,8 @@ class FDAAgent(AgentBase):
 
     def _parse_cold_llm(self, content: str) -> dict[str, Any]:
         """FDA Cold Path LLM 응답 파싱."""
-        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
         try:
-            parsed = json.loads(stripped)
+            parsed = parse_llm_json(content)
             rc = str(parsed.get("reason_code", "NORMAL_APPROVE"))
             if rc not in self._valid_reason_codes:
                 rc = "NORMAL_APPROVE"

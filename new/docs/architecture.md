@@ -9,6 +9,9 @@
 > v3.3 (2026-04-21): C9 input uncertainty_score non-breaking extension + uncertainty_signal channel
 > v3.4 (2026-04-21): MSG/APM/DEC/OP ID UUID8 정정 (seq 충돌 방지)
 > v3.5 (2026-04-21): PP/BUNDLE/BT/RPT/FCC/RGC ID UUID8 정정 (전수 통일). BT {tool} 컴포넌트 제거.
+> v3.6 (2026-05-02): Sprint 4 반영. dual_source 피처 표기 통일 (언더스코어) / Persistent Cache S4-7 SQLite 명시 / §5.6 prediction_history KB 범위 명확화 / DQR stage_0 / Memory Restorer Bootstrap / E2E Profiler.
+> v3.7 (2026-05-02): 전수 리뷰 fix. §8.0.1 타임라인 8단계 (stage_0 DQR) 명시 / §3.2 LightGBM n_estimators=500 (risk_config SSOT) 정정.
+> v3.8 (2026-05-03): §7.4 DYNAMIC_OVERLAY_ACTIVE / DYNAMIC_OVERLAY_DISABLED 2 상태 추가 + §14 신규 3 ID (ADM/EXT/WS) 등록. Sprint 5 진입.
 > 근거: 교수님 피드백 + 6개 논문 분석 (AAPM, AlphaGAT, MetaGPT, RD-Agent, TradeXpert, AlphaAgent)
 > 외부 AI 검증 (v2.1): GPT Pro 평균 8.6/10 (멀티에이전트 정체성 9.1, RL 배치 8.9, 실시간성 8.7, 아키텍처 8.6, 명세 7.2, 실거래 7.1)
 > 위치: /Elephant_Lab/new/
@@ -149,8 +152,8 @@ Layer 1: Execution (실행 + 피드백)
 팀 병합 결과로, 뉴스와 커뮤니티를 **같은 텍스트로 합치지 않고 서로 다른 소스**로 취급한다.
 
 - **뉴스**: 신뢰도 높고 반영 속도 빠름 → `news_score_t`, 빠른 decay (`lambda_news = 0.8`)
-- **커뮤니티**: 노이즈 높고 개인 투자자 반응이 늦음 → `comm_score_t-1`, `comm_score_t-2`, 느린 decay (`lambda_comm = 0.4`, `peak_lag_days = 2`)
-- **소스 간 불일치**: `news_comm_divergence = |news_score_t - comm_score_t-1|`
+- **커뮤니티**: 노이즈 높고 개인 투자자 반응이 늦음 → `comm_score_t_1`, `comm_score_t_2`, 느린 decay (`lambda_comm = 0.4`, `peak_lag_days = 2`)
+- **소스 간 불일치**: `news_comm_divergence = |news_score_t - comm_score_t_1|`
 - **노이즈 제어**: `community_noise_multiplier` (게시량 z-score 기반 감쇠)
 
 핵심 의미는 **"뉴스는 긍정인데 커뮤니티는 부정" 같은 방향 불일치 자체를 불확실성(UQ) 신호로 본다**는 것이다. 이 divergence는 가격/거래량만으로 포착하기 어렵고, 현재 프로젝트의 핵심 철학인 **정량화 불가능한 리스크 공백**을 채우는 대표 사례다.
@@ -191,7 +194,7 @@ Raw 1분봉 (8 features × active 20종목)
    (AlphaGAT CATimeMixer)
     ↓
 ④ Dual-Source 점수 생성 (08:00 batch, v3)
-   news_score_t / comm_score_t-1 / comm_score_t-2 / news_comm_divergence / community_noise_multiplier
+   news_score_t / comm_score_t_1 / comm_score_t_2 / news_comm_divergence / community_noise_multiplier
    ※ 뉴스는 FinBERT/로컬 분류기, 커뮤니티는 spam/manipulation/sentiment_dict 기반 점수화
     ↓
 ⑤ TSFresh 통계 추출 → 자연어 변환 (에이전트용)
@@ -254,7 +257,7 @@ Raw 1분봉 (8 features × active 20종목)
 
 **v3 즉시 반영 — Dual-Source Feature Pack**
 - `news_score_t`: 당일 뉴스/공시 점수 (빠른 decay)
-- `comm_score_t-1`, `comm_score_t-2`: 전일/전전일 커뮤니티 점수 (지연 반영)
+- `comm_score_t_1`, `comm_score_t_2`: 전일/전전일 커뮤니티 점수 (지연 반영)
 - `news_comm_divergence`: 두 소스 간 방향 불일치 → uncertainty
 - `community_noise_multiplier`: 게시량 급증 시 커뮤니티 가중치 감쇠
 
@@ -273,7 +276,7 @@ Cross-Asset 피처 (종목 간 correlation, sector mean)
   → LightGBM 입력 피처로 포함. "어제 밤 미국 → 오늘 한국" 패턴 학습.
   → Risk Agent도 동일 피처 사용 (us_vix → Regime Gate 판단).
     ↓
-LightGBM (n_estimators=200~2000, depth=4, early_stop)
+LightGBM (n_estimators=500, depth=4, early_stop)  # risk_config.yaml SSOT
     ↓
 출력: active 20종목 예측 시그널 + confidence
 ```
@@ -618,7 +621,9 @@ BacktestAgent = {
         "PerformanceAnalyzer"        # regime breakdown + ablation + baseline 비교 (C13)
     ],
     "deploy_decision_gate": {
-        "condition": "verdict == 'pass' AND regression_risk.flagged == false",
+        # Codex 권고 3 (2026-05-09): C12 spec 정합. minute_bar_leakage_check.verdict == "pass" 조건 추가.
+        # 이전: verdict + regression_risk 만 검증 → leakage 위반도 통과 가능 (PIT-Safety 우려).
+        "condition": "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass'",
         "on_pass": "22:00 배포 승인 (human_approval flag에 따라 자동 또는 operator 확인)",
         "on_warn": "operator 수동 확인 필수 (human_approval=true)",
         "on_fail": "22:00 배포 차단 + dead_letter_log 기록 + baseline 유지"
@@ -641,6 +646,7 @@ BacktestAgent = {
         "shared_message_pool_publish_during_market_hours",
         "production_direct_write"
     ],
+    "_note_c12_vs_c14": "C12 BacktestAgent forbidden_permissions = 6개 (위). C14 ModeBScheduler forbidden_permissions = 4개 (별도 집합, api_contracts.md C14 참조). 두 집합은 다른 권한 경계이므로 혼용 금지.",
     "runtime_guard": {
         "HOT_PATH_INTERVENTION_ATTEMPT": "Backtest Agent가 장중 시간대에 publish 시도 시 런타임 거부",
         "FORBIDDEN_FIELD_IN_OUTPUT": "output에 target_weights/order_deltas/approved/veto_reason/portfolio_patch_id 포함 시 런타임 거부"
@@ -1009,9 +1015,11 @@ failure_categories = {
 캐싱 대상:
   - 뉴스 분석 결과 (동일 뉴스 재분석 방지, TTL: 장중)
   - 팩터 IC 계산 결과 (매일 갱신)
-  - 에이전트 보고서 (TTL: 5분 or 이벤트까지)
+  - 에이전트 보고서 (TTL: risk_config.yaml `cache.agent_report_ttl_seconds`, 기본 1800초 = 30분)
   - Cross-Asset Attention 결과 (TTL: 1분)
 ```
+
+> S4-7 구현: backend=sqlite, storage_path=artifacts/cache/persistent_cache.db (risk_config.yaml cache 섹션 SSOT).
 
 ### 5.6 장중↔장마감 Memory 순환 연결 (GPT Pro 피드백 #6)
 
@@ -1021,7 +1029,7 @@ failure_categories = {
 │  에이전트별 memory 실시간 축적:                       │
 │  - News: micro_notes (종목별 이벤트 기록)             │
 │  - Risk: macro_notes (거시 상황 갱신)                 │
-│  - Quant: prediction_history (시그널 vs 실현)         │
+│  - Quant: prediction_history (시그널 vs 실현, Quant Agent 로컬 JSONL, KB storage_types 미포함)│
 │  - Debate: debate_history (pairwise 결과)             │
 │  - FDA: decision_history (승인/거부 + 결과)           │
 │                                                      │
@@ -1391,7 +1399,7 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 
 시스템은 아래 상태 중 하나에 있으며, 상태 전이는 명시적 이벤트로만 발생한다.
 
-**Mode A (장중) 상태 7개**
+**Mode A (장중) 상태 9개 (v3.8: DYNAMIC_OVERLAY_* 2개 추가)**
 
 | 상태 | 설명 | 전이 조건 |
 |------|------|---------|
@@ -1402,12 +1410,16 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
 | EMERGENCY_HALT | 긴급 전량 청산 + 시스템 중단. kill switch 또는 manual_emergency_halt. | kill_switch/manual_emergency_halt/OAuth 실패/잔고 불일치 → EMERGENCY_HALT |
 | MANUAL_OVERRIDE | 수동 일시정지 (manual_pause). 신규 주문 중단, 기존 포지션 유지. | manual_pause 명령 → MANUAL_OVERRIDE |
 | RECOVERY | 긴급 중단 후 복구 중. 포지션 확인 + 잔고 대조 | 검증 완료 → HOT_RUNNING |
+| DYNAMIC_OVERLAY_ACTIVE | `risk_config.yaml dynamic_universe.enabled=true` AND `candidate_pool_count >= 1` | `candidate_pool_count == 0` OR `enabled=false` → HOT_RUNNING |
+| DYNAMIC_OVERLAY_DISABLED | `risk_config.yaml dynamic_universe.enabled=false` | `enabled=true` AND operator 승인 → HOT_RUNNING |
+
+> **DYNAMIC_OVERLAY_ACTIVE 비고 (Sprint 5)**: Hot Path (LightGBM/PPO/PM/FDA)는 변경 없이 동작한다. overlay는 별도 pub/sub 채널 (`dynamic_overlay_update`) 비동기 발행. trade universe는 기존 20종목과 격리 유지.
 
 **Mode B (장마감) 상태 6개 — v2.2 신규 5개 + v3 MODE_B_BACKTEST 추가**
 
 | 상태 | 설명 | 전이 조건 |
 |------|------|---------|
-| MODE_B_IDLE | 장 마감 직후, 18:00 Mode B Scheduler 대기 | 18:00 → MODE_B_EVOLVING |
+| MODE_B_IDLE | 장 마감 직후, 18:00 Mode B Scheduler 대기 | 18:00 → MODE_B_EVOLVING<br>stage_0 DQR CRITICAL alert → MODE_B_BLOCKED |
 | MODE_B_EVOLVING | Alpha Factor Engine + Co-STEER + 에이전트 자기 개선 실행 (18:00~21:00) | 21:00 → MODE_B_BACKTEST |
 | MODE_B_BACKTEST | Backtest Agent 검증 실행 (21:00~21:30, v2.2 게이트) | verdict==pass → MODE_B_DEPLOY<br>verdict==warn → MODE_B_OPERATOR_REVIEW<br>verdict==fail → MODE_B_BLOCKED |
 | MODE_B_OPERATOR_REVIEW | human_approval 대기 | 승인 → MODE_B_DEPLOY<br>거부 → MODE_B_BLOCKED |
@@ -1422,9 +1434,15 @@ C11에서 드롭된 이벤트는 dead_letter_log에 보존한다.
   ANY → EMERGENCY_HALT → RECOVERY → HOT_RUNNING
   ANY → MANUAL_OVERRIDE → HOT_RUNNING
 
+Sprint 5 Dynamic Overlay 전이:
+  HOT_RUNNING + dynamic_universe.enabled=true + candidate_pool_count >= 1 → DYNAMIC_OVERLAY_ACTIVE
+  DYNAMIC_OVERLAY_ACTIVE + (candidate_pool_count == 0 OR enabled=false) → HOT_RUNNING
+  enabled=false 상태에서는 DYNAMIC_OVERLAY_ACTIVE 전이 자체가 차단됨 (gate.py)
+
 장 마감 전이 (v2.2 신규):
   HOT_RUNNING → MODE_B_IDLE (15:30 장 마감)
   MODE_B_IDLE → MODE_B_EVOLVING (18:00 Mode B Scheduler)
+  MODE_B_IDLE → MODE_B_BLOCKED (stage_0 DQR CRITICAL alert 시, 18:00 Scheduler 진입 전 차단)
   MODE_B_EVOLVING → MODE_B_BACKTEST (21:00)
   MODE_B_BACKTEST → MODE_B_DEPLOY (verdict==pass + no regression)
   MODE_B_BACKTEST → MODE_B_OPERATOR_REVIEW (verdict==warn)
@@ -1475,6 +1493,8 @@ Mode B는 **Mode B Scheduler**라는 전용 cron-style orchestrator가 관리한
 > **권한 분리 (v2.2)**: Backtest Agent = 검증자(verdict만), Mode B Deployer = 배포 실행자(actual swap).
 > Backtest Agent가 verdict=pass를 내도 실제 배포는 Deployer가 수행한다. 이는 C12 `can_write_to_production: false` 원칙과 일관된다.
 
+> **C12 vs C14 권한 경계 (SHIP-fix NEW-3, 2026-05-06)**: C14 ModeBScheduler `forbidden_permissions = 4개` (별도 집합, api_contracts.md C14 참조). §4.2 C12 BacktestAgent `forbidden_permissions = 6개`와 **다른 집합**이므로 혼용 금지. C12는 검증자 권한 경계, C14는 orchestrator 권한 경계.
+
 **bundle_id 생성 주체**: **Mode B Scheduler**가 `MODE_B_EVOLVING` 단계 시작 시 `BUNDLE-{yyyymmdd}-{UUID8}`를 발급하고, Alpha Factor Engine/Co-STEER/PPO retrain 출력물을 하나의 bundle로 묶어 Backtest Agent에 전달한다. (v3.5: {seq} → {UUID8} 정정)
 
 **backtest_history 저장**: KB (Knowledge Base)의 `backtest_history` 컬렉션. TTL 없음 (전체 이력 보존). Validation Tools 결과는 `result_persistence.ttl_days: 30` (risk_config.yaml).
@@ -1524,10 +1544,11 @@ Mode B Scheduler가 갱신하는 대상 yaml과 권한:
 
 ### 8.0.1 Mode B 타임라인 세분화
 
-> **v2.2 타임라인 세분화**: Mode B는 18:00~22:00 사이에 6단계로 진행된다.
+> **v2.2 타임라인 세분화**: Mode B는 18:00~22:00 사이에 8단계 (stage_0 DQR + stage_1~7)로 진행된다.
 > 각 단계는 직렬로 이어지며, Backtest Agent(§8.5.2)는 21:00~21:30의 시스템 검증 게이트이다.
 >
 > ```
+> 18:00       § stage_0  DQR (Data Quality Review, 2분 SLA)
 > 18:00       § 8.1  성과 분석 (8차원 벡터)
 > 18:30       § 8.2  방향 결정 (Thompson Sampling: factor vs model)
 > 19:00~20:00 § 8.3  팩터 진화 (Alpha Factor Engine: Idea/Factor/Eval)
@@ -1727,9 +1748,11 @@ v3 추가 — 산출물 분리:
     - config drift 검사 (risk_config.yaml vs api_contracts.md SSOT 일치)
 
 ③  배포 실행 (Mode B Deployer가 수행):
-    - 개선된 팩터 → Factor Zoo 활성화 (atomic swap)
-    - 재학습된 모델 → model_registry 교체 (rollback 가능)
-    - PPO Allocator → 새 policy 적용
+    - 배포 전 `artifacts/bundles/{bundle_id}` candidate 4종 존재/비어있지 않음 검증
+    - source와 live dest 경로가 같으면 즉시 차단 (live artifact 보호)
+    - 개선된 팩터 → `artifacts/alpha_factor/factor_zoo.jsonl` 활성화 (atomic swap)
+    - 재학습된 모델 → `artifacts/lgbm/latest_model.pkl` 교체 (rollback 가능)
+    - PPO Allocator → `artifacts/ppo/latest_policy.pkl` 적용
     - 에이전트 constraint → 다음 날 08:30 React Action에 반영
     - 배포 완료 ts + bundle_id + verdict → mode_b_audit_log 기록
     - 성공 → MODE_B_IDLE 전이
@@ -1970,6 +1993,9 @@ Phase 5: 통합 + 최적화
 | **model_version** (v3.1) | **baseline \| v{n}** | **baseline / v2 / v3** | **C17 ModelRegistryContract (artifacts/lgbm/)** |
 | **agent_performance_id** (v3.2, v3.4 포맷 정정) | **APM-{yyyymmdd}-{UUID8}** | **APM-20260421-A1B2C3D4** | **C18 AgentPerformanceContract (daily L2 rollup)** |
 | **kb_message_id** (v3.6, 2026-05-01) | **KB-{yyyymmdd}-{UUID8}** | **KB-20260501-A1B2C3D4** | **S3-11 KnowledgeBase.write() 반환값 (Layer 5)** |
+| **admission_event_id** (v3.8, Sprint 5) | **ADM-{yyyymmdd}-{UUID8}** | **ADM-20260503-A1B2C3D4** | **C15 candidate_pool 편입 이벤트** |
+| **exit_event_id** (v3.8, Sprint 5) | **EXT-{yyyymmdd}-{UUID8}** | **EXT-20260503-E5F6G7H8** | **C15 dynamic_holdings 청산 이벤트** |
+| **watch_snapshot_id** (v3.8, Sprint 5) | **WS-{yyyymmdd}-{UUID8}** | **WS-20260503-I9J0K1L2** | **C16 KOSPI200 60초 snapshot** |
 
 > 상세 계약서: new/specs/api_contracts.md 참조
 
@@ -1977,7 +2003,7 @@ Phase 5: 통합 + 최적화
 
 ---
 
-## §15 평가 매트릭스 & 성능 지표
+## 15. 평가 매트릭스 & 성능 지표
 
 평가 3-Layer (Sprint 2 S2-10 기준):
 - Layer 1: 모델 성능 (IC, ICIR, RankIC, AR, IR, MDD, SR)

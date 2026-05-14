@@ -186,6 +186,115 @@ def test_retrain_includes_bundle_id():
     assert result["bundle_id"] == bundle_id
 
 
+def test_retrain_bundle_candidate_not_promoted_latest():
+    """bundle_id가 있는 후보 학습은 deploy gate 전 latest로 승격하지 않는다."""
+    retrainer = _make_retrainer()
+    bundle_id = "BUNDLE-20260427-ABCD1234"
+
+    mock_trainer = MagicMock()
+    mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
+    mock_trainer.train.return_value = _mock_trainer_result("v3")
+
+    mock_registry = MagicMock()
+    mock_registry.list_versions.return_value = []
+
+    with patch.object(retrainer, "_next_version", return_value="v3"):
+        with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
+            with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
+                with patch.dict("sys.modules", {
+                    "src.models.lgbm_trainer": MagicMock(
+                        LGBMTrainer=MagicMock(return_value=mock_trainer)
+                    ),
+                    "src.models.registry": MagicMock(
+                        ModelRegistry=MagicMock(return_value=mock_registry)
+                    ),
+                }):
+                    result = retrainer.retrain(
+                        tickers=["005930"],
+                        end_date="2026-04-27",
+                        bundle_id=bundle_id,
+                    )
+
+    kwargs = mock_trainer.train.call_args.kwargs
+    assert kwargs["bundle_id"] == bundle_id
+    assert kwargs["is_latest"] is False
+    assert result["bundle_id"] == bundle_id
+    assert result["candidate_pending_deploy"] is True
+
+
+def test_retrain_blocks_synthetic_candidate_staging():
+    """synthetic fallback 학습 결과는 deploy candidate bundle로 stage하지 않는다."""
+    retrainer = _make_retrainer()
+    bundle_id = "BUNDLE-20260427-SYNTH001"
+
+    mock_trainer = MagicMock()
+    mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
+    mock_trainer.train.return_value = {
+        **_mock_trainer_result("v3"),
+        "synthetic_fallback": True,
+        "missing_tickers": [],
+    }
+
+    mock_registry = MagicMock()
+    mock_registry.list_versions.return_value = []
+
+    with patch.object(retrainer, "_next_version", return_value="v3"):
+        with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
+            with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
+                with patch.object(retrainer, "_stage_candidate_bundle") as stage_mock:
+                    with patch.dict("sys.modules", {
+                        "src.models.lgbm_trainer": MagicMock(
+                            LGBMTrainer=MagicMock(return_value=mock_trainer)
+                        ),
+                        "src.models.registry": MagicMock(
+                            ModelRegistry=MagicMock(return_value=mock_registry)
+                        ),
+                    }):
+                        result = retrainer.retrain(
+                            tickers=["005930"],
+                            end_date="2026-04-27",
+                            bundle_id=bundle_id,
+                        )
+
+    stage_mock.assert_not_called()
+    assert result["candidate_bundle_staged"] is False
+    assert result["candidate_bundle_reason"] == "synthetic_or_missing_real_data"
+    assert result["candidate_bundle_blockers"]["synthetic_fallback"] is True
+
+
+def test_retrain_normalizes_dates_for_lgbm_trainer():
+    """Nightly retrain은 DatasetBuilder 표준 YYYYMMDD로 날짜를 넘긴다."""
+    retrainer = _make_retrainer()
+
+    mock_trainer = MagicMock()
+    mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
+    mock_trainer.train.return_value = _mock_trainer_result("v3")
+
+    mock_registry = MagicMock()
+    mock_registry.list_versions.return_value = []
+
+    with patch.object(retrainer, "_next_version", return_value="v3"):
+        with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
+            with patch.dict("sys.modules", {
+                "src.models.lgbm_trainer": MagicMock(
+                    LGBMTrainer=MagicMock(return_value=mock_trainer)
+                ),
+                "src.models.registry": MagicMock(
+                    ModelRegistry=MagicMock(return_value=mock_registry)
+                ),
+            }):
+                retrainer.retrain(
+                    tickers=["005930"],
+                    start_date="2026-03-28",
+                    end_date="2026-04-27",
+                    bundle_id=None,
+                )
+
+    kwargs = mock_trainer.train.call_args.kwargs
+    assert kwargs["start_date"] == "20260328"
+    assert kwargs["end_date"] == "20260427"
+
+
 # ================================================================== #
 # 10. alpha factor → feature_cols에 추가 확인
 # ================================================================== #

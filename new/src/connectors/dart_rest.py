@@ -36,7 +36,9 @@ class DARTRestClient(BaseConnector):
     주요 기능:
       - list_disclosures(): 공시 목록 조회 → C2 정규화 이벤트 리스트
       - get_company(): 기업 개황 조회 → 원본 dict
-      - corpCode.xml 다운로드는 S0-8 구현 예정 (TODO)
+      - corpCode.xml 다운로드는 Sprint 1+ defer. 현재는 ticker → corp_code 매핑 없이
+        전체 공시(corp_code=None) 또는 호출자 직접 corp_code 지정만 지원.
+        자동 매핑은 별도 caching 필요 (KOSPI200 200종목 corp_code 캐시).
 
     불변 원칙: 키는 AuthManager 경유, rate는 RateLimiter 경유, 출력은 EventNormalizer.
     """
@@ -182,6 +184,9 @@ class DARTRestClient(BaseConnector):
             DARTAPIError: status != "000".
             ConnectionError: 3회 재시도 후 네트워크 실패.
         """
+        if self._is_mock:
+            return self._mock_get_company(corp_code)
+
         params: dict[str, str] = {"corp_code": corp_code}
         response = self._call_api("company.json", params)
 
@@ -320,6 +325,22 @@ class DARTRestClient(BaseConnector):
     # ------------------------------------------------------------------ #
     # Mock
     # ------------------------------------------------------------------ #
+
+    def _mock_get_company(self, corp_code: str) -> dict[str, Any]:
+        """Mock: 기업 개황 반환 (DART_API_KEY 미설정 또는 테스트용).
+
+        _mock_inquire_minute_bar 패턴 참고. auth.get_dart_key() 실 호출 없음.
+        """
+        logger.info("[dart_rest] Mock get_company 반환. corp_code=%s", corp_code)
+        return {
+            "status": "000",
+            "corp_code": corp_code,
+            "corp_name": f"MOCK_{corp_code}",
+            "corp_name_eng": "",
+            "ceo_nm": "",
+            "est_dt": "",
+            "_mode": "mock",
+        }
 
     def _mock_list_disclosures(
         self,

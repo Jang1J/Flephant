@@ -19,6 +19,7 @@ _KST = ZoneInfo("Asia/Seoul")
 
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
+from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 
 logger = get_logger("risk_slow")
@@ -216,9 +217,8 @@ class RiskAgentSlow(AgentBase):
     def _parse_llm_content(self, content: str) -> dict[str, Any]:
         """LLM 응답 파싱. JSON 1차 → 키워드 fallback 2차."""
         # 1차: JSON parse
-        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
         try:
-            parsed_json = json.loads(stripped)
+            parsed_json = parse_llm_json(content)
             stance = str(parsed_json.get("stance", "neutral"))
             if stance not in _VALID_STANCES:
                 stance = "neutral"

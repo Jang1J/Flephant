@@ -15,7 +15,7 @@ coverage:
   - sentiment score range: -1.0 ~ +1.0
   - empty posts: comm_score 0.0
   - rate_limiter: poll 호출마다 wait_and_acquire 1회
-  - real 모드: NotImplementedError 발생
+  - real 모드: Naver Search API 응답을 CommunityPost로 변환
   - poll_and_normalize: C2 event dict 반환
   - poll_and_normalize: 정규화 실패 skip (예외 미전파)
   - filter stages chain: spam -> manipulation -> sentiment 순서
@@ -95,8 +95,9 @@ def mock_normalizer():
 
 
 @pytest.fixture
-def crawler_mock(mock_rate_limiter, mock_normalizer):
+def crawler_mock(mock_rate_limiter, mock_normalizer, monkeypatch):
     """mock 모드 CommunityCrawler (COMMUNITY_SCRAPE_ENABLED 미설정)."""
+    monkeypatch.delenv("COMMUNITY_SCRAPE_ENABLED", raising=False)
     from src.connectors.community import CommunityCrawler
     return CommunityCrawler(
         rate_limiter=mock_rate_limiter,
@@ -315,17 +316,55 @@ def test_rate_limiter_invoked_per_poll(crawler_mock, mock_rate_limiter):
 
 
 # ------------------------------------------------------------------ #
-# 7. real 모드: NotImplementedError
+# 7. real 모드: 공식 Naver Search API
 # ------------------------------------------------------------------ #
 
-def test_poll_real_mode_raises_not_implemented(mock_rate_limiter, mock_normalizer, monkeypatch):
-    """COMMUNITY_SCRAPE_ENABLED=1 -> NotImplementedError."""
+def test_poll_real_mode_uses_naver_search_api(mock_rate_limiter, mock_normalizer, monkeypatch):
+    """COMMUNITY_SCRAPE_ENABLED=1 -> Naver Search API item을 CommunityPost로 변환."""
     monkeypatch.setenv("COMMUNITY_SCRAPE_ENABLED", "1")
+    monkeypatch.setenv("NAVER_CLIENT_ID", "client")
+    monkeypatch.setenv("NAVER_CLIENT_SECRET", "secret")
     from src.connectors.community import CommunityCrawler
+
     c = CommunityCrawler(rate_limiter=mock_rate_limiter, normalizer=mock_normalizer)
     assert c._is_mock is False
-    with pytest.raises(NotImplementedError, match="COMMUNITY_SCRAPE_NOT_IMPLEMENTED"):
-        c.poll(["005930"])
+
+    calls: list[tuple[str, dict]] = []
+
+    def fake_get_json(url, params, headers=None):
+        calls.append((url, params))
+        return {
+            "items": [
+                {
+                    "title": "<b>삼성전자</b> 커뮤니티 반응",
+                    "description": "실적 기대와 반등 기대가 있습니다.",
+                    "link": "https://example.com/community/1",
+                    "cafename": "주식토론",
+                }
+            ]
+        }
+
+    c._http_get_json = fake_get_json
+    posts = c.poll(["005930"])
+
+    assert len(posts) == 2
+    assert posts[0].ticker == "005930"
+    assert posts[0].title == "삼성전자 커뮤니티 반응"
+    assert posts[0].url == "https://example.com/community/1"
+    assert calls[0][1]["query"].startswith("삼성전자")
+
+
+def test_poll_real_mode_requires_naver_credentials(
+    mock_rate_limiter, mock_normalizer, monkeypatch
+):
+    """COMMUNITY_SCRAPE_ENABLED=1 이면 Naver API credential이 필요하다."""
+    monkeypatch.setenv("COMMUNITY_SCRAPE_ENABLED", "1")
+    monkeypatch.delenv("NAVER_CLIENT_ID", raising=False)
+    monkeypatch.delenv("NAVER_CLIENT_SECRET", raising=False)
+    from src.connectors.community import CommunityCrawler
+
+    with pytest.raises(EnvironmentError):
+        CommunityCrawler(rate_limiter=mock_rate_limiter, normalizer=mock_normalizer)
 
 
 # ------------------------------------------------------------------ #

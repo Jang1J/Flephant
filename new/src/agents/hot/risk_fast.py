@@ -10,7 +10,7 @@ trigger_catalog + risk_fast 섹션 기반 4개 규칙 평가.
 
 C5 risk_warning payload:
   stance: veto_recommendation | risk_reduce | neutral
-  risk_level: low | medium | high | critical
+  risk_level: low | medium | high
   fast_rule_match: [{rule_id, matched_at}] | null
 
 역할 분리 (architecture.md L395):
@@ -84,8 +84,8 @@ class RiskFastAgent(AgentBase):
             ts: 루프 기준 시각 (datetime).
 
         Returns:
-            risk_level: 'low' | 'medium' | 'high' | 'critical'
-            fast_rule_match: bool
+            risk_level: 'low' | 'medium' | 'high'
+            fast_rule_match: list[{rule_id, matched_at}] | None  (C5 schema 정합, P0-2 fix 2026-05-09)
             triggered_rules: list[str]
             affected_tickers: list[str]
             recommended_action: 'pass' | 'reduce' | 'halt'
@@ -182,11 +182,15 @@ class RiskFastAgent(AgentBase):
                 )
 
         # 종합 risk_level 결정
+        internal_severity = "critical" if "critical" in rule_levels else None
         risk_level = self._aggregate_risk_level(rule_levels)
-        fast_rule_match = bool(all_triggered_rules)
+        # P0-2 fix (Critical MA-2, 2026-05-09): C5 schema fast_rule_match: [{rule_id, matched_at}]|null.
+        # 이전 bool → list[dict] 또는 None. consumer (risk_slow) bool 검사는 truthy/falsy 로 호환.
 
         # recommended_action 결정
-        recommended_action = self._decide_action(risk_level)
+        recommended_action = (
+            "halt" if internal_severity == "critical" else self._decide_action(risk_level)
+        )
 
         # rationale 생성 (한국어)
         rationale = self._build_rationale(
@@ -205,13 +209,14 @@ class RiskFastAgent(AgentBase):
 
         return {
             "risk_level": risk_level,
-            "fast_rule_match": fast_rule_match,
+            "severity": internal_severity or risk_level,
+            # P0-2 fix (2026-05-09): C5 정합 list[dict]|None. fast_rule_match_details 키 제거 (중복).
+            "fast_rule_match": fast_rule_match_details or None,
             "triggered_rules": all_triggered_rules,
             "affected_tickers": affected_tickers_unique,
             "recommended_action": recommended_action,
             "stance": self._decide_stance(risk_level),
             "rationale": rationale,
-            "fast_rule_match_details": fast_rule_match_details or None,
             "latency_ms": elapsed_ms,
         }
 
@@ -376,10 +381,11 @@ class RiskFastAgent(AgentBase):
     def _aggregate_risk_level(self, levels: list[str]) -> str:
         """복수 규칙 트리거 → 최고 severity 우선 반환.
 
-        priority: critical > high > medium > low
+        priority: critical > high > medium > low. C5 risk_level enum에는
+        critical이 없으므로 외부 risk_level은 high로 낮추고 severity에만 보존한다.
         """
         if "critical" in levels:
-            return "critical"
+            return "high"
         if "high" in levels:
             return "high"
         if "medium" in levels:
@@ -389,10 +395,10 @@ class RiskFastAgent(AgentBase):
     def _decide_action(self, risk_level: str) -> str:
         """risk_level → recommended_action 매핑.
 
-        critical → halt, high → reduce, medium → reduce, low → pass
+        high → reduce, medium → reduce, low → pass.
+        critical halt는 evaluate()에서 severity 기반으로 별도 처리한다.
         """
         mapping = {
-            "critical": "halt",
             "high": "reduce",
             "medium": "reduce",
             "low": "pass",
@@ -402,9 +408,9 @@ class RiskFastAgent(AgentBase):
     def _decide_stance(self, risk_level: str) -> str:
         """risk_level → C5 stance 필드 매핑.
 
-        high|critical → veto_recommendation, medium → risk_reduce, low → neutral
+        high → veto_recommendation, medium → risk_reduce, low → neutral
         """
-        if risk_level in ("high", "critical"):
+        if risk_level == "high":
             return "veto_recommendation"
         if risk_level == "medium":
             return "risk_reduce"

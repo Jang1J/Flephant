@@ -152,13 +152,13 @@ L3는 발표 킬러다. "멀티에이전트가 있었다"는 주장이 아니라
 
 | 지표 | 정의 | 데이터 소스 | 계산 주기 | 구현 경로 | 수용 기준 (yaml 키) |
 |------|------|------------|---------|---------|-------------------|
-| `cause_attribution_accuracy` | FDA reason_code가 사후 원인과 일치한 비율 | C9 reason_code + 장마감 bar backfill | 일별 (Mode B 18:00) | `new/src/eval/cause_attribution.py` (Sprint 3 신설) | `system_os_metrics.cause_attribution_accuracy_min: 0.60` |
-| `hot_path_latency_p95_ms` | p95 latency <= 100ms 달성률 | OpsMonitor latency ring | 실시간 rolling + 일별 | `ops/monitor.py` (Sprint 1 구현됨) | `quant_agent.latency_p95_target_ms: 100` (SSOT. 중복 신설 금지) |
-| `cold_path_budget_efficiency` | Kanana-o 1회당 marginal PnL | LLM Router log + fill | 일별 | `analytics/llm_budget_analyzer.py` (Sprint 2 신설) | `system_os_metrics.cold_path_marginal_pnl_min_pct_per_call: 0.0001` |
-| `self_evolution_gain_sharpe` | `SR(v_{n+1}) - SR(v_n)` | C17 registry.json 버전 비교 | Mode B 배포마다 | `ModelRegistry.compare_versions()` (registry.py:L228, 구현 완료) | `system_os_metrics.self_evolution_gain_threshold: 0.05` |
-| `dual_source_divergence_lead_time_min` | divergence 탐지 시각 vs price break 시각 시차 (분) | dual_source_scorer + bar data | 이벤트별 | `analytics/dual_source_scorer.py` (Sprint 4 S4-1) | `system_os_metrics.dual_source_lead_time_target_min: 0` |
-| `reason_code_distribution` | FDA reason_code 분포 + 상위 3 coverage | audit_log.jsonl 집계 | 일별 | `eval/reason_code_stats.py` (Sprint 3 신설) | `system_os_metrics.reason_code_top3_coverage_min: 0.80` |
-| `regime_agent_contribution_matrix` | regime x agent 2D heatmap (4 regime x 7 agent = 28 셀) | L2 `realized_pnl_contribution` x L1 `regime_breakdown` | Mode B | `metrics.py regime_breakdown_fill()` 확장 + `analytics/regime_attribution.py` | `system_os_metrics.regime_breakdown_min_days_per_regime: 10` |
+| `cause_attribution_accuracy` | FDA reason_code가 사후 원인과 일치한 비율 | C9 reason_code + 장마감 bar backfill | 일별 (Mode B 18:00) | `new/src/eval/cause_attribution.py` **(W2 P1 SHIP 2026-05-09, 15 unit test PASS)** | `system_os_metrics.cause_attribution_accuracy_min: 0.60` |
+| `hot_path_latency_p95_ms` | p95 latency <= 100ms 달성률 | OpsMonitor latency ring | 실시간 rolling + 일별 | `new/src/ops/monitor.py` (Sprint 1 구현됨) | `quant_agent.latency_p95_target_ms: 100` (SSOT. 중복 신설 금지) |
+| `cold_path_budget_efficiency` | Kanana-o 1회당 marginal PnL | LLM Router log + fill | 일별 | `new/src/analytics/llm_budget_analyzer.py` **(미구현, defer)** | `system_os_metrics.cold_path_marginal_pnl_min_pct_per_call: 0.0001` |
+| `self_evolution_gain_sharpe` | `SR(v_{n+1}) - SR(v_n)` | C17 registry.json 버전 비교 | Mode B 배포마다 | `ModelRegistry.compare_versions()` (`new/src/models/registry.py:L228`, 구현 완료) | `system_os_metrics.self_evolution_gain_threshold: 0.05` |
+| `dual_source_divergence_lead_time_min` | divergence 탐지 시각 vs price break 시각 시차 (분) | dual_source_scorer + bar data | 이벤트별 | `new/src/analytics/dual_source_scorer.py` **(미구현, defer)** | `system_os_metrics.dual_source_lead_time_target_min: 0` |
+| `reason_code_distribution` | FDA reason_code 분포 + 상위 3 coverage | audit_log.jsonl 집계 | 일별 | `new/src/eval/reason_code_stats.py` **(W2 P1 SHIP 2026-05-09, 15 unit test PASS)** | `system_os_metrics.reason_code_top3_coverage_min: 0.80` |
+| `regime_agent_contribution_matrix` | regime x agent 2D heatmap (4 regime x 7 agent = 28 셀) | L2 `realized_pnl_contribution` x L1 `regime_breakdown` | Mode B | `new/src/models/metrics.py:regime_breakdown_fill()` 확장 + `new/src/analytics/regime_attribution.py` **(미구현, defer)** | `system_os_metrics.regime_breakdown_min_days_per_regime: 10` |
 
 `hot_path_latency_p95_ms`의 SSOT는 `quant_agent.latency_p95_target_ms: 100`이다. `system_os_metrics` 섹션에 중복 선언하지 않는다. risk_config.yaml 주석에 명시됨.
 
@@ -316,7 +316,7 @@ L2 realized_pnl_contribution x L1 regime_breakdown
 |--------|------|--------|------|
 | Sprint 1 (완료) | L1 7종 전체 + Hot Path latency OpsMonitor + `ModelRegistry.compare_versions()` 선행 신설 + 8차원 벡터 `to_performance_vector()` + `normalize_performance_vector()` | `new/src/models/metrics.py`, `new/src/models/registry.py`, `new/ops/monitor.py` | DONE |
 | Sprint 2 | AuditLogger 18 필드 확장 (`label_t5_ret` 장중 null 보장) + `sector_config.yaml` 신설 + ExecutionGateway VWAP 실계산 + LLM Router (`llm_called`, `llm_model`) + `ModeBPerformanceAggregator` 신설 | C18 구현체, L2 실시간 지표 인프라 | 미착수 |
-| Sprint 3 | Eval Agent 신설 (`cause_attribution_accuracy`, `reason_code_distribution`, `anomaly_detection_precision/recall`, `veto_precision/recall` 집계) | `new/src/eval/cause_attribution.py`, `eval/reason_code_stats.py` | 미착수 |
+| Sprint 3 | Eval Agent 신설 (`cause_attribution_accuracy`, `reason_code_distribution`, `anomaly_detection_precision/recall`, `veto_precision/recall` 집계) | `new/src/eval/cause_attribution.py`, `new/src/eval/reason_code_stats.py`, `new/src/eval/synth_audit_log.py` (KIS 키 미설정 시 발표용 합성) | **DONE (W2 P1, 2026-05-09)** — 15 unit test PASS, accuracy 0.755 / Top-3 coverage 0.869 (synthetic 107 entries) |
 | Sprint 4 | `self_evolution_gain_sharpe` 배포 연동 + `dual_source_divergence_lead_time_min` + `regime_agent_contribution_matrix` + 평가 Dashboard | L3 7종 전체 구현체 | 미착수 |
 | Sprint 5 | regime_breakdown 확장 (regime 라벨 정교화, KOSPI200 편입 데이터 반영) | `regime_breakdown_fill()` 확장 버전 | 미착수 |
 
@@ -329,3 +329,4 @@ Sprint 2 착수 시 가장 먼저 할 것은 AuditLogger 18 필드 확장이다.
 | 날짜 | 버전 | 내용 |
 |------|------|------|
 | 2026-04-21 | v1.0 | 신설. 3-Layer 21 메트릭 (L1 7 + L2 9 필드 / 7 컨셉 + L3 7). api_contracts.md v3.2 C18 신설과 동시 작성. Sprint 1 구현 완료 상태 기준. |
+| 2026-05-09 | v1.1 | W2 P1 SHIP. Sprint 3 (`cause_attribution_accuracy`, `reason_code_distribution`) DONE 정정 + L155/L160 경로 접두사 통일 (`new/src/eval/...`) + analytics/ 미구현 모듈 3건 (`llm_budget_analyzer.py`, `dual_source_scorer.py`, `regime_attribution.py`) defer 명시. SHIP 산출물: `new/src/eval/cause_attribution.py` (250줄), `new/src/eval/reason_code_stats.py` (210줄), `new/src/eval/synth_audit_log.py` (110줄, KIS 키 미설정 시 발표용 합성), `new/tests/unit/test_eval_l3.py` (15 tests PASS). 검증: synthetic 107 entries → accuracy 0.755 (threshold 0.60 PASS) + Top-3 coverage 0.869 (threshold 0.80 PASS). pytest 1164 → 1179 (+15, 회귀 0). |

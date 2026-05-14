@@ -53,14 +53,30 @@ class RiskAgentFast(AgentBase):
         # SLA: risk_config.yaml risk_fast.sla_ms 경유 (불변 원칙 5)
         self._sla_ms = self._load_sla_ms()
 
-    def _load_trigger_rules(self) -> list[dict[str, Any]]:
-        """risk_config.yaml trigger_catalog.rules 로드."""
+    def _publish_to_bus(self, channel: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """AgentBase 메시지를 만들고, PubSubBroker가 있으면 실제 MessagePool에 발행."""
+        msg = self.publish(channel, payload)
+        if self._pubsub is None:
+            return msg
         try:
-            catalog = config_load("risk_config.yaml", "trigger_catalog")
-            return catalog.get("rules", [])
+            msg["message_id"] = self._pubsub.publish(channel, msg)
         except Exception as e:
-            logger.warning("[risk_fast_cold] trigger_catalog 로드 실패: %s", e)
-            return []
+            msg["publish_error"] = str(e)
+            logger.warning(
+                "[risk_fast_cold] pubsub publish 실패: channel=%s error=%s",
+                channel,
+                e,
+            )
+        return msg
+
+    def _load_trigger_rules(self) -> list[dict[str, Any]]:
+        """trigger_catalog.rules 로드. trigger_loader 에 위임 (S5-2 DRY refactor).
+
+        filter 없이 전체 rules 반환. admit_candidate action rule 은
+        evaluate loop 에서 action 필드 확인 후 skip.
+        """
+        from src.utils.trigger_loader import load_trigger_rules
+        return load_trigger_rules()
 
     def _load_sla_ms(self) -> float:
         """risk_config.yaml risk_fast.sla_ms 로드 (불변 원칙 5)."""
@@ -74,25 +90,33 @@ class RiskAgentFast(AgentBase):
     def _load_thresholds(self) -> dict[str, float]:
         """risk_config.yaml risk_fast.cold_path 섹션에서 임계값 로드.
 
-        불변 원칙 5: 모든 수치는 yaml SSOT 경유. defaults는 yaml 파싱 실패 시 비상용.
+        불변 원칙 5: 모든 수치는 yaml SSOT 경유. 하드코딩 금지.
+        yaml 로드 실패 시 KeyError / RuntimeError 전파 (시스템 설정 오류 명확화).
         foreign_net_sell_krw: 음수 컨벤션 (-100B 이하 = 대규모 순매도).
         """
-        defaults = {
-            "comm_volume_zscore": 2.5,
-            "comm_sentiment_delta": 0.5,
-            "intraday_return_zscore": -3.0,
-            "foreign_net_sell_krw": -100_000_000_000.0,  # -100B KRW (음수 컨벤션)
-            "news_comm_divergence": 0.5,
-        }
-        try:
-            rf = config_load("risk_config.yaml", "risk_fast")
-            cold_cfg = rf.get("cold_path", {})
-            for key in defaults:
-                if key in cold_cfg:
-                    defaults[key] = float(cold_cfg[key])
-        except Exception as e:
-            logger.warning("[risk_fast_cold] cold_path 임계값 로드 실패, 비상 기본값 사용: %s", e)
-        return defaults
+        rf = config_load("risk_config.yaml", "risk_fast")
+        cold_cfg = rf.get("cold_path")
+        if cold_cfg is None:
+            raise KeyError(
+                "[risk_fast_cold] risk_config.yaml risk_fast.cold_path 섹션 없음. "
+                "설정 파일 점검 필요."
+            )
+        keys = [
+            "comm_volume_zscore",
+            "comm_sentiment_delta",
+            "intraday_return_zscore",
+            "foreign_net_sell_krw",
+            "news_comm_divergence",
+        ]
+        result: dict[str, float] = {}
+        for key in keys:
+            if key not in cold_cfg:
+                raise KeyError(
+                    f"[risk_fast_cold] risk_fast.cold_path.{key} 누락. "
+                    "risk_config.yaml 점검 필요."
+                )
+            result[key] = float(cold_cfg[key])
+        return result
 
     def evaluate(
         self,
@@ -123,6 +147,11 @@ class RiskAgentFast(AgentBase):
         event_type = event.get("event_type", "")
         payload = event.get("payload", {})
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # admit_candidate action rule 은 AdmissionEngine 담당. risk_fast 는 skip.
+        # _load_trigger_rules() 가 전체 rule 을 반환하므로 action 필드 체크 필요.
+        # 아래 6개 규칙은 명시적 rule_id 기반 평가 (action=review_risk/tighten_stop 등).
+        # action=admit_candidate 인 rule 은 이 evaluate loop 에 진입하지 않음.
 
         # 규칙 1: 커뮤니티 게시글 급증
         comm_z = ctx.get("comm_volume_zscore", 0.0)
@@ -182,12 +211,13 @@ class RiskAgentFast(AgentBase):
                 divergence,
             )
             # uncertainty_signal publish (Dual-Source divergence → FDA 연계)
-            self.publish(
+            self._publish_to_bus(
                 "uncertainty_signal",
                 {
                     "source": "risk_fast_cold",
                     "trigger": "news_comm_divergence_strong",
                     "ts": datetime.now(_KST).isoformat(),
+                    "reasoning": "뉴스-커뮤니티 방향 불일치로 불확실성 신호 발행",
                 },
             )
 
@@ -225,7 +255,8 @@ class RiskAgentFast(AgentBase):
             "fast_rule_match": triggered if triggered else None,
             "triggered_rules": [t["rule_id"] for t in triggered],
             "recommended_action": recommended_action,
-            "fast_rule_count": len(triggered),
+            # P1-1 fix (2026-05-09): fast_rule_count 제거. C5 schema 미정의 extra 필드.
+            # consumer 가 len(triggered_rules) 로 동등 계산 가능.
             "latency_ms": round(latency_ms, 2),
         }
 
@@ -236,7 +267,7 @@ class RiskAgentFast(AgentBase):
                 f"[risk_fast_cold] report_type={report_type} 미지원. "
                 "RiskAgentFast(Cold)는 risk_warning만 발행."
             )
-        msg = self.publish("risk_warning", payload)
+        msg = self._publish_to_bus("risk_warning", payload)
         msg["report_type"] = report_type
         msg["ts"] = datetime.now(timezone.utc).isoformat()
         return msg

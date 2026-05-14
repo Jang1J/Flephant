@@ -13,7 +13,7 @@ import pytest
 
 from src.data.dataset_builder import DatasetBuilder
 from src.models.lgbm_trainer import LGBMTrainer
-from src.models.registry import ModelRegistry
+from src.models.registry import ModelRegistry, VersionNotFoundError
 from src.models.splitter import WalkForwardSplitter
 
 
@@ -81,8 +81,14 @@ def synthetic_data(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def trainer_small(synthetic_data: Path) -> LGBMTrainer:
-    """테스트 전용 작은 fold 구성."""
+    """테스트 전용 작은 fold 구성.
+
+    S4-2: enabled_for_lgbm=False로 설정해 기존 4피처 경로 유지.
+    dual_source 5피처 join은 test_dual_source_ablation.py에서 별도 검증.
+    """
     builder = DatasetBuilder(artifacts_dir=synthetic_data)
+    # S4-2: 기존 4피처 테스트 경로 유지 (dual_source 비활성)
+    builder._ds_enabled_for_lgbm = False
     splitter = WalkForwardSplitter()
     # 테스트 데이터 규모에 맞게 조정
     splitter.train_window_days = 3
@@ -92,11 +98,17 @@ def trainer_small(synthetic_data: Path) -> LGBMTrainer:
     splitter.purge_bars = 0
     splitter.embargo_bars = 0
     registry = ModelRegistry(artifacts_dir=synthetic_data / "lgbm")
-    return LGBMTrainer(
+    trainer = LGBMTrainer(
         dataset_builder=builder,
         splitter=splitter,
         registry=registry,
     )
+    # S4-2: feature_cols를 4피처로 고정 (enabled_for_lgbm=False와 일치)
+    from src.utils.config_loader import load as _cfg_load
+    trainer.feature_cols = list(
+        _cfg_load("risk_config.yaml", "preprocessor")["feature_cols"]
+    )
+    return trainer
 
 
 # ====================================================================== #
@@ -135,6 +147,11 @@ def test_compute_data_version_string_format() -> None:
     assert "20260419" in v
 
 
+def test_normalize_yyyymmdd_accepts_hyphen() -> None:
+    assert LGBMTrainer._normalize_yyyymmdd("2026-01-07") == "20260107"
+    assert LGBMTrainer._normalize_yyyymmdd("20260107") == "20260107"
+
+
 # ====================================================================== #
 # Integration: end-to-end train
 # ====================================================================== #
@@ -166,12 +183,18 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     model, metadata = trainer_small.registry.load_latest()
     assert model is not None
     assert metadata["version"] == "baseline"
-    assert metadata["feature_cols"] == [
-        "feat_1m_close_robust_z",
-        "feat_5m_ret",
-        "feat_30m_vol",
-        "feat_60m_trend",
-    ]
+    assert metadata["train_start"] == "2026-01-01"
+    assert metadata["train_end"] == "2026-01-07"
+    assert metadata["label_generation_version"] == trainer_small.builder.label_generation_version
+    assert metadata["label_session_scope"] == trainer_small.builder.label_session_scope
+    assert metadata["data_source"] == "artifact_bars"
+    assert metadata["synthetic_fallback"] is False
+    # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
+    assert len(metadata["feature_cols"]) == 4
+    assert "feat_1m_close_robust_z" in metadata["feature_cols"]
+    assert "feat_5m_ret" in metadata["feature_cols"]
+    assert "feat_30m_vol" in metadata["feature_cols"]
+    assert "feat_60m_trend" in metadata["feature_cols"]
 
 
 def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:
@@ -190,6 +213,67 @@ def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:
     pred = booster.predict(X)
     assert pred.shape == (2,)
     assert np.all(np.isfinite(pred))
+
+
+def test_train_with_bundle_id_saves_candidate_not_latest(trainer_small: LGBMTrainer) -> None:
+    """C12 bundle 후보는 deploy gate 전 latest/active로 승격하지 않는다."""
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="candidate",
+        bundle_id="BUNDLE-TEST",
+    )
+
+    assert result["is_latest"] is False
+    assert result["metric_scope"]["scope"] == "trainer_validation_proxy"
+    assert result["metric_scope"]["deploy_quality"] is False
+    versions = {entry["version"]: entry for entry in trainer_small.registry.list_versions()}
+    assert versions["candidate"]["status"] == "candidate"
+    assert versions["candidate"]["bundle_id"] == "BUNDLE-TEST"
+    assert versions["candidate"]["metric_scope"]["deploy_quality"] is False
+    with pytest.raises(VersionNotFoundError, match="active_version"):
+        trainer_small.registry.load_latest()
+
+
+def test_train_accepts_cost_aware_target_override(
+    trainer_small: LGBMTrainer,
+) -> None:
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="cost-aware",
+        target_col_override="label_session_close_net_ret",
+    )
+
+    assert result["target_col"] == "label_session_close_net_ret"
+    _, metadata = trainer_small.registry.load_latest()
+    assert metadata["target_col"] == "label_session_close_net_ret"
+
+
+def test_train_blocks_missing_feature_manifest(trainer_small: LGBMTrainer) -> None:
+    """feature_cols가 DatasetBuilder panel에 없으면 deploy 불가능 모델 학습을 차단한다."""
+    trainer_small.feature_cols = list(trainer_small.feature_cols) + ["alpha_factor_0"]
+
+    with pytest.raises(RuntimeError, match="feature manifest mismatch"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="bad-alpha-feature",
+        )
+
+
+def test_train_blocks_missing_requested_ticker_data(trainer_small: LGBMTrainer) -> None:
+    """요청 universe 일부가 없으면 18/20 같은 partial 학습을 차단한다."""
+    with pytest.raises(RuntimeError, match="missing requested ticker data"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004", "000005"],
+            start_date="20260101",
+            end_date="20260107",
+            version="missing-ticker",
+        )
 
 
 def test_train_no_folds_raises(synthetic_data: Path) -> None:

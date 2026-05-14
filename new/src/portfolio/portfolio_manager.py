@@ -53,19 +53,27 @@ class PortfolioManager:
     def __init__(self) -> None:
         pos_cfg = config_load("risk_config.yaml", "position_limits")
         turnover_cfg = config_load("risk_config.yaml", "turnover_cap")
+        # Codex 권고 8 (2026-05-09): PM boundary 정책 SSOT. respect_ppo_weights=true 면 PM 이
+        # PPO target_weights 를 변경하지 않고 violation 만 errors 에 보고.
+        # 이전 default 동작 (false): clip/drop/renorm 으로 silently 변경 → 발표 핵심 차별점
+        # "PPO 가 비중, PM 이 order_deltas" boundary spirit 위반. backward compat 위해 default false 유지.
+        # 운영 strict mode 권장: yaml 에 portfolio_manager.respect_ppo_weights: true 명시.
+        pm_cfg = config_load("risk_config.yaml", "portfolio_manager") or {}
+        self._respect_ppo_weights: bool = bool(pm_cfg.get("respect_ppo_weights", False))
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
-        self._max_sector: float = float(pos_cfg.get("max_sector", 0.40))
+        self._max_sector: float = float(pos_cfg["max_sector"])
         self._min_cash: float = float(pos_cfg["min_cash"])
 
         self._daily_turnover_max: float = float(turnover_cfg["daily_max"])
 
         logger.info(
             "[portfolio_manager] 초기화: max_names=%d, max_single=%.2f, "
-            "max_sector=%.2f, min_cash=%.2f, turnover_max=%.2f",
+            "max_sector=%.2f, min_cash=%.2f, turnover_max=%.2f respect_ppo=%s",
             self._max_names, self._max_single_name,
             self._max_sector, self._min_cash, self._daily_turnover_max,
+            self._respect_ppo_weights,
         )
 
     # ================================================================== #
@@ -104,36 +112,65 @@ class PortfolioManager:
         }
         cold_path_exits_set = {pad_ticker(str(t)) for t in (cold_path_exits or [])}
 
+        # Codex 권고 8 (2026-05-09): PM boundary 정책. respect_ppo_weights=True 면 PPO weights
+        # 변경 안 함 + violation 만 errors 에 보고. False (default backward-compat) 면 clip/drop/renorm.
+        ppo_violations: list[dict[str, Any]] = []
+
         # max_names 초과 시 하위 종목 제거
         if len(target_weights_norm) > self._max_names:
-            sorted_by_weight = sorted(
-                target_weights_norm.items(), key=lambda x: x[1], reverse=True
-            )
-            keep = dict(sorted_by_weight[: self._max_names])
-            removed = len(target_weights_norm) - len(keep)
-            logger.info(
-                "[portfolio_manager] max_names(%d) 초과 %d종목 제거",
-                self._max_names, removed,
-            )
-            target_weights_norm = keep
+            if self._respect_ppo_weights:
+                ppo_violations.append({
+                    "type": "max_names_exceeded",
+                    "actual": len(target_weights_norm),
+                    "limit": self._max_names,
+                })
+                logger.warning(
+                    "[portfolio_manager] PPO 가 max_names(%d) 초과 %d종목 → respect 모드: 변경 안 함, violation 보고만",
+                    self._max_names, len(target_weights_norm) - self._max_names,
+                )
+            else:
+                sorted_by_weight = sorted(
+                    target_weights_norm.items(), key=lambda x: x[1], reverse=True
+                )
+                keep = dict(sorted_by_weight[: self._max_names])
+                removed = len(target_weights_norm) - len(keep)
+                logger.info(
+                    "[portfolio_manager] max_names(%d) 초과 %d종목 제거 (compat 모드)",
+                    self._max_names, removed,
+                )
+                target_weights_norm = keep
 
         # max_single_name clip
-        clipped = False
+        clipped_tickers = []
         for ticker in list(target_weights_norm.keys()):
             if target_weights_norm[ticker] > self._max_single_name:
-                target_weights_norm[ticker] = self._max_single_name
-                clipped = True
-        if clipped:
-            logger.info(
-                "[portfolio_manager] max_single_name(%.2f) clip 적용",
-                self._max_single_name,
-            )
-            # clip 후 재정규화
-            total = sum(target_weights_norm.values())
-            if total > 1e-12:
-                target_weights_norm = {
-                    t: w / total for t, w in target_weights_norm.items()
-                }
+                clipped_tickers.append({
+                    "ticker": ticker,
+                    "weight": target_weights_norm[ticker],
+                    "limit": self._max_single_name,
+                })
+                if not self._respect_ppo_weights:
+                    target_weights_norm[ticker] = self._max_single_name
+        if clipped_tickers:
+            if self._respect_ppo_weights:
+                ppo_violations.extend([
+                    {"type": "max_single_name_exceeded", **t} for t in clipped_tickers
+                ])
+                logger.warning(
+                    "[portfolio_manager] PPO 가 max_single_name(%.2f) 초과 %d 종목 → respect 모드: 변경 안 함, violation 보고만",
+                    self._max_single_name, len(clipped_tickers),
+                )
+            else:
+                logger.info(
+                    "[portfolio_manager] max_single_name(%.2f) clip %d 종목 (compat 모드)",
+                    self._max_single_name, len(clipped_tickers),
+                )
+                # clip 후 재정규화
+                total = sum(target_weights_norm.values())
+                if total > 1e-12:
+                    target_weights_norm = {
+                        t: w / total for t, w in target_weights_norm.items()
+                    }
 
         current_weights = {
             pad_ticker(str(p["ticker"])): float(p.get("weight", 0.0))
@@ -231,6 +268,9 @@ class PortfolioManager:
             "n_orders": len(order_deltas),
             "errors": errors,
             "n_errors": len(errors),
+            # Codex 권고 8 (2026-05-09): PPO boundary violations (respect_ppo_weights=True 시 변경 없이 보고).
+            "ppo_violations": ppo_violations,
+            "respect_ppo_weights": self._respect_ppo_weights,
             "constraints_applied": {
                 "max_names": self._max_names,
                 "max_single_name": self._max_single_name,

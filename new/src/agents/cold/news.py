@@ -3,6 +3,7 @@
 이벤트(뉴스/공시/커뮤니티) → LLMRouter 분석 → C5 news_signal / dart_alert publish.
 memory: artifacts/agent_memory/news_agent/{ticker}/{YYYYMMDD}.jsonl (micro)
         artifacts/agent_memory/macro/{YYYYMMDD}.jsonl (macro)
+cache: S4-7 Persistent Cache. key=news:{ticker}:{event_id}. TTL=risk_config.yaml cache.news_ttl_seconds.
 """
 from __future__ import annotations
 
@@ -14,7 +15,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.agents._base import AgentBase
+from src.cache.persistent_cache import PersistentCache
 from src.data.filter_loader import load_news_filter
+from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 
 logger = get_logger("news_agent")
@@ -48,6 +51,7 @@ class NewsAgent(AgentBase):
         llm_router: Any,
         pubsub: Any | None = None,
         memory_root: Path | str | None = None,
+        cache: PersistentCache | None = None,
     ) -> None:
         """NewsAgent 생성자.
 
@@ -55,10 +59,13 @@ class NewsAgent(AgentBase):
             llm_router: LLMRouter 인스턴스 (DI).
             pubsub: PubSubBroker 인스턴스 (optional). None이면 publish skip.
             memory_root: memory JSONL 저장 루트 경로. None이면 기본 경로 사용.
+            cache: PersistentCache 인스턴스 (optional). None이면 캐시 미사용.
+                   TTL은 cache.news_ttl (risk_config.yaml cache.news_ttl_seconds).
         """
         self._llm_router = llm_router
         self._pubsub = pubsub
         self._memory_root = Path(memory_root) if memory_root else _DEFAULT_MEMORY_ROOT
+        self._cache = cache
         # narrative 최대 길이: news_filter.yaml text_pack_settings.narrative_max_chars SSOT (하드코딩 금지)
         _settings = load_news_filter().get("text_pack_settings", {})
         self._narrative_max_chars = int(_settings.get("narrative_max_chars", 200))
@@ -140,13 +147,34 @@ class NewsAgent(AgentBase):
 
         publish_channel = self._EVENT_TYPE_TO_CHANNEL[event_type]
 
-        # ticker 추출 (6자리 zero-padded)
-        raw_ticker = event.get("ticker") or (event.get("tickers") or [None])[0]
+        # ticker 추출 (6자리 zero-padded). C2 정규화 이벤트는 payload.ticker 또는
+        # scope=ticker:{code}에 ticker를 둘 수 있으므로 모두 수용한다.
+        payload = event.get("payload") or {}
+        scope = str(event.get("scope") or "")
+        scope_ticker = scope.split(":", 1)[1] if scope.startswith("ticker:") else None
+        raw_ticker = (
+            event.get("ticker")
+            or payload.get("ticker")
+            or scope_ticker
+            or (event.get("tickers") or [None])[0]
+        )
         ticker = str(raw_ticker).zfill(6) if raw_ticker else ""
 
         title = event.get("title", "")
         summary = event.get("summary", "")
         event_id = event.get("event_id", "")
+
+        # S4-7 캐시 조회 (event_id 있을 때만 키 생성)
+        cache_key = f"news:{ticker}:{event_id}" if event_id else None
+        if cache_key and self._cache is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.info(
+                    "[news_agent] 캐시 HIT. event_id=%s ticker=%s LLM 호출 skip.",
+                    event_id,
+                    ticker,
+                )
+                return cached
 
         # LLM 프롬프트 구성
         prompt = (
@@ -155,7 +183,7 @@ class NewsAgent(AgentBase):
             f"내용: {summary}\n\n"
             "투자 관점에서 매수(buy)/매도(sell)/중립(neutral) 중 하나와 "
             "간단한 근거를 한국어로 답하세요.\n\n"
-            'Respond strictly in JSON: {"stance": "buy|sell|hold|neutral", '
+            'Respond strictly in JSON: {"stance": "buy|sell|neutral", '
             '"impacted_tickers": ["005930"], '
             '"impacted_sectors": ["반도체"], '
             '"narrative": "한국어 1~3문장"}'
@@ -207,14 +235,45 @@ class NewsAgent(AgentBase):
                 },
             )
 
-        return {
+        result = {
             "channel": publish_channel,
             "payload": rpt["payload"],
             "report_type": rpt["report_type"],
             "agent": rpt["agent"],
             "ts": rpt["ts"],
             "llm_fallback": llm_fallback,
+            "content": rpt["payload"]["narrative"],
+            "scope": f"ticker:{ticker}" if ticker else "market",
+            "confidence": float(parsed.get("confidence", 0.5)),
+            "reasoning": rpt["payload"]["narrative"],
         }
+
+        # S4-7 캐시 저장 (LLM fallback이 아닌 정상 분석 결과만)
+        if cache_key and self._cache is not None and not llm_fallback:
+            self._cache.set(cache_key, result, ttl_seconds=self._cache.news_ttl)
+            logger.info(
+                "[news_agent] 캐시 SET. event_id=%s ticker=%s ttl=%ds",
+                event_id,
+                ticker,
+                self._cache.news_ttl,
+            )
+
+        # 2026-05-12 audit C-D2 fix: C4 auto-publish to SharedMessagePool.
+        # 이전: result dict에 content/scope/confidence/reasoning 필드는 추가됐으나
+        # self._pubsub.publish() 호출 자체 없음 → EventGateway 우회 직접 호출 시
+        # C4 메시지 풀에 게시 안 됨 (5/11 fix incomplete).
+        # llm_fallback 시 publish 안 함 (neutral 결과로 풀 오염 방지).
+        if self._pubsub is not None and not llm_fallback:
+            try:
+                publish_msg = self.publish(publish_channel, rpt["payload"])
+                self._pubsub.publish(publish_channel, publish_msg)
+            except Exception as e:
+                logger.warning(
+                    "[news_agent] C4 publish 실패. event_id=%s channel=%s error=%s",
+                    event_id, publish_channel, e,
+                )
+
+        return result
 
     # ------------------------------------------------------------------
     # TextPack 소비 인터페이스
@@ -282,12 +341,7 @@ class NewsAgent(AgentBase):
         """
         # 1차: JSON parse 시도
         try:
-            # LLM이 JSON 앞뒤에 markdown fence(```) 를 붙이는 경우 제거
-            stripped = content.strip()
-            if stripped.startswith("```"):
-                stripped = re.sub(r"^```[a-zA-Z]*\n?", "", stripped)
-                stripped = re.sub(r"\n?```$", "", stripped.strip())
-            parsed_json = json.loads(stripped)
+            parsed_json = parse_llm_json(content)
 
             raw_stance = str(parsed_json.get("stance", "neutral")).lower()
             # "hold" → VALID_STANCES에 없으므로 "neutral" 보정

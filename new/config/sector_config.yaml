@@ -8,9 +8,9 @@
 
 mode_b_metadata:
   schema_version: "1.0.0"
-  data_version: "2026-04-21"
-  last_updated: "2026-04-21"
-  updated_by: "s2_audit_phase_5"
+  data_version: "2026-05-11"
+  last_updated: "2026-05-11"
+  updated_by: "codex_live_data_gate"
   mode_b_editable: false           # 종목 섹터 분류는 KRX 공식 기준. 자동 변경 불가.
   human_approval_required: true
   backup_retention_days: 365
@@ -52,7 +52,7 @@ ticker_to_sector:
   # 조선 (5종목)
   "329180": "shipbuilding"     # HD현대중공업
   "042660": "shipbuilding"     # 한화오션
-  "010620": "shipbuilding"     # HD현대미포
+  "010140": "shipbuilding"     # 삼성중공업
   "009540": "shipbuilding"     # HD한국조선해양
   "267250": "shipbuilding"     # HD현대인프라코어
   # 2차전지 (5종목)
@@ -66,5 +66,5 @@ ticker_to_sector:
   "047810": "defense"          # 한국항공우주
   "079550": "defense"          # LIG넥스원
   "298040": "defense"          # 효성중공업
-  "014880": "defense"          # 한라
+  "272210": "defense"          # 한화시스템
   # 미확정 섹터 10종목: universe_config.yaml 섹터5/6_미확정 확정 후 추가 예정.

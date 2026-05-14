@@ -1,5 +1,7 @@
 # KOSPI Decision OS v3 — API Contracts
 
+> v3.8 (2026-05-03): C15/C16 정식화 (Sprint 5 초안/보조 마크 제거 + forbidden_permissions + identity + activation_gate + weight_decision_authority + errors enum 확장 + watch_snapshot_id ID 등록 + polling_authority).
+> v3.7 (2026-05-02). **Sprint 4 반영**: C13 ablation_components `dual_source` 추가 / C14 `stage_0_dqr` trigger 명시 + DQRRunner sub_component 추가 / sla.stage_timeouts.stage_0=120.
 > v3.5 (2026-04-21). **PP/BUNDLE/BT/RPT/FCC/RGC 6개 ID spec UUID8 정정** (id_factory 실 구현 반영). BT 의 {tool} 컴포넌트 제거.
 > v3.4 (2026-04-21). **MSG ID 포맷 정정**: MSG-{yyyymmdd}-{UUID8} (기존 {hhmm}-{seq} 대신 UUID8, seq 충돌 방지). APM ID 포맷도 동일 기준으로 정정 (APM-{yyyymmdd}-{UUID8}).
 > v3.3 (2026-04-21). **C9 input non-breaking extension**: uncertainty_score 필드 추가 (Risk Fast sidecar → FDA Dual-Source 연계). message_taxonomy.publish_channels 에 uncertainty_signal 등록.
@@ -150,13 +152,13 @@ owner: Data Layer / Event Gateway
 transport: pull + webhook + crawler
 request:
   raw_event:
-    source: "naver_news|dart|community|us_market|ecos|krx_investor_flow"
+    source: "naver_news|dart|community|us_market|ecos|krx_investor_flow|price_snapshot"
     raw_payload_ref: string
 response:
   event:
     event_id: string
     source: string
-    event_type: "news|dart|macro|us_market|community|regime|investor_flow"
+    event_type: "news|dart|macro|us_market|community|regime|investor_flow|price_snapshot"
     scope: "ticker:{code}|sector:{name}|market"
     title: string
     summary: string
@@ -167,6 +169,8 @@ response:
     ttl: int
     expires_at: ISO8601
     supersedes: string|null
+    pit_safe: bool      # PIT-Safety 검증 결과 (불변 원칙 1, false 시 PITViolationError 발생)
+    payload: object     # source별 원본 데이터 (하위 구조는 source 종류에 따라 다름)
 constraints:
   dedupe_key: [source, occurred_at, scope, title]
   stale_drop: true
@@ -245,7 +249,7 @@ output:
         - news_comm_divergence
         - community_noise_multiplier
         availability: "08:00~08:30 KST 장전 batch"
-        time_alignment: "news_score_t → 당일 / comm_score_t-1,t-2 → 지연 반영"
+        time_alignment: "news_score_t → 당일 / comm_score_t_1, comm_score_t_2 → 지연 반영"
         rationale: "뉴스와 커뮤니티를 동일 텍스트로 합치지 않고, divergence를 uncertainty로 사용"
 
       alpha_factors:  # LLM 생성 (Mode B에서 갱신)
@@ -855,7 +859,7 @@ input:
 output:
   backtest_report:
     bundle_id: "string"
-    run_id: "string"
+    backtest_id: "BT-{yyyymmdd}-{UUID8}"   # SHIP-fix R-4 (2026-05-06): identity backtest_run_id 와 동일 의미. 코드 일관성 위해 backtest_id 채택
     started_at: "ISO8601"
     finished_at: "ISO8601"
     verdict: "pass|fail|warn"
@@ -906,6 +910,26 @@ output:
       replay_unit: "1m"
       leakage_detected: "bool"
       verdict: "pass|fail"
+    feature_quality:                  # C14 deploy 필수 evidence
+      dual_source_rows: "int"
+      dual_source_non_neutral_rows: "int"
+      exogenous_rows: "int"
+      exogenous_non_neutral_rows: "int"
+    service_policy_replay:            # C14 deploy 필수 evidence (read-only KIS paper policy replay)
+      status: "PASS|BLOCKED|MISSING|UNREADABLE"
+      service_policy_report_path: "string"
+      service_policy_report_sha256: "string"
+      gate:
+        status: "PASS|BLOCKED"
+        blockers: "[string]"
+      policy_checks:
+        deploy_candidate_by_service_policy: "bool"
+        no_naked_short_exposure: "bool"
+        order_caps_respected: "bool"
+        cash_guard_respected: "bool"
+      order_stats:
+        total_orders: "int"
+        naked_short_attempts: "int"
 
 memory:
   type: "backtest_history"
@@ -923,7 +947,13 @@ rules:
   can_intervene_hot_path: false             # 장중 실시간 매매 루프 완전 차단
   can_write_to_production: false            # 배포는 별도 게이트 (operator 승인 포함 가능)
   deploy_decision_gate:
-    condition: "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass'"  # v3 leakage 조건 추가
+    condition: "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass' AND feature_quality gate pass AND service_policy_replay.status == 'PASS'"  # v3 leakage + C14 evidence 조건 추가
+    # SHIP-fix MA-4 (2026-05-06): verdict 계산 임계값 SSOT = risk_config.yaml backtest_agent.deploy_decision_gate
+    # pass_sr_threshold (default 0.0): SR >= 임계값 AND IC >= pass_ic_threshold → "pass"
+    # pass_ic_threshold (default 0.0)
+    # warn_sr_threshold (default -0.5): SR >= 임계값 OR IC >= warn_ic_threshold → "warn", 그 외 "fail"
+    # warn_ic_threshold (default -0.1)
+    # severity 임계값 SSOT = risk_config.yaml backtest_agent.deploy_decision_gate (severity_*_sr_threshold 3개)
     on_fail: "Mode B 22:00 배포 차단 + dead_letter_log 기록 + 다음 날 baseline 유지"
     on_warn: "operator 수동 확인 필요 (human_approval: true)"
     on_pass: "자동 배포 승인 (human_approval: false) OR operator 승인 (human_approval: true)"
@@ -1076,7 +1106,19 @@ tools:
       backtest_run_id: "string"
       baseline_run_id: "string"
       regime_labels: "[{date: ISO8601, regime: string}]"
-      ablation_components: ["factor", "model", "allocator", "dual_source"]   # v3.5: dual_source 추가 (S4-1 Dual-Source 5피처 핵심 자산)
+      ablation_components:                                                     # v3.5: dual_source 추가 (S4-1). S4-2: description 확장.
+        - name: factor
+          description: "Alpha Factor Engine 기여도 (on/off)"
+          measurement: "w/ vs w/o factor IC/Sharpe delta"
+        - name: model
+          description: "LightGBM 모델 구조 기여도"
+          measurement: "baseline vs LightGBM Sharpe delta"
+        - name: allocator
+          description: "PPO Allocator 비중 최적화 기여도"
+          measurement: "equal-weight vs PPO Sharpe delta"
+        - name: dual_source
+          description: "Dual-Source 5피처 (news_score_t + comm_score_t_1/t_2 + news_comm_divergence + community_noise_multiplier)"
+          measurement: "w/ vs w/o dual_source ablation, IC/Sharpe/MDD delta. S4-2 baseline_with_dual_source.pkl 생성."
     output:
       run_id: "string"
       regime_breakdown:
@@ -1135,7 +1177,10 @@ lifecycle: "BootStrap 시 기동, 시스템 생명주기 동안 상주"
 triggers:
   cron_based:
     - time: "18:00 KST"
-      action: "stage_1_performance_analysis"       # §8.1
+      action: "stage_0_dqr"
+      description: "DQR 일별 측정. CRITICAL alert 시 파이프라인 차단 (S4-5)"
+    - time: "18:02 KST"
+      action: "stage_1_performance_analysis"       # §8.1 (stage_0 완료 후)
     - time: "18:30 KST"
       action: "stage_2_direction_selection"        # §8.2
     - time: "19:00 KST"
@@ -1183,13 +1228,24 @@ responsibilities:
       action: "Backtest Agent 호출 건너뛰기 → 직접 MODE_B_IDLE 전이 (baseline 유지)"
 
 sub_components:
+  - name: DQRRunner
+    role: "stage_0 데이터 품질 측정 실행자 (S4-5)"
+    inputs:
+      - date_str
+      - "risk_config.yaml dqr 섹션"
+    outputs:
+      - "DQR report JSON"
+      - "alerts JSONL"
+    critical_block: true  # CRITICAL alert 시 파이프라인 차단
   - name: ModeBDeployer
     role: "배포 실행자 (22:00)"
     inputs:
       bundle_id: string
       backtest_verdict: "pass"
       sanity_check_result: "ok"
+      candidate_bundle_root: "artifacts/bundles/{bundle_id}"
     actions:
+      - validate_candidate_bundle       # live artifact 변경 전 required 4종 존재/비어있지 않음 확인
       - atomic_swap_factor_zoo
       - model_registry_replace          # LightGBM 모델 교체
       - committee_model_replace         # v3.5 추가: AlphaGAT Stage II Committee (S3-8)
@@ -1198,8 +1254,24 @@ sub_components:
       - rollback_on_failure
     rules:
       called_only_if_verdict_pass: true
+      candidate_source_must_not_equal_live_dest: true
+      missing_candidate_blocks_before_backup: true
       rollback_on_failure: true
       human_approval_for_warn: true
+  - name: EvalRunner
+    role: "L3 평가 지표 일별 산출자 (W2 P1, 2026-05-09 SHIP)"
+    invocation: "stage_1 이후 Mode B 18:02 KST batch (또는 별도 cron)"
+    sub_modules:
+      - "new/src/eval/cause_attribution.py"      # cause_attribution_accuracy
+      - "new/src/eval/reason_code_stats.py"      # reason_code_distribution + Top-3 coverage
+    inputs:
+      - "artifacts/audit_log.jsonl (C18 18 필드, label_t5_ret post-hoc backfilled)"
+      - "risk_config.yaml system_os_metrics 임계값"
+    outputs:
+      - "artifacts/metrics/cause_attribution_YYYYMMDD.json"
+      - "artifacts/metrics/reason_code_stats_YYYYMMDD.json"
+    pit_safety: "label_t5_ret None entry 자동 skip (장중 backfill 위반 방지)"
+    critical_block: false  # L3 산출 실패는 alert만, 배포 차단 X
 
 forbidden_permissions:
   - hot_path_intervention
@@ -1217,6 +1289,7 @@ errors:
 sla:
   total_window: "18:00~22:00 KST (4시간)"
   stage_timeouts:
+    stage_0: 120        # DQR (S4-5)
     stage_1: 30         # 성과 분석
     stage_2: 60         # 방향 결정
     stage_3: 3600       # 팩터 진화 (1시간)
@@ -1265,14 +1338,15 @@ Alpha Factor Engine, Co-STEER, Thompson Sampling, 3중 정규화, Alpha Decay Mo
    C4/C8/C9/C10/C11에 대한 schema test, replay test, idempotency test를 구현 코드보다 먼저 작성.
 
 
-## C15. DynamicUniverseContract (Sprint 5 초안)
+## C15. DynamicUniverseContract
 
-> **Sprint 5 예정**. trade universe(active 20)와는 별도의 **watch universe(KOSPI200)** 를 감시하여, 이벤트 발생 시 dynamic overlay를 생성한다. Hot Path core와 PPO는 변경하지 않는다.
+> Sprint 5에서 활성화. trade universe(active 20)와는 별도의 **watch universe(KOSPI200)** 를 감시하여, 이벤트 발생 시 dynamic overlay를 생성한다. Hot Path core와 PPO는 변경하지 않는다.
 
 ```yaml
 name: DynamicUniverseContract
 owner: Risk Agent Fast Path + Event Layer
 mode: "event-driven intraday overlay"
+post_hoc_evaluation_only: true
 input:
   trade_universe_ref: "universe_config.yaml (active 20)"
   watch_universe_ref: "watch_universe_kospi200.yaml"
@@ -1281,7 +1355,8 @@ input:
 output:
   dynamic_candidate_pool:
     max_size: 10
-    current: "[{ticker, admitted_at, trigger_ids, ttl}]"
+    # P1-2 fix (2026-05-09): ttl → ttl_sec (단위 명시, dynamic_universe_config.yaml SSOT 정합).
+    current: "[{ticker, admitted_at, trigger_ids, ttl_sec}]"
   dynamic_holdings:
     max_size: 5
     current: "[{ticker, weight, admitted_at, exit_policy}]"
@@ -1294,15 +1369,31 @@ exit_policy:
   - ttl_expiry
   - stop_loss
   - spike_resolved
-forbidden:
+identity:
+  admission_event_id_prefix: "ADM"
+  exit_event_id_prefix: "EXT"
+  format: "{PREFIX}-{yyyymmdd}-{UUID8}"
+forbidden_permissions:
   - trade_universe_ssot_mutation
-  - lightgbm_inference_for_watch_universe
   - ppo_allocation_for_dynamic_overlay
+  - lightgbm_inference_for_watch_universe
+  - mode_b_cold_path_intervention
+  - fda_weight_modification
+  - direct_trade_execution_bypass_pm
+activation_gate:
+  requires_operator_approval: true
+  enabled_field: "risk_config.yaml dynamic_universe.enabled"
+  activation_command: "python -m new.src.ops.enable_dynamic_universe --approve"
+weight_decision_authority:
+  proposes: "DynamicUniverseManager (fixed_rule_only)"
+  final_executes: "PortfolioManager (order_deltas only)"
+  fda_role: "veto only on admission_event (no weight change)"
+  notes: "DynamicUniverseManager는 weight를 직접 적용하지 않는다. PM이 order_delta로 변환한다. FDA can_change_weight=false 원칙 유지."
 notes:
   rationale: "후보 10 / 실보유 3~5 구조로 운영하며, post-hoc evaluation으로 overlay 성과를 분리 검증"
 ```
 
-## C16. WatchUniverseSnapshotContract (Sprint 5 보조)
+## C16. WatchUniverseSnapshotContract
 
 ```yaml
 name: WatchUniverseSnapshotContract
@@ -1312,6 +1403,7 @@ input:
   universe_ref: "watch_universe_kospi200.yaml"
   interval_sec: 60
 output:
+  watch_snapshot_id: "WS-{yyyymmdd}-{UUID8}"
   snapshots:
     - ticker: string
       ts: ISO8601
@@ -1325,6 +1417,16 @@ use_cases:
 errors:
   - SNAPSHOT_MISSING
   - RATE_LIMIT_EXCEEDED
+  - TICKER_NOT_IN_WATCH_UNIVERSE
+  - STALE_SNAPSHOT  # interval_sec 2배 초과 시
+forbidden_permissions:
+  - direct_trade_execution
+  - trade_universe_mutation
+  - lightgbm_inference_for_watch_universe
+polling_authority:
+  subject: "WatchUniversePoller (Layer 2 Data, 신규)"
+  trigger: "장중 (09:00~15:30 KST) cron 60s interval"
+  mode_b_role: "post_hoc evaluation 데이터 read-only 사용"
 ```
 
 ## C17. ModelRegistryContract (S1-0 Batch B 신설, 2026-04-20)
@@ -1356,7 +1458,7 @@ storage:
 registry_schema:
   # registry.json 구조
   schema_version: "1.0.0"
-  active_version: "string"                  # "baseline" | "v{n}"
+  active_version: "string|null"             # "baseline" | "v{n}" | null (candidate only registry)
   versions:
     - version: "string"                     # "baseline" | "v2" | "v3" ...
       bundle_id: "string|null"              # C12 bundle_id (v2+ 있음)
@@ -1367,6 +1469,8 @@ registry_schema:
       train_end: "YYYY-MM-DD"
       feature_cols: "[string]"
       label_horizon_bars: "int"             # 5 (S1-0 Batch B 기준)
+      label_generation_version: "string"    # label 생성 알고리즘 버전 (risk_config.yaml label.generation_version)
+      label_session_scope: "string"         # ticker_trading_day 등 label session 범위
       metrics:                              # C12/C13 metrics 7종 준수
         ic: "float"
         icir: "float"
@@ -1377,13 +1481,16 @@ registry_schema:
         sr: "float"
       commit_hash: "string"                 # git rev-parse HEAD
       data_version: "string"                # parquet 파일 범위 hash
-      status: "active|archived|rollback"
+      status: "candidate|active|archived|rollback"
 
 api:
   save:
     input: "(model: lgb.Booster, metadata: dict, is_latest: bool)"
     output: "Path (저장된 pkl 경로)"
-    atomicity: "pkl + metadata JSON 완전 저장 후 registry.json + symlink 갱신"
+    atomicity: "pkl + metadata JSON 완전 저장 후 registry.json 갱신. is_latest=true일 때만 latest symlink + active_version 갱신"
+    rules:
+      is_latest_false_status: "candidate"
+      is_latest_false_active_version_mutation: "forbidden"
 
   load_latest:
     input: "()"
@@ -1467,9 +1574,12 @@ audit_log_schema:
     sector: "string|null"                         # KRX 업종 분류
     llm_called: "bool|null"                       # News/Risk/Debate only
     llm_model: "string|null"                      # kanana-o|gpt-4o
-    # PIT-Safety critical: 아래 2 필드는 장중 null, 18:00 이후 batch backfill
+    # PIT-Safety critical: 아래 4 필드는 장중 null, 18:00 이후 batch backfill
     label_t5_ret: "float|null"                    # t+5min forward return (post-hoc, batch only)
     price_t5_snapshot: "float|null"               # t+5min price (post-hoc, batch only)
+    # P1 fix (2026-05-09): backfill 메타. C-2 cause_attribution _is_label_pit_safe() 가드 SSOT.
+    label_backfilled_at: "ISO8601|null"           # backfill 실행 KST 시각. snapshot_hour(18 KST) 이후만 valid. null = 장중 미backfill
+    label_backfill_source: "string|null"          # backfill 원천 (mode_b_stage_1_rollup|synth_audit_log|manual)
 
 aggregation:
   trigger: "Mode B stage_1_data_rollup, 18:00 KST"

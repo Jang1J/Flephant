@@ -35,6 +35,7 @@ from src.models.metrics import sharpe_ratio
 from src.models.splitter import WalkForwardSplitter
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.mode_guard import mode_b_only
 
 logger = get_logger("committee")
 
@@ -256,6 +257,7 @@ class CommitteeModel:
     # Public API
     # ================================================================== #
 
+    @mode_b_only
     def fit(
         self,
         panel: Any,
@@ -265,7 +267,7 @@ class CommitteeModel:
         version: str | None = None,
         bundle_id: str | None = None,
     ) -> CommitteeResult:
-        """OOF stacking 앙상블 학습.
+        """OOF stacking 앙상블 학습. Mode B 전용 (W5 @mode_b_only 추가).
 
         Args:
             panel:        MultiIndex (ts_close, ticker) DataFrame. LGBMTrainer.train() 출력과 동일.

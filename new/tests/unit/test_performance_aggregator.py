@@ -42,6 +42,8 @@ def _make_quant_record(date: str = "2026-04-18", signal: float = 0.5, label: flo
         "anomaly_flag": False,
         "label_t5_ret": label,
         "price_t5_snapshot": 75100.0,
+        "label_backfilled_at": f"{date}T18:30:00+09:00",
+        "label_backfill_source": "mode_b_stage_1_rollup",
     }
 
 
@@ -66,6 +68,8 @@ def _make_fda_record(date: str = "2026-04-18", event_type: str = "veto", label: 
         "reason_code": "RISK_FAST_TRIGGER",
         "llm_called": False,
         "label_t5_ret": label,
+        "label_backfilled_at": f"{date}T18:30:00+09:00",
+        "label_backfill_source": "mode_b_stage_1_rollup",
     }
 
 
@@ -130,6 +134,21 @@ def test_prediction_accuracy_correct(tmp_path: Path) -> None:
     result = agg.aggregate("2020-01-03")
     acc = result["metrics"]["prediction_accuracy"]
     assert acc == pytest.approx(0.8, abs=0.01)
+
+
+def test_label_without_backfill_metadata_excluded(tmp_path: Path) -> None:
+    """C18: label이 있어도 backfill metadata 없으면 post-hoc metric에서 제외."""
+    record = _make_quant_record("2020-01-03", signal=0.5, label=0.01)
+    record["label_backfilled_at"] = None
+    record["label_backfill_source"] = None
+
+    agg = _make_agg(tmp_path)
+    _write_records(tmp_path / "audit_log.jsonl", [record])
+
+    result = agg.aggregate("2020-01-03")
+    assert result["post_hoc_count"] == 0
+    assert result["pit_label_violation_count"] == 1
+    assert result["metrics"]["prediction_accuracy"] is None
 
 
 # ------------------------------------------------------------------ #

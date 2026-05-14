@@ -409,6 +409,7 @@ def test_get_investor_info_mock_no_response() -> None:
     """mock 모드 (is_mock=True): mock_response=None → mock 데이터 반환, C3 3필드 포함."""
     mock_auth = MagicMock()
     mock_auth.get_krx_key.return_value = None  # 키 없음 → is_mock=True
+    mock_auth.get_kis_app_credentials.side_effect = EnvironmentError("KIS missing")
     mock_rate = MagicMock()
     mock_rate.wait_and_acquire.return_value = None
     client = KRXRestClient(auth=mock_auth, rate_limiter=mock_rate)
@@ -444,6 +445,60 @@ def test_get_investor_info_mock_response_injection() -> None:
     assert payload["foreign_net_buy"] == 50000.0
     assert payload["institutional_net_buy"] == -20000.0
     assert payload["retail_net_buy"] == -30000.0
+
+
+def test_get_investor_info_real_path_uses_kis_provider() -> None:
+    """실 수급 경로는 깨진 KRX public endpoint 대신 KIS provider를 사용한다."""
+    client = _make_client()
+    fake_kis = MagicMock()
+    fake_kis.investor_trade_by_stock_daily.return_value = [
+        {
+            "ticker": "005930",
+            "date": "2026-01-02T15:30:00+09:00",
+            "foreign_net_buy": -1500000000.0,
+            "institutional_net_buy": 500000000.0,
+            "retail_net_buy": 1000000000.0,
+        }
+    ]
+
+    with patch("src.connectors.krx_rest.KISRestClient", return_value=fake_kis):
+        result = client.get_investor_info("5930", "20260102", "20260102")
+
+    fake_kis.investor_trade_by_stock_daily.assert_called_once_with(
+        "005930", "20260102"
+    )
+    assert len(result) == 1
+    payload = result[0]["payload"]
+    assert payload["foreign_net_buy"] == -1500000000.0
+    assert payload["institutional_net_buy"] == 500000000.0
+    assert payload["retail_net_buy"] == 1000000000.0
+
+
+def test_get_investor_info_uses_kis_when_krx_key_missing() -> None:
+    """KRX key가 없어도 KIS credentials가 있으면 수급 실 provider를 사용한다."""
+    mock_auth = MagicMock()
+    mock_auth.get_krx_key.side_effect = EnvironmentError("KRX missing")
+    mock_auth.get_kis_app_credentials.return_value = ("app", "secret")
+    mock_rate = MagicMock()
+    mock_rate.wait_and_acquire.return_value = None
+    client = KRXRestClient(auth=mock_auth, rate_limiter=mock_rate)
+
+    fake_kis = MagicMock()
+    fake_kis.investor_trade_by_stock_daily.return_value = [
+        {
+            "ticker": "005930",
+            "date": "2026-01-02T15:30:00+09:00",
+            "foreign_net_buy": 1.0,
+            "institutional_net_buy": 2.0,
+            "retail_net_buy": 3.0,
+        }
+    ]
+
+    with patch("src.connectors.krx_rest.KISRestClient", return_value=fake_kis):
+        result = client.get_investor_info("005930", "20260102", "20260102")
+
+    assert len(result) == 1
+    assert result[0]["payload"]["foreign_net_buy"] == 1.0
 
 
 def test_get_investor_info_pit_safety_future_date() -> None:

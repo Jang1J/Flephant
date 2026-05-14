@@ -11,6 +11,9 @@
 > v3.0.5 (2026-04-25): S2-6 NewsFilter + TextPack 13 템플릿 + S2-7 NewsAgent 실구현 (Kanana-o CoT + consume_text_pack + C5 news_signal/dart_alert publish)
 > v3.0.6 (2026-04-26): Sprint 2 완료 반영. S2-8 RiskAgentFast/Slow Cold Path + S2-9 DebateAgent/FDA Cold Path + S2-10 ModeBPerformanceAggregator + S2-11 BaseConnector. reason_code 7종 최종 확정. Cold Path e2e 루프 닫힘.
 > v3.0.7 (2026-05-01): Sprint 3 완료 반영. ModeBScheduler 7-stage cron + ModeBDeployer atomic swap + KnowledgeBase Layer 5 + Committee (AlphaGAT Stage II) + Validation Tools 3 component. 4축 정합 일괄 수정 포함.
+> v3.0.8 (2026-05-02): Sprint 4 문서 fix. §7.1 8-stage + stage_0 DQR 박스 추가 / Layer 5 Persistent Caching S4-7 SQLite 표기 / §7.6 Bootstrap 다이어그램 신설.
+> v3.0.9 (2026-05-02): 전수 리뷰 fix. §3.0 6단계→8단계 + stage_0 DQR 박스 추가 / §14 active 20 표기 / §19 active 20 표기 / §20.3 RISK_BREACH→RISK_FAST_TRIGGER / Layer 3 n_est=500 정정.
+> v3.1.0 cleanup (2026-05-04): Sprint 0 검증 사후 cleanup. §3.1 Backtest Agent C12 실구현 반영 + §6 S4 모듈 5건 추가 (DQR Runner/DualSourceScorer/PersistentCache/HotPathProfiler/Memory Restorer) + C2 pit_safe/payload 계약서 등재.
 
 ## v2.2 변경점 요약
 
@@ -20,6 +23,8 @@
 | V2 | §3 Mode B | 18:00~22:00 6단계 타임라인 + Backtest Agent 게이트 시각화 신규 |
 | (추가) | §3 | Backtest Agent가 배포 게이트 직전에 추가됨 |
 | (추가) | §4 | Backtest Agent는 Shared Message Pool에 장중에 publish하지 않음 명시 |
+| v3.8 | §1 Layer 2, §2.1 | Layer 2에 Watch Universe Feed 표기 + §2.1 Dynamic Overlay 진입 구조 도식 신규 (Sprint 5 진입, 2026-05-03) |
+| v3.1.0 cleanup (2026-05-04) | §3.1 Backtest Agent C12 실구현 반영 + §6 S4 모듈 5건 (DQR/DualSource/Cache/Profiler/MemoryRestorer) 추가 + C2 pit_safe/payload 계약서 등재 (S0 검증 사후 cleanup) |
 
 ## 1. 전체 시스템 구조도
 
@@ -44,6 +49,8 @@
 │ ║  ┌──────────┐           ┌──────────────┐  ┌──────────┐             ║  │
 │ ║  │Persistent│           │  Vector DB   │  │Factor Zoo│             ║  │
 │ ║  │ Caching  │           │(similarity)  │  │(AST 저장)│             ║  │
+│ ║  │(S4-7     │           │              │  │          │             ║  │
+│ ║  │ SQLite)  │           │              │  │          │             ║  │
 │ ║  └──────────┘           └──────────────┘  └──────────┘             ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                          ↑↓                    ↑↓               │
@@ -95,9 +102,9 @@
 │ ║  │              Quant Model: LightGBM (확정)                    │    ║  │
 │ ║  │                                                              │    ║  │
 │ ║  │  Alpha Factors + Dual-Source 5피처 ──→ LightGBM ──→ active 20종목 예측 시그널           │    ║  │
-│ ║  │  (LLM 자동생성)    (n_est=200~2000  + confidence              │    ║  │
-│ ║  │  + Multi-scale      depth=4)        (추론 0.3ms)             │    ║  │
-│ ║  │  + Cross-Asset피처                                           │    ║  │
+│ ║  │  (LLM 자동생성)    (n_est=500        + confidence              │    ║  │
+│ ║  │  + Multi-scale      depth=4,        (추론 0.3ms)             │    ║  │
+│ ║  │  + Cross-Asset피처  risk_config SSOT)                         │    ║  │
 │ ║  └─────────────────────────────────────────────────────────────┘    ║  │
 │ ║                                                                     ║  │
 │ ║  ┌─────────────────────────────────────────────────────────────┐    ║  │
@@ -146,6 +153,11 @@
 │ ║  │  ④ TSFresh 통계 → 자연어 변환               ││ 3-stage  │       ║  │
 │ ║  │  ⑤ PIT-Safety: LLM에 raw data 비노출        │└──────────┘       ║  │
 │ ║  └─────────────────────────────────────────────┘                   ║  │
+│ ║                                                                     ║  │
+│ ║  ─ Watch Universe Feed (Sprint 5, S5-1):                            ║  │
+│ ║    KOSPI200 200종목 × KIS REST get_price_snapshot() 60초 polling     ║  │
+│ ║    → SnapshotStore (artifacts/watch_snapshots/) → EventGateway      ║  │
+│ ║    forbidden: trade_universe_mutation, lightgbm_inference            ║  │
 │ ╚══════════════════════════════════════════════════════════════════════╝  │
 │       ↑↓                                                                 │
 │ ╔══════════════════════════════════════════════════════════════════════╗  │
@@ -345,11 +357,43 @@
 Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass.
 ```
 
+### Dynamic Overlay 진입 구조 (Sprint 5, S5-1~S5-4)
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Watch Universe (KOSPI200 200종목)                                 │
+  │   └─ KIS REST get_price_snapshot() 60s polling                    │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ EventGateway → AdmissionEngine                                    │
+  │   trigger_catalog match: price_spike_admission ±5%                │
+  │                          dart_hot_ticker_admission                 │
+  │   → admission_event (ADM-yyyymmdd-UUID8)                          │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓ gate.is_enabled() == true 일 때만
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Candidate Pool (max 10)  →  Holdings Manager (max 5)              │
+  │   per_stock_max_weight: 0.03   total_max: 0.10                    │
+  │   allocator: fixed_rule_only (PPO 금지)                            │
+  └────────────┬─────────────────────────────────────────────────────┘
+               ↓
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Exit Engine (4조건)                                                │
+  │   market_close (15:30 KST) | ttl_expiry (1800s)                   │
+  │   stop_loss (-2%)          | spike_resolved                       │
+  │   → exit_event (EXT-yyyymmdd-UUID8)                                │
+  └──────────────────────────────────────────────────────────────────┘
+               ↓
+  비동기 채널 dynamic_overlay_update → PortfolioManager 다음 1분 틱 반영
+  Hot Path (LightGBM/PPO/PM/FDA) 격리 유지. trade universe 불변.
+```
+
 ## 3. 장마감 자동 진화 루프 (Mode B)
 
 ### 3.0 Mode B 타임라인 (v2.2 시각화 신규)
 
-> Mode B는 18:00~22:00 사이에 6단계로 직렬 진행된다. 각 단계 사이에는 명확한 artifact 전달이 있고,
+> Mode B는 18:00~22:00 사이에 8단계 (stage_0 DQR + stage_1~7)로 직렬 진행된다. 각 단계 사이에는 명확한 artifact 전달이 있고,
 > **21:00~21:30 Backtest Agent 게이트** 는 v2.2에서 신설된 시스템 레벨 검증 지점이다.
 >
 > **주체**: 모든 단계 호출은 **Mode B Scheduler (C14)** 가 cron-style로 수행한다.
@@ -359,7 +403,13 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 ```
 시간          단계                           산출물                         다음 단계 트리거
 ──────        ───────────                    ──────                         ──────────────
-  18:00  ┌──────────────────────────┐   → performance_vector            → §8.2
+  18:00  ┌──────────────────────────┐   → dqr_report                    → §8.1 (CRITICAL 시 차단)
+         │ stage_0 DQR              │      (outlier_rate, null_rate,
+         │ Data Quality Review      │       ticker 커버리지)
+         │ (2분 SLA)                │
+         └───────────┬──────────────┘
+                     │
+  18:00  ┌───────────▼──────────────┐   → performance_vector            → §8.2
          │ §8.1 성과 분석           │      8차원 [IC,ICIR,RankIC,
          │ x_t = 8차원 성과 벡터    │       ARR,IR,-MDD,SR, ...]
          └───────────┬──────────────┘
@@ -392,8 +442,8 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
                      │
   21:00  ┏━━━━━━━━━━━▼━━━━━━━━━━━━━┓   ←─────  v2.2 신규 게이트  ─────→
          ┃ §8.5.2 Backtest Agent   ┃   → backtest_report               →
-         ┃ (GPT-4o + C13 tools)    ┃     {verdict, regression_risk,       
-         ┃                         ┃      diagnostic_notes,              
+         ┃ (C12, S3-9 실구현 SHIP) ┃     {verdict, regression_risk,       
+         ┃  GPT-4o + C13 tools    ┃      diagnostic_notes,              
          ┃ ① BacktestEngine        ┃      deploy_recommendation}         
          ┃   walk-forward          ┃                                     
          ┃ ② ReplayRunner          ┃   ┌─ verdict == pass AND             
@@ -406,6 +456,10 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
          ┃ LLM reasoning (GPT-4o): ┃       regression_risk == true         
          ┃  diagnostic_notes 생성   ┃        → 배포 차단 + dead_letter     
          ┗━━━━━━━━━━━┳━━━━━━━━━━━━━┛      + baseline 유지
+
+         > 판정 임계값 SSOT (SHIP-fix NEW-4, 2026-05-06):
+         >   verdict 4 임계값 + severity 3 임계값 = risk_config.yaml backtest_agent.deploy_decision_gate 참조.
+         >   pass_sr/pass_ic/warn_sr/warn_ic + severity_none/low/medium_sr_threshold.
                      │
   21:30  ┌───────────▼──────────────┐   → updated keyword lists         → §8.6
          │ §8.5.1 뉴스 필터 + 규칙  │     (news_filter.yaml 등 5종
@@ -493,8 +547,8 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
   │  └─────────────────────────────────────────────────┘     │
   │                                                           │
   │  ┌─────────────────────────────────────────────────┐     │
-  │  │      Backtest Agent Gate (v2.2 신규)              │     │
-  │  │      [21:00~21:30]                                │     │
+  │  │      Backtest Agent Gate (C12, S3-9 실구현 SHIP) │     │
+  │  │      [21:00~21:30] BacktestEngine 직접 호출       │     │
   │  │                                                   │     │
   │  │  candidate_bundle = {factor, model, allocator}    │     │
   │  │                    ↓                              │     │
@@ -638,6 +692,25 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
         │ 주문 실행  │result│ Knowledge │
         │ KIS API   │─────→│ Base 저장  │
         └───────────┘      └───────────┘
+
+  [Sprint 4 인프라 모듈 (Mode A/B 공통)]
+  ┌──────────────────────────────────────────────────────────┐
+  │  DQR Runner (S4-5, Mode B stage_0)                       │
+  │  8개 커넥터 × 5 메트릭 자동 품질 검사, CRITICAL 시 차단  │
+  ├──────────────────────────────────────────────────────────┤
+  │  DualSourceScorer (S4-1, FinBERT + 3-yaml + decay)       │
+  │  뉴스 / 커뮤니티 divergence 5피처 → uncertainty 신호      │
+  │  08:00 KST 배치 (dual_source_runner.py)                  │
+  ├──────────────────────────────────────────────────────────┤
+  │  PersistentCache (S4-7, SQLite TTL)                      │
+  │  Cold Path 레이턴시 최적화, key=prompt_hash, TTL=config  │
+  ├──────────────────────────────────────────────────────────┤
+  │  HotPathProfiler (S4-4, 6단계 레이턴시 측정)             │
+  │  p50/p95/p99 + SLA 100ms alert (ops/profiler.py)         │
+  ├──────────────────────────────────────────────────────────┤
+  │  Memory Restorer (S4-8, KB 5종 → agent 복원)             │
+  │  시스템 시작 시 Bootstrap (상세: §7.6)                    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ## 7. 논문 매핑도
@@ -908,7 +981,7 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
   ┌────────────────────────────────────────────────────────┐
   │        Multi-scale Cross-Asset Attention                 │
   │                                                         │
-  │  1분봉 Raw Data (30종목 × 8 features)                   │
+  │  1분봉 Raw Data (active 20 × 8 features)                 │
   │            ↓ Multi-scale Decomposition                   │
   │                                                         │
   │  ┌──────────────────────────────────────────────────┐  │
@@ -1065,7 +1138,7 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 ## 19. 확정 파이프라인 순서 (GPT Pro #2)
 
 ```
-  LightGBM (30종목 시그널, 0.3ms)
+  LightGBM (active 20 시그널, 0.3ms)
        ↓
   Top-10 필터링 (퀀트 점수 순)
        ↓
@@ -1182,14 +1255,14 @@ FDA reason_code 분포 (2026-03-20 FOMC 이벤트 시나리오):
        /
       +  DEBATE_CONFLICT [==] 18%
        \
-        RISK_BREACH [=] 10%
+        RISK_FAST_TRIGGER [=] 10%
 ```
 
 | reason_code | 비율 | 의미 |
 |---|---|---|
 | NEWS_DIVERGENCE | 72% | 뉴스 vs 커뮤니티 방향 불일치 -> FDA 개입 |
 | DEBATE_CONFLICT | 18% | 에이전트 간 의견 충돌 -> FDA 중재 |
-| RISK_BREACH | 10% | 리스크 임계 위반 -> FDA veto |
+| RISK_FAST_TRIGGER | 10% | 리스크 규칙 트리거 -> FDA veto |
 
 Cause Attribution Accuracy: 64% (사후 일치 비율, Sprint 4 측정 후 확정).
 
@@ -1236,10 +1309,11 @@ Sharpe lift (Mode B 야간 재학습 전후):
 | 상태 | 포함 지표 | 슬라이드 표기 |
 |---|---|---|
 | 구현 완료 (Sprint 1) | L1 전체, Hot Path Latency, ModelRegistry.compare_versions | 실수치 직접 제시 |
-| 구현 진행 (Sprint 2~3) | L2 7종 (precision/recall 쌍 포함하여 9 key), L3 cause_attribution, reason_code_distribution | "Sprint 2~3 구현 중, 설계 완료" 뱃지 |
-| 설계 완료 (Sprint 4) | L3 self_evolution_gain, dual_source_lead_time, regime_agent_contribution | "Sprint 4 예정, 스키마 확정" 뱃지 |
+| 구현 완료 (W2 P1, 2026-05-09 SHIP) | **L3 cause_attribution_accuracy + reason_code_distribution** | `new/src/eval/cause_attribution.py`, `new/src/eval/reason_code_stats.py`, `new/src/eval/synth_audit_log.py`, 15 unit test PASS, accuracy 0.755 / Top-3 coverage 0.869 (synthetic) |
+| 구현 진행 (Sprint 2) | L2 7종 (precision/recall 쌍 포함하여 9 key) | "Sprint 2 구현 중, 설계 완료" 뱃지 |
+| 설계 완료 (Sprint 4+, defer) | L3 self_evolution_gain, dual_source_lead_time, regime_agent_contribution (`new/src/analytics/` 미구현) | "Sprint 4 예정, 스키마 확정" 뱃지 |
 
-mock 숨기지 않음. 설계 완료된 mock과 근거 없는 mock을 구별. SSOT 근거: C18 신설 (api_contracts.md v3.2), architecture.md §8.1 + §4.2.
+mock 숨기지 않음. 설계 완료된 mock과 근거 없는 mock을 구별. SSOT 근거: C18 신설 (api_contracts.md v3.2), architecture.md §8.1 + §4.2 + evaluation_metrics.md v1.1 (2026-05-09).
 
 ---
 
@@ -1288,13 +1362,14 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 
 ## 7. Sprint 3 추가 다이어그램
 
-### 7.1 ModeBScheduler 7-stage Cron Flow
+### 7.1 ModeBScheduler 8-stage Cron Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  ModeBScheduler (C14) — 18:00~22:00 KST 7-stage cron       │
+│  ModeBScheduler (C14) — 18:00~22:00 KST 8-stage cron       │
 │                                                             │
-│  18:00 stage_1 (30s SLA)  → performance_vector (8d)        │
+│  18:00 stage_0 (120s SLA) → DQR (CRITICAL alert 시 파이프라인 차단)│
+│  18:02 stage_1 (30s SLA)  → performance_vector (8d)        │
 │  18:30 stage_2 (60s SLA)  → direction ∈ {factor, model}    │
 │  19:00 stage_3 (3600s)    → factor_candidate (Alpha Engine) │
 │  20:00 stage_4 (1800s)    → model_candidate (Co-STEER)      │
@@ -1307,7 +1382,7 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 ModeBDeployer Atomic Swap 5-step
+### 7.2 ModeBDeployer Atomic Swap 6-step
 
 ```
 ┌───────────────────────────────────────────────────────┐
@@ -1315,13 +1390,36 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 │                                                       │
 │  Step 1: backtest_report.verdict == pass 확인         │
 │  Step 2: sanity_check() — NaN/Inf/shape 검증          │
-│  Step 3: backup 현재 artifacts/ (365일 보존)          │
-│  Step 4: atomic write → artifacts/deployed_bundle/   │
-│          (factor_zoo + lgbm_model + ppo_model         │
-│           + agent_constraints)                        │
-│  Step 5: audit_log 기록 (DEPLOY-{yyyymmdd}-{UUID8})   │
+│  Step 3: candidate 검증                               │
+│          artifacts/bundles/{bundle_id}/ required 4종  │
+│  Step 4: backup live → artifacts/backup/{deploy_id}/ │
+│  Step 5: atomic swap candidate → live artifacts/      │
+│          factor_zoo + lgbm + committee + ppo          │
+│  Step 6: audit_log 기록 (DEPLOY-{yyyymmdd}-{UUID8})   │
 │                                                       │
 │  실패 시: 롤백 + dead_letter_log + baseline 유지       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 7.2.1 EvalRunner (C14 sub-component, 2026-05-09 W2 P1 SHIP)
+
+```
+┌───────────────────────────────────────────────────────┐
+│  EvalRunner (C14 sub-component)                       │
+│  Trigger: stage_1 직후 (18:02 KST batch)              │
+│  PIT-Safety: snapshot_hour 18 KST 이후만 valid 산출   │
+│                                                       │
+│  L3 metrics (artifacts/metrics/):                     │
+│  ├─ reason_code_distribution_{yyyymmdd}.json          │
+│  │    Top-3 coverage threshold 0.80                   │
+│  └─ cause_attribution_{yyyymmdd}.json                 │
+│       Accuracy threshold 0.60 (발표 킬러 지표)        │
+│                                                       │
+│  입력: artifacts/audit_log.jsonl (C18 20 필드)        │
+│        label_t5_ret + label_backfilled_at             │
+│        + label_backfill_source (PIT-Safety meta)      │
+│                                                       │
+│  실패 시: PASS=false 메트릭 → operator alert          │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -1393,5 +1491,31 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 │     SLA: max_runtime_sec=600                             │
 │                                                          │
 │  result → KB TTL=30days (Sprint 4 KB.write 예정)         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 7.6 Bootstrap 단계 (시스템 시작 시 Memory 복원)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Bootstrap (시스템 시작 → HOT_RUNNING 진입 전)            │
+│                                                          │
+│  AgentMemoryRestorer.restore_all()   (S4-8)              │
+│    │                                                     │
+│    ├─ KB storage 읽기 (5종, factor_zoo 제외):             │
+│    │    micro_notes / macro_notes / debate_history       │
+│    │    decision_history / backtest_history              │
+│    │    (factor_zoo: Mode B Scheduler 전용, restorer 제외)  │
+│    │                                                     │
+│    ├─ 에이전트 인스턴스별 inject:                         │
+│    │    NewsAgent      ← micro_notes + macro_notes       │
+│    │    RiskAgent      ← macro_notes                     │
+│    │    DebateAgent    ← debate_history                  │
+│    │    FDA            ← decision_history                │
+│    │    BacktestAgent  ← backtest_history                │
+│    │                                                     │
+│    └─ 부트 완료 → HOT_RUNNING 진입                       │
+│                                                          │
+│  실패 시: 빈 memory로 cold start (warn 로그 출력)         │
 └──────────────────────────────────────────────────────────┘
 ```

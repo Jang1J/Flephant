@@ -7,9 +7,9 @@
 
 mode_b_metadata:
   schema_version: "1.0.0"
-  data_version: "1.0.0"
-  last_updated: "2026-04-06"
-  updated_by: "initial"
+  data_version: "1.2.0"                  # live-data fix: stale/invalid active tickers replaced
+  last_updated: "2026-05-11"
+  updated_by: "codex_live_data_gate"
   mode_b_editable: false          # universe는 Mode B가 자동 수정 금지 (수동 업데이트만)
   human_approval_required: true   # 종목 추가/제거는 operator 승인 필수
   backup_retention_days: 365      # universe는 장기 보관
@@ -21,9 +21,14 @@ backtest_universe_mode:            # v2.2 — Backtest Agent universe 정책
   allow_pending: false             # pending 10종목 제외
   rationale: "pending 종목은 데이터 검증 미완. Backtest 결과 신뢰도를 위해 active 20만 사용."
   override_flag: "backtest_config.include_pending"  # Sprint 4에서 overrideable
+  # SHIP-fix R-1 (W1 P0 cleanup): yaml 파싱 실패 또는 sectors 비어있을 때만 발동.
+  # 정상 운영에서는 sectors[X].stocks 20종목 사용. 불변 5원칙 (하드코딩 금지) 준수.
+  fallback_tickers:                # safety fallback (정상 yaml 구조에서는 미사용)
+    - "005930"                     # 삼성전자
+    - "000660"                     # SK하이닉스
 
-version: "1.0.0"
-last_updated: "2026-04-06"
+version: "1.1.0"
+last_updated: "2026-05-11"
 target_total_stocks: 30          # 최종 목표
 active_stock_count: 20           # 현재 확정
 pending_stock_count: 10          # 미확정 (2섹터)
@@ -45,7 +50,7 @@ sectors:
     stocks:
       - { ticker: "329180", name: "HD현대중공업", aliases: ["현대중공업", "HD현대"], status: "active" }
       - { ticker: "042660", name: "한화오션", aliases: ["대우조선"], status: "active" }
-      - { ticker: "010620", name: "HD현대미포", aliases: ["현대미포"], status: "active" }
+      - { ticker: "010140", name: "삼성중공업", aliases: ["삼성중공", "Samsung Heavy"], status: "active" }
       - { ticker: "009540", name: "HD한국조선해양", aliases: ["한국조선해양"], status: "active" }
       - { ticker: "267250", name: "HD현대인프라코어", aliases: [], status: "active" }
 
@@ -65,7 +70,7 @@ sectors:
       - { ticker: "047810", name: "한국항공우주", aliases: ["KAI"], status: "active" }
       - { ticker: "079550", name: "LIG넥스원", aliases: ["넥스원"], status: "active" }
       - { ticker: "298040", name: "효성중공업", aliases: [], status: "active" }
-      - { ticker: "014880", name: "한라", aliases: [], status: "active" }
+      - { ticker: "272210", name: "한화시스템", aliases: ["Hanwha Systems"], status: "active" }
 
   # 미확정 섹터 (2개) — 종목 분석 후 확정
   섹터5_미확정:

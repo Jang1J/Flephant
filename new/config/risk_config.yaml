@@ -48,6 +48,14 @@ regime_gate:
 turnover_cap:
   daily_max: 0.30              # 일일 최대 회전율 30%
 
+# Codex 권고 8 (2026-05-09): PM boundary 정책 SSOT.
+# false (default backward-compat): PM 이 PPO target_weights 를 max_names/max_single_name 기준 clip/drop/renorm.
+# true (strict, 권장): PM 이 PPO weights 그대로 + violation 만 errors.ppo_violations 에 보고. 발표 핵심 차별점
+# "PPO 가 비중 결정, PM 이 order_deltas" boundary spirit 보존. 운영 권장 = true.
+portfolio_manager:
+  respect_ppo_weights: true    # 운영 default. PM은 PPO weights를 변경하지 않고 violation만 보고.
+  rationale: "PPO Allocator (C7) 가 비중 결정 권한, PM (C8) 은 order_deltas 변환만. respect=true 시 PM 이 weights 변경 없이 violation 보고."
+
 position_limits:
   max_names: 10                # trade universe 전용 최대 보유 종목 수. Sprint 5 동적 overlay는 dynamic_universe.holdings_max 별도 (=5). 총 최대 = 15.
   max_single_name: 0.20        # 단일 종목 비중 상한 (20%)
@@ -104,6 +112,31 @@ alpha_decay:
 execution:
   mode: "mock"                 # mock | paper | live
   live_enabled: false          # true면 실계좌 주문 가능
+
+paper_trading:
+  report_dir: "artifacts/reports/paper_trading"
+  confirm_order_phrase: "PAPER_ORDER_OK"
+  require_virtual_mode: true
+  max_probe_order_qty: 1
+  allow_market_order: false
+  evidence_max_age_sec: 86400
+
+paper_auto_trading:
+  report_dir: "artifacts/reports/paper_auto_trading"
+  confirm_start_phrase: "PAPER_AUTO_OK"
+  require_virtual_mode: true
+  require_prelive_pass: true
+  require_active_model: true
+  default_max_cycles: 1
+  default_interval_sec: 60
+  max_tickers: 20
+  max_orders_per_cycle: 3
+  max_order_qty_per_order: 1
+  allow_market_order: false
+  use_latest_ppo_policy_if_available: true
+
+mode_b_deploy:
+  report_dir: "artifacts/reports/deploy"
 
 bounded_execution:
   news_agent_max_sec: 10
@@ -204,6 +237,26 @@ backtest_agent:
   deploy_decision_gate:
     verdict_required: "pass"           # pass | warn | fail
     regression_severity_block: "high"  # low | medium | high
+    # SHIP-fix R-2 (W1 P0 cleanup): backtest verdict 임계값. 불변 5원칙 (하드코딩 금지).
+    # backtest.py:_calc_verdict 가 참조. SR / IC 기준.
+    pass_sr_threshold: 0.0             # SR >= 0.0 AND IC >= 0.0 → "pass"
+    pass_ic_threshold: 0.0
+    warn_sr_threshold: -0.5            # SR >= -0.5 OR IC >= -0.1 → "warn", 그 외 "fail"
+    warn_ic_threshold: -0.1
+    # SHIP-fix NEW-1 (2026-05-06): regression_severity 임계값. backtest.py:_calc_regression_severity 가 참조.
+    severity_none_sr_threshold: 0.5    # SR >= 0.5 → "none"
+    severity_low_sr_threshold: 0.0     # SR >= 0.0 → "low"
+    severity_medium_sr_threshold: -0.5 # SR >= -0.5 → "medium", 그 외 "high"
+    feature_quality_gate:
+      min_dual_source_non_neutral_row_coverage: 0.8
+      min_exogenous_non_neutral_row_coverage: 0.8
+      missing_feature_quality_action: "block_deploy"
+    service_policy_gate:
+      require_status: "PASS"
+      require_no_naked_short: true
+      require_order_caps_respected: true
+      require_cash_guard_respected: true
+      missing_service_policy_action: "block_deploy"
     on_pass:
       human_approval_required: false
       action: "deploy"
@@ -223,16 +276,16 @@ backtest_agent:
     - production_direct_write
   mode_b_metadata:
     schema_version: "1.0.0"
-    data_version: "1.0.0"
-    last_updated: "2026-05-01"
-    updated_by: "Sprint 3 SHIP (elephant-ops)"
+    data_version: "1.1.0"                  # SHIP-fix R-2 + NEW-1 (2026-05-06): deploy_decision_gate 4 + severity 3 임계값 추가
+    last_updated: "2026-05-06"
+    updated_by: "w1_p0_cleanup_r2_new1 (2026-05-06)"
     mode_b_editable: false
     human_approval_required: true
     backup_retention_days: 365
     update_trigger: "manual_only"
     rationale: |
-      Backtest Agent 동작 설정. mode/llm/sla/forbidden_permissions 변경 시
-      불변 원칙 3 (Backtest Agent Mode B 전용) 위반 가능. 자동 변경 금지.
+      Backtest Agent 동작 설정. mode/llm/sla/forbidden_permissions/deploy_decision_gate 변경 시
+      불변 원칙 3 (Backtest Agent Mode B 전용) + 불변 원칙 5 (하드코딩 금지) 위반 가능. 자동 변경 금지.
 
 # v2.2 추가 — Validation Tools (C13 ValidationToolsContract)
 validation_tools:
@@ -256,6 +309,11 @@ validation_tools:
       price_noise_std: 1000.0          # 가격 노이즈 표준편차 (KRW)
       signal_return_correlation: 0.05  # 예측 시그널과 실제 수익률 상관 계수
       return_noise_std: 0.02           # 실제 수익률 노이즈 표준편차 (비율)
+    # DEPRECATED 2026-05-12 (Phase 1 재수정, Codex cross-check):
+    # Top-K long-only 산식 (trainer lgbm_trainer._group_for_metrics:401-411 정합) 으로
+    # 변경된 후 threshold filter 사용처 없음. 새 산식은 threshold 없이 top-K mean.
+    # 참고용으로만 유지. 코드 로드 path는 validation_tools.py:131 에서 제거.
+    trade_signal_threshold: 0.03       # DEPRECATED: dead config, 코드 미사용
     errors:
       - BUNDLE_LOAD_FAILED
       - DATA_UNAVAILABLE
@@ -349,6 +407,11 @@ dual_source:
       Dual-Source (뉴스↔커뮤니티) divergence 파라미터. Risk Fast sidecar 감지 임계값 +
       FDA uncertainty 연계 계수. 불변 원칙 1~5 중 PIT-Safety + 하드코딩 금지 직결.
   enabled: true
+  # S4-2 추가 (2026-05-02): LightGBM 피처 주입 제어 플래그.
+  # true = 5피처를 DatasetBuilder 통해 LightGBM 학습에 포함 (baseline_with_dual_source.pkl).
+  # false = 기존 4피처만 사용 (baseline.pkl 롤백 경로).
+  # 불변 원칙 5: 하드코딩 금지. 코드에서 이 키를 로드해 on/off 분기.
+  enabled_for_lgbm: true
   news_decay_lambda: 0.8
   community_decay_lambda: 0.4
   community_peak_lag_days: 2
@@ -393,9 +456,9 @@ dual_source:
 trigger_catalog:
   mode_b_metadata:
     schema_version: "1.0.0"
-    data_version: "1.0.0"
-    last_updated: "2026-04-20"
-    updated_by: "s1_batch_bc_part_c"
+    data_version: "1.1.0"
+    last_updated: "2026-05-03"
+    updated_by: "s5_p4_admission_rules"
     mode_b_editable: true
     human_approval_required: false
     backup_retention_days: 30
@@ -454,6 +517,26 @@ trigger_catalog:
       stance: "risk_reduce"
       description: "뉴스↔커뮤니티 방향 불일치 심각. position sizing 축소 + FDA uncertainty_score 상승 신호. memory project_v3_universe_and_dual_source.md §2."
       publishes_to: "uncertainty_signal"
+
+    # Sprint 5 — Dynamic Universe 편입 트리거
+    # action: admit_candidate 가 신규 행동. AdmissionEngine 이 처리.
+    - id: "price_spike_admission"
+      condition: "watch_universe ticker 1min return > +5% OR < -5%"
+      priority: "urgent"
+      action: "admit_candidate"
+      risk_level: "medium"
+      stance: "opportunity"
+      description: "watch universe (KOSPI200) 종목 ±5% 급변 → dynamic_candidate_pool 편입 후보. AdmissionEngine 이 max_size=10 가드 적용."
+      publishes_to: "admission_event"
+
+    - id: "dart_hot_ticker_admission"
+      condition: "dart 공시 + watch universe ticker AND dart_rules.yaml material 매칭"
+      priority: "urgent"
+      action: "admit_candidate"
+      risk_level: "medium"
+      stance: "opportunity"
+      description: "watch universe 종목의 중요 공시 → dynamic_candidate_pool 편입 후보. trade universe 종목은 별도 (Cold Path 처리)."
+      publishes_to: "admission_event"
 
 
 # Sprint 5 초안 — Dynamic Event Universe (watch universe overlay)
@@ -516,6 +599,19 @@ connector_defaults:
 pit_safety:
   snapshot_hour: 18     # KST 기준 시(24시간제)
   snapshot_minute: 0
+  timezone: "Asia/Seoul"
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-02"
+    updated_by: "coder1_sprint012_fix (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: |
+      PIT-Safety snapshot 기준 시각. 18:00 KST 기준. 불변 원칙 1 직결.
+      snapshot_hour 변경은 미래 데이터 접근 허용 범위 변경 — 자동 수정 절대 금지.
 
 # Event Normalizer 정책 (C2 EventNormalizeContract 기본값)
 # event_normalizer.py가 참조. 각 source별 기본값.
@@ -527,6 +623,7 @@ event_normalizer:
     community: 900
     ecos: 86400           # 거시지표: 1일
     us_market: 3600
+    price_snapshot: 60    # S5-1 C16: 60초 snapshot polling 주기와 일치
   priority:
     dart: urgent
     krx_investor_flow: normal
@@ -534,6 +631,7 @@ event_normalizer:
     community: low
     ecos: normal
     us_market: normal
+    price_snapshot: normal  # S5-1 C16 AdmissionEngine 편입 판정 트리거
   llm_required:
     dart: true
     krx_investor_flow: false
@@ -541,6 +639,7 @@ event_normalizer:
     community: true
     ecos: false
     us_market: false
+    price_snapshot: false   # S5-1 C16: 비LLM 규칙 기반 판정 전용
 
 # Auth Manager 정책 (KIS OAuth 재시도 + refresh)
 # auth.py가 참조. 불변 원칙 5 준수.
@@ -564,11 +663,57 @@ preprocessor:
   # S1-0 Batch C 추가 (2026-04-20): LGBMTrainer/DatasetBuilder 공용 피처 목록
   # DatasetBuilder._compute_rolling_features 출력과 1:1 대응.
   # 피처 추가/제거 시 이 목록 + dataset_builder 양쪽 동시 수정 필수.
+  # S4-2 추가 (2026-05-02): dual_source 5피처 포함 여부는 dual_source.enabled_for_lgbm 플래그로 제어.
+  # dual_source.enabled_for_lgbm=true 시 아래 5피처를 feature_cols에 병합.
+  # 이 목록은 base 피처 (항상 포함).
   feature_cols:
     - feat_1m_close_robust_z
     - feat_5m_ret
     - feat_30m_vol
     - feat_60m_trend
+  # Dual-Source 5피처 (S4-2). dual_source.enabled_for_lgbm=true 일 때만 feature_cols에 병합.
+  # 값 범위: news_score_t (-1~+1), comm_score_t_1 (-1~+1), comm_score_t_2 (-1~+1),
+  #          news_comm_divergence (0~2), community_noise_multiplier (0~1).
+  # 결측 시 기본값 0.0 (PIT-safe: 점수 없으면 중립 처리).
+  dual_source_feature_cols:
+    - news_score_t
+    - comm_score_t_1
+    - comm_score_t_2
+    - news_comm_divergence
+    - community_noise_multiplier
+  # C3 feature_manifest 외생/수급 피처. exogenous_features.enabled_for_lgbm=true 일 때 병합.
+  # 초기 결측은 neutral_defaults로 채운다. 실제 connector 값은 QuantAgent side-channel로 주입 가능.
+  exogenous_feature_cols:
+    - us_sp500_change
+    - us_nasdaq_change
+    - us_vix
+    - us_soxx_change
+    - foreign_net_buy
+    - institutional_net_buy
+    - retail_net_buy
+    - interest_rate
+    - usd_krw
+
+exogenous_features:
+  enabled_for_lgbm: true
+  neutral_defaults:
+    us_sp500_change: 0.0
+    us_nasdaq_change: 0.0
+    us_vix: 0.0
+    us_soxx_change: 0.0
+    foreign_net_buy: 0.0
+    institutional_net_buy: 0.0
+    retail_net_buy: 0.0
+    interest_rate: 0.0
+    usd_krw: 0.0
+
+phase2_feature_backfill:
+  # Phase 2 gate for exogenous + Dual-Source historical feature remediation.
+  # These thresholds are diagnostic, not deploy gates. C12/C14 remain the
+  # deploy authority.
+  min_dual_source_non_neutral_date_coverage: 0.8
+  min_exogenous_non_neutral_date_coverage: 0.8
+  neutral_placeholder_allowed_for_rehearsal: true
 
 # Sprint 2 확정 예정: FDA reason_code enum stub
 # 코드에서 이 목록 참조 필수 (불변 원칙 5 하드코딩 금지)
@@ -635,19 +780,39 @@ walk_forward:
   step_days: 20                     # fold 간 step = test window와 일치 (no-overlap)
   trading_minutes_per_day: 390      # KRX 정규장 09:00~15:30
 
+# Live data readiness gate. live_data_readiness.py가 이 섹션에서 로드한다.
+# 목적: 오래된/부분 파일이 LightGBM 학습 가능 날짜로 계산되는 것을 차단.
+live_data_readiness:
+  min_rows_per_day: 300             # KIS virtual 과거 분봉은 일부 종목 381 rows도 정상으로 허용
+  train_min_rows_per_day: 300       # LightGBM real artifact 날짜 인정 최소 row 수
+  require_all_tickers_for_backfill: true
+  require_all_tickers_for_train: true
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-11"
+    updated_by: "codex_live_data_gate"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "실데이터 backfill readiness와 LightGBM train gate. partial/stale artifact가 학습으로 넘어가는 것을 차단한다."
+
 # Label 생성 파라미터 (S1-0 Batch B dataset_builder.py 참조)
 # label = fwd_return_{horizon_bars}m. PIT-Safety 준수.
 label:
   mode_b_metadata:
     schema_version: "1.0.0"
-    data_version: "1.0.0"
-    last_updated: "2026-04-20"
-    updated_by: "s1_batch_bc"
+    data_version: "1.1.0"
+    last_updated: "2026-05-12"
+    updated_by: "codex_label_leakage_fix"
     mode_b_editable: false           # label 정의 변경은 모델 학습 목표 변경 = 프로젝트 근본
     human_approval_required: true
     backup_retention_days: 365
     update_trigger: "manual_only"
-    rationale: "label horizon(5분) 변경은 전체 학습 재실행 필요. 자동 수정 금지."
+    rationale: "label horizon/생성 범위 변경은 전체 학습 재실행 필요. 거래일 경계 밖 forward label 참조를 금지한다."
+  generation_version: "session_local_v2"
+  session_scope: "ticker_trading_day"
   horizon_bars: 5                   # 5분 후 수익률 (사용자 결정 2026-04-20)
   target_col: "label_5m_ret"
   rank_col: "cs_rank"
@@ -684,6 +849,92 @@ evaluation:
   performance_vector_clip_high: 0.99       # 상한
   performance_vector_neutral_fallback: 0.5 # history 부재/rng=0 시 neutral 값
 
+# Service-policy replay: KIS paper cash-account execution policy for C14 evidence.
+# 실제 paper-auto 제약(저회전/최소 보유/cooldown/no-trade)을 C12 이후 read-only
+# replay에 반영한다. 변경 시 C12/service-policy 전체 재실행 필요.
+service_policy_replay:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-13"
+    updated_by: "codex_service_policy_controls"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_review_then_mode_b_replay"
+    rationale: "KIS paper cash-account replay의 거래 빈도/회전율 제약. 변경 시 성과 비교 불가하므로 C12/service-policy 전체 재실행 필요."
+  # 2026-05-13 cost-policy grid (BUNDLE-20260512-QUICKCHECK, 20260414~20260503):
+  # 30m decision stride + half-session hold/cooldown reduced churn and passed
+  # service-policy constraints without relaxing gate thresholds.
+  decision_stride_bars: 30
+  min_holding_bars: 195
+  rebalance_cooldown_bars: 195
+  no_trade_score_spread: 0.0
+  allow_position_pyramiding: false
+  turnover_budget_hard_stop: true
+  min_expected_net_alpha_bps: 15.0
+  min_service_policy_sharpe: 0.0
+
+# Cost-aware retraining preparation. 이 섹션은 모델을 자동 deploy하지 않는다.
+# 목적은 5m label/cost/turnover mismatch를 다음 Mode B 재학습 실험으로 넘길 때
+# 필요한 objective 후보와 gate 입력을 한 곳에 고정하는 것이다.
+cost_aware_retraining:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-13"
+    updated_by: "codex_cost_aware_retraining_prep"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 365
+    update_trigger: "manual_review_then_mode_b_training"
+    rationale: "label horizon / net-of-cost target / turnover objective는 성과 비교 기준을 바꾸므로 operator 승인 및 C12 재실행 필요."
+  horizon_candidates: [5, 30, 60, "session_close"]
+  objective:
+    net_of_cost_target: true
+    trade_no_trade_classifier: true
+    turnover_penalty_from_ppo_config: true
+    min_expected_net_alpha_bps_from_service_policy: true
+    require_phase2_non_neutral_coverage: true
+    require_service_policy_replay_before_deploy: true
+
+# S4-4 추가 (2026-05-02) — Hot Path 성능 최적화
+# HotPathProfiler 단계별 SLA 임계값. 전체 p95 SSOT = quant_agent.latency_p95_target_ms.
+# 이 섹션은 단계별 세분화 목적. system_os_metrics L821-L823 중복 선언 금지 준수.
+hot_path:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-05-02"
+    last_updated: "2026-05-02T00:00:00+09:00"
+    updated_by: "s4_4_modeler (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: true
+    backup_retention_days: 180
+    update_trigger: "manual_only"
+    rationale: |
+      Hot Path SLA 임계값. 변경 시 단계별 레이턴시 허용 범위 변경.
+      operator 수동 승인 필수. Mode B 자동 변경 금지.
+  sla:
+    p50_ms: 50       # hot_loop 전체 p50 목표 (ms)
+    p95_ms: 100      # hot_loop 전체 p95 목표 (ms). SSOT = quant_agent.latency_p95_target_ms
+    p99_ms: 150      # hot_loop 전체 p99 목표 (ms)
+    alert_on_violation: true   # SLA 위반 시 ops_alerts.jsonl 기록
+  # Feature Store 백엔드 결정 (S4-4).
+  # A: in-memory (BarBuffer 확장, 재시작 시 warmup 60분)
+  # B: parquet (artifacts/feature_store/, 영속 + 몇 ms I/O 추가)
+  # C: sqlite (영속 + index, 매 tick I/O)
+  # 결정: A (in-memory). Hot Path SLA <100ms 가장 안전. 재시작 warmup 60분으로 커버.
+  feature_store:
+    backend: "in_memory"       # in_memory | parquet | sqlite
+    warmup_bars: 60            # 재시작 후 BarBuffer warmup 필요 bar 수 (= quant_agent.warmup_bars)
+    backend_rationale: |
+      in_memory 선택 이유:
+        - Hot Path <100ms SLA 최우선. in_memory가 가장 낮은 레이턴시.
+        - parquet I/O: 3~10ms 추가. SLA 여유 소진.
+        - sqlite: 매 tick disk write. 더 높음.
+        - 재시작 시 warmup 60분(= warmup_bars)으로 in_memory 상태 복구 가능.
+        - 실데이터 연결 전까지 변경 불요.
+
 # S1-1 추가 (2026-04-20) — Quant Agent 런타임 파라미터
 # new/src/agents/hot/quant.py 참조. Hot Path <100ms.
 # 동기 LLM 미호출. ModelRegistry.load_latest()로 booster 로드 후 추론.
@@ -702,6 +953,7 @@ quant_agent:
   anomaly_zscore_threshold: 3.0      # intraday drop anomaly 임계 (|z| > threshold → anomaly)
   latency_window: 1000               # p50/p95/p99 측정 창 (최근 N개 기록)
   latency_p95_target_ms: 100         # Hot Path SLA (경고/로그용, enforcement는 S1-9 Monitor)
+  investor_flow_stale_sec: 1800      # 수급 side-channel snapshot stale 기준
 
 # Model Registry 파라미터 (S1-0 Batch B registry.py 참조)
 # artifacts/lgbm/ 하위 파일 관리. S3-6 야간 재학습이 동일 registry 재사용.
@@ -734,6 +986,8 @@ model_registry:
     - data_version
     - created_at
     - label_horizon_bars
+    - label_generation_version
+    - label_session_scope
 
 # ============================================================
 # agent_performance: Layer 2 (Agent 기여도 지표) 임계값
@@ -885,7 +1139,18 @@ debate:
     rationale: "DebateAgent 설정. max_pairwise/uncertainty_threshold는 Mode B 야간 False Positive 분석 후 자동 갱신 가능."
   max_pairwise: 45          # C6 SSOT: C(10,2)=45 쌍 (10 에이전트 기준)
   uncertainty_threshold: 0.7  # uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
-  llm_caller: "debate"      # LLMRouter caller 식별자
+  llm_caller: "debate_agent"      # LLMRouter caller 식별자
+  max_runtime_sec: 15       # bounded_execution.debate_agent_max_sec와 동일한 cold-path deadline
+  conflict_criteria:        # C6 SSOT (debate.py _CONFLICT_PATTERNS 하드코딩 제거 → yaml 이동)
+    - signal_a: "quant_top10"
+      signal_b: "veto_recommendation"
+      reason: "Quant TOP-10 종목에 대한 Risk veto 충돌"
+    - signal_a: "quant_buy"
+      signal_b: "risk_high"
+      reason: "Quant 매수 신호 + Risk high 동시 발생"
+    - signal_a: "news_sell"
+      signal_b: "quant_top5"
+      reason: "News 매도 알림 + Quant TOP-5 동시 발생"
 
 risk_fast:
   mode_b_metadata:
@@ -955,6 +1220,7 @@ mode_b_scheduler:
       자동 수정 시 stage 완료 판정 기준이 바뀌어 배포 게이트 오동작 가능.
       stage_timeouts 변경은 operator 수동 확인 후 commit.
   stage_timeouts:
+    stage_0: 120         # 18:00 DQR (S4-5, 2분 SLA)
     stage_1: 30          # 18:00 성과 분석
     stage_2: 60          # 18:30 방향 결정
     stage_3: 3600        # 19:00 Alpha Factor Engine
@@ -962,6 +1228,9 @@ mode_b_scheduler:
     stage_5: 1800        # 20:30 에이전트 자기 개선
     stage_6: 1800        # 21:00 Backtest 검증
     stage_7: 900         # 22:00 배포
+  execution_window:
+    start_hour: 18
+    end_hour: 22
   audit_log_path: "artifacts/mode_b_audit_log.jsonl"
   weekdays: ["MON", "TUE", "WED", "THU", "FRI"]
 
@@ -977,6 +1246,8 @@ alpha_factor:
   ic_duplicate_threshold: 0.99   # IC_max >= 0.99 → 중복 제거
   alpha_decay_warning_months: 3  # IC 3개월 연속 하락 → decay 경고
   alpha_decay_retire_months: 6   # IC 6개월 연속 하락 → 자동 은퇴
+  # W3 yaml화: factor_agent._make_test_df seed (불변 원칙 5).
+  factor_agent_seed: 42         # FactorAgent 검증용 test_df seed (재현성)
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"
@@ -1015,6 +1286,11 @@ eval_agent:
   sl_clip_max: 2.0         # SL 클립 상한 (1.0 초과 = complexity_violation 허용)
   synthetic_bars: 50       # IC 계산용 synthetic DataFrame bar 수
   min_valid_samples: 5     # IC 계산 최소 유효 샘플 수
+  # C3 yaml화: _compute_alignment 가중치 (불변 원칙 5).
+  alignment_c1_weight: 0.5  # C(h,d,f) c1 가중치 (hypothesis ↔ description)
+  alignment_c2_weight: 0.5  # C(h,d,f) c2 가중치 (description ↔ factor code)
+  # W3 yaml화: synthetic DataFrame seed (eval_agent._make_synthetic_df).
+  synthetic_seed: 42        # IC 계산용 synthetic OHLCV seed (재현성)
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"
@@ -1061,14 +1337,20 @@ co_steer:
 # nightly_lgbm_retrainer.py가 이 섹션에서 로드 (불변 원칙 5 하드코딩 금지).
 # ============================================================
 nightly_retrainer:
-  lookback_days: 30        # 재학습 데이터 기간 (일). sliding window 크기.
+  lookback_days: 365       # 재학습 데이터 기간 (일). walk_forward 8 folds 확보용.
   max_alpha_factors: 5     # 사용할 최대 alpha factor 수 (FactorZoo active 상위 N개)
   tickers: []              # 빈 리스트 = DatasetBuilder 기본값 (20 KOSPI 종목)
+  synthetic_fallback_enabled: true  # KIS/backfill 데이터 부재 시 mock 1분봉 학습 허용
+  synthetic_seed: 42       # synthetic fallback 재현성 seed
+  synthetic_session_start: "09:00"   # KRX regular session start for synthetic fallback bars
+  synthetic_drift_scale: 0.00005     # ticker별 deterministic drift scale
+  synthetic_return_noise_std: 0.0015 # synthetic 1m return noise std
+  synthetic_min_price: 1000.0        # synthetic OHLC lower price guard
   mode_b_metadata:
     schema_version: "1.0.0"
-    data_version: "1.0.0"
-    last_updated: "2026-04-27"
-    updated_by: "s3_6_coder (elephant-ops)"
+    data_version: "1.1.0"
+    last_updated: "2026-05-09"
+    updated_by: "codex_bt_diag_fix (elephant-ops)"
     mode_b_editable: false
     human_approval_required: false
     backup_retention_days: 365
@@ -1078,6 +1360,8 @@ nightly_retrainer:
       lookback_days 변경은 학습 데이터량 직결 (단축 시 과적합 위험).
       max_alpha_factors 변경은 feature 수 변화 → 모델 구조 영향.
       tickers 빈 리스트 = DatasetBuilder 내부 KOSPI 20 기본값 사용.
+      synthetic_fallback_enabled=true 는 KIS 키 blocker 환경의 발표/CI 검증용.
+      candidate metadata에 synthetic_fallback=true를 남겨 실거래 검증과 분리한다.
       자동 변경 금지 (operator 수동 검토 필요).
 
 # ============================================================
@@ -1185,6 +1469,30 @@ knowledge_base:
       pit_safety_check: timestamp 미래 참조 차단 (불변 원칙 1 직결).
 
 # ============================================================
+# agent_memory: S4-8 Agent Memory 영속화. AgentMemoryRestorer 로드 (불변 원칙 5).
+# 5종 storage_type: micro_notes/macro_notes/debate_history/decision_history/backtest_history
+# restore_window_days: KB에서 복원할 과거 일수. restore_max_entries_per_agent: 에이전트당 최대 복원 수.
+# ttl_days: storage_type별 보관 일수 (미래 TTL pruner 연동 기준).
+# enabled: false 시 restore_all() 즉시 반환 (테스트 편의).
+# ============================================================
+agent_memory:
+  enabled: true
+  storage_types:
+    - micro_notes
+    - macro_notes
+    - debate_history
+    - decision_history
+    - backtest_history
+  restore_window_days: 7
+  restore_max_entries_per_agent: 100
+  ttl_days:
+    micro_notes: 30
+    macro_notes: 90
+    debate_history: 30
+    decision_history: 365
+    backtest_history: 365
+
+# ============================================================
 # backtest: BacktestEngine ARR 계산용 초기 자본 (S3 알고리즘 수정 2026-05-01)
 # daily_pnl(dollar) → 수익률 비율 변환 기준. 단위 혼용 방지.
 # 하드코딩 금지: validation_tools.py는 이 섹션에서 로드.
@@ -1206,3 +1514,147 @@ alpha_decay_monitor:
   # revival_threshold: |IC| 최근 warn_months 평균이 이 값 초과 시 복귀.
   # alpha_factor.alpha_decay_warning_months 개월 기준.
   revival_threshold: 0.02
+
+# ============================================================
+# cache: S4-7 Persistent Cache (뉴스/에이전트 보고서). Cold Path 레이턴시 최적화.
+# persistent_cache.py가 이 섹션에서 로드. 하드코딩 금지.
+# ============================================================
+cache:
+  # enabled: false로 설정 시 모든 get/set noop 처리.
+  enabled: true
+  # backend: 저장 백엔드. sqlite 고정 (Python stdlib, 동시성 안전).
+  backend: sqlite
+  # storage_path: DB 파일 경로 (repo root 기준 상대 경로 또는 절대 경로).
+  storage_path: artifacts/cache/persistent_cache.db
+  # news_ttl_seconds: 뉴스 분석 LLM 결과 캐시 유지 시간 (초). 기본 3600 = 1시간.
+  news_ttl_seconds: 3600
+  # agent_report_ttl_seconds: 에이전트 보고서 (Risk Slow, Debate) 캐시 유지 시간 (초). 기본 1800 = 30분.
+  agent_report_ttl_seconds: 1800
+  # cleanup_interval_seconds: 만료 항목 lazy 정리 주기 (초). 기본 600 = 10분.
+  cleanup_interval_seconds: 600
+  # max_entries: DB 최대 항목 수. 초과 시 가장 오래된 항목 LRU eviction (disk full 방지).
+  # ttl=0 (만료 없음) 항목 무한 누적 방지용.
+  max_entries: 100000
+
+# ============================================================
+# dqr: S4-5 Data Quality Report 일별 자동화 설정.
+# DQRRunner가 이 섹션에서 로드. 하드코딩 금지 (불변 원칙 5).
+# Mode B 18:00 KST 이후 실행. PIT-Safety 강제 (불변 원칙 1).
+# ============================================================
+dqr:
+  enabled: true
+  output_dir: artifacts/dqr
+  ops_alert_path: artifacts/ops_alerts.jsonl
+
+  # thresholds: 임계값 초과 시 check_alerts()가 alert 생성.
+  # 단위: missing_rate_pct / outlier_rate_pct / error_rate_pct = % / delay_minutes = 분.
+  thresholds:
+    missing_rate_pct: 5.0        # 누락률 5% 초과 시 alert
+    delay_minutes: 10.0          # 수집-적재 지연 10분 초과 시 alert
+    outlier_rate_pct: 2.0        # MAD robust-z |z|>5 이상치 2% 초과 시 alert
+    error_rate_pct: 1.0          # HTTP 4xx/5xx + retry 에러율 1% 초과 시 alert
+
+  # expected_bars: 커넥터별 하루 기대 데이터 건수.
+  # kis_rest/kis_ws: 장중 09:00~15:30 = 390 1분봉.
+  # community: 5분 폴링 = 78회 (390/5).
+  # dart_rest/naver_rest: 1분 폴링 = 390회.
+  # ecos_rest/krx_rest/us_market: 일 1회 배치.
+  expected_bars:
+    kis_rest: 390
+    kis_ws: 390
+    krx_rest: 1
+    dart_rest: 390
+    naver_rest: 390
+    community: 78
+    ecos_rest: 1
+    us_market: 1
+
+  # per_connector: 커넥터별 개별 설정.
+  # critical=true: 임계값 초과 시 severity=CRITICAL (이 커넥터 없이 Mode B 진행 차단).
+  # critical=false: severity=WARNING (Mode B 계속 진행).
+  per_connector:
+    kis_rest:
+      critical: true
+    kis_ws:
+      critical: true
+    krx_rest:
+      critical: false
+    dart_rest:
+      critical: false
+    naver_rest:
+      critical: false
+    community:
+      critical: false
+    ecos_rest:
+      critical: false
+    us_market:
+      critical: false
+
+  # alert_channels: alert 기록 채널.
+  # log: logger.ERROR 레벨 출력.
+  # jsonl: artifacts/ops_alerts.jsonl append.
+  alert_channels:
+    - log
+    - jsonl
+  # outlier_z_threshold: MAD robust-z 이상치 임계값. W1 yaml화 (불변 원칙 5).
+  # DQRRunner._compute_outlier_rate에 주입.
+  outlier_z_threshold: 5.0
+
+  # skip_on_holiday: KRX 비거래일(주말/공휴일)에 DQR skip (missing_rate=100% false CRITICAL 방지).
+  skip_on_holiday: true
+
+  # kospi_holidays_2026: KRX 공휴일 목록 (평일 비거래일). 토/일은 별도 weekday 체크.
+  kospi_holidays_2026:
+    - "2026-01-01"  # 신정
+    - "2026-02-16"  # 설날
+    - "2026-02-17"  # 설날 연휴
+    - "2026-02-18"  # 설날 연휴
+    - "2026-03-02"  # 삼일절 대체휴일
+    - "2026-05-01"  # 근로자의 날 (KRX 휴장)
+    - "2026-05-05"  # 어린이날
+    - "2026-05-25"  # 부처님오신날
+    - "2026-08-17"  # 광복절 대체휴일
+    - "2026-09-23"  # 추석 전날 (2026 추석 연휴 9/23~9/25, 2026-05-12 audit C-D1 fix)
+    - "2026-09-24"  # 추석 전날
+    - "2026-09-25"  # 추석 당일
+    - "2026-10-05"  # 개천절 대체휴일
+    - "2026-10-09"  # 한글날
+    - "2026-12-25"  # 성탄절
+
+# ============================================================
+# coder2_sprint3_additions: Sprint 3 fix W1/W3/C3 신규 키 (coder2 담당)
+# eval_agent.alignment_c1/c2_weight, eval_agent.synthetic_seed,
+# alpha_factor.factor_agent_seed는 각 원 섹션(eval_agent/alpha_factor) 끝에
+# append 방식으로 추가. 아래 블록은 추가 출처 메모.
+# ============================================================
+# NOTE: 아래 키들은 각 원 섹션에 직접 추가됨 (아래 별도 섹션 없음).
+# eval_agent 섹션 끝: alignment_c1_weight, alignment_c2_weight, synthetic_seed
+# alpha_factor 섹션 끝: factor_agent_seed
+
+# ============================================================
+# connector_mock: KIS Mock 모드 생성 파라미터 (불변 원칙 5 하드코딩 금지)
+# kis_rest.py / kis_ws.py mock 데이터 생성 시 이 섹션에서 로드.
+# magic number randint 범위를 yaml SSOT로 관리.
+# ============================================================
+connector_mock:
+  kis:
+    base_price: 50000         # mock 가격 기준값 (S0 cleanup, 이전 _MOCK_BASE_PRICE 모듈 상수)
+    price_modulo: 100000      # ticker hash offset modulo (S0 cleanup, 이전 _MOCK_PRICE_MODULO)
+    volume_min: 1000          # 분봉 거래량 하한 (주)
+    volume_max: 100000        # 분봉 거래량 상한 (주)
+    change_min: 0             # 가격 보정치 하한 (원)
+    change_max: 100           # 가격 보정치 상한 (원)
+    bid_size_min: 500         # WS 분봉 거래량 하한 (주)
+    bid_size_max: 10000       # WS 분봉 거래량 상한 (주)
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-02"
+    updated_by: "coder1_sprint012_fix (elephant-ops)"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 30
+    update_trigger: "manual_only"
+    rationale: |
+      KIS Mock 모드 랜덤 생성 파라미터. 단위 테스트 재현성 + 불변 원칙 5 준수.
+      volume_min/max 변경 시 mock 데이터 특성 변경 — operator 검토 권고.

@@ -117,6 +117,11 @@ class EvalAgent:
         self._sl_clip_max: float = float(cfg.get("sl_clip_max", 2.0))
         self._synthetic_bars: int = int(cfg.get("synthetic_bars", 50))
         self._min_valid_samples: int = int(cfg.get("min_valid_samples", 5))
+        # C3 yaml화: _compute_alignment 가중치 (불변 원칙 5)
+        self._c1_w: float = float(cfg.get("alignment_c1_weight", 0.5))
+        self._c2_w: float = float(cfg.get("alignment_c2_weight", 0.5))
+        # W3 yaml화: synthetic DataFrame seed (불변 원칙 5)
+        self._synthetic_seed: int = int(cfg.get("synthetic_seed", 42))
 
         self._llm_router = llm_router
         logger.info(
@@ -151,7 +156,7 @@ class EvalAgent:
         zoo: list[dict] = factor_zoo or []
 
         # --- execution_failure 조기 감지 ---
-        _test_df = _make_synthetic_df(n=self._synthetic_bars)
+        _test_df = _make_synthetic_df(n=self._synthetic_bars, seed=self._synthetic_seed)
         _exec_ok = _exec_factor_scores(candidate.code, _test_df) is not None
         if not _exec_ok:
             return EvalResult(
@@ -292,7 +297,7 @@ class EvalAgent:
             code_snippet,
             "description과 factor code",
         )
-        return 0.5 * c1 + 0.5 * c2
+        return self._c1_w * c1 + self._c2_w * c2
 
     def _llm_score_alignment(self, text_a: str, text_b: str, label: str) -> float:
         """GPT-4o로 text_a↔text_b 정합 점수 (0~1) 반환. 실패 시 0.5."""
@@ -366,7 +371,7 @@ class EvalAgent:
         Returns:
             (ic, rank_ic). 계산 불가 시 (0.0, 0.0).
         """
-        df = _make_synthetic_df(n=self._synthetic_bars)
+        df = _make_synthetic_df(n=self._synthetic_bars, seed=self._synthetic_seed)
         scores = _exec_factor_scores(code, df)
         if scores is None:
             return 0.0, 0.0
@@ -442,12 +447,14 @@ class EvalAgent:
 # Module-level helpers (not bound to EvalAgent)
 # ------------------------------------------------------------------ #
 
-def _make_synthetic_df(n: int = 50) -> pd.DataFrame:
+def _make_synthetic_df(n: int = 50, seed: int = 42) -> pd.DataFrame:
     """IC 계산용 synthetic OHLCV DataFrame (50 bars).
 
     numpy seed 고정 → 동일 데이터로 반복 평가 가능.
+    seed: risk_config.yaml eval_agent.synthetic_seed에서 로드 (불변 원칙 5).
+          EvalAgent.__init__에서 self._synthetic_seed로 로드 후 호출 시 주입.
     """
-    rng = np.random.default_rng(seed=42)
+    rng = np.random.default_rng(seed=seed)
     base_price = np.abs(rng.standard_normal(n) * 100 + 1000)
     return pd.DataFrame({
         "close":                  base_price,

@@ -138,12 +138,15 @@ class EventGateway:
                 event.get("event_id"), etype,
             )
         except Exception as e:
+            event_id = event.get("event_id")
             logger.warning(
                 "[event_gateway] 핸들러 실패: event_id=%s err=%s",
-                event.get("event_id"), e,
+                event_id, e,
             )
+            # dead_letter_log에 핸들러 오류 기록 (C11 format)
+            self._admission._write_dead_letter(event, f"handler_error: {e}")
             return {
-                "event_id": event.get("event_id"),
+                "event_id": event_id,
                 "status": "handler_error",
                 "reason": str(e),
             }

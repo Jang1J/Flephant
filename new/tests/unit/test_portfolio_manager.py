@@ -25,6 +25,7 @@ def test_init_loads_config(pm: PortfolioManager) -> None:
     assert pm._max_names == 10
     assert pm._max_single_name == pytest.approx(0.20)
     assert pm._daily_turnover_max == pytest.approx(0.30)
+    assert pm._respect_ppo_weights is True
 
 
 # ====================================================================== #
@@ -226,6 +227,25 @@ def test_target_weights_echo_readonly(pm: PortfolioManager) -> None:
         portfolio_value=10_000_000.0,
     )
     assert result["portfolio_patch"]["target_weights"] == tw
+
+
+def test_target_weights_not_clipped_when_ppo_weight_exceeds_limit(pm: PortfolioManager) -> None:
+    """C8: PM은 PPO weight를 clip하지 않고 violation만 보고한다."""
+    tw = {"005930": 0.25}
+    result = pm.plan(
+        target_weights=tw,
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+    assert result["respect_ppo_weights"] is True
+    assert result["portfolio_patch"]["target_weights"] == tw
+    assert any(
+        v["type"] == "max_single_name_exceeded"
+        and v["ticker"] == "005930"
+        and v["weight"] == pytest.approx(0.25)
+        for v in result["ppo_violations"]
+    )
 
 
 def test_order_delta_fields(pm: PortfolioManager) -> None:

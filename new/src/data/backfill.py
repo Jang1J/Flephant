@@ -100,6 +100,26 @@ def _is_market_hours(ts_str: str) -> bool:
         return False
 
 
+def _is_target_trading_bar(bar: dict, date_str: str) -> bool:
+    """bar가 요청한 날짜의 장중 1분봉이면 True.
+
+    KIS 과거 분봉 endpoint는 일부 종목/anchor에서 전일 bar를 함께 반환할 수 있다.
+    요청일과 다른 bar를 저장하면 DatasetBuilder가 잘못된 날짜 파일을 학습에 섞으므로,
+    실 API 응답도 mock 재매핑과 동일하게 요청일 기준으로 강제 필터링한다.
+    """
+    ts_raw = str(bar.get("ts_close", ""))
+    if not _is_market_hours(ts_raw):
+        return False
+    try:
+        dt = datetime.fromisoformat(ts_raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST).strftime("%Y%m%d") == date_str
+    except Exception as e:
+        logger.debug("[backfill] target date 파싱 실패: %s", e)
+        return False
+
+
 class Backfill:
     """과거 1분봉 데이터 수집. S1-0 baseline 학습 전제.
 
@@ -162,12 +182,22 @@ class Backfill:
         return all_bars
 
     def _fetch_single_day(self, ticker: str, date_str: str) -> list[dict]:
-        """단일 날짜 1분봉 조회. Mock: 390분봉 생성 후 장중 필터 적용."""
+        """단일 날짜 1분봉 조회. 실 KIS는 date 지정, mock은 날짜 재매핑."""
         try:
-            # Mock은 n_bars=390 (하루 최대 장중 분봉 수)
-            bars = self._client.inquire_minute_bar(ticker, n_bars=390)
+            # 하루 장중 최대 분봉 수. 실 KIS는 date를 받아 과거 일자 분봉을 조회한다.
+            bars = self._client.inquire_minute_bar(ticker, n_bars=390, date=date_str)
         except Exception as e:
             raise BackfillError(f"KIS inquire_minute_bar 실패: {e}") from e
+
+        if bars and bars[0].get("_mode") != "mock":
+            filtered = [bar for bar in bars if _is_target_trading_bar(bar, date_str)]
+            dropped = len(bars) - len(filtered)
+            if dropped > 0:
+                logger.info(
+                    "[backfill] %s %s: 요청일 외/장외 bar %d개 제외",
+                    ticker, date_str, dropped,
+                )
+            return filtered
 
         # ts_close를 날짜에 맞게 재매핑 (Mock 데이터는 현재 시각 기반이므로 date_str로 교체)
         target_date = _parse_date(date_str)

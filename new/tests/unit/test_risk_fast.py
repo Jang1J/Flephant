@@ -55,7 +55,8 @@ def test_low_risk_no_bars(agent: RiskFastAgent, ts: datetime) -> None:
         ts=ts,
     )
     assert result["risk_level"] == "low"
-    assert result["fast_rule_match"] is False
+    # P0-2 fix (2026-05-09): fast_rule_match is list[dict]|None per C5 schema (was bool).
+    assert result["fast_rule_match"] is None
     assert result["triggered_rules"] == []
     assert result["recommended_action"] == "pass"
 
@@ -76,7 +77,9 @@ def test_intraday_drop_triggers_high(agent: RiskFastAgent, ts: datetime) -> None
     assert "rule_intraday_drop" in result["triggered_rules"]
     assert result["risk_level"] == "high"
     assert "005930" in result["affected_tickers"]
-    assert result["fast_rule_match"] is True
+    # P0-2 fix (2026-05-09): C5 schema list[{rule_id, matched_at}] (was bool True).
+    assert isinstance(result["fast_rule_match"], list)
+    assert any(item["rule_id"] == "rule_intraday_drop" for item in result["fast_rule_match"])
     assert result["recommended_action"] == "reduce"
 
 
@@ -124,12 +127,12 @@ def test_volatility_triggers_medium(agent: RiskFastAgent, ts: datetime) -> None:
 
 
 # ====================================================================== #
-# 5. top10 붕괴 → rule_top10_collapse, risk_level='critical'
+# 5. top10 붕괴 → rule_top10_collapse, risk_level='high' + severity='critical'
 # ====================================================================== #
 
 
 def test_top10_collapse_critical(agent: RiskFastAgent, ts: datetime) -> None:
-    """Top10 중 high 트리거 3개 이상 → rule_top10_collapse, risk_level='critical'."""
+    """Top10 중 high 트리거 3개 이상 → rule_top10_collapse, severity='critical'."""
     # 5% 이상 급락 종목 3개
     drop_bars: dict[str, list[dict]] = {}
     tickers_drop = ["005930", "000660", "035720"]
@@ -151,7 +154,8 @@ def test_top10_collapse_critical(agent: RiskFastAgent, ts: datetime) -> None:
         ts=ts,
     )
     assert "rule_top10_collapse" in result["triggered_rules"]
-    assert result["risk_level"] == "critical"
+    assert result["risk_level"] == "high"
+    assert result["severity"] == "critical"
     assert result["recommended_action"] == "halt"
 
 
@@ -198,7 +202,8 @@ def test_report_payload_schema(agent: RiskFastAgent, ts: datetime) -> None:
         "risk_level": eval_result["risk_level"],
         "macro_note_ref": None,
         "micro_note_ref": None,
-        "fast_rule_match": eval_result["fast_rule_match_details"],
+        # P0-2 fix (2026-05-09): fast_rule_match_details 키 제거됨. fast_rule_match 가 직접 list[dict].
+        "fast_rule_match": eval_result["fast_rule_match"],
     }
     report = agent.report("risk_warning", payload)
 

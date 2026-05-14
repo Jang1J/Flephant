@@ -10,6 +10,8 @@ __MACOSX/
 
 # === Python ===
 __pycache__/
+.pytest_cache/
+.mypy_cache/
 *.pyc
 *.pyo
 *.egg-info/
@@ -30,13 +32,31 @@ models/rebound_cnn/calibrator_meta.json
 
 # === Runtime artifacts (AuditLogger dead_letter, ModelRegistry 등) ===
 artifacts/
+dist/
 
 # === Claude Code 하네스 (개인 작업 환경) ===
 .claude/
 
+# === Codex 하네스 + 외부 AI agent 메타 (개인 작업 환경) ===
+.Codex/
+.agents/
+AGENTS.md
+Codex-progress.md
+
 # === 개인 작업 로그 / 트래킹 ===
 claude-progress.md
 feature_list.json
+
+# === 외부 학습 자료 (KIS 공식 문서 / 저작권) ===
+KIS api 문서/
+open-trading-api-main/
+한국투자증권_오픈API_*.xlsx
+
+# === 실험용 jupyter notebook (개인) ===
+notebooks/
+
+# === 다른 팀원 코드 (별도 공유 채널) ===
+예경님 코드/
 
 # === 시각화 / 임시 산출물 ===
 feedback_/

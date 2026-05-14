@@ -135,3 +135,39 @@ def generate_kb_id() -> str:
     architecture.md §14 ID Convention: KB-{yyyymmdd}-{UUID8}.
     """
     return _make_id("KB")
+
+
+def generate_admission_event_id() -> str:
+    """C15 admission_event_id. 예: ADM-20260501-A8F3D91C (Sprint 5).
+
+    api_contracts.md C15 AdmissionEventContract identity SSOT.
+    dynamic_universe/admission_engine.py 인라인 uuid4 대체.
+    """
+    return _make_id("ADM")
+
+
+def generate_exit_event_id() -> str:
+    """C15 exit_event_id. 예: EXT-20260501-A8F3D91C (Sprint 5).
+
+    api_contracts.md C15 ExitEventContract identity SSOT.
+    dynamic_universe/holdings_manager.py 인라인 uuid4 대체.
+    """
+    return _make_id("EXT")
+
+
+def generate_watch_snapshot_id() -> str:
+    """C16 watch_snapshot_id. 예: WS-20260501-A8F3D91C (Sprint 5).
+
+    api_contracts.md C16 WatchUniverseSnapshotContract identity SSOT.
+    dynamic_universe/snapshot_fetcher.py 인라인 uuid4 대체.
+    """
+    return _make_id("WS")
+
+
+def generate_promotion_id() -> str:
+    """C15 promotion_id. 예: PRM-20260501-A8F3D91C (Sprint 5).
+
+    api_contracts.md C15 holdings_manager identity SSOT.
+    dynamic_universe/holdings_manager.py 인라인 uuid4 대체.
+    """
+    return _make_id("PRM")

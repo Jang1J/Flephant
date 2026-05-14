@@ -1,0 +1,249 @@
+"""Historical feature materializer fail-closed tests."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+
+def _load_script(name: str):
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dual_source_history_blocks_without_archived_raw_events(tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=tmp_path / "missing_raw",
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["files_written"] == []
+    assert "no_dual_source_artifacts_written" in report["blockers"]
+    assert report["per_date"][0]["status"] == "MISSING_RAW_EVENTS"
+
+
+def test_agent_memory_dual_source_export_is_rehearsal_only(tmp_path):
+    export_mod = _load_script("export_agent_memory_dual_source_raw")
+    materialize_mod = _load_script("materialize_dual_source_history")
+
+    memory_file = tmp_path / "agent_memory" / "news_agent" / "005930" / "20260508.jsonl"
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    memory_file.write_text(
+        '{"ts":"2026-05-08T08:00:00+09:00","ticker":"005930",'
+        '"content":{"event_type":"news","title":"삼성 실적 호조","stance":"buy"}}\n',
+        encoding="utf-8",
+    )
+
+    export_report = export_mod.export_agent_memory_dual_source_raw(
+        end_date="20260508",
+        business_days=1,
+        agent_memory_dir=tmp_path / "agent_memory",
+        output_dir=tmp_path / "raw_agent_memory",
+        report_dir=tmp_path / "reports",
+    )
+
+    assert export_report["status"] == "PASS"
+    assert export_report["deploy_quality"] is False
+    raw_path = tmp_path / "raw_agent_memory" / "events_20260508.json"
+    assert raw_path.exists()
+
+    materialize_report = materialize_mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=tmp_path / "raw_agent_memory",
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "materialize_reports",
+    )
+
+    assert materialize_report["status"] == "BLOCKED"
+    assert materialize_report["files_written"] == []
+    assert "non_deploy_quality_raw_events" in materialize_report["blockers"]
+    assert materialize_report["per_date"][0]["status"] == "NON_DEPLOY_QUALITY_RAW_EVENTS"
+
+
+def test_dual_source_history_uses_sector_and_market_fallback(monkeypatch, tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "20260508.json").write_text(
+        (
+            "{"
+            '"provenance":{"deploy_quality":true},'
+            '"events":['
+            '{'
+            '"ticker":"005930",'
+            '"event_ts":"2026-05-08T08:00:00+09:00",'
+            '"source":"news",'
+            '"title":"삼성전자 실적 호조"'
+            '}'
+            "]}"
+        ),
+        encoding="utf-8",
+    )
+
+    captured_rows = []
+
+    class DummyScorer:
+        def score_universe(self, rows, snapshot_ts=None):
+            captured_rows.extend(rows)
+            return [
+                {
+                    "ticker": row["ticker"],
+                    "asof": "2026-05-08T08:30:00+09:00",
+                    "news_score_t": 0.5 if row["ticker"] == "005930" else 0.0,
+                    "comm_score_t_1": 0.0,
+                    "comm_score_t_2": 0.0,
+                    "news_comm_divergence": 0.5 if row["ticker"] == "005930" else 0.0,
+                    "community_noise_multiplier": 1.0,
+                    "source_notes": "fake",
+                }
+                for row in rows
+            ]
+
+        def score(self, **kwargs):
+            return {
+                "ticker": kwargs["ticker"],
+                "asof": "2026-05-08T08:30:00+09:00",
+                "news_score_t": 0.25,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.25,
+                "community_noise_multiplier": 1.0,
+                "source_notes": "market",
+            }
+
+    monkeypatch.setattr(mod, "_load_active_universe", lambda: [
+        {"ticker": "005930"},
+        {"ticker": "000660"},
+        {"ticker": "051910"},
+    ])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+    monkeypatch.setattr(mod, "DualSourceScorer", lambda: DummyScorer())
+
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=raw_dir,
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    rows_by_ticker = {row["ticker"]: row for row in captured_rows}
+    assert rows_by_ticker["005930"]["source_scope"]["news"] == "ticker"
+    assert rows_by_ticker["000660"]["source_scope"]["news"] == "sector_fallback"
+    assert rows_by_ticker["051910"]["source_scope"]["news"] == "market_fallback"
+    source_stats = report["per_date"][0]["source_stats"]
+    assert source_stats["fallback_scope_counts"]["news"]["ticker"] == 1
+    assert source_stats["fallback_scope_counts"]["news"]["sector_fallback"] == 1
+    assert source_stats["fallback_scope_counts"]["news"]["market_fallback"] == 1
+    assert source_stats["market_backstop_rows"] == 2
+    artifact = tmp_path / "dual_source" / "20260508.json"
+    assert artifact.exists()
+    assert "news_scope=sector_fallback" in artifact.read_text(encoding="utf-8")
+    assert "market_backstop" in artifact.read_text(encoding="utf-8")
+
+
+def test_exogenous_history_blocks_without_required_real_providers(monkeypatch, tmp_path):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+    class DummyECOS:
+        _is_mock = True
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return False
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260508",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["files_written"] == []
+    assert "required_real_provider_unavailable" in report["blockers"]
+    assert report["provider_availability"]["ecos_real"] is False
+    assert report["provider_availability"]["kis_investor_real"] is False
+
+
+def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_path):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            return SimpleNamespace(
+                us_sp500_change=0.01,
+                us_nasdaq_change=0.02,
+                us_vix=18.5,
+                us_soxx_change=0.03,
+                source="fake_real",
+                as_of_date=as_of,
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 3.5, "usd_krw": 1350.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            assert bgn_de == "20260507"
+            assert end_de == "20260507"
+            return [
+                {
+                    "event_type": "investor_flow",
+                    "occurred_at": "2026-05-07T15:30:00+09:00",
+                    "payload": {
+                        "ticker": ticker,
+                        "date": "2026-05-07T15:30:00+09:00",
+                        "foreign_net_buy": "1000",
+                        "institutional_net_buy": -250,
+                        "retail_net_buy": "-750",
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930", "000660"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260508",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert report["coverage"]["written_date_count"] == 1
+    assert report["per_date"][0]["source_stats"]["investor_ticker_count"] == 2
+    assert report["per_date"][0]["source_stats"]["investor_failures"] == {}
+    assert (tmp_path / "exogenous" / "20260508.json").exists()

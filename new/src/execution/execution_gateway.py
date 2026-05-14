@@ -1,6 +1,7 @@
 """S1-6 Execution Gateway (C10 ExecutionFeedbackContract).
 
-Sprint 1 MVP: mock 모드 실동작. paper/live 모드는 NotImplementedError (Sprint 4+).
+Sprint 1 MVP: mock 모드 실동작. paper/live 모드는 KIS 클라이언트 주입 시
+주문 제출 경로까지 수행한다.
 
 Mode 분기:
   - mock: 즉시 filled 시뮬레이션 (가격 = order price or last known)
@@ -12,6 +13,7 @@ Audit Log: 모든 execute 호출 → JSONL 기록.
 """
 from __future__ import annotations
 
+import inspect
 import random
 import time
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_order_plan_id
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("execution_gateway")
 
@@ -34,11 +37,15 @@ class LiveNotEnabledError(PermissionError):
     """execution_mode=live인데 live_enabled=false."""
 
 
+class ExecutionDependencyError(RuntimeError):
+    """paper/live 실행에 필요한 broker client가 없음."""
+
+
 class ExecutionGateway:
     """C10 Execution Gateway. final_decision → execution_report.
 
     mock 모드에서는 주문 미발송 + 즉시 filled 시뮬레이션.
-    paper/live는 후속 sprint. Kill Switch 활성 시 전면 차단.
+    paper/live는 주입된 KIS client.submit_order 경유. Kill Switch 활성 시 전면 차단.
     """
 
     def __init__(
@@ -46,10 +53,16 @@ class ExecutionGateway:
         kill_switch: KillSwitch | None = None,
         audit_logger: AuditLogger | None = None,
         kis_client: Any | None = None,
+        mode_override: str | None = None,
+        live_enabled_override: bool | None = None,
     ) -> None:
         exec_cfg = config_load("risk_config.yaml", "execution")
-        self._mode: str = str(exec_cfg["mode"]).lower()
-        self._live_enabled: bool = bool(exec_cfg["live_enabled"])
+        self._mode: str = str(mode_override or exec_cfg["mode"]).lower()
+        self._live_enabled: bool = (
+            bool(exec_cfg["live_enabled"])
+            if live_enabled_override is None
+            else bool(live_enabled_override)
+        )
         exec_cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
         self._slippage_bps: float = float(exec_cost_cfg.get("slippage_bps", 10))
 
@@ -113,17 +126,22 @@ class ExecutionGateway:
                 order_plan_id, decision_id, order_deltas, t0,
             )
         elif self._mode == "paper":
-            raise NotImplementedError(
-                "Paper mode는 S4-6 Paper Trading에서 KIS 모의투자 서버 연동"
+            report = self._execute_broker(
+                order_plan_id, decision_id, order_deltas, t0,
             )
         elif self._mode == "live":
             if not self._live_enabled:
-                raise LiveNotEnabledError(
-                    "live_enabled=false. 실계좌 주문 차단."
+                report = self._rejected(
+                    order_plan_id,
+                    decision_id,
+                    "live_enabled=false. 실계좌 주문 차단.",
+                    order_deltas,
+                    t0,
                 )
-            raise NotImplementedError(
-                "Live mode는 S1-8 (KIS API) + Phase 2 안전장치 완성 후"
-            )
+            else:
+                report = self._execute_broker(
+                    order_plan_id, decision_id, order_deltas, t0,
+                )
         else:
             raise ExecutionModeError(
                 f"invalid execution_mode={self._mode}"
@@ -214,6 +232,168 @@ class ExecutionGateway:
             "latency_ms": elapsed_ms,
             "n_fills": len(fills),
         }
+
+    # ================================================================== #
+    # Internal: Broker-backed execution
+    # ================================================================== #
+
+    def _execute_broker(
+        self,
+        order_plan_id: str,
+        decision_id: str,
+        order_deltas: list[dict[str, Any]],
+        t0: float,
+    ) -> dict[str, Any]:
+        """paper/live: KIS client.submit_order 경유 주문 제출.
+
+        실제 체결 조회와 정산은 broker reconciliation 단계가 담당한다. 이 메서드는
+        C10 계약에 맞춰 제출 성공/실패를 execution_report로 정규화한다.
+        """
+        if self._kis_client is None:
+            raise ExecutionDependencyError(
+                f"execution_mode={self._mode} requires kis_client.submit_order"
+            )
+        if not hasattr(self._kis_client, "submit_order"):
+            raise ExecutionDependencyError(
+                "kis_client must expose submit_order(ticker, side, qty)"
+            )
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        fills: list[dict[str, Any]] = []
+        rejections: list[dict[str, Any]] = []
+        estimated_cost = 0.0
+
+        for od in order_deltas:
+            ticker_raw = od.get("ticker", "")
+            ticker = pad_ticker(str(ticker_raw))
+            side = str(od.get("side", "")).lower()
+            qty = int(od.get("qty", 0) or 0)
+            price = float(od.get("price", 0.0) or 0.0)
+            order_type = str(od.get("order_type", "00") or "00")
+
+            if ticker == "000000" or side not in {"buy", "sell"} or qty <= 0:
+                rejections.append({
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": qty,
+                    "reason": "invalid_order_delta",
+                })
+                continue
+
+            try:
+                broker_response = self._submit_broker_order(
+                    ticker,
+                    side,
+                    qty,
+                    price,
+                    order_type,
+                )
+                if not isinstance(broker_response, dict):
+                    broker_response = {"raw_response": repr(broker_response)}
+                broker_status = str(
+                    broker_response.get("status", "submitted")
+                ).lower()
+                if broker_status in {"rejected", "failed", "error", "cancelled"}:
+                    rejections.append({
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "reason": broker_status,
+                        "broker_response": broker_response,
+                    })
+                    continue
+
+                avg_fill_price = float(
+                    broker_response.get(
+                        "avg_fill_price",
+                        broker_response.get("price", price),
+                    ) or price
+                )
+                estimated_cost += qty * avg_fill_price
+                fills.append({
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": qty,
+                    "avg_fill_price": avg_fill_price,
+                    "fill_ts": str(broker_response.get("fill_ts", now)),
+                    "broker_status": broker_status,
+                    "broker_order_id": (
+                        broker_response.get("order_id")
+                        or broker_response.get("order_no")
+                        or broker_response.get("odno")
+                    ),
+                    "broker_response": broker_response,
+                })
+            except Exception as e:
+                rejections.append({
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": qty,
+                    "reason": "broker_submit_exception",
+                    "error": str(e),
+                })
+
+        if not fills:
+            status = "rejected"
+        elif rejections:
+            status = "partial_filled"
+        elif all(
+            fill.get("broker_status") in {"filled", "mock_accepted"}
+            for fill in fills
+        ):
+            status = "filled"
+        else:
+            status = "submitted"
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        lesson_stub = (
+            None if not rejections else f"{len(rejections)} broker submission(s) rejected"
+        )
+        return {
+            "execution_report": {
+                "order_plan_id": order_plan_id,
+                "submitted_at": now,
+                "status": status,
+                "fills": fills,
+                "estimated_cost": float(estimated_cost),
+                "realized_slippage": 0.0,
+                "execution_mode": self._mode,
+                "rejections": rejections,
+            },
+            "feedback_record": {
+                "kb_message_id": f"KB-{order_plan_id}",
+                "pnl_contribution": 0.0,
+                "execution_shortfall": 0.0,
+                "lesson_stub": lesson_stub,
+            },
+            "final_decision_ref": decision_id,
+            "latency_ms": elapsed_ms,
+            "n_fills": len(fills),
+        }
+
+    def _submit_broker_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> Any:
+        submit_order = self._kis_client.submit_order
+        signature = inspect.signature(submit_order)
+        params = signature.parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in params.values()
+        )
+        kwargs: dict[str, Any] = {}
+        if "price" in params or accepts_kwargs:
+            kwargs["price"] = price
+        if "order_type" in params or accepts_kwargs:
+            kwargs["order_type"] = order_type
+        if kwargs:
+            return submit_order(ticker, side, qty, **kwargs)
+        return submit_order(ticker, side, qty)
 
     # ================================================================== #
     # Internal: REJECTED

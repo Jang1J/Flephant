@@ -22,6 +22,7 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # source → event_type 매핑 (C2 SSOT: news|dart|macro|us_market|community|regime|investor_flow)
 # enum 성격이므로 코드에 유지. kis_bar/kis_event는 C1 bypass이므로 포함하지 않음.
+# S5-1: price_snapshot 추가 (C16 WatchUniverseSnapshotContract, AdmissionEngine 편입 트리거 전용)
 _EVENT_TYPE_MAP: dict[str, str] = {
     "dart": "dart",
     "krx_investor_flow": "investor_flow",
@@ -29,6 +30,7 @@ _EVENT_TYPE_MAP: dict[str, str] = {
     "community": "community",
     "ecos": "macro",
     "us_market": "us_market",
+    "price_snapshot": "price_snapshot",
 }
 
 
@@ -101,6 +103,7 @@ class EventNormalizer:
     SUPPORTED_SOURCES: frozenset[str] = frozenset({
         "dart", "krx_investor_flow", "naver_news", "community",
         "ecos", "us_market",
+        "price_snapshot",  # S5-1 C16 WatchUniverseSnapshot
     })
 
     def __init__(self) -> None:
@@ -109,6 +112,14 @@ class EventNormalizer:
         self.default_ttl: dict[str, int] = cfg["default_ttl"]
         self.priority: dict[str, str] = cfg["priority"]
         self.llm_required: dict[str, bool] = cfg["llm_required"]
+        # market_hours.close 캐시: _market_close_time_str() 매 호출 yaml I/O 방지
+        self._market_close_str: str = self._load_market_close_str()
+
+    @staticmethod
+    def _load_market_close_str() -> str:
+        """risk_config.yaml market_hours.close 최초 로드 헬퍼 (캐시 초기화 전용)."""
+        mh = config_load("risk_config.yaml", "market_hours")
+        return str(mh["close"])
 
     def normalize(self, raw_event: dict[str, Any], source: str) -> dict[str, Any]:
         """raw_event를 C2 스키마로 정규화.
@@ -138,6 +149,7 @@ class EventNormalizer:
             "community": self._normalize_community,
             "ecos": self._normalize_ecos,
             "us_market": self._normalize_us_market,
+            "price_snapshot": self._normalize_price_snapshot,  # S5-1 C16
         }
 
         partial = dispatch[source](raw_event)
@@ -174,6 +186,12 @@ class EventNormalizer:
             "pit_safe": pit_safe_result,
             "payload": partial.get("payload", {}),
         }
+        payload_ticker = result["payload"].get("ticker")
+        scope = str(result["scope"])
+        if payload_ticker:
+            result["ticker"] = str(payload_ticker).zfill(6)
+        elif scope.startswith("ticker:"):
+            result["ticker"] = scope.split(":", 1)[1].zfill(6)
 
         logger.info(
             "이벤트 정규화 완료: source=%s event_id=%s event_type=%s occurred_at=%s",
@@ -277,16 +295,9 @@ class EventNormalizer:
             },
         }
 
-    @staticmethod
-    def _market_close_time_str() -> str:
-        """risk_config.yaml market_hours.close (HH:MM:SS) 로드.
-
-        불변 원칙 5 엄격 적용 (2026-04-20 Phase 1+2 정리):
-          yaml 섹션 누락 시 KeyError 전파. silent fallback 금지.
-          backfill._load_market_hours와 동일한 정책.
-        """
-        mh = config_load("risk_config.yaml", "market_hours")
-        return str(mh["close"])
+    def _market_close_time_str(self) -> str:
+        """market_hours.close 문자열 반환. __init__ 에서 캐시된 값 사용 (yaml I/O 없음)."""
+        return self._market_close_str
 
     def _normalize_naver_news(self, raw: dict[str, Any]) -> dict[str, Any]:
         """네이버 뉴스 정규화.
@@ -421,3 +432,53 @@ class EventNormalizer:
             },
         }
 
+    def _normalize_price_snapshot(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """C16 WatchUniverseSnapshot 정규화. S5-1.
+
+        필수: watch_snapshot_id, ts
+        선택: snapshots (종목별 현재가 list)
+
+        AdmissionEngine 편입 판정을 위해 EventGateway 를 경유해야 할 때만 이 경로를 사용한다.
+        snapshot 자체는 WatchSnapshotFetcher.fetch_once() 가 직접 저장하므로,
+        여기서는 이벤트 정규화 스키마만 구성한다.
+        """
+        watch_snapshot_id = _require(raw, "watch_snapshot_id", "price_snapshot")
+        ts_val = _require(raw, "ts", "price_snapshot")
+
+        occurred_at = _parse_ts_to_kst_str(ts_val, "ts", "price_snapshot")
+        snapshots = raw.get("snapshots", [])
+        ticker_count = len(snapshots) if isinstance(snapshots, list) else 0
+        ticker = str(raw.get("ticker", "") or "").zfill(6)
+        return_pct = raw.get("return_pct", raw.get("day_change_pct"))
+
+        if not ticker or ticker == "000000":
+            if isinstance(snapshots, list) and len(snapshots) == 1 and isinstance(snapshots[0], dict):
+                ticker = str(snapshots[0].get("ticker", "") or "").zfill(6)
+                return_pct = snapshots[0].get(
+                    "return_pct",
+                    snapshots[0].get("day_change_pct", return_pct),
+                )
+
+        scope = f"ticker:{ticker}" if ticker and ticker != "000000" else "market"
+        payload = {
+            "watch_snapshot_id": watch_snapshot_id,
+            "ticker_count": ticker_count,
+            "snapshots": snapshots,
+            **{k: v for k, v in raw.items()
+               if k not in ("watch_snapshot_id", "ts", "snapshots")},
+        }
+        if ticker and ticker != "000000":
+            payload["ticker"] = ticker
+        if return_pct is not None:
+            payload["return_pct"] = return_pct
+
+        return {
+            "event_type": "price_snapshot",
+            "scope": scope,
+            "title": f"Watch Universe 스냅샷: {ticker_count}종목",
+            "summary": f"watch_snapshot_id={watch_snapshot_id} ticker_count={ticker_count}",
+            "occurred_at": occurred_at,
+            "priority": "normal",
+            "llm_required": False,
+            "payload": payload,
+        }

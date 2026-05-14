@@ -4,9 +4,14 @@
 
 set -e
 
-PYTHON="/opt/anaconda3/envs/elephant/bin/python"
+PYTHON="${PYTHON:-python3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 echo "[eval] 독립 검증 시작..."
+echo "[eval] python=$PYTHON"
+echo "[eval] thread caps: OMP=$OMP_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS MKL=$MKL_NUM_THREADS"
 
 # 1. smoke test 먼저
 ./smoke.sh || { echo "[eval] ✗ smoke test 실패 — 기본 환경 문제"; exit 1; }
@@ -32,7 +37,9 @@ import json
 data = json.load(open('feature_list.json'))
 total = sum(len(s['features']) for s in data['sprints'])
 done = sum(1 for s in data['sprints'] for f in s['features'] if f['status'] == 'done')
-print(f'[eval] ✓ feature_list.json: {done}/{total} 완료 ({done*100//total}%)')
+# SHIP-fix A-2: round 기반 percent (feature_list.json progress.percent 계산식과 통일)
+percent = round(done / total * 100, 1) if total > 0 else 0.0
+print(f'[eval] ✓ feature_list.json: {done}/{total} 완료 ({percent}%)')
 " 2>/dev/null; then
     :
 else

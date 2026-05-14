@@ -6,14 +6,26 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 
 from src.data.event_admission import EventAdmission
 
 _KST = ZoneInfo("Asia/Seoul")
+
+
+@pytest.fixture
+def _enable_stale_check(monkeypatch):
+    """conftest.py 의 ELEPHANT_TEST_FRESHNESS_SKIP=1 을 이 테스트에서만 해제.
+
+    stale_drop 동작을 직접 검증하는 테스트에 적용. STALE 필터가 실제로 동작해야
+    테스트가 의미 있다.
+    """
+    monkeypatch.setenv("ELEPHANT_TEST_FRESHNESS_SKIP", "0")
 
 
 def _cfg(overrides: dict | None = None) -> dict:
@@ -128,7 +140,7 @@ def test_supersedes_blocks_reprocess(tmp_path: Path) -> None:
 # 4. stale_drop: expires_at < now
 # ------------------------------------------------------------------
 
-def test_stale_drop_expired_event(tmp_path: Path) -> None:
+def test_stale_drop_expired_event(tmp_path: Path, _enable_stale_check) -> None:
     cfg = _cfg()
     ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
 
@@ -252,7 +264,7 @@ def test_comparator_trigger_order(tmp_path: Path) -> None:
 # 10. dead_letter_log JSONL 포맷 (C11 필드 4개)
 # ------------------------------------------------------------------
 
-def test_dead_letter_log_jsonl_format(tmp_path: Path) -> None:
+def test_dead_letter_log_jsonl_format(tmp_path: Path, _enable_stale_check) -> None:
     cfg = _cfg()
     ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
 

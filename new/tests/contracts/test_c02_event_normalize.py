@@ -63,13 +63,25 @@ def test_c02_occurred_at_iso8601() -> None:
     assert dt.tzinfo is not None, "occurred_at에 timezone 정보 필요"
 
 
-def test_c02_all_6_sources_supported() -> None:
-    """C2: 6개 source 지원. kis_bar/kis_event는 C1 bypass (EventNormalizer 제외).
+def test_c02_all_7_sources_supported() -> None:
+    """C2: 7개 source 지원 (S5-1 v3.8 price_snapshot 추가).
 
+    kis_bar/kis_event는 C1 bypass (EventNormalizer 제외).
     architect 판단 (2026-04-19 Critical 정리): 1분봉은 Quant Agent가
     bar_buffer 직접 consume. EventNormalizer를 거치지 않는다.
+
+    price_snapshot 은 S5-1 (Sprint 5 Watch Universe) WatchSnapshotFetcher 가
+    EventGateway 에 발행하는 source. AdmissionEngine 의 price_spike_admission rule 매칭에 사용.
     """
-    expected = {"dart", "krx_investor_flow", "naver_news", "community", "ecos", "us_market"}
+    expected = {
+        "dart",
+        "krx_investor_flow",
+        "naver_news",
+        "community",
+        "ecos",
+        "us_market",
+        "price_snapshot",
+    }
     assert expected == EventNormalizer.SUPPORTED_SOURCES
 
 

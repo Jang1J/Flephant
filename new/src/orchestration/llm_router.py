@@ -17,6 +17,7 @@ SSOT: api_contracts.md v3.4 C5 (llm_budget.source: risk_config.yaml llm_budget)
 from __future__ import annotations
 
 import os
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -244,7 +245,7 @@ class LLMRouter:
     API 키는 os.environ에서만 로드 (.env 직접 읽기 금지).
 
     Sprint 2 구현 레벨:
-      실제 HTTP 호출은 mock (TODO: Sprint4-S4-6에서 실 API 교체).
+    실제 HTTP 호출은 mock (TODO: Sprint4-S4-6에서 실 API 교체).
       인터페이스 + 예산/circuit/fallback 로직은 완전 구현.
     """
 
@@ -295,6 +296,12 @@ class LLMRouter:
         # API 키 (environ에서만 로드, .env 직접 읽기 금지)
         self._kanana_key: str | None = os.environ.get("KANANA_API_KEY")
         self._openai_key: str | None = os.environ.get("OPENAI_API_KEY")
+        self._kanana_api_url: str | None = os.environ.get("KANANA_API_URL")
+        self._allow_mock_provider: bool = bool(
+            cfg.get("allow_mock_provider", False)
+            or os.environ.get("ELEPHANT_ALLOW_LLM_MOCK") == "1"
+            or os.environ.get("PYTEST_CURRENT_TEST")
+        )
 
         logger.info(
             f"초기화 완료: Kanana 한도={self._daily_limit}회/일, "
@@ -415,7 +422,7 @@ class LLMRouter:
         raise ValueError(f"UNKNOWN_MODEL: {model}. 허용: kanana-o | gpt-4o")
 
     # ------------------------------------------------------------------ #
-    # Provider 래퍼 (Sprint 2: mock, Sprint 4-S4-6: 실 API 교체)
+    # Provider 래퍼
     # ------------------------------------------------------------------ #
 
     def _call_kanana(
@@ -424,15 +431,10 @@ class LLMRouter:
         caller: str,
         schema: dict | None,
     ) -> LLMCallResult:
-        """Kanana-o 호출 (Sprint 2: mock 응답).
+        """Kanana-o 호출.
 
         성공 시 budget.record() 호출.
         API 키 누락 시 graceful failure (RuntimeError 미발생).
-
-        TODO(Sprint4-S4-6): 실 Kanana API 호출로 교체.
-          - OAuth 토큰: connectors/auth.py 패턴 참조
-          - timeout: self._timeout_sec
-          - HTTP 429/5xx → LLMCallResult(success=False) 반환
         """
         if self._kanana_key is None:
             logger.warning("KANANA_API_KEY 미설정: Kanana-o 호출 불가")
@@ -444,36 +446,74 @@ class LLMRouter:
                 error="KANANA_API_KEY_MISSING",
                 circuit_state=self._kanana_cb.state,
             )
+        if self._allow_mock_provider:
+            return self._mock_provider_result(
+                model=LLMModel.KANANA_O.value,
+                prompt=prompt,
+                caller=caller,
+                cost_usd=self._kanana_cost_placeholder,
+                is_fallback=False,
+                record_budget=True,
+            )
+        if not self._kanana_api_url:
+            logger.warning("KANANA_API_URL 미설정: Kanana-o 실 호출 불가")
+            return LLMCallResult(
+                success=False,
+                model_used=LLMModel.KANANA_O.value,
+                content=None,
+                latency_ms=0.0,
+                error="KANANA_API_URL_MISSING",
+                circuit_state=self._kanana_cb.state,
+            )
 
         start = time.time()
-        # TODO(Sprint4-S4-6): 실 Kanana API 호출.
-        #   주의: HTTP 호출이 self._budget.record() 다음 줄에 있어 실패 시 예산 소모 문제.
-        #   실 교체 시:
-        #     1. 먼저 HTTP 호출 → 성공/실패 판정
-        #     2. 성공 시에만 self._budget.record()
-        #     3. 실패 시 self._kanana_cb.record_failure() 후 return LLMCallResult(success=False, ...)
-        latency_ms = (time.time() - start) * 1000.0
+        try:
+            import requests
 
-        # budget 기록 (호출 성공 확정 후)
-        # FIXME(Sprint 4 S4-6): 실 API 교체 시 record를 HTTP 성공 확인 후로 이동. 실패 시 예산 미소모 보장.
-        self._budget.record(caller)
-
-        logger.info(
-            f"Kanana-o 호출 완료: caller={caller}, "
-            f"latency={latency_ms:.1f}ms, "
-            f"잔여={self._budget.remaining_total()}회"
-        )
-
-        return LLMCallResult(
-            success=True,
-            model_used=LLMModel.KANANA_O.value,
-            content=f"[MOCK Kanana-o] caller={caller} prompt='{prompt[:50]}'",
-            latency_ms=latency_ms,
-            tokens_in=max(1, len(prompt) // 4),
-            tokens_out=50,
-            cost_usd=self._kanana_cost_placeholder,
-            circuit_state=self._kanana_cb.state,
-        )
+            response = requests.post(
+                self._kanana_api_url,
+                headers={
+                    "Authorization": f"Bearer {self._kanana_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": LLMModel.KANANA_O.value,
+                    "prompt": prompt,
+                    "schema": schema,
+                },
+                timeout=self._timeout_sec,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            content = (
+                payload.get("content")
+                or payload.get("text")
+                or payload.get("message")
+                or json.dumps(payload, ensure_ascii=False)
+            )
+            latency_ms = (time.time() - start) * 1000.0
+            self._budget.record(caller)
+            return LLMCallResult(
+                success=True,
+                model_used=LLMModel.KANANA_O.value,
+                content=str(content),
+                latency_ms=latency_ms,
+                tokens_in=max(1, len(prompt) // 4),
+                tokens_out=int(payload.get("tokens_out", 0) or 0) or None,
+                cost_usd=self._kanana_cost_placeholder,
+                circuit_state=self._kanana_cb.state,
+            )
+        except Exception as e:
+            latency_ms = (time.time() - start) * 1000.0
+            logger.warning("[llm_router] Kanana-o 실 호출 실패: %s", e)
+            return LLMCallResult(
+                success=False,
+                model_used=LLMModel.KANANA_O.value,
+                content=None,
+                latency_ms=latency_ms,
+                error=str(e),
+                circuit_state=self._kanana_cb.state,
+            )
 
     def _call_gpt4o(
         self,
@@ -482,13 +522,9 @@ class LLMRouter:
         schema: dict | None,
         is_fallback: bool,
     ) -> LLMCallResult:
-        """GPT-4o 호출 (Sprint 2: mock 응답).
+        """GPT-4o 호출.
 
         API 키 누락 또는 circuit OPEN 시 graceful failure.
-
-        TODO(Sprint4-S4-6): 실 OpenAI API 호출로 교체.
-          - timeout: self._timeout_sec
-          - HTTP 429/5xx → LLMCallResult(success=False) 반환
         """
         if self._openai_key is None:
             logger.warning("OPENAI_API_KEY 미설정: GPT-4o 호출 불가")
@@ -500,6 +536,15 @@ class LLMRouter:
                 error="OPENAI_API_KEY_MISSING",
                 circuit_state=self._gpt4o_cb.state,
                 fallback_used=is_fallback,
+            )
+        if self._allow_mock_provider:
+            return self._mock_provider_result(
+                model=LLMModel.GPT_4O.value,
+                prompt=prompt,
+                caller=caller,
+                cost_usd=self._gpt4o_cost_placeholder,
+                is_fallback=is_fallback,
+                record_budget=False,
             )
 
         if not self._gpt4o_cb.can_attempt():
@@ -515,28 +560,84 @@ class LLMRouter:
             )
 
         start = time.time()
-        # TODO(Sprint4-S4-6): 실 OpenAI API 호출.
-        #   주의: 실 교체 시 HTTP 실패(5xx, timeout) 경로에 반드시 self._gpt4o_cb.record_failure() 호출.
-        #   현재 mock 은 항상 success 이므로 record_failure 경로 미구현.
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=self._openai_key, timeout=self._timeout_sec)
+            kwargs: dict[str, Any] = {}
+            if schema is not None:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = client.chat.completions.create(
+                model=LLMModel.GPT_4O.value,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs,
+            )
+            content = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            latency_ms = (time.time() - start) * 1000.0
+            self._gpt4o_cb.record_success()
+            return LLMCallResult(
+                success=True,
+                model_used=LLMModel.GPT_4O.value,
+                content=content,
+                latency_ms=latency_ms,
+                tokens_in=getattr(usage, "prompt_tokens", None),
+                tokens_out=getattr(usage, "completion_tokens", None),
+                cost_usd=self._gpt4o_cost_placeholder,
+                circuit_state=self._gpt4o_cb.state,
+                fallback_used=is_fallback,
+            )
+        except Exception as e:
+            latency_ms = (time.time() - start) * 1000.0
+            self._gpt4o_cb.record_failure()
+            logger.warning("[llm_router] GPT-4o 실 호출 실패: %s", e)
+            return LLMCallResult(
+                success=False,
+                model_used=LLMModel.GPT_4O.value,
+                content=None,
+                latency_ms=latency_ms,
+                error=str(e),
+                circuit_state=self._gpt4o_cb.state,
+                fallback_used=is_fallback,
+            )
+
+    def _mock_provider_result(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        caller: str,
+        cost_usd: float,
+        is_fallback: bool,
+        record_budget: bool,
+    ) -> LLMCallResult:
+        """테스트/명시적 demo 모드에서만 쓰는 provider mock."""
+        start = time.time()
+        if record_budget:
+            self._budget.record(caller)
+        if model == LLMModel.GPT_4O.value:
+            self._gpt4o_cb.record_success()
         latency_ms = (time.time() - start) * 1000.0
-
-        self._gpt4o_cb.record_success()
-
-        prefix = "MOCK GPT-4o fallback" if is_fallback else "MOCK GPT-4o"
+        prefix = f"MOCK {model}" + (" fallback" if is_fallback else "")
         logger.info(
-            f"GPT-4o 호출 완료: caller={caller}, fallback={is_fallback}, "
-            f"latency={latency_ms:.1f}ms"
+            "[llm_router] mock provider 호출: model=%s caller=%s fallback=%s",
+            model,
+            caller,
+            is_fallback,
         )
-
         return LLMCallResult(
             success=True,
-            model_used=LLMModel.GPT_4O.value,
+            model_used=model,
             content=f"[{prefix}] caller={caller} prompt='{prompt[:50]}'",
             latency_ms=latency_ms,
             tokens_in=max(1, len(prompt) // 4),
             tokens_out=50,
-            cost_usd=self._gpt4o_cost_placeholder,
-            circuit_state=self._gpt4o_cb.state,
+            cost_usd=cost_usd,
+            circuit_state=(
+                self._kanana_cb.state
+                if model == LLMModel.KANANA_O.value
+                else self._gpt4o_cb.state
+            ),
             fallback_used=is_fallback,
         )
 

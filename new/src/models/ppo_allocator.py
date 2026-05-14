@@ -65,7 +65,7 @@ class PPOAllocator:
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
-        self._max_sector: float = float(pos_cfg.get("max_sector", 0.40))
+        self._max_sector: float = float(pos_cfg["max_sector"])
         self._min_cash: float = float(pos_cfg["min_cash"])
         self._min_confidence: float = float(pos_cfg["min_confidence"])
 
@@ -432,11 +432,31 @@ class PPOAllocator:
         tickers = list(scores.keys())
         n = len(tickers)
         n_stocks: int = getattr(self, "_policy_n_stocks", 20)
+        if n != n_stocks:
+            rejected = [
+                {
+                    "ticker": ticker,
+                    "reason": "ppo_policy_universe_mismatch",
+                    "policy_n_stocks": n_stocks,
+                    "input_n_stocks": n,
+                }
+                for ticker in tickers
+            ]
+            logger.warning(
+                "[ppo_allocator] PPO policy universe mismatch. input=%d policy=%d",
+                n,
+                n_stocks,
+            )
+            return self._empty_allocation(
+                quant_output,
+                rejected=rejected,
+                reason="ppo_policy_universe_mismatch",
+            )
 
         # scores 벡터 구성 (n_stocks 길이에 맞게 패드/자름)
         score_vals = np.array([scores[t] for t in tickers], dtype=np.float32)
         score_buf = np.zeros(n_stocks, dtype=np.float32)
-        take = min(n, n_stocks)
+        take = n
         score_buf[:take] = score_vals[:take]
 
         # 정규화 scores → [-1, 1]
@@ -533,8 +553,26 @@ class PPOAllocator:
             raise PolicyNotLoadedError(f"PPO policy 로드 실패: {e}") from e
 
     def load(self) -> None:
-        """레거시 스텁 호환 (S0 생성분). policy_path 지정 없이 호출 시 에러."""
-        raise NotImplementedError(
-            "policy_path를 PPOAllocator(policy_path=...) 로 주입하거나 "
-            "NightlyPPORetrainer.retrain()으로 먼저 학습하세요."
+        """레거시 공개 API 호환: 최신 PPO zip이 있으면 로드, 없으면 heuristic 유지."""
+        candidates = sorted(
+            _ARTIFACTS_PATH.glob("v*.zip"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
+        if not candidates:
+            self._policy = None
+            self._policy_version = "heuristic_v1"
+            logger.warning(
+                "[ppo_allocator] PPO policy artifact 없음. heuristic_v1 유지: %s",
+                _ARTIFACTS_PATH,
+            )
+            return
+        try:
+            self._load_policy(candidates[0])
+        except PolicyNotLoadedError as e:
+            self._policy = None
+            self._policy_version = "heuristic_v1"
+            logger.warning(
+                "[ppo_allocator] PPO policy artifact 로드 실패. heuristic_v1 유지: %s",
+                e,
+            )

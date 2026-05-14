@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import os
 import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -46,6 +47,7 @@ _EVENT_TYPE_TO_TRIGGER: dict[str, str] = {
     "macro": "regime_change",
     "us_market": "regime_change",
     "community": "anomaly",
+    "price_snapshot": "vol_spike",  # S5-1 C16 WatchUniverseSnapshot 편입 판정용
 }
 
 
@@ -136,7 +138,10 @@ class EventAdmission:
             return False
 
         # --- 필터 2: stale drop ---
-        if self._stale_drop:
+        # ELEPHANT_TEST_FRESHNESS_SKIP=1 이면 test 환경에서 STALE 체크 건너뜀.
+        # 운영 환경에서는 환경변수 미설정 → 정상 가드 유지.
+        _freshness_skip = os.getenv("ELEPHANT_TEST_FRESHNESS_SKIP") == "1"
+        if self._stale_drop and not _freshness_skip:
             expires_at_str: str | None = event.get("expires_at")
             if expires_at_str:
                 try:

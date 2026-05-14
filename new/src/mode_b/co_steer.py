@@ -147,7 +147,10 @@ class CoSteer:
                 market_context,
                 anchors=anchors or None,
             )
-            active = zoo.list_by_status("active")
+            active_entries = zoo.list_by_status("active")
+            # W2: EvalAgent._compute_similarity가 e.get("status") 호출 → dataclass는 .get() 없음.
+            # FactorZooEntry.to_dict()로 변환하여 dict list 전달.
+            active = [e.to_dict() for e in active_entries]
 
             for hyp in hypotheses:
                 candidate = factor_a.implement(hyp)

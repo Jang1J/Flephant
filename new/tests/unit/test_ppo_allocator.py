@@ -251,15 +251,38 @@ def test_output_ts_propagation(allocator: PPOAllocator) -> None:
 
 
 # ====================================================================== #
-# 6. Policy loading (Sprint 3+ stub)
+# 6. Policy loading (Sprint 3+)
 # ====================================================================== #
 
 
-def test_load_policy_not_implemented_stub() -> None:
+def test_load_policy_uses_latest_artifact_or_keeps_heuristic() -> None:
     alloc = PPOAllocator()
-    with pytest.raises(NotImplementedError):
-        alloc.load()
+    alloc.load()
+    assert alloc.policy_version == "heuristic_v1" or alloc.policy_version.startswith("ppo_")
 
 
 def test_policy_version_default_heuristic(allocator: PPOAllocator) -> None:
     assert allocator.policy_version == "heuristic_v1"
+
+
+def test_ppo_policy_rejects_larger_dynamic_universe(allocator: PPOAllocator) -> None:
+    allocator._policy = object()
+    allocator._policy_n_stocks = 20
+    scores = {str(i).zfill(6): float(i) for i in range(21)}
+
+    result = allocator.allocate(_quant_output(scores))
+
+    assert result["allocation_plan"]["target_weights"] == {}
+    assert result["metadata"]["reason"] == "ppo_policy_universe_mismatch"
+
+
+def test_ppo_policy_rejects_smaller_dynamic_universe(allocator: PPOAllocator) -> None:
+    allocator._policy = object()
+    allocator._policy_n_stocks = 20
+    scores = {str(i).zfill(6): float(i) for i in range(19)}
+
+    result = allocator.allocate(_quant_output(scores))
+
+    assert result["allocation_plan"]["target_weights"] == {}
+    assert result["metadata"]["reason"] == "ppo_policy_universe_mismatch"
+    assert result["metadata"]["n_rejected"] == 19
