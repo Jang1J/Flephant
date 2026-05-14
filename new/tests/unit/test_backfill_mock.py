@@ -136,3 +136,49 @@ def test_start_after_end_raises(monkeypatch):
 
     with pytest.raises(BackfillError):
         bf.fetch_1m_bars("005930", yesterday, two_days_ago)
+
+
+def test_fetch_single_day_filters_non_target_real_bars(monkeypatch, tmp_path):
+    """실 KIS 응답에 전일 bar가 섞여도 요청일 장중 bar만 남긴다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    from src.data.backfill import Backfill
+
+    class FakeKISClient:
+        def inquire_minute_bar(self, ticker: str, n_bars: int = 390, date: str | None = None):
+            return [
+                {
+                    "ticker": ticker,
+                    "ts_close": "2026-05-07T15:29:00+09:00",
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "volume": 1,
+                    "_mode": "virtual",
+                },
+                {
+                    "ticker": ticker,
+                    "ts_close": "2026-05-08T08:59:00+09:00",
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "volume": 1,
+                    "_mode": "virtual",
+                },
+                {
+                    "ticker": ticker,
+                    "ts_close": "2026-05-08T09:00:00+09:00",
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "volume": 1,
+                    "_mode": "virtual",
+                },
+            ]
+
+    bf = Backfill(kis_client=FakeKISClient(), output_dir=tmp_path)
+    bars = bf._fetch_single_day("005930", "20260508")
+    assert len(bars) == 1
+    assert bars[0]["ts_close"] == "2026-05-08T09:00:00+09:00"

@@ -456,6 +456,10 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
          ┃ LLM reasoning (GPT-4o): ┃       regression_risk == true         
          ┃  diagnostic_notes 생성   ┃        → 배포 차단 + dead_letter     
          ┗━━━━━━━━━━━┳━━━━━━━━━━━━━┛      + baseline 유지
+
+         > 판정 임계값 SSOT (SHIP-fix NEW-4, 2026-05-06):
+         >   verdict 4 임계값 + severity 3 임계값 = risk_config.yaml backtest_agent.deploy_decision_gate 참조.
+         >   pass_sr/pass_ic/warn_sr/warn_ic + severity_none/low/medium_sr_threshold.
                      │
   21:30  ┌───────────▼──────────────┐   → updated keyword lists         → §8.6
          │ §8.5.1 뉴스 필터 + 규칙  │     (news_filter.yaml 등 5종
@@ -1305,10 +1309,11 @@ Sharpe lift (Mode B 야간 재학습 전후):
 | 상태 | 포함 지표 | 슬라이드 표기 |
 |---|---|---|
 | 구현 완료 (Sprint 1) | L1 전체, Hot Path Latency, ModelRegistry.compare_versions | 실수치 직접 제시 |
-| 구현 진행 (Sprint 2~3) | L2 7종 (precision/recall 쌍 포함하여 9 key), L3 cause_attribution, reason_code_distribution | "Sprint 2~3 구현 중, 설계 완료" 뱃지 |
-| 설계 완료 (Sprint 4) | L3 self_evolution_gain, dual_source_lead_time, regime_agent_contribution | "Sprint 4 예정, 스키마 확정" 뱃지 |
+| 구현 완료 (W2 P1, 2026-05-09 SHIP) | **L3 cause_attribution_accuracy + reason_code_distribution** | `new/src/eval/cause_attribution.py`, `new/src/eval/reason_code_stats.py`, `new/src/eval/synth_audit_log.py`, 15 unit test PASS, accuracy 0.755 / Top-3 coverage 0.869 (synthetic) |
+| 구현 진행 (Sprint 2) | L2 7종 (precision/recall 쌍 포함하여 9 key) | "Sprint 2 구현 중, 설계 완료" 뱃지 |
+| 설계 완료 (Sprint 4+, defer) | L3 self_evolution_gain, dual_source_lead_time, regime_agent_contribution (`new/src/analytics/` 미구현) | "Sprint 4 예정, 스키마 확정" 뱃지 |
 
-mock 숨기지 않음. 설계 완료된 mock과 근거 없는 mock을 구별. SSOT 근거: C18 신설 (api_contracts.md v3.2), architecture.md §8.1 + §4.2.
+mock 숨기지 않음. 설계 완료된 mock과 근거 없는 mock을 구별. SSOT 근거: C18 신설 (api_contracts.md v3.2), architecture.md §8.1 + §4.2 + evaluation_metrics.md v1.1 (2026-05-09).
 
 ---
 
@@ -1377,7 +1382,7 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 ModeBDeployer Atomic Swap 5-step
+### 7.2 ModeBDeployer Atomic Swap 6-step
 
 ```
 ┌───────────────────────────────────────────────────────┐
@@ -1385,13 +1390,36 @@ Trade Universe (active 20)                      Watch Universe (KOSPI200)
 │                                                       │
 │  Step 1: backtest_report.verdict == pass 확인         │
 │  Step 2: sanity_check() — NaN/Inf/shape 검증          │
-│  Step 3: backup 현재 artifacts/ (365일 보존)          │
-│  Step 4: atomic write → artifacts/deployed_bundle/   │
-│          (factor_zoo + lgbm_model + ppo_model         │
-│           + agent_constraints)                        │
-│  Step 5: audit_log 기록 (DEPLOY-{yyyymmdd}-{UUID8})   │
+│  Step 3: candidate 검증                               │
+│          artifacts/bundles/{bundle_id}/ required 4종  │
+│  Step 4: backup live → artifacts/backup/{deploy_id}/ │
+│  Step 5: atomic swap candidate → live artifacts/      │
+│          factor_zoo + lgbm + committee + ppo          │
+│  Step 6: audit_log 기록 (DEPLOY-{yyyymmdd}-{UUID8})   │
 │                                                       │
 │  실패 시: 롤백 + dead_letter_log + baseline 유지       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 7.2.1 EvalRunner (C14 sub-component, 2026-05-09 W2 P1 SHIP)
+
+```
+┌───────────────────────────────────────────────────────┐
+│  EvalRunner (C14 sub-component)                       │
+│  Trigger: stage_1 직후 (18:02 KST batch)              │
+│  PIT-Safety: snapshot_hour 18 KST 이후만 valid 산출   │
+│                                                       │
+│  L3 metrics (artifacts/metrics/):                     │
+│  ├─ reason_code_distribution_{yyyymmdd}.json          │
+│  │    Top-3 coverage threshold 0.80                   │
+│  └─ cause_attribution_{yyyymmdd}.json                 │
+│       Accuracy threshold 0.60 (발표 킬러 지표)        │
+│                                                       │
+│  입력: artifacts/audit_log.jsonl (C18 20 필드)        │
+│        label_t5_ret + label_backfilled_at             │
+│        + label_backfill_source (PIT-Safety meta)      │
+│                                                       │
+│  실패 시: PASS=false 메트릭 → operator alert          │
 └───────────────────────────────────────────────────────┘
 ```
 

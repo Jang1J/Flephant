@@ -55,12 +55,16 @@ assert "lightgbm" not in dir(), (
     "admission_engine 에서 LightGBM 추론/임포트 금지."
 )
 
-# 기본 경로
+# 기본 경로 (Codex 권고 1, 2026-05-09 fix): parents[3] → parents[2].
+# 이전: /Elephant_Lab/config/* (잘못된 root). 현재: /Elephant_Lab/new/config/*.
 _DYNAMIC_CONFIG_PATH_DEFAULT = (
-    Path(__file__).resolve().parents[3] / "config" / "dynamic_universe_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "dynamic_universe_config.yaml"
 )
 _UNIVERSE_CONFIG_PATH = (
-    Path(__file__).resolve().parents[3] / "config" / "universe_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "universe_config.yaml"
+)
+_WATCH_UNIVERSE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2] / "config" / "watch_universe_kospi200.yaml"
 )
 _ARTIFACTS_DIR_DEFAULT = (
     Path(__file__).resolve().parents[3] / "artifacts" / "dynamic_holdings"
@@ -93,6 +97,7 @@ class AdmissionEngine:
         self,
         dynamic_config_path: Path | None = None,
         trade_universe_path: Path | None = None,
+        watch_universe_path: Path | None = None,
         artifacts_dir: Path | None = None,
     ) -> None:
         """AdmissionEngine 초기화.
@@ -101,10 +106,13 @@ class AdmissionEngine:
             dynamic_config_path: dynamic_universe_config.yaml 경로. None이면 기본값.
             trade_universe_path: universe_config.yaml 경로. None이면 기본값.
                                  read-only 사용 (C15 trade_universe_ssot_mutation 금지).
+            watch_universe_path: watch_universe_kospi200.yaml 경로. None이면 기본값.
+                                 read-only 사용 (C16 watch universe SSOT).
             artifacts_dir: admission_events.jsonl 저장 디렉토리. None이면 기본값.
         """
         self._dynamic_cfg_path = dynamic_config_path or _DYNAMIC_CONFIG_PATH_DEFAULT
         self._trade_universe_path = trade_universe_path or _UNIVERSE_CONFIG_PATH
+        self._watch_universe_path = watch_universe_path or _WATCH_UNIVERSE_CONFIG_PATH
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_DIR_DEFAULT
 
         # C15 trade_universe_ssot_mutation 가드: write 경로 블록 어서션
@@ -131,7 +139,8 @@ class AdmissionEngine:
             filter_action="admit_candidate"
         )
 
-        # watch universe tickers (read-only)
+        # trade/watch universe tickers (read-only)
+        self._trade_tickers: set[str] = self._load_trade_tickers()
         self._watch_tickers: set[str] = self._load_watch_tickers()
 
         # 내부 상태
@@ -142,16 +151,17 @@ class AdmissionEngine:
 
         logger.info(
             "[admission_engine] 초기화 완료: min_trigger_count=%d cooldown_sec=%d "
-            "pool_max=%d admission_rules=%d watch_tickers=%d",
+            "pool_max=%d admission_rules=%d trade_tickers=%d watch_tickers=%d",
             self._min_trigger_count,
             self._cooldown_sec,
             self._candidate_pool_max,
             len(self._admission_rules),
+            len(self._trade_tickers),
             len(self._watch_tickers),
         )
 
-    def _load_watch_tickers(self) -> set[str]:
-        """trade universe tickers 로드 (watch universe 식별 목적).
+    def _load_trade_tickers(self) -> set[str]:
+        """trade universe tickers 로드.
 
         universe_config.yaml 에서 sectors.*.stocks.ticker 읽기 (read-only).
         C15 trade_universe_ssot_mutation: write 금지.
@@ -168,17 +178,34 @@ class AdmissionEngine:
             logger.warning(
                 "[admission_engine] universe_config.yaml 로드 실패: %s", e
             )
-        logger.info(
-            "[admission_engine] trade_universe 로드: %d종목", len(trade_tickers)
-        )
+        logger.info("[admission_engine] trade_universe 로드: %d종목", len(trade_tickers))
         return trade_tickers
+
+    def _load_watch_tickers(self) -> set[str]:
+        """C16 watch_universe_kospi200.yaml tickers 로드 (read-only)."""
+        watch_tickers: set[str] = set()
+        try:
+            watch_cfg = _load_yaml(self._watch_universe_path)
+            for item in watch_cfg.get("tickers", []):
+                ticker = item.get("ticker") if isinstance(item, dict) else item
+                if ticker:
+                    watch_tickers.add(str(ticker).zfill(6))
+        except Exception as e:
+            logger.warning(
+                "[admission_engine] watch_universe_kospi200.yaml 로드 실패: %s", e
+            )
+        logger.info("[admission_engine] watch_universe 로드: %d종목", len(watch_tickers))
+        return watch_tickers
 
     def _match_admission_rules(self, event: dict) -> list[str]:
         """admission rules 매칭. 매칭된 rule id 리스트 반환.
 
-        rule 평가 기준:
-          - price_spike_admission: event_type=price AND (return_pct >= 0.05 OR return_pct <= -0.05)
+        rule 평가 기준 (Codex 권고 7, 2026-05-09 fix: event_type=price → price_snapshot):
+          - price_spike_admission: event_type=price_snapshot AND (return_pct >= 0.05 OR return_pct <= -0.05)
           - dart_hot_ticker_admission: event_type=dart AND priority in (critical, urgent)
+
+        C2 (api_contracts.md L161) event_type enum: news|dart|macro|us_market|community|regime|investor_flow|price_snapshot.
+        이전: "price" 사용 → C2 위반. 현재: "price_snapshot" 정합 (legacy "price" backward-compat 유지).
 
         각 rule 은 id 필드와 condition 을 기준으로 평가.
         action="admit_candidate" 가 아닌 rule 은 evaluate loop 에서 skip.
@@ -200,14 +227,13 @@ class AdmissionEngine:
             rule_id = rule.get("id", "")
 
             if rule_id == "price_spike_admission":
-                # event_type=price OR payload 에 return_pct 포함
-                ret_pct = float(payload.get("return_pct", 0.0))
-                if event_type == "price" and (ret_pct >= 0.05 or ret_pct <= -0.05):
+                # Codex 권고 7 (2026-05-09): C2 event_type 정합. price_snapshot 우선, "price" backward-compat.
+                ret_pct = self._event_return_pct(payload)
+                if event_type in ("price_snapshot", "price") and (ret_pct >= 0.05 or ret_pct <= -0.05):
                     matched.append(rule_id)
                     logger.info(
-                        "[admission_engine] rule 매칭: %s return_pct=%.3f",
-                        rule_id,
-                        ret_pct,
+                        "[admission_engine] rule 매칭: %s return_pct=%.3f event_type=%s",
+                        rule_id, ret_pct, event_type,
                     )
 
             elif rule_id == "dart_hot_ticker_admission":
@@ -243,8 +269,20 @@ class AdmissionEngine:
         Returns:
             admission_event dict 또는 None (거부).
         """
-        ticker = str(event.get("ticker", "")).zfill(6)
-        ts_str: str = event.get("ts", "")
+        event = self._normalize_price_snapshot_candidate(event)
+
+        # Codex 권고 7 (2026-05-09): C2 정합 ticker 추출.
+        # ticker: top-level 우선, 없으면 C2 scope/payload ticker/scope.
+        # ts: occurred_at 우선 (C2 L165), 없으면 ts (legacy backward-compat).
+        payload = event.get("payload", {}) or {}
+        ticker_raw = (
+            event.get("ticker")
+            or self._ticker_from_scope(event.get("scope"))
+            or payload.get("ticker")
+            or self._ticker_from_scope(payload.get("scope"))
+        )
+        ticker = str(ticker_raw).zfill(6)
+        ts_str: str = event.get("occurred_at") or event.get("ts", "")
 
         # PIT-Safety 가드
         pit_skip = os.getenv("ELEPHANT_TEST_PIT_SKIP", "").lower() in ("true", "1")
@@ -263,9 +301,15 @@ class AdmissionEngine:
 
         # watch_universe 체크: trade_universe 종목이면 DROP
         # (trade_universe 는 이미 active 20종목이므로 동적 편입 불필요)
-        if ticker in self._watch_tickers:
+        if ticker in self._trade_tickers:
             logger.info(
                 "[admission_engine] trade_universe ticker: %s → DROP (Cold Path 처리)", ticker
+            )
+            return None
+
+        if ticker not in self._watch_tickers:
+            logger.info(
+                "[admission_engine] watch_universe 외 ticker: %s → DROP", ticker
             )
             return None
 
@@ -345,6 +389,63 @@ class AdmissionEngine:
             self._candidate_pool_max,
         )
         return admission_event
+
+    @staticmethod
+    def _ticker_from_scope(scope: Any) -> str:
+        """C2 scope 값에서 ticker 추출."""
+        scope_str = str(scope or "")
+        if scope_str.startswith("ticker:"):
+            return scope_str.split(":", 1)[1].zfill(6)
+        if scope_str.isdigit():
+            return scope_str.zfill(6)
+        return ""
+
+    @staticmethod
+    def _event_return_pct(payload: dict[str, Any]) -> float:
+        """price snapshot payload의 수익률 필드 alias 정규화."""
+        for key in ("return_pct", "day_change_pct", "change_pct", "pct_change"):
+            if payload.get(key) is not None:
+                return float(payload.get(key, 0.0))
+        return 0.0
+
+    def _normalize_price_snapshot_candidate(self, event: dict[str, Any]) -> dict[str, Any]:
+        """market-scoped C16 snapshot에서 admission 후보 1종목을 추출."""
+        if event.get("event_type") != "price_snapshot":
+            return event
+        if event.get("ticker") or self._ticker_from_scope(event.get("scope")):
+            return event
+
+        payload = event.get("payload", {}) or {}
+        snapshots = payload.get("snapshots", [])
+        if not isinstance(snapshots, list) or not snapshots:
+            return event
+
+        best_snapshot: dict[str, Any] | None = None
+        best_abs_return = -1.0
+        for item in snapshots:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker", "")).zfill(6)
+            if not ticker or ticker == "000000":
+                continue
+            ret_pct = self._event_return_pct(item)
+            abs_ret = abs(ret_pct)
+            if abs_ret > best_abs_return:
+                best_abs_return = abs_ret
+                best_snapshot = {**item, "ticker": ticker, "return_pct": ret_pct}
+
+        if best_snapshot is None:
+            return event
+
+        normalized = dict(event)
+        normalized["ticker"] = best_snapshot["ticker"]
+        normalized["scope"] = f"ticker:{best_snapshot['ticker']}"
+        normalized["payload"] = {
+            **payload,
+            **best_snapshot,
+            "snapshots": snapshots,
+        }
+        return normalized
 
     def get_pool_state(self) -> list[dict]:
         """현재 candidate_pool 상태 반환 (테스트/디버깅용)."""

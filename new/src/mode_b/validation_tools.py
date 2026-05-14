@@ -1,8 +1,11 @@
 """C13 ValidationToolsContract. BacktestEngine / ReplayRunner / PerformanceAnalyzer."""
 from __future__ import annotations
 
+import json
 import math
+import pickle
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,6 +17,7 @@ from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("BacktestEngine")
 _KST = ZoneInfo("Asia/Seoul")
+_ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
 
 # ────────────────────────────────────────────────────────────────────
 # C13 forbidden_callers 검증 (불변 원칙 3: Backtest Agent Mode B 전용)
@@ -108,13 +112,20 @@ class BacktestEngine:
         self,
         model_callable: Any | None = None,
         seed: int = 42,
+        artifacts_root: Path | None = None,
     ) -> None:
         self._model_callable = model_callable
         self._seed = seed
+        self._artifacts_root = artifacts_root or _ARTIFACTS_ROOT
         self._cfg_vt = config_load("risk_config.yaml", "validation_tools.backtest_engine")
         self._cfg_wf = config_load("risk_config.yaml", "walk_forward")
         self._cfg_cost = config_load("risk_config.yaml", "execution_cost_model")
         self._cfg_eval = config_load("risk_config.yaml", "evaluation")
+        self._cfg_paper_auto = config_load("risk_config.yaml", "paper_auto_trading") or {}
+        self._cfg_position = config_load("risk_config.yaml", "position_limits") or {}
+        self._cfg_turnover = config_load("risk_config.yaml", "turnover_cap") or {}
+        self._cfg_label = config_load("risk_config.yaml", "label") or {}
+        self._cfg_service_policy = config_load("risk_config.yaml", "service_policy_replay") or {}
         # S3 Critical 8: 하드코딩 제거. mock_data 파라미터를 yaml에서 로드.
         _mock_cfg: dict[str, Any] = (self._cfg_vt or {}).get("mock_data", {})
         self._mock_base_price: float = float(_mock_cfg.get("base_price", 50000.0))
@@ -123,6 +134,9 @@ class BacktestEngine:
             _mock_cfg.get("signal_return_correlation", 0.05)
         )
         self._mock_return_noise_std: float = float(_mock_cfg.get("return_noise_std", 0.02))
+        # 2026-05-12 Phase 1 재수정: trade_signal_threshold 폐기.
+        # trainer (lgbm_trainer._group_for_metrics:401-411) 는 threshold 없이 항상 top-K mean.
+        # backtest replay도 정합 위해 threshold filter 미적용. yaml line 301 deprecated.
         # S3 ARR Fix: initial_capital으로 daily_pnl(dollar) → 수익률 비율 변환.
         # 단위 혼용 방지. risk_config.yaml backtest 섹션에서 로드.
         _backtest_cfg: dict[str, Any] = config_load("risk_config.yaml", "backtest") or {}
@@ -210,8 +224,21 @@ class BacktestEngine:
                 "walk-forward fold 생성 실패: date_range가 너무 짧거나 파라미터 불일치"
             )
 
+        candidate_model, candidate_feature_width, candidate_artifact = (
+            self._resolve_candidate_model(bundle_ref)
+        )
+
         # 각 fold 실행 + 결과 수집
-        fold_results = self._run_folds(folds, padded_universe, _purge, _embargo)
+        fold_results = self._run_folds(
+            folds,
+            padded_universe,
+            _purge,
+            _embargo,
+            model_callable=candidate_model,
+            feature_width=candidate_feature_width,
+            feature_cols=candidate_artifact.get("feature_cols", []),
+            candidate_artifact=candidate_artifact,
+        )
 
         # 집계 metrics 계산
         metrics = self._aggregate_metrics(fold_results)
@@ -228,8 +255,79 @@ class BacktestEngine:
             daily_pnl.extend(fr["daily_pnl"])
             trade_log.extend(fr["trade_log"])
             bar_count += fr["bar_count"]
+        backtest_data_sources = sorted(
+            {str(fr.get("data_source", "synthetic_simulator")) for fr in fold_results}
+        )
 
         finished_at = datetime.now(_KST).isoformat()
+
+        # 2026-05-12 Phase 1 재수정 (Codex cross-check): BacktestAgent dead-path 해소.
+        # reviewer [C-1] regression_evidence 실 evidence 채움. trade_count / cost_burn /
+        # mean_net_return / dual_source default 4종 evidence string list로 BacktestAgent에
+        # 전달. BacktestAgent _normalize_evidence는 list[str] 정규화.
+        # reviewer [C-3] minute_bar_leakage_check 명시 (BacktestAgent default="pass" 하드코딩
+        # 대신 engine 실 결과 전달. _build_folds에서 LeakageDetected raise 안 됐으면 PASS).
+        leakage_check_result = {
+            "purge_bars_used": _purge,
+            "embargo_bars_used": _embargo,
+            "replay_unit": "1m",
+            "leakage_detected": False,
+            "verdict": "pass",
+        }
+
+        # regression_evidence 4종 build (Codex 2026-05-12 cross-check 권고):
+        trade_count_total = len(trade_log)
+        if trade_count_total > 0:
+            mean_net_return = sum(
+                float(t.get("net_return", 0.0)) for t in trade_log
+            ) / trade_count_total
+        else:
+            mean_net_return = 0.0
+        _cost_components = (self._cfg_cost or {}).get("components", {}) or {}
+        _commission_bps = float(_cost_components.get("commission_bps", 0.0))
+        _slippage_bps = float(_cost_components.get("slippage_bps", 0.0))
+        _cost_burn_pct_per_trade = (_commission_bps + _slippage_bps) / 100.0
+        _cost_burn_pct_total = trade_count_total * _cost_burn_pct_per_trade
+        _dual_source_cols = {
+            "news_score_t", "comm_score_t_1", "comm_score_t_2",
+            "news_comm_divergence", "community_noise_multiplier",
+        }
+        _exogenous_cols = {
+            "us_sp500_change", "us_nasdaq_change", "us_vix", "us_soxx_change",
+            "foreign_net_buy", "institutional_net_buy", "retail_net_buy",
+            "interest_rate", "usd_krw",
+        }
+        _candidate_features = set(candidate_artifact.get("feature_cols", []) or [])
+        _dual_source_in_manifest = bool(_dual_source_cols & _candidate_features)
+        _exogenous_in_manifest = bool(_exogenous_cols & _candidate_features)
+        _feature_quality = self._summarize_feature_quality(fold_results)
+        _dual_source_non_neutral_rows = int(
+            _feature_quality.get("dual_source_non_neutral_rows", 0)
+        )
+        _dual_source_rows = int(_feature_quality.get("dual_source_rows", 0))
+        _exogenous_non_neutral_rows = int(
+            _feature_quality.get("exogenous_non_neutral_rows", 0)
+        )
+        _exogenous_rows = int(_feature_quality.get("exogenous_rows", 0))
+        _dual_source_default_evidence = (
+            _dual_source_in_manifest
+            and _dual_source_rows > 0
+            and _dual_source_non_neutral_rows == 0
+        )
+        _exogenous_default_evidence = (
+            _exogenous_in_manifest
+            and _exogenous_rows > 0
+            and _exogenous_non_neutral_rows == 0
+        )
+        regression_evidence: list[str] = [
+            f"trade_count={trade_count_total}",
+            f"cost_burn_pct_total={_cost_burn_pct_total:.4f}",
+            f"mean_net_return={mean_net_return:.6f}",
+            f"dual_source_default_used={_dual_source_default_evidence}",
+            f"dual_source_non_neutral_rows={_dual_source_non_neutral_rows}/{_dual_source_rows}",
+            f"exogenous_default_used={_exogenous_default_evidence}",
+            f"exogenous_non_neutral_rows={_exogenous_non_neutral_rows}/{_exogenous_rows}",
+        ]
 
         result: dict[str, Any] = {
             "run_id": run_id,
@@ -239,10 +337,16 @@ class BacktestEngine:
             "daily_pnl": daily_pnl,
             "trade_log": trade_log,
             "bar_count": bar_count,
+            "regression_evidence": regression_evidence,
+            "minute_bar_leakage_check": leakage_check_result,
             # C13 rules.result_persistence: "KB with TTL=30days"
             # Sprint 4 KB 통합 시 KnowledgeBase.write(result, "backtest_history") + 30일 후 자동 삭제.
             # 현재는 메타 필드만 명시 (실 KB write 없음).
             "_persistence_target": "kb_30d",  # TODO Sprint 4: KB integration
+            "candidate_artifact": candidate_artifact,
+            "backtest_data_sources": backtest_data_sources,
+            "feature_quality": _feature_quality,
+            "service_policy_expected_date_range": self._service_policy_expected_date_range(folds),
         }
 
         logger.info(
@@ -321,6 +425,10 @@ class BacktestEngine:
         universe: list[str],
         purge_bars: int,
         embargo_bars: int,
+        model_callable: Any | None = None,
+        feature_width: int = 4,
+        feature_cols: list[str] | None = None,
+        candidate_artifact: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """각 fold에 대해 시뮬레이션 실행. fold_result 목록 반환."""
         import numpy as np
@@ -328,105 +436,618 @@ class BacktestEngine:
 
         fold_results = []
         for fold in folds:
-            fr = self._run_single_fold(fold, universe, rng)
+            fr = self._run_single_fold(
+                fold,
+                universe,
+                rng,
+                model_callable=model_callable,
+                feature_width=feature_width,
+                feature_cols=feature_cols or [],
+                candidate_artifact=candidate_artifact or {},
+            )
             fold_results.append(fr)
 
         return fold_results
+
+    @staticmethod
+    def _service_policy_expected_date_range(folds: list[dict[str, Any]]) -> dict[str, str]:
+        """Return the exact fold window that service-policy replay must bind to."""
+        if not folds:
+            return {}
+        first_fold = folds[0]
+        test_start = first_fold.get("test_start")
+        test_end = first_fold.get("test_end")
+        if not hasattr(test_start, "strftime") or not hasattr(test_end, "strftime"):
+            return {}
+        return {
+            "start": test_start.strftime("%Y%m%d"),
+            "end": (test_end - timedelta(days=1)).strftime("%Y%m%d"),
+        }
+
+    @staticmethod
+    def _summarize_feature_quality(fold_results: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate fold-level feature quality telemetry for C12 evidence."""
+        summary = {
+            "dual_source_rows": 0,
+            "dual_source_non_neutral_rows": 0,
+            "exogenous_rows": 0,
+            "exogenous_non_neutral_rows": 0,
+        }
+        for fold_result in fold_results:
+            quality = fold_result.get("feature_quality") or {}
+            for key in summary:
+                summary[key] += int(quality.get(key, 0))
+        summary["dual_source_non_neutral_rate"] = (
+            summary["dual_source_non_neutral_rows"] / max(summary["dual_source_rows"], 1)
+        )
+        summary["exogenous_non_neutral_rate"] = (
+            summary["exogenous_non_neutral_rows"] / max(summary["exogenous_rows"], 1)
+        )
+        return summary
 
     def _run_single_fold(
         self,
         fold: dict[str, Any],
         universe: list[str],
         rng: Any,
+        model_callable: Any | None = None,
+        feature_width: int = 4,
+        feature_cols: list[str] | None = None,
+        candidate_artifact: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """단일 fold 시뮬레이션.
 
         모델이 없으면 rng 기반 예측 stub 사용 (테스트용).
         NaN 입력 탐지 시 NaNInMetrics 즉시 raise.
         """
+        candidate_artifact = candidate_artifact or {}
+        feature_cols = feature_cols or []
+        effective_model = model_callable if model_callable is not None else self._model_callable
+        if (
+            effective_model is not None
+            and candidate_artifact.get("loaded")
+            and candidate_artifact.get("source") == "candidate_bundle_lgbm"
+            and not candidate_artifact.get("synthetic_fallback")
+        ):
+            return self._run_single_fold_real_bars(
+                fold=fold,
+                universe=universe,
+                model_callable=effective_model,
+                feature_cols=feature_cols,
+            )
+
+        import pandas as pd
+
         test_start = fold["test_start"]
         test_end = fold["test_end"]
         test_days = max(1, (test_end - test_start).days)
         trading_minutes = int(self._cfg_wf["trading_minutes_per_day"])
+        n_features = max(1, int(feature_width or 4))
 
-        # 거래비용 파라미터 (risk_config.yaml SSOT)
-        commission_bps = float(self._cfg_cost["components"]["commission_bps"])
-        slippage_bps = float(self._cfg_cost["components"]["slippage_bps"])
-        total_cost_bps = (commission_bps + slippage_bps) / 10000.0  # bps → 비율
+        if effective_model is None:
+            synthetic_feature_cols = ["synthetic_signal"]
 
-        daily_pnl: list[float] = []
-        trade_log: list[dict[str, Any]] = []
-        bar_count_fold = 0
+            def synthetic_model(features: list[float]) -> float:
+                return float(features[0])
 
-        predicted_signals: list[float] = []
-        actual_returns: list[float] = []
+            model_for_replay = synthetic_model
+        else:
+            synthetic_feature_cols = [f"synthetic_feature_{i}" for i in range(n_features)]
+            model_for_replay = effective_model
+
+        rows: list[dict[str, float | str | Any]] = []
+        index_tickers: list[str] = []
+        index_ts: list[Any] = []
+        price_state = {
+            ticker: max(
+                1.0,
+                self._mock_base_price + float(rng.normal(0, self._mock_price_noise_std)),
+            )
+            for ticker in universe
+        }
 
         for day_offset in range(test_days):
             day = test_start + timedelta(days=day_offset)
-            day_pnl = 0.0
-
+            session_open = day.replace(hour=9, minute=0, second=0, microsecond=0)
             for bar_idx in range(trading_minutes):
+                ts_close = session_open + timedelta(minutes=bar_idx)
                 for ticker in universe:
-                    # 예측 시그널 생성
-                    if self._model_callable is not None:
-                        pred = float(self._model_callable(
-                            rng.normal(0, 1, size=4).tolist()
-                        ))
+                    if effective_model is None:
+                        signal = float(rng.normal(0, 1))
+                        features = [signal]
                     else:
-                        pred = float(rng.normal(0, 1))
-
-                    # NaN 탐지
-                    if math.isnan(pred):
+                        features = rng.normal(0, 1, size=n_features).tolist()
+                    pred_for_label = float(model_for_replay(features))
+                    if math.isnan(pred_for_label):
                         raise NaNInMetrics(
                             f"예측값 NaN: ticker={ticker} "
                             f"fold={fold['fold_idx']} day_offset={day_offset}"
                         )
-
-                    # 실제 수익률 (synthetic: 예측과 약한 상관. 파라미터는 risk_config.yaml SSOT)
                     actual_ret = (
-                        pred * self._mock_signal_return_corr
+                        pred_for_label * self._mock_signal_return_corr
                         + float(rng.normal(0, self._mock_return_noise_std))
                     )
-
-                    predicted_signals.append(pred)
-                    actual_returns.append(actual_ret)
-
-                    # 시그널이 양수면 매수, 음수면 매도
-                    side = "buy" if pred > 0 else "sell"
-                    qty = 1
-                    price = self._mock_base_price + float(rng.normal(0, self._mock_price_noise_std))
-                    slippage_amt = price * (slippage_bps / 10000.0)
-
-                    # 거래비용 반영 수익률
-                    gross_ret = actual_ret
-                    net_ret = (1 + gross_ret) * (1 - total_cost_bps) - 1
-                    day_pnl += net_ret * qty * price
-
-                    trade_log.append({
+                    price_state[ticker] = max(1.0, price_state[ticker] * (1.0 + actual_ret))
+                    row = {
                         "ticker": ticker,
-                        "side": side,
-                        "qty": qty,
-                        "price": price,
-                        "ts": (
-                            day.replace(
-                                hour=9, minute=bar_idx % 60,
-                                second=0, microsecond=0,
-                            ).isoformat()
-                        ),
-                        "slippage": slippage_amt,
-                    })
-                    bar_count_fold += 1
+                        "ts_close": ts_close,
+                        "synthetic_return": actual_ret,
+                        "close": price_state[ticker],
+                    }
+                    for col, value in zip(synthetic_feature_cols, features, strict=False):
+                        row[col] = float(value)
+                    rows.append(row)
+                    index_tickers.append(ticker)
+                    index_ts.append(ts_close)
 
-            daily_pnl.append(day_pnl)
+        panel = pd.DataFrame(rows)
+        panel.index = pd.MultiIndex.from_arrays(
+            [index_tickers, index_ts],
+            names=["ticker", "ts_close"],
+        )
+        return self._run_policy_panel(
+            fold_idx=fold["fold_idx"],
+            panel=panel,
+            model_callable=model_for_replay,
+            feature_cols=synthetic_feature_cols,
+            target_col="synthetic_return",
+            data_source="synthetic_simulator",
+            feature_quality={},
+        )
+
+    def _service_policy_config(self) -> Any:
+        """Load the same cash-account execution policy C14 requires."""
+        from src.mode_b.service_policy_replay import ServicePolicyConfig
+
+        cost_components = (self._cfg_cost or {}).get("components", {}) or {}
+
+        return ServicePolicyConfig(
+            initial_capital=float(self._initial_capital),
+            top_k_fraction=float(self._cfg_eval.get("top_k_fraction", 0.25)),
+            max_orders_per_cycle=max(1, int(self._cfg_paper_auto.get("max_orders_per_cycle", 1))),
+            max_order_qty_per_order=max(
+                1,
+                int(self._cfg_paper_auto.get("max_order_qty_per_order", 1)),
+            ),
+            max_names=max(1, int(self._cfg_position.get("max_names", 10))),
+            max_single_name=float(self._cfg_position.get("max_single_name", 1.0)),
+            min_cash=max(0.0, float(self._cfg_position.get("min_cash", 0.0))),
+            daily_turnover_cap=float(self._cfg_turnover.get("daily_max", 1.0)),
+            commission_bps=float(cost_components.get("commission_bps", 0.0)),
+            slippage_bps=float(cost_components.get("slippage_bps", 0.0)),
+            annualization_factor=int(self._cfg_eval.get("annualization_factor", 252)),
+            min_daily_return_std=float(self._cfg_eval.get("min_daily_pnl_std", 1e-8)),
+            decision_stride_bars=max(
+                1,
+                int(self._cfg_service_policy.get(
+                    "decision_stride_bars",
+                    self._cfg_label.get("horizon_bars", 1),
+                )),
+            ),
+            min_holding_bars=max(0, int(self._cfg_service_policy.get("min_holding_bars", 0))),
+            rebalance_cooldown_bars=max(
+                0,
+                int(self._cfg_service_policy.get("rebalance_cooldown_bars", 0)),
+            ),
+            no_trade_score_spread=max(
+                0.0,
+                float(self._cfg_service_policy.get("no_trade_score_spread", 0.0)),
+            ),
+            allow_position_pyramiding=bool(
+                self._cfg_service_policy.get("allow_position_pyramiding", False)
+            ),
+            turnover_budget_hard_stop=bool(
+                self._cfg_service_policy.get("turnover_budget_hard_stop", True)
+            ),
+            min_expected_net_alpha_bps=float(
+                self._cfg_service_policy.get("min_expected_net_alpha_bps", 0.0)
+            ),
+            min_service_policy_sharpe=float(
+                self._cfg_service_policy.get("min_service_policy_sharpe", 0.0)
+            ),
+        )
+
+    def _run_policy_panel(
+        self,
+        *,
+        fold_idx: int,
+        panel: Any,
+        model_callable: Any,
+        feature_cols: list[str],
+        target_col: str,
+        data_source: str,
+        feature_quality: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run C12 fold through the same stateful policy used by service replay."""
+        from src.mode_b.service_policy_replay import ServicePolicyReplayEngine
+
+        policy = self._service_policy_config()
+        replay_engine = ServicePolicyReplayEngine(
+            artifacts_root=self._artifacts_root,
+            engine=self,
+            policy=policy,
+        )
+        predicted_signals, actual_returns, actual_by_order_key = (
+            self._collect_policy_panel_signals(
+                panel=panel,
+                model_callable=model_callable,
+                feature_cols=feature_cols,
+                target_col=target_col,
+            )
+        )
+        if not predicted_signals:
+            raise DataUnavailable(f"policy replay fold={fold_idx} 시그널 없음")
+
+        replay_result = replay_engine._simulate_panel(
+            panel=panel,
+            model_callable=model_callable,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            policy=policy,
+        )
+        trade_log = self._orders_to_backtest_trade_log(
+            orders=replay_result.get("orders", []),
+            actual_by_order_key=actual_by_order_key,
+            policy=policy,
+        )
+        daily_pnl = self._daily_pnl_from_equity(
+            initial_capital=policy.initial_capital,
+            daily_equity=replay_result.get("daily_equity", {}),
+        )
 
         return {
-            "fold_idx": fold["fold_idx"],
+            "fold_idx": fold_idx,
             "predicted_signals": predicted_signals,
             "actual_returns": actual_returns,
             "daily_pnl": daily_pnl,
             "trade_log": trade_log,
-            "bar_count": bar_count_fold,
+            "bar_count": len(predicted_signals),
+            "data_source": data_source,
+            "feature_quality": feature_quality,
+            "service_policy_gate": replay_result.get("gate", {}),
+            "service_policy_order_stats": replay_result.get("order_stats", {}),
         }
+
+    @staticmethod
+    def _collect_policy_panel_signals(
+        *,
+        panel: Any,
+        model_callable: Any,
+        feature_cols: list[str],
+        target_col: str,
+    ) -> tuple[list[float], list[float], dict[tuple[str, str], float]]:
+        predicted_signals: list[float] = []
+        actual_returns: list[float] = []
+        actual_by_order_key: dict[tuple[str, str], float] = {}
+
+        for ts_close, ts_group in panel.groupby(level="ts_close", sort=True):
+            ts_text = ts_close.isoformat() if hasattr(ts_close, "isoformat") else str(ts_close)
+            for (ticker, _), row in ts_group.iterrows():
+                ticker_s = pad_ticker(ticker)
+                try:
+                    features = [float(row[col]) for col in feature_cols]
+                    actual_ret = float(row[target_col])
+                    price = float(row["close"])
+                except Exception as e:
+                    raise DataUnavailable(
+                        f"invalid policy replay row ticker={ticker_s} ts={ts_text}: {e}"
+                    ) from e
+                if (
+                    any(math.isnan(value) for value in features)
+                    or math.isnan(actual_ret)
+                    or math.isnan(price)
+                    or price <= 0
+                ):
+                    continue
+                pred = float(model_callable(features))
+                if math.isnan(pred):
+                    raise NaNInMetrics(
+                        f"예측값 NaN: ticker={ticker_s} ts={ts_text}"
+                    )
+                predicted_signals.append(pred)
+                actual_returns.append(actual_ret)
+                actual_by_order_key[(ticker_s, ts_text)] = actual_ret
+        return predicted_signals, actual_returns, actual_by_order_key
+
+    @staticmethod
+    def _orders_to_backtest_trade_log(
+        *,
+        orders: list[dict[str, Any]],
+        actual_by_order_key: dict[tuple[str, str], float],
+        policy: Any,
+    ) -> list[dict[str, Any]]:
+        trade_log: list[dict[str, Any]] = []
+        for order in orders:
+            ticker = pad_ticker(order.get("ticker", ""))
+            ts_text = str(order.get("ts", ""))
+            side = str(order.get("side", ""))
+            price = float(order.get("price", 0.0))
+            qty = int(order.get("qty", 0))
+            actual_ret = float(actual_by_order_key.get((ticker, ts_text), 0.0))
+            gross_ret = actual_ret if side == "buy" else 0.0
+            if side == "buy":
+                net_ret = (1.0 + gross_ret) * (1.0 - policy.total_cost_rate) - 1.0
+            else:
+                net_ret = -policy.total_cost_rate
+            enriched = dict(order)
+            enriched.update({
+                "ticker": ticker,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "ts": ts_text,
+                "slippage": price * (policy.slippage_bps / 10_000.0),
+                "actual_return": actual_ret,
+                "gross_return": gross_ret,
+                "net_return": net_ret,
+            })
+            trade_log.append(enriched)
+        return trade_log
+
+    @staticmethod
+    def _daily_pnl_from_equity(
+        *,
+        initial_capital: float,
+        daily_equity: dict[str, float],
+    ) -> list[float]:
+        daily_pnl: list[float] = []
+        previous_equity = float(initial_capital)
+        for _, equity_value in sorted(daily_equity.items()):
+            equity = float(equity_value)
+            daily_pnl.append(equity - previous_equity)
+            previous_equity = equity
+        return daily_pnl or [0.0]
+
+    def _run_single_fold_real_bars(
+        self,
+        fold: dict[str, Any],
+        universe: list[str],
+        model_callable: Any,
+        feature_cols: list[str],
+    ) -> dict[str, Any]:
+        """candidate bundle backtest를 real artifact 1분봉 replay로 실행한다."""
+        if not feature_cols:
+            raise BundleLoadFailed("candidate feature_cols 없음")
+
+        try:
+            from src.data.dataset_builder import DatasetBuilder
+
+            start_date = fold["test_start"].strftime("%Y%m%d")
+            # _build_folds의 test_end는 exclusive 성격이므로 전일까지만 로드.
+            end_dt = fold["test_end"] - timedelta(days=1)
+            end_date = end_dt.strftime("%Y%m%d")
+            builder = DatasetBuilder(
+                artifacts_dir=self._artifacts_root / "data",
+            )
+            panel = self._build_replay_panel(builder, universe, start_date, end_date)
+            target_col = builder.target_col
+            feature_quality = self._panel_feature_quality(panel)
+        except Exception as e:
+            raise DataUnavailable(
+                "real bar replay 데이터셋 생성 실패: "
+                f"fold={fold['fold_idx']} {e}"
+            ) from e
+
+        present = {
+            str(ticker).zfill(6)
+            for ticker in panel.index.get_level_values("ticker").unique().tolist()
+        }
+        missing_tickers = sorted(set(universe) - present)
+        if missing_tickers:
+            raise DataUnavailable(
+                "real bar replay missing tickers: "
+                f"{missing_tickers}"
+            )
+
+        missing_features = [col for col in feature_cols if col not in panel.columns]
+        if missing_features:
+            raise BundleLoadFailed(
+                "candidate feature manifest mismatch in backtest replay: "
+                f"missing={missing_features}"
+            )
+
+        return self._run_policy_panel(
+            fold_idx=fold["fold_idx"],
+            panel=panel,
+            model_callable=model_callable,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            data_source="artifact_bars",
+            feature_quality=feature_quality,
+        )
+
+    @staticmethod
+    def _panel_feature_quality(panel: Any) -> dict[str, int]:
+        """Count non-neutral feature rows in a replay panel."""
+        dual_cols = [
+            "news_score_t", "comm_score_t_1", "comm_score_t_2",
+            "news_comm_divergence", "community_noise_multiplier",
+        ]
+        exog_cols = [
+            "us_sp500_change", "us_nasdaq_change", "us_vix", "us_soxx_change",
+            "foreign_net_buy", "institutional_net_buy", "retail_net_buy",
+            "interest_rate", "usd_krw",
+        ]
+        result = {
+            "dual_source_rows": 0,
+            "dual_source_non_neutral_rows": 0,
+            "exogenous_rows": 0,
+            "exogenous_non_neutral_rows": 0,
+        }
+        if all(col in panel.columns for col in dual_cols):
+            result["dual_source_rows"] = int(len(panel))
+            dual_mask = (
+                (panel["news_score_t"].astype(float).abs() > 1e-12)
+                | (panel["comm_score_t_1"].astype(float).abs() > 1e-12)
+                | (panel["comm_score_t_2"].astype(float).abs() > 1e-12)
+                | (panel["news_comm_divergence"].astype(float).abs() > 1e-12)
+                | ((panel["community_noise_multiplier"].astype(float) - 1.0).abs() > 1e-12)
+            )
+            result["dual_source_non_neutral_rows"] = int(dual_mask.sum())
+        if all(col in panel.columns for col in exog_cols):
+            result["exogenous_rows"] = int(len(panel))
+            exog_mask = False
+            for col in exog_cols:
+                exog_mask = exog_mask | (panel[col].astype(float).abs() > 1e-12)
+            result["exogenous_non_neutral_rows"] = int(exog_mask.sum())
+        return result
+
+    @staticmethod
+    def _build_replay_panel(
+        builder: Any,
+        universe: list[str],
+        start_date: str,
+        end_date: str,
+    ):
+        """DatasetBuilder의 PIT-safe feature/label만 재사용해 replay panel 생성."""
+        import pandas as pd
+
+        frames = []
+        missing_tickers: list[str] = []
+        for ticker in universe:
+            raw = builder._load_ticker_bars(ticker, start_date, end_date)
+            if raw is None or raw.empty:
+                missing_tickers.append(ticker)
+                continue
+            with_feats = builder._compute_rolling_features(raw)
+            with_label = builder._generate_labels(with_feats)
+            if with_label.empty:
+                missing_tickers.append(ticker)
+                continue
+            frames.append(with_label)
+        if missing_tickers:
+            raise DataUnavailable(
+                f"real replay missing/empty tickers: {sorted(set(missing_tickers))}"
+            )
+        if not frames:
+            raise DataUnavailable("real replay panel empty")
+        panel = pd.concat(frames, axis=0, ignore_index=True)
+        panel["ticker"] = panel["ticker"].astype(str).str.zfill(6)
+        panel["ts_close"] = pd.to_datetime(panel["ts_close"], utc=False)
+        panel = panel.set_index(["ticker", "ts_close"]).sort_index()
+        if getattr(builder, "_ds_enabled_for_lgbm", False):
+            panel = builder._join_dual_source_features(panel, start_date, end_date)
+        if getattr(builder, "_exog_enabled_for_lgbm", False):
+            panel = builder._join_exogenous_features(panel)
+        if getattr(builder, "_neutral_feature_cols", []):
+            panel = builder._join_neutral_feature_columns(panel)
+        return panel
+
+    # ────────────────────────────────────────────────────
+    # candidate artifact 로드
+    # ────────────────────────────────────────────────────
+
+    def _resolve_candidate_model(
+        self,
+        bundle_ref: str,
+    ) -> tuple[Any | None, int, dict[str, Any]]:
+        """bundle_ref의 candidate LightGBM artifact를 Backtest 입력으로 해석.
+
+        테스트 전용 직접 주입(model_callable)은 명시 artifact로 간주한다. bundle staging
+        파일이 없으면 기존 단위 테스트 호환을 위해 synthetic fallback은 유지하되,
+        BacktestAgent가 이 metadata를 보고 verdict를 fail로 강제할 수 있게 표시한다.
+        """
+        if self._model_callable is not None:
+            return self._model_callable, 4, {
+                "loaded": True,
+                "synthetic_fallback": False,
+                "source": "injected_model_callable",
+                "model_path": "",
+                "metadata_path": "",
+                "feature_cols": [],
+                "feature_width": 4,
+            }
+
+        bundle_root = self._artifacts_root / "bundles" / bundle_ref / "lgbm"
+        model_path = bundle_root / "latest_model.pkl"
+        metadata_path = bundle_root / "latest_model_metadata.json"
+
+        if not bundle_root.exists():
+            logger.warning(
+                "[BacktestEngine] candidate bundle 없음: %s. synthetic fallback metadata 표시.",
+                bundle_root,
+            )
+            return None, 4, {
+                "loaded": False,
+                "synthetic_fallback": True,
+                "source": "missing_candidate_bundle",
+                "model_path": str(model_path),
+                "metadata_path": str(metadata_path),
+                "feature_cols": [],
+                "feature_width": 4,
+            }
+
+        if not model_path.is_file():
+            raise BundleLoadFailed(f"candidate model artifact 없음: {model_path}")
+        if model_path.stat().st_size <= 0:
+            raise BundleLoadFailed(f"candidate model artifact 비어있음: {model_path}")
+
+        if not metadata_path.is_file():
+            raise BundleLoadFailed(f"candidate metadata artifact 없음: {metadata_path}")
+        if metadata_path.stat().st_size <= 0:
+            raise BundleLoadFailed(f"candidate metadata artifact 비어있음: {metadata_path}")
+
+        try:
+            with metadata_path.open("r", encoding="utf-8") as fh:
+                loaded_meta = json.load(fh)
+            if not isinstance(loaded_meta, dict):
+                raise TypeError(f"metadata root가 dict가 아님: {type(loaded_meta).__name__}")
+            metadata: dict[str, Any] = loaded_meta
+        except Exception as e:
+            raise BundleLoadFailed(
+                f"candidate metadata 읽기 실패: {metadata_path} ({e})"
+            ) from e
+
+        try:
+            with model_path.open("rb") as fh:
+                model = pickle.load(fh)
+        except Exception as e:
+            raise BundleLoadFailed(
+                f"candidate model pickle load 실패: {model_path} ({e})"
+            ) from e
+
+        if hasattr(model, "predict"):
+            model_callable = self._predict_callable(model)
+        elif callable(model):
+            model_callable = model
+        else:
+            raise BundleLoadFailed(
+                f"candidate model이 predict/callable을 제공하지 않음: {type(model).__name__}"
+            )
+
+        feature_cols = metadata.get("feature_cols") if isinstance(metadata, dict) else []
+        if not isinstance(feature_cols, list):
+            feature_cols = []
+        if not feature_cols:
+            raise BundleLoadFailed(f"candidate metadata feature_cols 없음: {metadata_path}")
+        feature_width = len(feature_cols) if feature_cols else 4
+        metadata_synthetic_fallback = bool(metadata.get("synthetic_fallback", False))
+
+        return model_callable, feature_width, {
+            "loaded": True,
+            "synthetic_fallback": metadata_synthetic_fallback,
+            "source": "candidate_bundle_lgbm",
+            "data_source": str(metadata.get("data_source", "artifact_bars")),
+            "model_path": str(model_path),
+            "metadata_path": str(metadata_path),
+            "feature_cols": [str(col) for col in feature_cols],
+            "feature_width": feature_width,
+        }
+
+    @staticmethod
+    def _predict_callable(model: Any):
+        """LightGBM/Mock Booster predict(X) → scalar callable adapter."""
+        import numpy as np
+
+        def _call(features: list[float]) -> float:
+            x = np.asarray([features], dtype=float)
+            pred = model.predict(x)
+            arr = np.asarray(pred, dtype=float).reshape(-1)
+            if arr.size == 0:
+                raise NaNInMetrics("candidate model predict 결과가 비어있음")
+            return float(arr[0])
+
+        return _call
 
     # ────────────────────────────────────────────────────
     # 집계 metrics 계산
@@ -486,20 +1107,21 @@ class BacktestEngine:
         years = total_days / max(ann_factor, 1)
         arr = (1 + total_return_ratio) ** (1.0 / max(years, 1.0 / ann_factor)) - 1
 
-        # IR = mean(daily_pnl) / std(daily_pnl) * sqrt(252)
-        # 이전 구현 버그: arr(이미 연율화된 값) / std * sqrt(252) → ~252배 과대평가.
-        # 올바른 계산: mean_daily / std_daily * sqrt(ann_factor).
-        # SR과 동일한 형태이나 SR은 무위험수익률 차감 없는 원시 Sharpe이고,
-        # IR은 정보 비율로 같은 공식 사용. 2026-05-01 S3 Tier 1 수정.
-        std_pnl = self._std(all_daily_pnl)
-        mean_pnl = sum(all_daily_pnl) / max(len(all_daily_pnl), 1)
-        ir = mean_pnl / max(std_pnl, min_pnl_std) * math.sqrt(ann_factor)
+        # IR / SR: daily_pnl(dollar) → daily_ret(initial_capital 대비 비율) 정규화 후 산출.
+        # 2026-05-12 4-role 진단 후 수정: 이전엔 dollar PnL raw를 IR/SR 산식에 직접 투입 →
+        # initial_capital(1억 KRW) 단위 배율로 비현실 수치 발생 (in-sample IR=24.89,
+        # OOS IR=-133.96). 정규화로 daily_ret 비율 기반 IR/SR 산출 (Bailey & Lopez de Prado
+        # 2014 표준 SR 정의 정합).
+        daily_ret = [p / max(self._initial_capital, 1.0) for p in all_daily_pnl]
+        mean_ret = sum(daily_ret) / max(len(daily_ret), 1)
+        std_ret = self._std(daily_ret)
+        ir = mean_ret / max(std_ret, min_pnl_std) * math.sqrt(ann_factor)
 
-        # MDD = min(cumulative / running_max - 1)
-        mdd = self._max_drawdown(all_daily_pnl)
+        # MDD = initial_capital 기반 equity curve drawdown.
+        mdd = self._max_drawdown(all_daily_pnl, initial_capital=self._initial_capital)
 
-        # SR = mean(daily_pnl) / std(daily_pnl) * sqrt(252)
-        sr = mean_pnl / max(std_pnl, min_pnl_std) * math.sqrt(ann_factor)
+        # SR = 무위험수익률 0 가정 IR과 동일 산식 (daily_ret 기반).
+        sr = mean_ret / max(std_ret, min_pnl_std) * math.sqrt(ann_factor)
 
         return {
             "ic": ic,
@@ -577,28 +1199,45 @@ class BacktestEngine:
         return cls._pearsonr(cls._rank(xs), cls._rank(ys))
 
     @staticmethod
-    def _max_drawdown(daily_pnl: list[float]) -> float:
+    def _max_drawdown(
+        daily_pnl: list[float],
+        initial_capital: float | None = None,
+    ) -> float:
         """MDD 계산. 음수 반환 (risk_config.yaml evaluation.mdd_sign='negative').
 
-        peak=0 초기화: 누적 PnL이 아직 양수에 도달하지 않은 경우 high water mark가
-        없으므로 drawdown 계산을 skip한다. peak > 0인 시점부터 비율 기반 MDD 측정.
-        이전 구현의 `max(abs(peak), 1e-10)` 분모는 peak=0 시 -1e10 생산 버그.
-        2026-05-01 S3 Tier 1 수정.
+        initial_capital이 있으면 daily_pnl을 금액 PnL로 보고 equity curve를 만든다.
+        없으면 기존 PerformanceAnalyzer 호환을 위해 daily_pnl을 일별 수익률로 본다.
         """
         if not daily_pnl:
             return 0.0
-        cum = 0.0
-        peak = 0.0
-        mdd = 0.0
-        for pnl in daily_pnl:
-            cum += pnl
-            if cum > peak:
-                peak = cum
-            # high water mark가 양수일 때만 비율 기반 drawdown 계산
-            if peak > 0:
-                dd = (cum - peak) / peak
+
+        if initial_capital is not None:
+            equity = max(float(initial_capital), 1.0)
+            peak = equity
+            mdd = 0.0
+            for pnl in daily_pnl:
+                equity += float(pnl)
+                if equity <= 0.0:
+                    return -1.0
+                if equity > peak:
+                    peak = equity
+                dd = equity / peak - 1.0
                 if dd < mdd:
                     mdd = dd
+            return mdd
+
+        equity = 1.0
+        peak = 1.0
+        mdd = 0.0
+        for ret in daily_pnl:
+            equity *= 1.0 + float(ret)
+            if equity <= 0.0:
+                return -1.0
+            if equity > peak:
+                peak = equity
+            dd = equity / peak - 1.0
+            if dd < mdd:
+                mdd = dd
         return mdd
 
 

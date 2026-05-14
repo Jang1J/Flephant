@@ -147,8 +147,17 @@ class NewsAgent(AgentBase):
 
         publish_channel = self._EVENT_TYPE_TO_CHANNEL[event_type]
 
-        # ticker 추출 (6자리 zero-padded)
-        raw_ticker = event.get("ticker") or (event.get("tickers") or [None])[0]
+        # ticker 추출 (6자리 zero-padded). C2 정규화 이벤트는 payload.ticker 또는
+        # scope=ticker:{code}에 ticker를 둘 수 있으므로 모두 수용한다.
+        payload = event.get("payload") or {}
+        scope = str(event.get("scope") or "")
+        scope_ticker = scope.split(":", 1)[1] if scope.startswith("ticker:") else None
+        raw_ticker = (
+            event.get("ticker")
+            or payload.get("ticker")
+            or scope_ticker
+            or (event.get("tickers") or [None])[0]
+        )
         ticker = str(raw_ticker).zfill(6) if raw_ticker else ""
 
         title = event.get("title", "")
@@ -233,6 +242,10 @@ class NewsAgent(AgentBase):
             "agent": rpt["agent"],
             "ts": rpt["ts"],
             "llm_fallback": llm_fallback,
+            "content": rpt["payload"]["narrative"],
+            "scope": f"ticker:{ticker}" if ticker else "market",
+            "confidence": float(parsed.get("confidence", 0.5)),
+            "reasoning": rpt["payload"]["narrative"],
         }
 
         # S4-7 캐시 저장 (LLM fallback이 아닌 정상 분석 결과만)
@@ -244,6 +257,21 @@ class NewsAgent(AgentBase):
                 ticker,
                 self._cache.news_ttl,
             )
+
+        # 2026-05-12 audit C-D2 fix: C4 auto-publish to SharedMessagePool.
+        # 이전: result dict에 content/scope/confidence/reasoning 필드는 추가됐으나
+        # self._pubsub.publish() 호출 자체 없음 → EventGateway 우회 직접 호출 시
+        # C4 메시지 풀에 게시 안 됨 (5/11 fix incomplete).
+        # llm_fallback 시 publish 안 함 (neutral 결과로 풀 오염 방지).
+        if self._pubsub is not None and not llm_fallback:
+            try:
+                publish_msg = self.publish(publish_channel, rpt["payload"])
+                self._pubsub.publish(publish_channel, publish_msg)
+            except Exception as e:
+                logger.warning(
+                    "[news_agent] C4 publish 실패. event_id=%s channel=%s error=%s",
+                    event_id, publish_channel, e,
+                )
 
         return result
 

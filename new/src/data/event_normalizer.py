@@ -186,6 +186,12 @@ class EventNormalizer:
             "pit_safe": pit_safe_result,
             "payload": partial.get("payload", {}),
         }
+        payload_ticker = result["payload"].get("ticker")
+        scope = str(result["scope"])
+        if payload_ticker:
+            result["ticker"] = str(payload_ticker).zfill(6)
+        elif scope.startswith("ticker:"):
+            result["ticker"] = scope.split(":", 1)[1].zfill(6)
 
         logger.info(
             "이벤트 정규화 완료: source=%s event_id=%s event_type=%s occurred_at=%s",
@@ -442,19 +448,37 @@ class EventNormalizer:
         occurred_at = _parse_ts_to_kst_str(ts_val, "ts", "price_snapshot")
         snapshots = raw.get("snapshots", [])
         ticker_count = len(snapshots) if isinstance(snapshots, list) else 0
+        ticker = str(raw.get("ticker", "") or "").zfill(6)
+        return_pct = raw.get("return_pct", raw.get("day_change_pct"))
+
+        if not ticker or ticker == "000000":
+            if isinstance(snapshots, list) and len(snapshots) == 1 and isinstance(snapshots[0], dict):
+                ticker = str(snapshots[0].get("ticker", "") or "").zfill(6)
+                return_pct = snapshots[0].get(
+                    "return_pct",
+                    snapshots[0].get("day_change_pct", return_pct),
+                )
+
+        scope = f"ticker:{ticker}" if ticker and ticker != "000000" else "market"
+        payload = {
+            "watch_snapshot_id": watch_snapshot_id,
+            "ticker_count": ticker_count,
+            "snapshots": snapshots,
+            **{k: v for k, v in raw.items()
+               if k not in ("watch_snapshot_id", "ts", "snapshots")},
+        }
+        if ticker and ticker != "000000":
+            payload["ticker"] = ticker
+        if return_pct is not None:
+            payload["return_pct"] = return_pct
 
         return {
             "event_type": "price_snapshot",
-            "scope": "market",
+            "scope": scope,
             "title": f"Watch Universe 스냅샷: {ticker_count}종목",
             "summary": f"watch_snapshot_id={watch_snapshot_id} ticker_count={ticker_count}",
             "occurred_at": occurred_at,
             "priority": "normal",
             "llm_required": False,
-            "payload": {
-                "watch_snapshot_id": watch_snapshot_id,
-                "ticker_count": ticker_count,
-                **{k: v for k, v in raw.items()
-                   if k not in ("watch_snapshot_id", "ts", "snapshots")},
-            },
+            "payload": payload,
         }

@@ -10,6 +10,8 @@ __MACOSX/
 
 # === Python ===
 __pycache__/
+.pytest_cache/
+.mypy_cache/
 *.pyc
 *.pyo
 *.egg-info/
@@ -30,6 +32,7 @@ models/rebound_cnn/calibrator_meta.json
 
 # === Runtime artifacts (AuditLogger dead_letter, ModelRegistry 등) ===
 artifacts/
+dist/
 
 # === Claude Code 하네스 (개인 작업 환경) ===
 .claude/

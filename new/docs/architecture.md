@@ -621,7 +621,9 @@ BacktestAgent = {
         "PerformanceAnalyzer"        # regime breakdown + ablation + baseline 비교 (C13)
     ],
     "deploy_decision_gate": {
-        "condition": "verdict == 'pass' AND regression_risk.flagged == false",
+        # Codex 권고 3 (2026-05-09): C12 spec 정합. minute_bar_leakage_check.verdict == "pass" 조건 추가.
+        # 이전: verdict + regression_risk 만 검증 → leakage 위반도 통과 가능 (PIT-Safety 우려).
+        "condition": "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass'",
         "on_pass": "22:00 배포 승인 (human_approval flag에 따라 자동 또는 operator 확인)",
         "on_warn": "operator 수동 확인 필수 (human_approval=true)",
         "on_fail": "22:00 배포 차단 + dead_letter_log 기록 + baseline 유지"
@@ -644,6 +646,7 @@ BacktestAgent = {
         "shared_message_pool_publish_during_market_hours",
         "production_direct_write"
     ],
+    "_note_c12_vs_c14": "C12 BacktestAgent forbidden_permissions = 6개 (위). C14 ModeBScheduler forbidden_permissions = 4개 (별도 집합, api_contracts.md C14 참조). 두 집합은 다른 권한 경계이므로 혼용 금지.",
     "runtime_guard": {
         "HOT_PATH_INTERVENTION_ATTEMPT": "Backtest Agent가 장중 시간대에 publish 시도 시 런타임 거부",
         "FORBIDDEN_FIELD_IN_OUTPUT": "output에 target_weights/order_deltas/approved/veto_reason/portfolio_patch_id 포함 시 런타임 거부"
@@ -1490,6 +1493,8 @@ Mode B는 **Mode B Scheduler**라는 전용 cron-style orchestrator가 관리한
 > **권한 분리 (v2.2)**: Backtest Agent = 검증자(verdict만), Mode B Deployer = 배포 실행자(actual swap).
 > Backtest Agent가 verdict=pass를 내도 실제 배포는 Deployer가 수행한다. 이는 C12 `can_write_to_production: false` 원칙과 일관된다.
 
+> **C12 vs C14 권한 경계 (SHIP-fix NEW-3, 2026-05-06)**: C14 ModeBScheduler `forbidden_permissions = 4개` (별도 집합, api_contracts.md C14 참조). §4.2 C12 BacktestAgent `forbidden_permissions = 6개`와 **다른 집합**이므로 혼용 금지. C12는 검증자 권한 경계, C14는 orchestrator 권한 경계.
+
 **bundle_id 생성 주체**: **Mode B Scheduler**가 `MODE_B_EVOLVING` 단계 시작 시 `BUNDLE-{yyyymmdd}-{UUID8}`를 발급하고, Alpha Factor Engine/Co-STEER/PPO retrain 출력물을 하나의 bundle로 묶어 Backtest Agent에 전달한다. (v3.5: {seq} → {UUID8} 정정)
 
 **backtest_history 저장**: KB (Knowledge Base)의 `backtest_history` 컬렉션. TTL 없음 (전체 이력 보존). Validation Tools 결과는 `result_persistence.ttl_days: 30` (risk_config.yaml).
@@ -1743,9 +1748,11 @@ v3 추가 — 산출물 분리:
     - config drift 검사 (risk_config.yaml vs api_contracts.md SSOT 일치)
 
 ③  배포 실행 (Mode B Deployer가 수행):
-    - 개선된 팩터 → Factor Zoo 활성화 (atomic swap)
-    - 재학습된 모델 → model_registry 교체 (rollback 가능)
-    - PPO Allocator → 새 policy 적용
+    - 배포 전 `artifacts/bundles/{bundle_id}` candidate 4종 존재/비어있지 않음 검증
+    - source와 live dest 경로가 같으면 즉시 차단 (live artifact 보호)
+    - 개선된 팩터 → `artifacts/alpha_factor/factor_zoo.jsonl` 활성화 (atomic swap)
+    - 재학습된 모델 → `artifacts/lgbm/latest_model.pkl` 교체 (rollback 가능)
+    - PPO Allocator → `artifacts/ppo/latest_policy.pkl` 적용
     - 에이전트 constraint → 다음 날 08:30 React Action에 반영
     - 배포 완료 ts + bundle_id + verdict → mode_b_audit_log 기록
     - 성공 → MODE_B_IDLE 전이

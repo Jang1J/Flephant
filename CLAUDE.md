@@ -91,6 +91,10 @@ Mode B 장마감 (18:00~22:00):
 | `new/config/dynamic_universe_config.yaml` | C15 운영 파라미터 SSOT (Sprint 5 P3, ttl_sec/stop_loss_pct/cache_ttl/admission/holdings/forbidden_runtime_checks, mode_b_metadata 8필드) |
 | `new/config/watch_universe_kospi200.yaml` | C16 KOSPI200 watch universe (Sprint 5 P5, 200종목 + watch_rules + mode_b_editable=false) |
 | `new/scripts/generate_watch_universe.py` | KRX KOSPI200 종목 자동 생성 스크립트 (Sprint 5 P5, 658줄, --source krx/static, dry-run + diff) |
+| `new/src/eval/reason_code_stats.py` | L3 reason_code 분포 + Top-3 coverage 일별 산출 (W2 P1 SHIP 2026-05-09, ~210줄, threshold 0.80) |
+| `new/src/eval/cause_attribution.py` | L3 Cause Attribution Accuracy 산출 (W2 P1 SHIP 2026-05-09, ~250줄, FDA reason_code vs label_t5_ret 사후 일치율, threshold 0.60, 발표 킬러 지표) |
+| `new/src/eval/synth_audit_log.py` | 발표용 synthetic audit_log generator (W2 P1, KIS 키 미설정 시 7종 reason_code × 107 entries 합성, hit_rate 분포 보존) |
+| `new/src/jobs/run_final_demo.py` + `demo.sh` | 발표 단일 명령 demo runner (W1 P0-6, Hot/Cold/Mode B 3 demo wrapping, --demo all/hot/cold/mode_b) |
 | `.env` | API 키 (DART, Naver, ECOS, KRX, Kanana, OpenAI) |
 
 ## LLM 구성
@@ -111,8 +115,8 @@ Mode B 장마감 (18:00~22:00):
    - `/validate` (reviewer+architect) · `/build-model` (modeler+data-engineer+runner) · `/team-merge` (architect+gpt-tracker)
 
 2. **전문가 스킬 (8)**: 단일 에이전트 디스패치 또는 도구 호출
-   - `/arch-sync` (architect) · `/gpt` (gpt-tracker) · `/smoke-test` (runner) · `/cleanup` (architect+coder)
-   - `/agent-research` (analyst) · `/paper-trending` (analyst) · `/worklog` · `/present` (presenter+analyst)
+   - `/arch-sync` (architect) · `/gpt` (gpt-tracker) · `/smoke-test` (runner) · `/cleanup` (reviewer 단독 탐지, 삭제 user 승인)
+   - `/agent-research` (analyst) · `/paper-trending` (analyst) · `/worklog` · `/present` (default: presenter+analyst, review 모드: presenter+reviewer 병렬)
 
 3. **세이프티/세션 (5)**: 운영 안전성 + 세션 컨텍스트 관리
    - `/careful` · `/freeze` · `/guard` (careful+freeze 동시) · `/unfreeze` · `/checkpoint`
@@ -127,8 +131,10 @@ Mode B 장마감 (18:00~22:00):
 - **SessionStart**: 스킬/에이전트 목록 + 세션 시작 시퀀스 안내
 
 ### Preamble + Rules (.claude/preamble + .claude/rules)
-- `_elephant_preamble.md` 10 섹션: 불변 5원칙 / Ethos / AskUserQuestion / Completion Status / Escalation / Plan Mode / Self-Improvement / User Sovereignty / Voice / Context Recovery
-- 9 rule 파일: `agents-code` · `architecture-v3` · `composition` · `confidence_calibration` · `config-protection` · `connectors` · `jobs` · `schemas` · `voice`
+- `_elephant_preamble.md` 10 섹션 + §7.1/7.2/7.3 (5/11 verification + 5/12 interpretation 모드)
+- 15 rule 파일:
+  - 기존 9: `agents-code` · `architecture-v3` · `composition` · `confidence_calibration` · `config-protection` · `connectors` · `jobs` · `schemas` · `voice`
+  - 신규 6 (5/11~5/12 Codex 패턴 흡수): `preamble-load` · `deep-fix` · `test-isolation` · `cross-check` · `performance-interpretation` · `env-config` (canonical env 단일 SSOT)
 - 충돌 시 우선순위: Preamble > rule 파일 > 스킬 본문 > 에이전트 정의
 
 ### bin (.claude/bin/)
@@ -138,6 +144,49 @@ Mode B 장마감 (18:00~22:00):
 ### 외부 출처 스킬 정책
 v3 KOSPI 1분봉 OS 도메인 외 스킬은 보유하지 않는다 (2026-05-03 audit으로 a4-print-design / docx / project-spec-writer 삭제).
 docx 산출물은 사용자가 GPT 등 외부 도구로 처리한다 (memory `feedback_docx_quality.md`).
+
+### Codex 협업 패턴 (2026-05-11 verification + 2026-05-12 interpretation 입증)
+
+별도 Codex 하네스 (`.Codex/`) 가 Claude (`.claude/`) 와 mirror 유지. 차이 4개만:
+- 경로 (`.Codex/` ↔ `.claude/`)
+- 도구명 (`spawn_agent / send_input / wait_agent` ↔ `Agent / SendMessage / TaskCreate`)
+- 스킬 prefix (`/codex-*`)
+- agent 포맷 (`.toml` ↔ `.md`)
+
+본문 내용 (architect 11 카테고리 + code-review workflow + agent 본문)은 동일.
+
+**Codex 사용 시점**:
+- Claude self-review 한계 인정 시 (rules/cross-check.md §1)
+- Critical fix 후 외부 cross-check 필요 시 (rules/cross-check.md §2 trigger)
+- 깊이 있는 multi-role 검증 필요 시 (4-role 병렬 default, preamble §7.1)
+
+**Hand-off prompt 표준** (rules/cross-check.md §5):
+
+```
+/codex-{skill}
+
+[배경] claude-progress.md / Codex-progress.md 해당 섹션 인용 + 현재 작업 / 제약
+[발견 사항] file:line:category + 증상 / 증거 / confidence
+[Fix 방향] 구체적 코드 sketch (before/after) + 영향받는 path 모두 명시
+[제약] .env 안 읽음 + 진행 중 작업 (예: 80일 backfill / artifacts/data) 안 건드림
+[검증] targeted pytest + dry-run + compileall + git diff --check
+```
+
+**Codex 5/11 입증 결과** (`Codex-progress.md` "AI 파트 최종 연결 검증" 참고):
+- AI/Mode B 핵심 묶음: 192 passed, 1 skipped
+- 데이터/계약/통합 묶음: 178 passed + 59 passed
+- LGBM 단독: 9 passed
+- unit 파일별 독립: 76 files PASS (subprocess per file, canonical env)
+- 31 파일 변경 +1176/-206 (Cold Path publish bridge + LLMRouter mock 제한 + Mode B safety + Dual-Source train/serve skew 제거 + 등)
+
+**fingerprint 통합** (rules/cross-check.md §6): Claude + Codex 양측 confirm 시 effective confidence +1 (cap 10), 한쪽만 발견 시 caveat "single-source, verify".
+
+**Codex 5/12 입증** (성능 해석 도메인, rules/performance-interpretation.md 신규):
+- 3-agent 병렬 (modeler+reviewer+analyst) + 외부 논문 인용 (Bailey & Lopez de Prado 2014 Deflated Sharpe `arxiv:2010.08601` / AFML §7 walk-forward / AAPM/AlphaGAT SOTA IC range)
+- in-sample IR=25.35 overfit 의심 → 5-stage verdict (in-sample → 4-perspective → Deflated Sharpe → OOS BacktestAgent → 1주 paper trading)
+- verification mode (5/11) 와 분리된 interpretation mode (preamble §7.3, code-review SKILL "4-role 변형: 성능 해석")
+- WebSearch / WebFetch primary source 인용 의무 (analyst.md 강화)
+- reviewer.md 체크리스트 신규 3 row: PIT leakage label horizon / metric 산식 오류 / train-val cross-sectional leakage
 
 ## v3 핵심 구조
 

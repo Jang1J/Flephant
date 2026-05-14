@@ -20,6 +20,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_bundle_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.trading_calendar import load_kospi_holidays
 
 logger = get_logger("mode_b_scheduler")
 _KST = ZoneInfo("Asia/Seoul")
@@ -87,6 +88,10 @@ class ModeBScheduler:
         self._backtest_agent = backtest_agent
         self._bundle_id: str | None = None
         self._current_verdict: str | None = None
+        self._current_regression_risk: dict[str, Any] | None = None
+        self._current_sanity_check_result: str = "fail"
+        self._current_feature_quality: dict[str, Any] | None = None
+        self._current_service_policy_evidence: dict[str, Any] | None = None
         logger.info("[mode_b_scheduler] 초기화 완료. audit_log=%s", self._audit_log_path)
 
     # ================================================================== #
@@ -108,6 +113,10 @@ class ModeBScheduler:
         self._transition(PipelineState.MODE_B_EVOLVING)
         self._bundle_id = None
         self._current_verdict = None
+        self._current_regression_risk = None
+        self._current_sanity_check_result = "fail"
+        self._current_feature_quality = None
+        self._current_service_policy_evidence = None
 
         # Stage 0: DQR (S4-5). 데이터 품질 확인 후 나머지 진행.
         # critical 커넥터에서 CRITICAL alert 발생 시 파이프라인 차단.
@@ -137,26 +146,36 @@ class ModeBScheduler:
             self.stage_1_performance_analysis,
             self._stage_timeouts.get("stage_1", 30),
         )
+        if self._stage_blocked(s1):
+            return self._finish_blocked_pipeline(date_str, [s0, s1], s1)
         s2 = self._run_stage(
             "stage_2",
             self.stage_2_direction_selection,
             self._stage_timeouts.get("stage_2", 60),
         )
+        if self._stage_blocked(s2):
+            return self._finish_blocked_pipeline(date_str, [s0, s1, s2], s2)
         s3 = self._run_stage(
             "stage_3",
             self.stage_3_factor_evolution,
             self._stage_timeouts.get("stage_3", 3600),
         )
+        if self._stage_blocked(s3):
+            return self._finish_blocked_pipeline(date_str, [s0, s1, s2, s3], s3)
         s4 = self._run_stage(
             "stage_4",
             self.stage_4_model_evolution,
             self._stage_timeouts.get("stage_4", 1800),
         )
+        if self._stage_blocked(s4):
+            return self._finish_blocked_pipeline(date_str, [s0, s1, s2, s3, s4], s4)
         s5 = self._run_stage(
             "stage_5",
             self.stage_5_agent_self_improvement,
             self._stage_timeouts.get("stage_5", 1800),
         )
+        if self._stage_blocked(s5):
+            return self._finish_blocked_pipeline(date_str, [s0, s1, s2, s3, s4, s5], s5)
 
         # C14 backtest_skip_condition: candidate 없으면 Backtest 건너뜀
         has_candidates = bool(
@@ -188,13 +207,26 @@ class ModeBScheduler:
         self._current_verdict = verdict
 
         # BACKTEST → DEPLOY / OPERATOR_REVIEW / BLOCKED
-        if verdict == "pass":
+        if verdict == "pass" and not s6.get("critical_alert"):
             self._transition(PipelineState.MODE_B_DEPLOY)
             s7 = self._run_stage(
                 "stage_7",
                 self.stage_7_deploy,
                 self._stage_timeouts.get("stage_7", 900),
             )
+        elif verdict == "pass":
+            self._transition(PipelineState.MODE_B_BLOCKED)
+            s7 = {"stage": "stage_7", "status": "skipped_gate_blocked",
+                  "verdict": verdict, "duration_sec": 0.0,
+                  "error": "critical_alert_after_backtest"}
+            self._append_audit_log({
+                "timestamp": datetime.now(_KST).isoformat(),
+                "stage": "stage_7", "duration_sec": 0.0,
+                "bundle_id": self._bundle_id, "verdict": verdict,
+                "regression_severity": s6.get("regression_severity"),
+                "deploy_result": "skipped", "operator_approval": None,
+                "error": "critical_alert_after_backtest",
+            })
         elif verdict == "warn":
             self._transition(PipelineState.MODE_B_OPERATOR_REVIEW)
             s7 = {"stage": "stage_7", "status": "awaiting_operator_approval",
@@ -218,6 +250,9 @@ class ModeBScheduler:
                 "operator_approval": None, "error": None,
             })
 
+        deploy_status = self._classify_deploy_status(s7)
+        pipeline_status = self._classify_pipeline_status(verdict, s6, s7, deploy_status)
+
         # → IDLE
         if verdict in ("pass", "blocked"):
             self._transition(PipelineState.MODE_B_IDLE)
@@ -227,6 +262,9 @@ class ModeBScheduler:
             "date": date_str,
             "stages": [s0, s1, s2, s3, s4, s5, s6, s7],
             "verdict": verdict,
+            "pipeline_status": pipeline_status,
+            "deploy_status": deploy_status,
+            "deploy_result": s7.get("deploy_result"),
         }
         logger.info(
             "[mode_b_scheduler] Mode B 파이프라인 완료: verdict=%s, bundle_id=%s",
@@ -286,25 +324,7 @@ class ModeBScheduler:
         섹션 또는 year 키 없으면 빈 set.
         skip_on_holiday=false이면 빈 set 반환.
         """
-        try:
-            dqr_cfg = config_load("risk_config.yaml", "dqr")
-        except Exception as e:
-            logger.warning("[mode_b_scheduler] risk_config.yaml dqr 로드 실패: %s", e)
-            return set()
-
-        if not dqr_cfg.get("skip_on_holiday", True):
-            return set()
-
-        key = f"kospi_holidays_{year}"
-        raw: list[str] = dqr_cfg.get(key, [])
-        from datetime import date as _date_cls
-        holidays: set = set()
-        for s in raw:
-            try:
-                holidays.add(_date_cls.fromisoformat(s))
-            except ValueError as e:
-                logger.warning("[mode_b_scheduler] 공휴일 날짜 파싱 실패: %s error=%s", s, e)
-        return holidays
+        return load_kospi_holidays(year)
 
     def stage_0_dqr(self, date: str) -> dict[str, Any]:
         """S4-5 DQR (Data Quality Report). Mode B 첫 단계. 18:00 KST 이후 실행.
@@ -477,8 +497,10 @@ class ModeBScheduler:
         evaluated: list[dict[str, Any]] = []
         try:
             from src.mode_b.alpha_factor.eval_agent import EvalAgent
+            from src.mode_b.alpha_factor.factor_zoo import FactorZoo
 
             eval_a = EvalAgent(llm_router=self._llm_router)
+            factor_zoo = [entry.to_dict() for entry in FactorZoo().list_by_status("active")]
             for candidate in factor_candidates_out:
                 h = hypothesis_by_id.get(candidate.hypothesis_id)
                 if h is None:
@@ -490,7 +512,7 @@ class ModeBScheduler:
                     factor_candidates.append(item)
                     evaluated.append(item)
                     continue
-                eval_result = eval_a.evaluate(candidate, h)
+                eval_result = eval_a.evaluate(candidate, h, factor_zoo=factor_zoo)
                 entry: dict[str, Any] = {
                     "candidate": candidate.to_dict(),
                     "eval": eval_result.to_dict(),
@@ -680,22 +702,55 @@ class ModeBScheduler:
 
         verdict = bt_result.get("verdict", "fail")
         regression_severity = bt_result.get("regression_severity", "high")
+        regression_risk = bt_result.get("regression_risk") or {
+            "flagged": regression_severity in ("medium", "high"),
+            "severity": regression_severity if regression_severity in ("low", "medium", "high") else "low",
+            "evidence": [],
+        }
+        leakage_check = bt_result.get("minute_bar_leakage_check") or {
+            "verdict": "fail",
+            "leakage_detected": True,
+        }
+        feature_quality = bt_result.get("feature_quality")
+        if not isinstance(feature_quality, dict):
+            feature_quality = {}
+        service_policy_evidence = bt_result.get("service_policy_replay")
+        if not isinstance(service_policy_evidence, dict):
+            service_policy_evidence = {}
+        sanity_check_result = (
+            "ok" if leakage_check.get("verdict") == "pass" else "leakage_check_failed"
+        )
 
-        # severity >= severity_block → critical_alert (stage_7 deploy 차단)
+        # regression_risk.flagged=True 이면 C14 deploy gate에서 배포 금지.
         severity_order = {"none": 0, "low": 1, "medium": 2, "high": 3}
         sev_level = severity_order.get(regression_severity, 3)
         block_level = severity_order.get(severity_block, 2)
-        critical_alert = verdict == "fail" or sev_level >= block_level
+        risk_flagged = bool(regression_risk.get("flagged"))
+        critical_alert = (
+            verdict == "fail"
+            or sanity_check_result != "ok"
+            or risk_flagged
+            or sev_level >= block_level
+        )
+        self._current_regression_risk = regression_risk
+        self._current_sanity_check_result = sanity_check_result
+        self._current_feature_quality = feature_quality
+        self._current_service_policy_evidence = service_policy_evidence
 
         logger.info(
-            "[mode_b_scheduler] stage_6 완료. bundle_id=%s verdict=%s severity=%s critical_alert=%s",
-            bundle_id, verdict, regression_severity, critical_alert,
+            "[mode_b_scheduler] stage_6 완료. bundle_id=%s verdict=%s severity=%s sanity=%s critical_alert=%s",
+            bundle_id, verdict, regression_severity, sanity_check_result, critical_alert,
         )
 
         return {
             "status": "ok",
             "verdict": verdict,
             "regression_severity": regression_severity,
+            "regression_risk": regression_risk,
+            "minute_bar_leakage_check": leakage_check,
+            "feature_quality": feature_quality,
+            "service_policy_replay": service_policy_evidence,
+            "sanity_check_result": sanity_check_result,
             "backtest_id": bt_result.get("backtest_id"),
             "metrics": bt_result.get("metrics", {}),
             "critical_alert": critical_alert,
@@ -703,19 +758,138 @@ class ModeBScheduler:
         }
 
     def stage_7_deploy(self) -> dict[str, Any]:
-        """§8.6 22:00 배포. ModeBDeployer 경유. S3-10에서 실구현."""
+        """§8.6 22:00 배포. ModeBDeployer 경유. S3-10에서 실구현.
+
+        Codex 권고 5 (2026-05-09 fix): ModeBDeployer.deploy() 시그니처 정합.
+        이전: deploy(self._bundle_id) 단일 인자 → TypeError 재현.
+        현재: deploy(bundle_id, backtest_verdict, sanity_check_result) 3 인자.
+        verdict 는 stage_6 종료 시 self._current_verdict 에 저장된 값 사용.
+        sanity_check_result 는 BacktestEngine.minute_bar_leakage_check + smoke_test
+        통합 결과 (현재 stub: "ok" default. Sprint 4+ 실 검증).
+        """
         logger.info(
-            "[mode_b_scheduler] stage_7 배포 실행, bundle_id=%s", self._bundle_id
+            "[mode_b_scheduler] stage_7 배포 실행, bundle_id=%s verdict=%s",
+            self._bundle_id, self._current_verdict,
         )
         if self._deployer:
+            missing_evidence = []
+            if not self._current_feature_quality:
+                missing_evidence.append("feature_quality")
+            if not self._current_service_policy_evidence:
+                missing_evidence.append("service_policy_replay")
+            if missing_evidence:
+                return {
+                    "status": "blocked",
+                    "deploy_status": "blocked",
+                    "deploy_result": "c12_deploy_evidence_missing",
+                    "bundle_id": self._bundle_id,
+                    "missing_evidence": missing_evidence,
+                    "sanity_check_result": self._current_sanity_check_result,
+                    "regression_risk": self._current_regression_risk or {},
+                    "error": "c12_deploy_evidence_missing",
+                }
             try:
-                return self._deployer.deploy(self._bundle_id)
+                from src.mode_b.deployer import RegressionRisk
+
+                risk = self._current_regression_risk or {}
+                return self._deployer.deploy(
+                    bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
+                    backtest_verdict=self._current_verdict or "fail",
+                    sanity_check_result=self._current_sanity_check_result,
+                    regression_risk=RegressionRisk(
+                        flagged=bool(risk.get("flagged", False)),
+                        severity=str(risk.get("severity", "low")),
+                        evidence=[str(e) for e in risk.get("evidence", [])],
+                    ),
+                    feature_quality=self._current_feature_quality,
+                    service_policy_evidence=self._current_service_policy_evidence,
+                )
             except NotImplementedError:
                 pass
         return {
-            "status": "stub",
+            "status": "blocked",
+            "deploy_status": "not_configured",
             "deploy_result": "stub_no_deployer",
             "bundle_id": self._bundle_id,
+            "sanity_check_result": self._current_sanity_check_result,
+            "regression_risk": self._current_regression_risk or {},
+            "error": "deployer_not_configured",
+        }
+
+    @staticmethod
+    def _classify_deploy_status(stage_7: dict[str, Any]) -> str:
+        """stage_7 결과를 BE-safe deploy_status enum으로 정규화."""
+        if stage_7.get("deploy_status"):
+            return str(stage_7["deploy_status"])
+        if stage_7.get("error"):
+            return "failed"
+        deploy_result = stage_7.get("deploy_result")
+        if deploy_result in {"deployed", "success", "ok"}:
+            return "deployed"
+        if deploy_result == "stub_no_deployer":
+            return "not_configured"
+        if str(stage_7.get("status", "")).startswith("skipped"):
+            return "skipped"
+        if stage_7.get("status") == "awaiting_operator_approval":
+            return "awaiting_operator_approval"
+        return "unknown"
+
+    @staticmethod
+    def _classify_pipeline_status(
+        verdict: str,
+        stage_6: dict[str, Any],
+        stage_7: dict[str, Any],
+        deploy_status: str,
+    ) -> str:
+        """C12 verdict와 C14 deploy 결과를 분리해 top-level 실행 상태를 반환."""
+        if stage_6.get("error") or stage_7.get("error"):
+            return "failed"
+        if verdict == "warn" or deploy_status == "awaiting_operator_approval":
+            return "awaiting_operator_approval"
+        if verdict != "pass":
+            return "blocked"
+        if stage_6.get("critical_alert"):
+            return "blocked"
+        if deploy_status == "deployed":
+            return "deployed"
+        return "blocked"
+
+    @staticmethod
+    def _stage_blocked(stage: dict[str, Any]) -> bool:
+        """Fail closed before C12/C14 when a pre-deploy stage is unhealthy."""
+        status = str(stage.get("status", "")).lower()
+        return (
+            status in {"timeout", "error", "blocked"}
+            or bool(stage.get("critical_alert"))
+            or bool(stage.get("error"))
+        )
+
+    def _finish_blocked_pipeline(
+        self,
+        date_str: str,
+        stages: list[dict[str, Any]],
+        blocked_stage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return a fail-closed pipeline result after stage_1~5 failure."""
+        stage_name = str(blocked_stage.get("stage", "unknown"))
+        reason = blocked_stage.get("error") or blocked_stage.get("status") or "stage_blocked"
+        logger.error(
+            "[mode_b_scheduler] %s blocked before C12/deploy. reason=%s",
+            stage_name,
+            reason,
+        )
+        self._transition(PipelineState.MODE_B_BLOCKED)
+        self._transition(PipelineState.MODE_B_IDLE)
+        return {
+            "bundle_id": self._bundle_id,
+            "date": date_str,
+            "stages": stages,
+            "verdict": "blocked_stage_failure",
+            "pipeline_status": "blocked",
+            "deploy_status": "skipped",
+            "deploy_result": "skipped_predeploy_stage_blocked",
+            "blocked_stage": stage_name,
+            "error": str(reason),
         }
 
     # ================================================================== #
@@ -761,18 +935,59 @@ class ModeBScheduler:
         t0 = time.perf_counter()
         error: str | None = None
         result: dict[str, Any] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(stage_fn)
+        timed_out = False
+        if stage_name == "stage_7":
             try:
-                result = future.result(timeout=timeout_sec) or {}
-            except concurrent.futures.TimeoutError:
-                error = f"StageTimeoutError: {stage_name} exceeded {timeout_sec}s"
-                logger.error("[mode_b_scheduler] %s", error)
+                result = stage_fn() or {}
             except Exception as e:
                 error = str(e)
                 logger.error("[mode_b_scheduler] %s 오류: %s", stage_name, e)
+            duration = round(time.perf_counter() - t0, 3)
+            result.setdefault("timeout_policy", "synchronous_no_thread_timeout")
+            stage_error = error if error is not None else result.get("error")
+            log_entry = {
+                "timestamp": datetime.now(_KST).isoformat(),
+                "stage": stage_name,
+                "duration_sec": duration,
+                "bundle_id": self._bundle_id,
+                "verdict": result.get("verdict"),
+                "regression_severity": result.get("regression_severity"),
+                "deploy_result": result.get("deploy_result"),
+                "operator_approval": result.get("operator_approval"),
+                "error": stage_error,
+            }
+            self._append_audit_log(log_entry)
+            return {**result, "stage": stage_name, "duration_sec": duration, "error": stage_error}
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(stage_fn)
+        try:
+            result = future.result(timeout=timeout_sec) or {}
+        except concurrent.futures.TimeoutError:
+            timed_out = True
+            error = f"StageTimeoutError: {stage_name} exceeded {timeout_sec}s"
+            result = {
+                "status": "timeout",
+                "verdict": "blocked",
+                "critical_alert": True,
+                "timeout_sec": timeout_sec,
+                "timeout_warning": True,
+                "timeout_policy": "fail_closed_no_thread_hard_cancel",
+                "timeout_hard_cancelled": False,
+            }
+            future.cancel()
+            logger.error("[mode_b_scheduler] %s", error)
+        except Exception as e:
+            error = str(e)
+            logger.error("[mode_b_scheduler] %s 오류: %s", stage_name, e)
+        finally:
+            # ThreadPoolExecutor cannot hard-kill a running Python function.
+            # On timeout, return a blocked stage result immediately and record
+            # timeout_hard_cancelled=False so demo/pass reports cannot hide it.
+            executor.shutdown(wait=not timed_out, cancel_futures=True)
 
         duration = round(time.perf_counter() - t0, 3)
+        stage_error = error if error is not None else result.get("error")
 
         log_entry = {
             "timestamp": datetime.now(_KST).isoformat(),
@@ -783,10 +998,10 @@ class ModeBScheduler:
             "regression_severity": result.get("regression_severity"),
             "deploy_result": result.get("deploy_result"),
             "operator_approval": result.get("operator_approval"),
-            "error": error,
+            "error": stage_error,
         }
         self._append_audit_log(log_entry)
-        return {**result, "stage": stage_name, "duration_sec": duration, "error": error}
+        return {**result, "stage": stage_name, "duration_sec": duration, "error": stage_error}
 
     def _append_audit_log(self, entry: dict[str, Any]) -> None:
         with self._audit_log_path.open("a", encoding="utf-8") as f:

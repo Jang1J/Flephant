@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError
+from src.utils.trading_calendar import is_kospi_trading_day
 
 logger = get_logger("dqr")
 _KST = ZoneInfo("Asia/Seoul")
@@ -250,6 +251,23 @@ class DQRRunner:
         if current.tzinfo is None:
             current = current.replace(tzinfo=_KST)
         date_str = date or current.strftime("%Y-%m-%d")
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        if not skip_pit_guard and not is_kospi_trading_day(target_date):
+            reason = "weekend" if target_date.weekday() >= 5 else "holiday"
+            logger.info("[dqr] 비거래일 DQR skip: date=%s reason=%s", date_str, reason)
+            return {
+                "date": date_str,
+                "generated_at": current.isoformat(),
+                "status": "SKIP",
+                "reason": reason,
+                "connectors": {},
+                "alerts": [],
+                "summary": {
+                    "total_connectors": 0,
+                    "alert_count": 0,
+                    "skipped": True,
+                },
+            }
 
         logger.info("[dqr] 일별 DQR 시작: date=%s", date_str)
 

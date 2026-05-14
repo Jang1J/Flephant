@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, date as _date, timedelta
 from pathlib import Path
@@ -514,77 +515,158 @@ class E2EScenarioRunner:
         scheduler = ModeBScheduler(state_machine=sm)
         scheduler._bundle_id = bundle_id
 
+        if self._short_mode:
+            def _stage_4_model_evolution_stub() -> dict[str, Any]:
+                return {
+                    "status": "stub_short_mode",
+                    "bundle_id": scheduler._bundle_id,
+                    "simulation_only": True,
+                    "production_ready": False,
+                    "production_blocker": "short_mode_model_evolution_stub",
+                    "model_candidates": [{
+                        "model_type": "lgbm",
+                        "version": "scenario_stub",
+                        "metrics": {"sr": 0.1, "ic": 0.01},
+                    }],
+                    "allocator_candidates": [],
+                    "metrics": {"sr": 0.1, "ic": 0.01},
+                }
+
+            class _ScenarioBacktestAgent:
+                def run(self, bundle_ref: str) -> dict[str, Any]:
+                    now = f"{date_str}T18:30:00+09:00"
+                    return {
+                        "backtest_id": f"BT-{date_str.replace('-', '')}-AABBCCDD",
+                        "bundle_id": bundle_ref,
+                        "metrics": {
+                            "ic": 0.01,
+                            "icir": 0.1,
+                            "rank_ic": 0.01,
+                            "arr": 0.01,
+                            "ir": 0.1,
+                            "mdd": -0.01,
+                            "sr": 0.1,
+                        },
+                        "folds": [],
+                        "started_at": now,
+                        "completed_at": now,
+                        "verdict": "pass",
+                        "regression_severity": "none",
+                        "regression_risk": {
+                            "flagged": False,
+                            "severity": "low",
+                            "evidence": [],
+                        },
+                        "minute_bar_leakage_check": {
+                            "verdict": "pass",
+                            "leakage_detected": False,
+                            "purge_bars": 5,
+                            "embargo_bars": 5,
+                            "replay_unit": "1min",
+                        },
+                    }
+
+            scheduler.stage_4_model_evolution = _stage_4_model_evolution_stub
+            scheduler._backtest_agent = _ScenarioBacktestAgent()
+
         stages: list[dict[str, Any]] = []
         errors: list[str] = []
 
-        stage_calls = [
-            ("stage_0_dqr", lambda: scheduler.stage_0_dqr(date_str)),
-            ("stage_1_performance_analysis", scheduler.stage_1_performance_analysis),
-            ("stage_2_direction_selection", scheduler.stage_2_direction_selection),
-            ("stage_3_factor_evolution", scheduler.stage_3_factor_evolution),
-            ("stage_4_model_evolution", scheduler.stage_4_model_evolution),
-            ("stage_5_agent_self_improvement", scheduler.stage_5_agent_self_improvement),
-        ]
+        previous_mode = os.environ.get("ELEPHANT_MODE")
+        os.environ["ELEPHANT_MODE"] = "mode_b"
+        try:
+            stage_calls = [
+                ("stage_0_dqr", lambda: scheduler.stage_0_dqr(date_str)),
+                ("stage_1_performance_analysis", scheduler.stage_1_performance_analysis),
+                ("stage_2_direction_selection", scheduler.stage_2_direction_selection),
+                ("stage_3_factor_evolution", scheduler.stage_3_factor_evolution),
+                ("stage_4_model_evolution", scheduler.stage_4_model_evolution),
+                ("stage_5_agent_self_improvement", scheduler.stage_5_agent_self_improvement),
+            ]
 
-        for stage_name, stage_fn in stage_calls:
-            t0 = time.perf_counter()
-            try:
-                result = stage_fn()
-                result["stage"] = stage_name
-                result["duration_sec"] = round(time.perf_counter() - t0, 3)
-                stages.append(result)
-                logger.info("[e2e_scenario_runner] %s 완료: status=%s", stage_name, result.get("status"))
-            except Exception as e:
-                err_msg = f"{stage_name} 오류: {e}"
-                errors.append(err_msg)
-                logger.warning("[e2e_scenario_runner] %s", err_msg)
+            for stage_name, stage_fn in stage_calls:
+                t0 = time.perf_counter()
+                try:
+                    result = stage_fn()
+                    result["stage"] = stage_name
+                    result["duration_sec"] = round(time.perf_counter() - t0, 3)
+                    stages.append(result)
+                    logger.info("[e2e_scenario_runner] %s 완료: status=%s", stage_name, result.get("status"))
+                except Exception as e:
+                    err_msg = f"{stage_name} 오류: {e}"
+                    errors.append(err_msg)
+                    logger.warning("[e2e_scenario_runner] %s", err_msg)
+                    stages.append({
+                        "stage": stage_name,
+                        "status": "error",
+                        "error": str(e),
+                        "duration_sec": round(time.perf_counter() - t0, 3),
+                    })
+
+            # candidate 존재 여부 판단
+            s3 = next((s for s in stages if s.get("stage") == "stage_3_factor_evolution"), {})
+            s4 = next((s for s in stages if s.get("stage") == "stage_4_model_evolution"), {})
+            has_candidates = bool(s3.get("factor_candidates") or s4.get("model_candidates"))
+
+            if not has_candidates:
+                verdict = "skipped_no_candidates"
+                sm.transition(PipelineState.MODE_B_BLOCKED)
                 stages.append({
-                    "stage": stage_name,
-                    "status": "error",
-                    "error": str(e),
-                    "duration_sec": round(time.perf_counter() - t0, 3),
+                    "stage": "stage_6_backtest_validation",
+                    "status": "skipped_no_candidates",
+                    "verdict": verdict,
                 })
+                stages.append({
+                    "stage": "stage_7_deploy",
+                    "status": "skipped",
+                    "verdict": verdict,
+                })
+                sm.transition(PipelineState.MODE_B_IDLE)
+            else:
+                # EVOLVING → BACKTEST
+                sm.transition(PipelineState.MODE_B_BACKTEST)
+                s6_result = scheduler.stage_6_backtest_validation()
+                s6_result["stage"] = "stage_6_backtest_validation"
+                stages.append(s6_result)
+                verdict = s6_result.get("verdict", "blocked")
+                scheduler._current_verdict = verdict
 
-        # candidate 존재 여부 판단
-        s3 = next((s for s in stages if s.get("stage") == "stage_3_factor_evolution"), {})
-        s4 = next((s for s in stages if s.get("stage") == "stage_4_model_evolution"), {})
-        has_candidates = bool(s3.get("factor_candidates") or s4.get("model_candidates"))
+                # BACKTEST → DEPLOY / BLOCKED
+                if verdict == "pass" and not s6_result.get("critical_alert"):
+                    sm.transition(PipelineState.MODE_B_DEPLOY)
+                    s7_result = scheduler.stage_7_deploy()
+                    s7_result["stage"] = "stage_7_deploy"
+                    stages.append(s7_result)
+                    sm.transition(PipelineState.MODE_B_IDLE)
+                else:
+                    sm.transition(PipelineState.MODE_B_BLOCKED)
+                    stages.append({
+                        "stage": "stage_7_deploy",
+                        "status": "skipped",
+                        "verdict": verdict,
+                    })
+                    sm.transition(PipelineState.MODE_B_IDLE)
 
-        # EVOLVING → BACKTEST
-        sm.transition(PipelineState.MODE_B_BACKTEST)
-        s6_result = scheduler.stage_6_backtest_validation()
-        s6_result["stage"] = "stage_6_backtest_validation"
-        stages.append(s6_result)
-        verdict = s6_result.get("verdict", "blocked")
-
-        # BACKTEST → DEPLOY / BLOCKED
-        if verdict == "pass":
-            sm.transition(PipelineState.MODE_B_DEPLOY)
-            s7_result = scheduler.stage_7_deploy()
-            s7_result["stage"] = "stage_7_deploy"
-            stages.append(s7_result)
-            sm.transition(PipelineState.MODE_B_IDLE)
-        else:
-            sm.transition(PipelineState.MODE_B_BLOCKED)
-            stages.append({
-                "stage": "stage_7_deploy",
-                "status": "skipped",
+            logger.info(
+                "[e2e_scenario_runner] Mode B 시뮬 완료: date=%s verdict=%s bundle_id=%s",
+                date_str, verdict, bundle_id,
+            )
+            return {
+                "date": date_str,
+                "bundle_id": bundle_id,
                 "verdict": verdict,
-            })
-            sm.transition(PipelineState.MODE_B_IDLE)
-
-        logger.info(
-            "[e2e_scenario_runner] Mode B 시뮬 완료: date=%s verdict=%s bundle_id=%s",
-            date_str, verdict, bundle_id,
-        )
-        return {
-            "date": date_str,
-            "bundle_id": bundle_id,
-            "verdict": verdict,
-            "stages": stages,
-            "errors": errors,
-            "stage_count": len(stages),
-        }
+                "simulation_only": bool(self._short_mode),
+                "production_ready": False,
+                "production_gate_required": "ModeBScheduler.run_pipeline + C12 real backtest + C14 deploy",
+                "stages": stages,
+                "errors": errors,
+                "stage_count": len(stages),
+            }
+        finally:
+            if previous_mode is None:
+                os.environ.pop("ELEPHANT_MODE", None)
+            else:
+                os.environ["ELEPHANT_MODE"] = previous_mode
 
     # ------------------------------------------------------------------ #
     # IO helpers

@@ -23,7 +23,9 @@ logger = get_logger("cache")
 # 설정 로드 (SSOT: risk_config.yaml)
 # ============================================================
 
-_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "risk_config.yaml"
+# Codex 권고 1, 2026-05-09 fix: parents[3] → parents[2].
+# 이전: /Elephant_Lab/config/risk_config.yaml (잘못된 root). 현재: /Elephant_Lab/new/config/risk_config.yaml.
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "risk_config.yaml"
 
 # 기본값 (yaml 로드 실패 시 폴백)
 _DEFAULT_CONFIG: dict = {
@@ -79,10 +81,12 @@ class PersistentCache:
             resolved = Path(db_path)
         else:
             raw_path = self._cfg.get("storage_path", _DEFAULT_CONFIG["storage_path"])
-            # 절대 경로가 아니면 repo root 기준 상대 경로로 처리
+            # Codex 권고 1, 2026-05-09 fix: parents[4] → parents[3].
+            # 이전: /Users/jangjaewon/Desktop/artifacts/cache/... (잘못된 root 한 단계 위).
+            # 현재: /Users/jangjaewon/Desktop/Elephant_Lab/artifacts/cache/... (repo root 정합).
             candidate = Path(raw_path)
             if not candidate.is_absolute():
-                resolved = Path(__file__).resolve().parents[4] / candidate
+                resolved = Path(__file__).resolve().parents[3] / candidate
             else:
                 resolved = candidate
 

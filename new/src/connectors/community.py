@@ -29,6 +29,8 @@ SSOT: api_contracts.md v3.5 C2 EventNormalizeContract (source='community')
 """
 from __future__ import annotations
 
+import hashlib
+import html
 import os
 import re
 from collections import defaultdict
@@ -43,6 +45,7 @@ import yaml
 from src.connectors.base import BaseConnector
 from src.data.filter_loader import load_spam_rules, load_manipulation_rules, load_sentiment_dict
 from src.utils.config_loader import load as config_load
+from src.utils.auth import AuthManager
 from src.utils.logger import get_logger
 from src.utils.rate_limiter import RateLimiter
 from src.data.event_normalizer import EventNormalizer
@@ -53,6 +56,35 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # new/ 루트 기준 yaml 경로 (Path, 절대경로 독립)
 _CONFIG_ROOT = Path(__file__).resolve().parents[2] / "config"
+_NAVER_COMMUNITY_URLS = {
+    "cafearticle": "https://openapi.naver.com/v1/search/cafearticle.json",
+    "blog": "https://openapi.naver.com/v1/search/blog.json",
+}
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Naver Search API HTML tag/entity 제거."""
+    return html.unescape(_HTML_TAG_PATTERN.sub("", text or "")).strip()
+
+
+def _stable_author_hash(*parts: str) -> str:
+    """원문 작성자 노출 없이 안정적인 author_id 생성."""
+    payload = "|".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_blog_postdate(postdate: str) -> datetime:
+    """Naver blog postdate(YYYYMMDD) → KST datetime.
+
+    cafearticle API는 작성 시각을 제공하지 않으므로 이 함수는 blog 전용이다.
+    """
+    try:
+        return datetime.strptime(postdate, "%Y%m%d").replace(
+            tzinfo=_KST, hour=12, minute=0, second=0
+        )
+    except (TypeError, ValueError):
+        return datetime.now(_KST)
 
 
 @dataclass
@@ -94,6 +126,7 @@ class CommunityCrawler(BaseConnector):
 
     def __init__(
         self,
+        auth: AuthManager | None = None,
         rate_limiter: RateLimiter | None = None,
         normalizer: EventNormalizer | None = None,
     ) -> None:
@@ -101,6 +134,7 @@ class CommunityCrawler(BaseConnector):
         self._timeout_sec = self.timeout_sec
         self._max_retries = self.max_retries
         self._backoff_base = self.backoff_base
+        self._auth = auth or AuthManager()
 
         # rate limiter: risk_config.yaml rate_limits.community 경유
         if rate_limiter is not None:
@@ -135,11 +169,19 @@ class CommunityCrawler(BaseConnector):
         # 환경변수 COMMUNITY_SCRAPE_ENABLED=1 로 실 스크래핑 활성화 가능 (Sprint 4 정책 결정 후)
         self._scrape_enabled = os.environ.get("COMMUNITY_SCRAPE_ENABLED") == "1"
         self._is_mock = not self._scrape_enabled
+        self._client_id: str | None = None
+        self._client_secret: str | None = None
+        self._ticker_name_map = self._load_ticker_name_map()
+        if not self._is_mock:
+            self._client_id, self._client_secret = self._auth.get_naver_client()
 
         self._normalizer = normalizer or EventNormalizer()
 
         if self._is_mock:
             logger.info("[community] Sprint 2 mock 모드 (COMMUNITY_SCRAPE_ENABLED 미설정)")
+        else:
+            provider = self._community_cfg.get("real_provider", "naver_search")
+            logger.info("[community] real 모드 활성: provider=%s", provider)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -156,7 +198,7 @@ class CommunityCrawler(BaseConnector):
             raw CommunityPost 리스트. 필터 적용 전.
 
         Raises:
-            NotImplementedError: COMMUNITY_SCRAPE_ENABLED=1 인데 실 스크래핑 미구현.
+            ConnectionError/TimeoutError: 공식 Naver Search API 호출 실패.
         """
         # PIT-Safety: Sprint 4 실 스크래핑 시 timestamp guard 추가 예정
         # 현재 mock 전용 → 미래 데이터 생성 없음
@@ -168,11 +210,7 @@ class CommunityCrawler(BaseConnector):
         if self._is_mock:
             return self._mock_poll(normalized_tickers, window_minutes)
 
-        # 실 스크래핑 경로 (Sprint 4 S4-6 에서 구현)
-        raise NotImplementedError(
-            "COMMUNITY_SCRAPE_NOT_IMPLEMENTED: 실 스크래핑은 Sprint 4 S4-6 Paper Trading 정책 결정 후 구현. "
-            "현재는 Mock 모드 (COMMUNITY_SCRAPE_ENABLED=0) 권장."
-        )
+        return self._naver_search_poll(normalized_tickers, window_minutes)
 
     def parse_sentiment(
         self,
@@ -279,6 +317,129 @@ class CommunityCrawler(BaseConnector):
         if root or section is None:
             return data
         return data.get(section, [])
+
+    @staticmethod
+    def _load_ticker_name_map() -> dict[str, str]:
+        """universe_config.yaml에서 ticker → 종목명 매핑 로드."""
+        path = _CONFIG_ROOT / "universe_config.yaml"
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception as e:
+            logger.warning("[community] universe_config 로드 실패: %s", e)
+            return {}
+
+        mapping: dict[str, str] = {}
+        for sector in (data.get("sectors") or {}).values():
+            for stock in sector.get("stocks", []) or []:
+                ticker = str(stock.get("ticker", "")).zfill(6)
+                name = str(stock.get("name", "")).strip()
+                if ticker and name:
+                    mapping[ticker] = name
+        return mapping
+
+    # ------------------------------------------------------------------ #
+    # 내부 helper: 공식 Naver Search API 기반 community 대체 소스
+    # ------------------------------------------------------------------ #
+
+    def _naver_search_poll(
+        self,
+        tickers: list[str],
+        window_minutes: int,
+    ) -> list[CommunityPost]:
+        """Naver Search cafearticle/blog API로 사용자 생성 글을 수집.
+
+        비공식 종토방 scraping 대신 Naver 공식 Search API를 사용한다.
+        cafearticle는 작성 시각을 제공하지 않으므로 ingest 시각을 timestamp로 쓰고,
+        blog는 postdate(YYYYMMDD)를 사용한다.
+        """
+        if not self._client_id or not self._client_secret:
+            raise EnvironmentError("NAVER_CLIENT_ID/SECRET required for community real mode")
+
+        provider_names = self._community_cfg.get(
+            "naver_search_providers", ["cafearticle", "blog"]
+        )
+        providers = [
+            str(provider)
+            for provider in provider_names
+            if str(provider) in _NAVER_COMMUNITY_URLS
+        ]
+        if not providers:
+            raise ValueError("dual_source.community.naver_search_providers is empty")
+
+        max_posts = int(self._community_cfg.get("max_posts_per_ticker", 3))
+        display = max(1, min(100, max_posts))
+        suffix = str(self._community_cfg.get("naver_query_suffix", "주식")).strip()
+        sort = str(self._community_cfg.get("sort", "date"))
+        if sort not in {"sim", "date"}:
+            sort = "date"
+
+        headers = {
+            "X-Naver-Client-Id": self._client_id,
+            "X-Naver-Client-Secret": self._client_secret,
+        }
+        posts: list[CommunityPost] = []
+
+        for ticker in tickers:
+            query_name = self._ticker_name_map.get(ticker, ticker)
+            query = f"{query_name} {suffix}".strip()
+            ticker_posts: list[CommunityPost] = []
+
+            for provider in providers:
+                if len(ticker_posts) >= max_posts:
+                    break
+                payload = self._http_get_json(
+                    _NAVER_COMMUNITY_URLS[provider],
+                    params={
+                        "query": query,
+                        "display": str(display),
+                        "start": "1",
+                        "sort": sort,
+                    },
+                    headers=headers,
+                )
+                for idx, raw in enumerate(payload.get("items", []) or []):
+                    if len(ticker_posts) >= max_posts:
+                        break
+                    ticker_posts.append(
+                        self._naver_item_to_post(provider, ticker, raw, idx)
+                    )
+
+            posts.extend(ticker_posts)
+
+        return posts
+
+    def _naver_item_to_post(
+        self,
+        provider: str,
+        ticker: str,
+        raw: dict[str, Any],
+        idx: int,
+    ) -> CommunityPost:
+        """Naver Search item → CommunityPost."""
+        title = _strip_html(str(raw.get("title", "")))
+        content = _strip_html(str(raw.get("description", "")))
+        link = str(raw.get("link", ""))
+
+        if provider == "blog":
+            timestamp = _parse_blog_postdate(str(raw.get("postdate", "")))
+            author_basis = str(raw.get("bloggername", ""))
+        else:
+            timestamp = datetime.now(_KST)
+            author_basis = str(raw.get("cafename", ""))
+
+        post_id = f"NAVER-{provider}-{ticker}-{_stable_author_hash(link, title)[:10]}-{idx}"
+        return CommunityPost(
+            post_id=post_id,
+            ticker=ticker,
+            author_id=_stable_author_hash(provider, author_basis, link),
+            title=title,
+            content=content,
+            timestamp=timestamp,
+            url=link,
+            view_count=0,
+            comment_count=0,
+        )
 
     # ------------------------------------------------------------------ #
     # 내부 helper: 필터 파이프라인

@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_agent_performance_id
+from src.utils.label_meta import is_label_backfill_pit_safe
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError
 
@@ -42,12 +43,13 @@ _DEFAULT_KB_PATH = (
     Path(__file__).resolve().parents[3] / "knowledge_base" / "agent_performance_history.jsonl"
 )
 
-# C18 18 필드
+# C18 20 필드
 _C18_FIELDS = (
     "ts", "decision_id", "agent", "event_type", "ticker", "reason_code",
     "signal_score", "anomaly_flag", "target_weight", "actual_weight",
     "fill_price", "snapshot_vwap", "slippage_bps", "sector",
     "llm_called", "llm_model", "label_t5_ret", "price_t5_snapshot",
+    "label_backfilled_at", "label_backfill_source",
 )
 
 
@@ -138,9 +140,8 @@ class ModeBPerformanceAggregator:
             "agent_performance_id": apm_id,
             "rollup_date": date_str,
             "record_count": len(records),
-            "post_hoc_count": sum(
-                1 for r in records if r.get("label_t5_ret") is not None
-            ),
+            "post_hoc_count": len(self._labelled_records(records)),
+            "pit_label_violation_count": self._pit_label_violation_count(records),
             "metrics": metrics,
             "performance_vector_8d": perf_vector,
             "aggregated_at": datetime.now(_KST).isoformat(),
@@ -191,8 +192,8 @@ class ModeBPerformanceAggregator:
         """C18 L2 9지표 전체 계산."""
         metrics: dict[str, Any] = {}
 
-        # post-hoc 가능 레코드 (label_t5_ret 있는 것만)
-        labelled = [r for r in records if r.get("label_t5_ret") is not None]
+        # post-hoc 가능 레코드: label과 C18 backfill metadata가 PIT-safe인 것만.
+        labelled = self._labelled_records(records)
 
         metrics["prediction_accuracy"] = self._calc_prediction_accuracy(labelled)
         metrics["realized_pnl_contribution"] = self._calc_realized_pnl(records)
@@ -205,6 +206,20 @@ class ModeBPerformanceAggregator:
         metrics["false_positive_event_trigger_rate"] = self._calc_false_positive_rate(records)
 
         return metrics
+
+    def _labelled_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """C18 post-hoc label metadata까지 검증한 labelled records."""
+        return [
+            r for r in records
+            if r.get("label_t5_ret") is not None and is_label_backfill_pit_safe(r)
+        ]
+
+    def _pit_label_violation_count(self, records: list[dict[str, Any]]) -> int:
+        """label은 있으나 backfill metadata가 안전하지 않은 레코드 수."""
+        return sum(
+            1 for r in records
+            if r.get("label_t5_ret") is not None and not is_label_backfill_pit_safe(r)
+        )
 
     def _calc_prediction_accuracy(self, labelled: list[dict]) -> float | None:
         """count(signal_score > 0 AND label_t5_ret > 0) / count(non-null label)."""

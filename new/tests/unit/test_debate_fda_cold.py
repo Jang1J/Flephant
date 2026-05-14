@@ -13,7 +13,16 @@ from src.agents.fda import FDAAgent
 # fixtures
 # ------------------------------------------------------------------ #
 
-def _make_router(content: str = '{"winner": "news_agent", "confidence": 0.8, "reasoning": "뉴스 신호가 더 신뢰"}') -> MagicMock:
+_DEFAULT_DEBATE_BATCH = (
+    '{"results":['
+    '{"pair":["005930","000660"],"winner":"005930","confidence":0.8,"reasoning":"삼성전자 우위"},'
+    '{"pair":["005930","035420"],"winner":"005930","confidence":0.7,"reasoning":"삼성전자 우위"},'
+    '{"pair":["000660","035420"],"winner":"000660","confidence":0.6,"reasoning":"하이닉스 우위"}'
+    ']}'
+)
+
+
+def _make_router(content: str = _DEFAULT_DEBATE_BATCH) -> MagicMock:
     mock = MagicMock()
     mock.call.return_value = MagicMock(
         success=True,
@@ -76,29 +85,33 @@ def test_debate_conflict_triggers_pairwise() -> None:
     }
     risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
     signals = [quant_sig, risk_sig]
-    result = debate.run_debate(signals, candidates=["005930"])
+    result = debate.run_debate(signals, candidates=["005930", "000660", "035420"])
     assert result["conflict_detected"]
-    assert result["comparison_count"] >= 1
-    assert result["winner_view"] is not None
+    assert result["comparison_count"] == 3
+    assert result["completed_comparisons"] == 3
+    assert result["ranked_tickers"][0] == "005930"
+    assert result["winner_view"] in {"news", "risk", "quant", "mixed"}
+    assert debate._llm_router.call.call_count == 1
+    payload = result["pairwise_msgs"][0]["payload"]
+    assert payload["comparison_count"] == 3
+    assert payload["wins"][0]["ticker"] == "005930"
 
 
 def test_debate_max_pairwise_respected() -> None:
     """C6 max_pairwise=45 초과 쌍은 truncate."""
     debate = _make_debate()
-    # 10개 신호 → C(10,2)=45 쌍
-    signals = [
-        {
-            "agent": f"agent_{i}", "channel": "quant_signal" if i == 0 else "risk_warning",
-            "payload": {
-                "stance": "veto_recommendation" if i > 0 else "neutral",
-                "top10_candidates": ["005930"] if i == 0 else [],
-            },
-            "ts": "2026-04-26T10:00:00+09:00",
-        }
-        for i in range(10)
-    ]
-    result = debate.run_debate(signals, candidates=["005930"])
-    assert result["comparison_count"] <= 45
+    candidates = [f"{i:06d}" for i in range(1, 12)]
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {"stance": "neutral", "top10_candidates": candidates},
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+    result = debate.run_debate([quant_sig, risk_sig], candidates=candidates)
+    assert result["comparison_count"] == 45
+    assert result["completed_comparisons"] == 45
+    assert debate._llm_router.call.call_count == 1
 
 
 def test_debate_report_schema() -> None:
@@ -109,7 +122,7 @@ def test_debate_report_schema() -> None:
         "channel": "quant_signal",
         "payload": {
             "stance": "neutral",
-            "top10_candidates": ["005930"],
+            "top10_candidates": ["005930", "000660"],
         },
         "ts": "2026-04-26T10:00:00+09:00",
     }
@@ -136,7 +149,7 @@ def test_debate_llm_failure_heuristic_fallback() -> None:
     quant_sig = {
         "agent": "quant",
         "channel": "quant_signal",
-        "payload": {"stance": "neutral", "top10_candidates": ["005930"]},
+        "payload": {"stance": "neutral", "top10_candidates": ["005930", "000660"]},
         "ts": "2026-04-26T10:00:00+09:00",
     }
     risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
@@ -260,7 +273,7 @@ def test_fda_reason_code_catalog_final() -> None:
 
 
 def test_fda_cold_llm_calls_with_correct_mode() -> None:
-    """Cold Path LLM 호출 시 mode='cold', caller='fda'."""
+    """Cold Path LLM 호출 시 mode='cold', caller='fda_cold_path'."""
     fda = _make_fda(with_router=True)
     fda.decide(
         portfolio_patch_ref="PP-TEST",
@@ -276,4 +289,4 @@ def test_fda_cold_llm_calls_with_correct_mode() -> None:
         mode_val = kwargs.get("mode") or (args[1] if len(args) > 1 else None)
         caller_val = kwargs.get("caller") or (args[2] if len(args) > 2 else None)
         assert mode_val == "cold"
-        assert caller_val == "fda"
+        assert caller_val == "fda_cold_path"

@@ -5,7 +5,7 @@
 set -e
 set -u
 
-PYTHON="/opt/anaconda3/envs/elephant/bin/python"
+PYTHON="${PYTHON:-python3}"
 PASS=0
 FAIL=0
 

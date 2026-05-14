@@ -62,7 +62,34 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Mode B 건너뜀. Mode A 시나리오만 검증할 때 사용.",
     )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=False,
+        help="BE 호출용 JSON만 출력.",
+    )
     return parser.parse_args()
+
+
+def _summary_failures(summary: dict, skip_mode_b: bool) -> list[str]:
+    failures: list[str] = []
+    if int(summary.get("pit_violations", 0)) > 0:
+        failures.append("pit_violations")
+    if int(summary.get("fda_missing_reason_code", 0)) > 0:
+        failures.append("fda_missing_reason_code")
+    if int(summary.get("total_errors", 0)) > 0:
+        failures.append("total_errors")
+    if not bool(summary.get("hot_path_sla", {}).get("sla_ok", False)):
+        failures.append("hot_path_sla")
+    if not skip_mode_b:
+        bad_mode_b = [
+            verdict for verdict in summary.get("mode_b_verdicts", [])
+            if verdict != "pass"
+        ]
+        if bad_mode_b:
+            failures.append("mode_b_verdict")
+    return failures
 
 
 def main() -> int:
@@ -83,6 +110,13 @@ def main() -> int:
 
     result = runner.run()
     summary = result.summary()
+    failures = _summary_failures(summary, skip_mode_b=args.skip_mode_b)
+    summary["status"] = "FAIL" if failures else "PASS"
+    summary["failures"] = failures
+
+    if args.json_output:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 1 if failures else 0
 
     # 콘솔 출력
     print("\n" + "=" * 60)
@@ -111,13 +145,9 @@ def main() -> int:
     print(f"  FDA reason_code 100%: {fda_status}")
     print(f"  Hot Path p95 <100ms: {sla_status}")
 
-    exit_code = 0
-    if summary["pit_violations"] > 0:
-        logger.error("[run_e2e_scenario] PIT violation %d건. 불변 원칙 1 위반.", summary["pit_violations"])
-        exit_code = 1
-    if summary["fda_missing_reason_code"] > 0:
-        logger.error("[run_e2e_scenario] FDA reason_code 누락 %d건. 불변 원칙 검증 실패.", summary["fda_missing_reason_code"])
-        exit_code = 1
+    exit_code = 1 if failures else 0
+    if failures:
+        logger.error("[run_e2e_scenario] 실패 조건: %s", failures)
 
     logger.info("[run_e2e_scenario] 완료: exit_code=%d", exit_code)
     return exit_code

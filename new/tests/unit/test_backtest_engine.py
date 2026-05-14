@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import math
 import os
+import pickle
 import re
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -91,13 +94,18 @@ def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None):
 
 def _make_engine(seed: int = 42, model_callable: Any = None, **cfg_overrides):
     """BacktestEngine 인스턴스 생성 with patched config."""
+    artifacts_root = cfg_overrides.pop("artifacts_root", None)
     loader = _make_cfg_loader(**cfg_overrides)
     with patch(
         "src.mode_b.validation_tools.config_load",
         side_effect=loader,
     ):
         from src.mode_b.validation_tools import BacktestEngine
-        return BacktestEngine(model_callable=model_callable, seed=seed)
+        return BacktestEngine(
+            model_callable=model_callable,
+            seed=seed,
+            artifacts_root=artifacts_root,
+        )
 
 
 def _default_date_range(days: int = 20) -> dict[str, str]:
@@ -130,6 +138,130 @@ class _mode_b_env:
 
     def __exit__(self, *_):
         os.environ.pop("ELEPHANT_MODE", None)
+
+
+def test_replay_panel_includes_manifest_side_features() -> None:
+    """Replay panel must mirror DatasetBuilder feature joins used in training."""
+    import pandas as pd
+
+    from src.mode_b.validation_tools import BacktestEngine
+
+    class _Builder:
+        target_col = "label_5m_ret"
+        _ds_enabled_for_lgbm = True
+        _exog_enabled_for_lgbm = True
+        _neutral_feature_cols = ["neutral_alpha"]
+
+        def _load_ticker_bars(self, ticker, start_date, end_date):
+            return pd.DataFrame({
+                "ticker": [ticker, ticker],
+                "ts_close": pd.to_datetime([
+                    "2026-01-12T09:00:00+09:00",
+                    "2026-01-12T09:01:00+09:00",
+                ]),
+                "close": [100.0, 101.0],
+            })
+
+        def _compute_rolling_features(self, raw):
+            raw = raw.copy()
+            raw["feat_1m_close_robust_z"] = 0.0
+            raw["feat_5m_ret"] = 0.0
+            raw["feat_30m_vol"] = 0.0
+            raw["feat_60m_trend"] = 0.0
+            return raw
+
+        def _generate_labels(self, with_feats):
+            with_feats = with_feats.copy()
+            with_feats["label_5m_ret"] = 0.001
+            return with_feats
+
+        def _join_dual_source_features(self, panel, start_date, end_date):
+            panel = panel.copy()
+            panel["news_score_t"] = 0.0
+            return panel
+
+        def _join_exogenous_features(self, panel):
+            panel = panel.copy()
+            panel["us_sp500_change"] = 0.0
+            return panel
+
+        def _join_neutral_feature_columns(self, panel):
+            panel = panel.copy()
+            panel["neutral_alpha"] = 0.0
+            return panel
+
+    panel = BacktestEngine._build_replay_panel(
+        _Builder(),
+        ["005930"],
+        "20260112",
+        "20260112",
+    )
+
+    for col in ["news_score_t", "us_sp500_change", "neutral_alpha"]:
+        assert col in panel.columns
+    assert "ticker" not in panel.columns
+    assert "ts_close" not in panel.columns
+
+
+def test_service_policy_expected_date_range_uses_first_test_fold() -> None:
+    from datetime import datetime
+
+    from src.mode_b.validation_tools import BacktestEngine
+
+    folds = [
+        {
+            "test_start": datetime(2026, 4, 14),
+            "test_end": datetime(2026, 5, 4),
+        },
+        {
+            "test_start": datetime(2026, 5, 4),
+            "test_end": datetime(2026, 5, 24),
+        },
+    ]
+
+    assert BacktestEngine._service_policy_expected_date_range(folds) == {
+        "start": "20260414",
+        "end": "20260503",
+    }
+
+
+class _CandidateModel:
+    """candidate bundle pickle 테스트용 predict 모델."""
+
+    def predict(self, X):
+        return [float(sum(row) * 0.01) for row in X]
+
+
+def _write_backtest_day(
+    artifacts_root: Path,
+    ticker: str,
+    yyyymmdd: str,
+    n_bars: int = 90,
+    seed: int = 0,
+) -> None:
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    ticker_dir = artifacts_root / "data" / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    price = 50000.0 + seed * 10
+    with out.open("w", encoding="utf-8") as fh:
+        for i in range(n_bars):
+            close_p = max(1.0, price + float(rng.normal(1.0, 20.0)))
+            hour = 9 + (i // 60)
+            minute = i % 60
+            rec = {
+                "ticker": ticker,
+                "ts_close": f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}T{hour:02d}:{minute:02d}:00+09:00",
+                "open": price,
+                "high": max(price, close_p) + 5.0,
+                "low": min(price, close_p) - 5.0,
+                "close": close_p,
+                "volume": 1000.0 + i,
+            }
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            price = close_p
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -280,6 +412,132 @@ def test_metrics_7_keys():
         assert not math.isnan(metrics[k]), f"metrics[{k!r}] 가 NaN"
 
 
+def test_missing_candidate_bundle_marked_synthetic_fallback(tmp_path: Path):
+    """bundle staging 파일이 없으면 synthetic fallback을 metadata로 노출한다."""
+    engine = _make_engine(artifacts_root=tmp_path)
+
+    result = _run_engine(engine, universe=["005930"], date_range=_default_date_range(25))
+
+    artifact = result["candidate_artifact"]
+    assert artifact["loaded"] is False
+    assert artifact["synthetic_fallback"] is True
+    assert artifact["source"] == "missing_candidate_bundle"
+
+
+def test_mdd_uses_initial_capital_for_dollar_pnl():
+    """금액 PnL 기반 MDD는 누적이익이 아니라 초기자본 equity curve 기준이어야 한다."""
+    from src.mode_b.validation_tools import BacktestEngine
+
+    mdd = BacktestEngine._max_drawdown(
+        [100.0, -200.0],
+        initial_capital=1000.0,
+    )
+
+    assert mdd == pytest.approx(-200.0 / 1100.0, abs=1e-9)
+    assert -1.0 <= mdd <= 0.0
+
+
+def test_loads_candidate_bundle_model(tmp_path: Path):
+    """candidate bundle backtest는 real 1분봉 artifact를 replay한다."""
+    bundle_id = "BUNDLE-20260509-ABCD1234"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": [
+                    "feat_1m_close_robust_z",
+                    "feat_5m_ret",
+                    "feat_30m_vol",
+                    "feat_60m_trend",
+                ]
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+    universe = ["005930", "000660", "042700", "403870"]
+    for idx, ticker in enumerate(universe):
+        _write_backtest_day(tmp_path, ticker, "20260109", seed=idx)
+        _write_backtest_day(tmp_path, ticker, "20260112", seed=idx + 10)
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    with _mode_b_env():
+        result = engine.run(
+            bundle_ref=bundle_id,
+            baseline_ref="baseline",
+            universe=universe,
+            date_range=_default_date_range(25),
+        )
+
+    artifact = result["candidate_artifact"]
+    assert artifact["loaded"] is True
+    assert artifact["synthetic_fallback"] is False
+    assert artifact["source"] == "candidate_bundle_lgbm"
+    assert artifact["feature_width"] == 4
+    assert result["bar_count"] > 0
+    assert result["trade_log"]
+
+
+def test_candidate_bundle_metadata_synthetic_fallback_is_exposed(tmp_path: Path):
+    """후보 모델 metadata의 synthetic_fallback=true는 artifact gate까지 전달돼야 한다."""
+    bundle_id = "BUNDLE-20260509-SYNTH001"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        import json
+
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "data_source": "synthetic_fallback",
+                "synthetic_fallback": True,
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    with _mode_b_env():
+        result = engine.run(
+            bundle_ref=bundle_id,
+            baseline_ref="baseline",
+            universe=["005930"],
+            date_range=_default_date_range(25),
+        )
+
+    artifact = result["candidate_artifact"]
+    assert artifact["loaded"] is True
+    assert artifact["synthetic_fallback"] is True
+    assert artifact["data_source"] == "synthetic_fallback"
+
+
+def test_candidate_bundle_requires_metadata(tmp_path: Path):
+    """candidate pkl만 있고 feature metadata가 없으면 backtest를 실패시킨다."""
+    from src.mode_b.validation_tools import BundleLoadFailed
+
+    bundle_id = "BUNDLE-20260509-NOMETA00"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    with _mode_b_env():
+        with pytest.raises(BundleLoadFailed, match="metadata"):
+            engine.run(
+                bundle_ref=bundle_id,
+                baseline_ref="baseline",
+                universe=["005930"],
+                date_range=_default_date_range(25),
+            )
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 5. NaN_IN_METRICS: NaN 예측값 → NaNInMetrics
 # ────────────────────────────────────────────────────────────────────────
@@ -420,6 +678,60 @@ def test_cost_reduces_net_return():
         f"net_pnl({total_net:.6f}) >= gross_pnl({total_gross:.6f}): "
         "거래비용이 반영되지 않음"
     )
+
+
+def test_top_k_long_only_gross_equals_actual():
+    """Top-K long-only: side="buy"만 발생하므로 gross_return == actual_return (direction=+1).
+    이전 sell semantics (direction=-1, gross=-actual) 폐기. Phase 1 재수정 (2026-05-12)
+    trainer 정합 산식 검증.
+    """
+    cost_zero = {
+        "name": "slippage_v1",
+        "components": {
+            "commission_bps": 0,
+            "slippage_bps": 0,
+            "market_impact_coef": 0.0,
+        },
+    }
+    vt_cfg = dict(_MINIMAL_CFG_VT)
+    vt_cfg["mock_data"] = {
+        "base_price": 50000.0,
+        "price_noise_std": 0.0,
+        "signal_return_correlation": 0.05,
+        "return_noise_std": 0.0,
+    }
+
+    engine = _make_engine(
+        seed=42,
+        model_callable=lambda _: -1.0,
+        cost=cost_zero,
+        vt=vt_cfg,
+    )
+
+    result = _run_engine(engine, universe=["005930"], date_range=_default_date_range(20))
+
+    assert result["trade_log"], "Top-K long-only는 universe 종목 1개라도 매 ts buy 발생"
+    first = result["trade_log"][0]
+    assert first["side"] == "buy"
+    assert math.isclose(first["gross_return"], first["actual_return"], rel_tol=1e-9)
+
+
+def test_top_k_long_only_no_sell_side():
+    """Top-K long-only 산식: trainer (lgbm_trainer._group_for_metrics:401-411)와 정합.
+    매 ts에서 pred 상위 K개만 buy, 나머지 no-trade. sell side 발생 안 함.
+    2026-05-12 Phase 1 재수정: median long/short 폐기 후 산식 정합 검증.
+    """
+    engine = _make_engine(
+        seed=42,
+        model_callable=lambda _: -1.0,
+        vt=dict(_MINIMAL_CFG_VT),
+    )
+
+    result = _run_engine(engine, universe=["005930"], date_range=_default_date_range(20))
+
+    assert result["bar_count"] > 0
+    sides = {t["side"] for t in result["trade_log"]}
+    assert sides <= {"buy"}, f"Top-K long-only는 sell 발생 금지: {sides}"
 
 
 # ────────────────────────────────────────────────────────────────────────

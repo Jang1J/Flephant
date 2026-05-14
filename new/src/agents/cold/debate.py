@@ -1,7 +1,7 @@
 """C6 Debate Agent. pairwise CoT, Kanana-o, 충돌 시만 호출.
 
 S2-9 실구현. Cold Path 에이전트 간 신호 충돌 시 호출.
-pairwise 비교 최대 45회 (C(10,2) = 45 쌍). Kanana-o 100회/일 예산 내.
+pairwise 비교 최대 45쌍 (C(10,2))을 1회 batch 요청. Kanana-o 100회/일 예산 내.
 결과: debate_resolution / pairwise_ranking publish + FDA에 전달.
 
 불변 원칙 준수:
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,13 +25,14 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("debate")
 
 _DEFAULT_MEMORY_ROOT = (
     Path(__file__).resolve().parents[4] / "artifacts" / "agent_memory"
 )
-_CALLER = "debate"
+_CALLER = "debate_agent"
 # max_pairwise SSOT: risk_config.yaml debate.max_pairwise (기본값 45 = C(10,2))
 
 
@@ -57,6 +59,7 @@ class DebateAgent(AgentBase):
             Path(memory_root) if memory_root else _DEFAULT_MEMORY_ROOT
         )
         self._max_pairwise = self._load_max_pairwise()
+        self._max_runtime_sec = self._load_max_runtime_sec()
         self._uncertainty_threshold = self._load_uncertainty_threshold()
         self._conflict_criteria = self._load_conflict_criteria()
 
@@ -71,6 +74,18 @@ class DebateAgent(AgentBase):
         except Exception as e:
             logger.warning("[debate] max_pairwise 로드 실패: %s. 기본값 사용", e)
             return 45
+
+    def _load_max_runtime_sec(self) -> float:
+        """risk_config.yaml debate.max_runtime_sec 로드."""
+        try:
+            debate_cfg = config_load("risk_config.yaml", "debate") or {}
+            if "max_runtime_sec" in debate_cfg:
+                return float(debate_cfg["max_runtime_sec"])
+            bounded_cfg = config_load("risk_config.yaml", "bounded_execution") or {}
+            return float(bounded_cfg.get("debate_agent_max_sec", 15))
+        except Exception as e:
+            logger.warning("[debate] max_runtime_sec 로드 실패: %s. 기본값 사용", e)
+            return 15.0
 
     def _load_uncertainty_threshold(self) -> float:
         """risk_config.yaml debate.uncertainty_threshold 로드 (불변 원칙 5)."""
@@ -175,45 +190,60 @@ class DebateAgent(AgentBase):
             debate_id, conflict.get("patterns", []),
         )
 
-        # pairwise CoT 비교
-        pairs = self._build_pairs(signals)
-        pairs = pairs[: self._max_pairwise]
+        ranked_base = self._resolve_candidates(candidates, signals)
+        if not ranked_base:
+            logger.warning("[debate] 충돌은 감지됐지만 후보 ticker 없음. debate skip.")
+            return {
+                "conflict_detected": True,
+                "debate_id": debate_id,
+                "winner_view": "mixed",
+                "ranked_tickers": [],
+                "uncertainty_delta": 0.5,
+                "comparison_count": 0,
+                "completed_comparisons": 0,
+                "deadline_hit": False,
+                "debate_resolution_msg": None,
+                "pairwise_msgs": [],
+                "skipped_reason": "no_candidates",
+            }
+
+        # C6 pairwise ranking: 후보 ticker끼리 비교해야 한다. LLM 호출은 1회 batch로 제한한다.
+        pairs = self._build_ticker_pairs(ranked_base)[: self._max_pairwise]
         all_pair_results: list[dict[str, Any]] = []
         pairwise_msgs: list[dict[str, Any]] = []
+        deadline = time.perf_counter() + self._max_runtime_sec
+        deadline_hit = False
 
-        for s1, s2 in pairs:
-            cmp_result = self._pairwise_compare(s1, s2, conflict)
-            winner = cmp_result.get("winner", s1.get("agent", "quant"))
-            all_pair_results.append({
-                "winner": winner,
-                "pair": [s1.get("agent"), s2.get("agent")],
-                "reasoning": cmp_result.get("reasoning", ""),
-            })
+        if pairs:
+            if time.perf_counter() >= deadline:
+                deadline_hit = True
+                all_pair_results = self._heuristic_fallback(pairs)
+            else:
+                all_pair_results = self._batch_pairwise_compare(pairs, signals, conflict)
 
         # C6 pairwise_ranking: 집계 후 1회 publish
-        win_counts: dict[str, int] = {}
+        win_counts: dict[str, int] = {ticker: 0 for ticker in ranked_base}
         for pr in all_pair_results:
             winner = pr.get("winner")
-            if winner:
+            if winner in win_counts:
                 win_counts[winner] = win_counts.get(winner, 0) + 1
 
-        ranked = sorted(win_counts, key=lambda t: win_counts[t], reverse=True)
+        ranked = self._rank_tickers_by_win_count(ranked_base, win_counts)
         pr_msg = self.publish("pairwise_ranking", {
             "wins": [{"ticker": t, "win_count": win_counts[t]} for t in ranked],
             "ranked": ranked,
             "top_k": ranked[:3],
-            "total_pairs": len(all_pair_results),
+            "comparison_count": len(pairs),
+            "completed_comparisons": len(all_pair_results),
+            "total_pairs": len(pairs),  # legacy field, C6 clients should read comparison_count.
             "ts": datetime.now(_KST).isoformat(),
         })
         pairwise_msgs.append(pr_msg)
 
         wins = win_counts
 
-        # 최종 합의
-        if wins:
-            winner_view = max(wins, key=wins.__getitem__)
-        else:
-            winner_view = "mixed"
+        # C6 winner_view는 ticker가 아니라 관점 enum {"news","risk","quant","mixed"}만 허용.
+        winner_view = self._infer_winner_view(signals)
 
         # uncertainty_delta: 의견 갈림 정도
         total = sum(wins.values())
@@ -223,20 +253,22 @@ class DebateAgent(AgentBase):
         else:
             uncertainty_delta = 0.5
 
-        # ranked_tickers (candidates 기준, debate 결과로 재정렬 스텁)
-        ranked = candidates or []
-
         # debate_resolution 리포트
         conflict_patterns = conflict.get("patterns", [])
         resolution_payload = {
             "conflict_id": debate_id,
             "winner_view": winner_view,
             "conflict_patterns": conflict_patterns,
-            "wins": [{"agent": a, "win_count": c} for a, c in wins.items()],
+            "wins": [{"ticker": t, "win_count": wins.get(t, 0)} for t in ranked],
             "comparison_count": len(pairs),
+            "completed_comparisons": len(all_pair_results),
+            "deadline_hit": deadline_hit,
             "uncertainty_delta": uncertainty_delta,
             "ranked_tickers": ranked,
-            "reasoning": f"winner_view={winner_view}, patterns={len(conflict_patterns)}건 해소",
+            "reasoning": (
+                f"winner_view={winner_view}, patterns={len(conflict_patterns)}건 해소"
+                + ("; deadline_hit=true" if deadline_hit else "")
+            ),
         }
         resolution_msg = self.report("debate_resolution", resolution_payload)
 
@@ -250,6 +282,8 @@ class DebateAgent(AgentBase):
             "ranked_tickers": ranked,
             "uncertainty_delta": uncertainty_delta,
             "comparison_count": len(pairs),
+            "completed_comparisons": len(all_pair_results),
+            "deadline_hit": deadline_hit,
             "debate_resolution_msg": resolution_msg,
             "pairwise_msgs": pairwise_msgs,
             "skipped_reason": None,
@@ -303,15 +337,191 @@ class DebateAgent(AgentBase):
     # Pairwise 비교
     # ------------------------------------------------------------------
 
-    def _build_pairs(
-        self, signals: list[dict[str, Any]]
-    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-        """신호 리스트에서 pairwise 쌍 생성."""
-        pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        for i in range(len(signals)):
-            for j in range(i + 1, len(signals)):
-                pairs.append((signals[i], signals[j]))
+    def _resolve_candidates(
+        self,
+        candidates: list[str] | None,
+        signals: list[dict[str, Any]],
+    ) -> list[str]:
+        """명시 candidates 우선, 없으면 quant/news/risk payload에서 ticker 후보 추출."""
+        raw_candidates: list[Any] = list(candidates or [])
+        if not raw_candidates:
+            raw_candidates = self._extract_candidates(signals)
+
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_candidates:
+            ticker = pad_ticker(str(raw))
+            if not ticker.isdigit() or ticker in seen:
+                continue
+            resolved.append(ticker)
+            seen.add(ticker)
+            if len(resolved) >= 10:
+                break
+        return resolved
+
+    def _extract_candidates(self, signals: list[dict[str, Any]]) -> list[str]:
+        """signals payload에서 C6 후보 ticker 목록 추출."""
+        out: list[str] = []
+        list_keys = ("top10_candidates", "candidates", "ranked", "top_k", "tickers")
+        for signal in signals:
+            payload = signal.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            for key in list_keys:
+                values = payload.get(key)
+                if isinstance(values, list):
+                    out.extend(str(v) for v in values)
+            ticker = payload.get("ticker")
+            if ticker:
+                out.append(str(ticker))
+        return out
+
+    def _build_ticker_pairs(self, candidates: list[str]) -> list[tuple[str, str]]:
+        """후보 ticker 리스트에서 pairwise 쌍 생성."""
+        pairs: list[tuple[str, str]] = []
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                pairs.append((candidates[i], candidates[j]))
         return pairs
+
+    def _batch_pairwise_compare(
+        self,
+        ticker_pairs: list[tuple[str, str]],
+        signals: list[dict[str, Any]],
+        conflict_ctx: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """후보 ticker pair 전체를 Kanana-o 1회 호출로 비교. 실패 시 기존 랭킹 fallback."""
+        prompt = (
+            "다음은 KOSPI 후보 종목 간 pairwise 재랭킹 요청입니다.\n"
+            "각 pair마다 더 신뢰할 수 있는 후보 ticker를 하나 고르세요. "
+            "판단이 같으면 기존 순서를 보존하기 위해 첫 번째 ticker를 고르세요.\n\n"
+            f"충돌 맥락: {', '.join(conflict_ctx.get('patterns', []))}\n"
+            f"에이전트 신호: {json.dumps(signals, ensure_ascii=False)}\n"
+            f"비교 pair 목록: {json.dumps(ticker_pairs, ensure_ascii=False)}\n\n"
+            "반드시 JSON만 응답하세요: "
+            '{"results":[{"pair":["005930","000660"],"winner":"005930",'
+            '"confidence":0.0,"reasoning":"한국어 1문장"}]}'
+        )
+
+        try:
+            llm_result = self._llm_router.call(prompt, mode="cold", caller=_CALLER)
+        except Exception as e:
+            logger.warning("[debate] batch pairwise 호출 예외. heuristic fallback: %s", e)
+            return self._heuristic_fallback(ticker_pairs)
+
+        if not llm_result.success:
+            logger.warning(
+                "[debate] batch pairwise LLM 실패. heuristic fallback: %s",
+                getattr(llm_result, "error", None),
+            )
+            return self._heuristic_fallback(ticker_pairs)
+
+        return self._parse_batch_result(llm_result.content, ticker_pairs)
+
+    def _parse_batch_result(
+        self,
+        content: str,
+        ticker_pairs: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        """LLM batch 응답을 C6 pairwise 결과로 파싱."""
+        try:
+            parsed = parse_llm_json(content)
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("[debate] batch 응답 파싱 실패. heuristic fallback: %s", e)
+            return self._heuristic_fallback(ticker_pairs)
+
+        raw_results = parsed.get("results", [])
+        if not isinstance(raw_results, list):
+            return self._heuristic_fallback(ticker_pairs)
+
+        parsed_by_pair: dict[frozenset[str], dict[str, Any]] = {}
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            raw_pair = item.get("pair", [])
+            if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+                continue
+            left = pad_ticker(str(raw_pair[0]))
+            right = pad_ticker(str(raw_pair[1]))
+            if not left.isdigit() or not right.isdigit():
+                continue
+            winner = pad_ticker(str(item.get("winner", "")))
+            if winner not in {left, right}:
+                winner = left
+            parsed_by_pair[frozenset((left, right))] = {
+                "pair": [left, right],
+                "winner": winner,
+                "confidence": float(item.get("confidence", 0.5) or 0.5),
+                "reasoning": str(item.get("reasoning", "")),
+            }
+
+        results: list[dict[str, Any]] = []
+        for left, right in ticker_pairs:
+            found = parsed_by_pair.get(frozenset((left, right)))
+            if found:
+                found["pair"] = [left, right]
+                results.append(found)
+            else:
+                results.append({
+                    "pair": [left, right],
+                    "winner": left,
+                    "confidence": 0.5,
+                    "reasoning": "[LLM 누락 pair, 기존 순서 fallback]",
+                })
+        return results
+
+    def _heuristic_fallback(
+        self,
+        ticker_pairs: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        """LLM 실패 시 기존 Quant 후보 순서를 보존하는 deterministic fallback."""
+        return [
+            {
+                "pair": [left, right],
+                "winner": left,
+                "confidence": 0.5,
+                "reasoning": "[LLM 실패, 기존 순서 fallback]",
+            }
+            for left, right in ticker_pairs
+        ]
+
+    def _rank_tickers_by_win_count(
+        self,
+        candidates: list[str],
+        win_counts: dict[str, int],
+    ) -> list[str]:
+        """win_count 우선, 동률은 기존 후보 순서 보존."""
+        original_order = {ticker: idx for idx, ticker in enumerate(candidates)}
+        return sorted(
+            candidates,
+            key=lambda ticker: (-win_counts.get(ticker, 0), original_order[ticker]),
+        )
+
+    def _infer_winner_view(self, signals: list[dict[str, Any]]) -> str:
+        """C6 winner_view enum 산출. ticker reranking과 agent-view enum을 분리한다."""
+        has_quant = False
+        has_news = False
+        for signal in signals:
+            channel = str(signal.get("channel", ""))
+            payload = signal.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            if channel == "risk_warning":
+                stance = str(payload.get("stance", ""))
+                risk_level = str(payload.get("risk_level", ""))
+                if stance == "veto_recommendation" or risk_level == "high":
+                    return "risk"
+            if channel == "news_signal":
+                has_news = True
+            if channel == "quant_signal":
+                has_quant = True
+        if has_news and has_quant:
+            return "mixed"
+        if has_news:
+            return "news"
+        if has_quant:
+            return "quant"
+        return "mixed"
 
     def _pairwise_compare(
         self,
@@ -319,7 +529,7 @@ class DebateAgent(AgentBase):
         s2: dict[str, Any],
         conflict_ctx: dict[str, Any],
     ) -> dict[str, Any]:
-        """두 신호 간 Kanana-o CoT 1:1 비교. 예산 부족 시 heuristic fallback."""
+        """두 신호 간 Kanana-o 1:1 비교. legacy tests/backward compatibility용."""
         prompt = (
             f"두 에이전트 신호를 비교하여 어느 쪽이 더 신뢰할 수 있는지 판단하세요.\n\n"
             f"신호 A ({s1.get('agent', '?')}, 채널: {s1.get('channel', '?')}):\n"

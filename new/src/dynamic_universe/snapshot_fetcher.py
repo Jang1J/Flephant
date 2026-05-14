@@ -62,19 +62,22 @@ _DEFAULT_SNAPSHOT_DIR = (
     Path(__file__).resolve().parents[3] / "artifacts" / "watch_snapshots"
 )
 
+# Codex 권고 1, 2026-05-09 fix: parents[3] → parents[2].
+# 이전: /Elephant_Lab/config/* (잘못된 root, 파일 없음). 현재: /Elephant_Lab/new/config/*.
+
 # universe_config.yaml 경로 (read-only, write 금지 — C16 trade_universe_mutation)
 _UNIVERSE_CONFIG_PATH = (
-    Path(__file__).resolve().parents[3] / "config" / "universe_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "universe_config.yaml"
 )
 
 # watch_universe_kospi200.yaml 경로
 _WATCH_UNIVERSE_PATH_DEFAULT = (
-    Path(__file__).resolve().parents[3] / "config" / "watch_universe_kospi200.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "watch_universe_kospi200.yaml"
 )
 
 # dynamic_universe_config.yaml 경로
 _DYNAMIC_CONFIG_PATH_DEFAULT = (
-    Path(__file__).resolve().parents[3] / "config" / "dynamic_universe_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "dynamic_universe_config.yaml"
 )
 
 

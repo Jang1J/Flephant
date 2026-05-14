@@ -13,7 +13,7 @@ import pytest
 
 from src.data.dataset_builder import DatasetBuilder
 from src.models.lgbm_trainer import LGBMTrainer
-from src.models.registry import ModelRegistry
+from src.models.registry import ModelRegistry, VersionNotFoundError
 from src.models.splitter import WalkForwardSplitter
 
 
@@ -147,6 +147,11 @@ def test_compute_data_version_string_format() -> None:
     assert "20260419" in v
 
 
+def test_normalize_yyyymmdd_accepts_hyphen() -> None:
+    assert LGBMTrainer._normalize_yyyymmdd("2026-01-07") == "20260107"
+    assert LGBMTrainer._normalize_yyyymmdd("20260107") == "20260107"
+
+
 # ====================================================================== #
 # Integration: end-to-end train
 # ====================================================================== #
@@ -178,6 +183,12 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     model, metadata = trainer_small.registry.load_latest()
     assert model is not None
     assert metadata["version"] == "baseline"
+    assert metadata["train_start"] == "2026-01-01"
+    assert metadata["train_end"] == "2026-01-07"
+    assert metadata["label_generation_version"] == trainer_small.builder.label_generation_version
+    assert metadata["label_session_scope"] == trainer_small.builder.label_session_scope
+    assert metadata["data_source"] == "artifact_bars"
+    assert metadata["synthetic_fallback"] is False
     # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
     assert len(metadata["feature_cols"]) == 4
     assert "feat_1m_close_robust_z" in metadata["feature_cols"]
@@ -202,6 +213,67 @@ def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:
     pred = booster.predict(X)
     assert pred.shape == (2,)
     assert np.all(np.isfinite(pred))
+
+
+def test_train_with_bundle_id_saves_candidate_not_latest(trainer_small: LGBMTrainer) -> None:
+    """C12 bundle 후보는 deploy gate 전 latest/active로 승격하지 않는다."""
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="candidate",
+        bundle_id="BUNDLE-TEST",
+    )
+
+    assert result["is_latest"] is False
+    assert result["metric_scope"]["scope"] == "trainer_validation_proxy"
+    assert result["metric_scope"]["deploy_quality"] is False
+    versions = {entry["version"]: entry for entry in trainer_small.registry.list_versions()}
+    assert versions["candidate"]["status"] == "candidate"
+    assert versions["candidate"]["bundle_id"] == "BUNDLE-TEST"
+    assert versions["candidate"]["metric_scope"]["deploy_quality"] is False
+    with pytest.raises(VersionNotFoundError, match="active_version"):
+        trainer_small.registry.load_latest()
+
+
+def test_train_accepts_cost_aware_target_override(
+    trainer_small: LGBMTrainer,
+) -> None:
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="cost-aware",
+        target_col_override="label_session_close_net_ret",
+    )
+
+    assert result["target_col"] == "label_session_close_net_ret"
+    _, metadata = trainer_small.registry.load_latest()
+    assert metadata["target_col"] == "label_session_close_net_ret"
+
+
+def test_train_blocks_missing_feature_manifest(trainer_small: LGBMTrainer) -> None:
+    """feature_cols가 DatasetBuilder panel에 없으면 deploy 불가능 모델 학습을 차단한다."""
+    trainer_small.feature_cols = list(trainer_small.feature_cols) + ["alpha_factor_0"]
+
+    with pytest.raises(RuntimeError, match="feature manifest mismatch"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="bad-alpha-feature",
+        )
+
+
+def test_train_blocks_missing_requested_ticker_data(trainer_small: LGBMTrainer) -> None:
+    """요청 universe 일부가 없으면 18/20 같은 partial 학습을 차단한다."""
+    with pytest.raises(RuntimeError, match="missing requested ticker data"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004", "000005"],
+            start_date="20260101",
+            end_date="20260107",
+            version="missing-ticker",
+        )
 
 
 def test_train_no_folds_raises(synthetic_data: Path) -> None:

@@ -19,12 +19,18 @@ news:
   scorer: "local_finbert_or_equivalent"
   decay_lambda: 0.8
   score_window_hours: 12
+  finbert_batch_size: 16
 
 community:
   scorer: "spam_rules + manipulation_rules + sentiment_dict + optional_small_model"
   decay_lambda: 0.4
   peak_lag_days: 2
   noise_zscore: 2.5
+  real_provider: "naver_search"
+  naver_search_providers: ["cafearticle", "blog"]
+  naver_query_suffix: "주식"
+  max_posts_per_ticker: 3
+  sort: "date"
 
 divergence:
   threshold: 0.5

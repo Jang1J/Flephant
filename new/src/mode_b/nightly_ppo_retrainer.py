@@ -22,6 +22,8 @@ Note:
 from __future__ import annotations
 
 import re
+import shutil
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -34,8 +36,28 @@ try:
     _GYM_BASE = _gym.Env
 except ImportError:
     _gym = None  # type: ignore[assignment]
-    _spaces = None  # type: ignore[assignment]
-    _GYM_BASE = object  # type: ignore[assignment, misc]
+
+    class _FallbackEnv:
+        """Small gymnasium-compatible base used for deterministic unit smoke."""
+
+        def reset(self, *, seed: int | None = None, options: dict | None = None):
+            self.np_random = np.random.default_rng(seed)
+            return None
+
+    class _FallbackBox:
+        def __init__(self, low: float, high: float, shape: tuple[int, ...], dtype: Any):
+            self.low = low
+            self.high = high
+            self.shape = shape
+            self.dtype = dtype
+
+        def sample(self) -> np.ndarray:
+            if np.isfinite(self.low) and np.isfinite(self.high):
+                return np.random.uniform(self.low, self.high, self.shape).astype(self.dtype)
+            return np.zeros(self.shape, dtype=self.dtype)
+
+    _spaces = SimpleNamespace(Box=_FallbackBox)  # type: ignore[assignment]
+    _GYM_BASE = _FallbackEnv  # type: ignore[assignment, misc]
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
@@ -68,8 +90,6 @@ class AllocationEnv(_GYM_BASE):  # type: ignore[valid-type]
         constraint_penalty: float,
         episode_length: int,
     ) -> None:
-        if _gym is None:
-            raise ImportError("gymnasium 미설치. pip install gymnasium")
         super().__init__()
 
         if scores_data.shape != returns_data.shape:
@@ -105,6 +125,8 @@ class AllocationEnv(_GYM_BASE):  # type: ignore[valid-type]
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
+        if not hasattr(self, "np_random"):
+            self.np_random = np.random.default_rng(seed)
         max_start = max(0, self._T - self._episode_length)
         self._ep_start = int(self.np_random.integers(0, max_start + 1))
         self._t = 0
@@ -236,6 +258,7 @@ class NightlyPPORetrainer:
 
         # 2. 학습 데이터 준비 (synthetic fallback)
         s_data, r_data = self._prepare_data(scores_data, returns_data)
+        synthetic_fallback = scores_data is None or returns_data is None
 
         # 3. AllocationEnv 구성
         env = AllocationEnv(
@@ -272,6 +295,9 @@ class NightlyPPORetrainer:
         # 5. 저장 (SB3는 .zip suffix 자동 추가)
         model.save(str(save_path))
         model_path_str = str(save_path) + ".zip"
+        candidate_bundle_path = None
+        if bundle_id is not None and not synthetic_fallback:
+            candidate_bundle_path = self._stage_candidate_bundle(bundle_id, Path(model_path_str))
         logger.info(
             "[nightly_ppo_retrainer] 재학습 완료. version=%s path=%s",
             version_label,
@@ -285,6 +311,7 @@ class NightlyPPORetrainer:
             "model_path": model_path_str,
             "policy_type": "MlpPolicy",
             "n_stocks": self._n_stocks,
+            "synthetic_fallback": synthetic_fallback,
         }
 
         return {
@@ -293,6 +320,9 @@ class NightlyPPORetrainer:
             "bundle_id": bundle_id,
             "n_timesteps": self._total_timesteps,
             "allocator_candidate": allocator_candidate,
+            "synthetic_fallback": synthetic_fallback,
+            "candidate_bundle_staged": candidate_bundle_path is not None,
+            "candidate_bundle_path": str(candidate_bundle_path) if candidate_bundle_path else None,
         }
 
     # ================================================================== #
@@ -353,3 +383,11 @@ class NightlyPPORetrainer:
             n,
         )
         return scores, returns
+
+    def _stage_candidate_bundle(self, bundle_id: str, model_path: Path) -> Path:
+        """C14 deployer가 참조하는 bundle/ppo/latest_policy.pkl에 후보 policy를 복사."""
+        bundle_dir = self._artifacts_path.parent / "bundles" / bundle_id / "ppo"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        dest = bundle_dir / "latest_policy.pkl"
+        shutil.copy2(model_path, dest)
+        return dest

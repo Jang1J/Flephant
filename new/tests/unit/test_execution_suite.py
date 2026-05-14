@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from src.execution.execution_gateway import ExecutionGateway
+from src.execution.execution_gateway import (
+    ExecutionDependencyError,
+    ExecutionGateway,
+)
 from src.execution.kill_switch import (
     InvalidOperatorTokenError,
     KillSwitch,
@@ -148,6 +151,20 @@ def _final_decision(approved: bool, order_deltas: list[dict] | None = None) -> d
     }
 
 
+def _patch_execution_config(monkeypatch, mode: str, live_enabled: bool = False) -> None:
+    def fake_config_load(file_name: str, section: str):
+        if section == "execution":
+            return {"mode": mode, "live_enabled": live_enabled}
+        if section == "execution_cost_model":
+            return {"slippage_bps": 10}
+        return {}
+
+    monkeypatch.setattr(
+        "src.execution.execution_gateway.config_load",
+        fake_config_load,
+    )
+
+
 def test_execute_mock_filled(gateway: ExecutionGateway) -> None:
     fd = _final_decision(
         approved=True,
@@ -237,3 +254,166 @@ def test_execute_empty_order_deltas_still_filled(gateway: ExecutionGateway) -> N
     assert result["execution_report"]["status"] == "filled"
     assert result["execution_report"]["fills"] == []
     assert result["n_fills"] == 0
+
+
+def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Path) -> None:
+    """paper 모드는 NotImplemented가 아니라 주입된 KIS client로 주문 제출한다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int, float]] = []
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.calls.append((ticker, side, qty, price))
+            return {
+                "status": "submitted",
+                "order_id": "OD-001",
+                "price": price,
+            }
+
+    client = FakeKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "5930", "side": "buy", "qty": 10, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "submitted"
+    assert report["execution_mode"] == "paper"
+    assert report["fills"][0]["broker_order_id"] == "OD-001"
+    assert client.calls == [("005930", "buy", 10, 70000.0)]
+
+
+def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
+    """paper/live는 명시적인 broker client 없이 조용히 mock으로 흐르지 않는다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=None,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
+    )
+
+    with pytest.raises(ExecutionDependencyError):
+        gw.execute(fd)
+
+
+def test_execute_live_requires_live_enabled(monkeypatch, tmp_path: Path) -> None:
+    """live_enabled=false이면 KIS client가 있어도 C10 rejected report로 차단한다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=False)
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=object(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+    assert report["status"] == "rejected"
+    assert report["execution_mode"] == "live"
+    assert "live_enabled=false" in report["rejection_reason"]
+
+
+def test_execute_broker_partial_fill_reports_rejections(monkeypatch, tmp_path: Path) -> None:
+    """broker 제출 일부 실패는 C10 partial_filled와 rejections로 남긴다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PartialKISClient:
+        def submit_order(self, ticker: str, side: str, qty: int) -> dict:
+            if ticker == "000660":
+                return {"status": "rejected", "message": "insufficient cash"}
+            return {"status": "filled", "order_no": "OD-OK", "avg_fill_price": 70000.0}
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PartialKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[
+            {"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0},
+            {"ticker": "000660", "side": "buy", "qty": 3, "price": 120000.0},
+        ],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "partial_filled"
+    assert report["fills"][0]["broker_order_id"] == "OD-OK"
+    assert report["rejections"][0]["ticker"] == "000660"
+    assert result["feedback_record"]["lesson_stub"] == "1 broker submission(s) rejected"
+
+
+def test_execute_mode_override_routes_to_paper_and_passes_order_type(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """config mock 상태에서도 paper smoke는 명시 override로 C10 paper 경로를 검증한다."""
+    _patch_execution_config(monkeypatch, mode="mock")
+
+    class PaperKISClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def submit_order(
+            self,
+            ticker: str,
+            side: str,
+            qty: int,
+            price: float,
+            order_type: str,
+        ) -> dict:
+            self.calls.append({
+                "ticker": ticker,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "order_type": order_type,
+            })
+            return {"status": "submitted", "order_id": "OD-PAPER", "price": price}
+
+    client = PaperKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="paper",
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{
+            "ticker": "005930",
+            "side": "buy",
+            "qty": 1,
+            "price": 70000.0,
+            "order_type": "00",
+        }],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["execution_mode"] == "paper"
+    assert client.calls == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]

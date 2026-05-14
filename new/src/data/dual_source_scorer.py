@@ -45,6 +45,7 @@ _KST = ZoneInfo("Asia/Seoul")
 # FinBERT 로드 여부 추적 (모듈 수준 lazy init)
 _FINBERT_MODEL: Any = None
 _FINBERT_TOKENIZER: Any = None
+_FINBERT_PIPELINE: Any = None
 _FINBERT_AVAILABLE: bool | None = None  # None = 아직 시도 안 함
 
 
@@ -54,7 +55,7 @@ def _try_load_finbert(model_name: str = "snunlp/KR-FinBert-SC") -> bool:
     한국어 우선: snunlp/KR-FinBert-SC. 실패 시 ProsusAI/finbert 시도.
     둘 다 실패 시 fallback 모드 (sentiment_dict.yaml 키워드 매칭).
     """
-    global _FINBERT_MODEL, _FINBERT_TOKENIZER, _FINBERT_AVAILABLE
+    global _FINBERT_MODEL, _FINBERT_TOKENIZER, _FINBERT_PIPELINE, _FINBERT_AVAILABLE
 
     if _FINBERT_AVAILABLE is not None:
         return _FINBERT_AVAILABLE
@@ -72,6 +73,13 @@ def _try_load_finbert(model_name: str = "snunlp/KR-FinBert-SC") -> bool:
             mdl = AutoModelForSequenceClassification.from_pretrained(candidate)
             _FINBERT_TOKENIZER = tok
             _FINBERT_MODEL = mdl
+            _FINBERT_PIPELINE = pipeline(
+                "text-classification",
+                model=mdl,
+                tokenizer=tok,
+                truncation=True,
+                max_length=512,
+            )
             _FINBERT_AVAILABLE = True
             logger.info("[dual_source] FinBERT 로드 성공: %s", candidate)
             return True
@@ -93,16 +101,24 @@ def _finbert_score(text: str) -> float:
         neutral  → 0.0
         negative → -1.0 × confidence
     """
-    from transformers import pipeline  # noqa: PLC0415
+    if _FINBERT_PIPELINE is None:
+        raise RuntimeError("FinBERT pipeline is not initialized")
+    result = _FINBERT_PIPELINE(text[:512])[0]
+    return _score_finbert_result(result)
 
-    pipe = pipeline(
-        "text-classification",
-        model=_FINBERT_MODEL,
-        tokenizer=_FINBERT_TOKENIZER,
-        truncation=True,
-        max_length=512,
+
+def _finbert_scores(texts: list[str], *, batch_size: int) -> list[float]:
+    """FinBERT batch inference. -1.0(부정) ~ +1.0(긍정)."""
+    if _FINBERT_PIPELINE is None:
+        raise RuntimeError("FinBERT pipeline is not initialized")
+    results = _FINBERT_PIPELINE(
+        [text[:512] for text in texts],
+        batch_size=batch_size,
     )
-    result = pipe(text[:512])[0]
+    return [_score_finbert_result(result) for result in results]
+
+
+def _score_finbert_result(result: dict[str, Any]) -> float:
     label: str = result["label"].lower()
     score: float = float(result["score"])
 
@@ -303,6 +319,7 @@ class DualSourceScorer:
         div_cfg: dict = cfg.get("divergence", {})
 
         self._news_decay_lambda: float = float(news_cfg.get("decay_lambda", 0.8))
+        self._finbert_batch_size: int = max(1, int(news_cfg.get("finbert_batch_size", 1)))
         self._comm_decay_lambda: float = float(comm_cfg.get("decay_lambda", 0.4))
         self._peak_lag_days: int = int(comm_cfg.get("peak_lag_days", 2))
         self._noise_zscore_threshold: float = float(comm_cfg.get("noise_zscore", 2.5))
@@ -357,21 +374,29 @@ class DualSourceScorer:
         use_finbert = _try_load_finbert()
         source_note = "finbert" if use_finbert else "finbert_fallback"
 
-        scores: list[float] = []
-        for text in news_texts:
-            if not text or not text.strip():
-                continue
-            if use_finbert:
-                try:
-                    s = _finbert_score(text)
-                except Exception as e:
-                    logger.warning("[dual_source] FinBERT 추론 실패 fallback: %s", e)
-                    s = _keyword_fallback_score(text, self._sentiment_dict)
-                    source_note = "finbert_fallback"
-            else:
-                s = _keyword_fallback_score(text, self._sentiment_dict)
+        valid_texts = [text for text in news_texts if text and text.strip()]
+        if not valid_texts:
+            return 0.0, source_note
 
-            scores.append(s)
+        scores: list[float] = []
+        if use_finbert:
+            try:
+                scores = _finbert_scores(
+                    valid_texts,
+                    batch_size=self._finbert_batch_size,
+                )
+            except Exception as e:
+                logger.warning("[dual_source] FinBERT batch 추론 실패 fallback: %s", e)
+                source_note = "finbert_fallback"
+                scores = [
+                    _keyword_fallback_score(text, self._sentiment_dict)
+                    for text in valid_texts
+                ]
+        else:
+            scores = [
+                _keyword_fallback_score(text, self._sentiment_dict)
+                for text in valid_texts
+            ]
 
         if not scores:
             return 0.0, source_note

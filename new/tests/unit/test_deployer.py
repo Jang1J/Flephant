@@ -6,8 +6,8 @@ C14 ModeBDeployer 실구현 검증.
   1.  test_mode_b_only_deploy               - Mode A 호출 시 RuntimeError
   2.  test_mode_b_only_rollback             - rollback Mode A 호출 시 RuntimeError
   3.  test_deploy_pass_no_regression        - verdict=pass, flagged=False → deploy 성공
-  4.  test_deploy_pass_regression_low       - verdict=pass, flagged=True, severity=low → rgc_id 반환
-  5.  test_deploy_regression_high_blocked   - severity=high → DeployBlocked(regression_severity_blocked)
+  4.  test_deploy_pass_regression_low       - flagged=True, severity=low → DeployBlocked(regression_risk_flagged)
+  5.  test_deploy_regression_high_blocked   - severity=high → DeployBlocked(regression_risk_flagged)
   6.  test_deploy_verdict_warn              - verdict=warn → DeployBlocked(operator_review_required)
   7.  test_deploy_verdict_fail              - verdict=fail → DeployBlocked(verdict_fail) + dead_letter_log
   8.  test_deploy_sanity_not_ok             - sanity_check_result != "ok" → DeployBlocked(sanity_check_failed)
@@ -20,7 +20,7 @@ C14 ModeBDeployer 실구현 검증.
   15. test_rollback_missing_backup          - backup 없으면 DeployRollbackFailed raise
   16. test_dead_letter_log_append           - fail 시 dead_letter_log.jsonl append
   17. test_forbidden_callers_mode_check     - HotPath = Mode A → mode_b_only 차단 확인
-  18. test_deploy_medium_regression_passes  - severity=medium < block=high → deploy 진행
+  18. test_deploy_medium_regression_blocked - flagged=True, severity=medium → DeployBlocked
 """
 from __future__ import annotations
 
@@ -100,6 +100,105 @@ class _mode_b_env:
 
 _DEPLOY_ID_RE = re.compile(r"^DEPLOY-\d{8}-[0-9A-F]{8}$")
 _RGC_ID_RE = re.compile(r"^RGC-\d{8}-[0-9A-F]{8}$")
+_BUNDLE_ID = "BUNDLE-20260501-AABBCCDD"
+
+
+_REQUIRED_CANDIDATE_ARTIFACTS = {
+    "alpha_factor/factor_zoo.jsonl": b'{"factor": "candidate"}\n',
+    "lgbm/latest_model.pkl": b"CANDIDATE_LGBM",
+    "lgbm/committee.pkl": b"CANDIDATE_COMMITTEE",
+    "ppo/latest_policy.pkl": b"CANDIDATE_PPO",
+}
+
+
+def _candidate_lgbm_metadata(bundle_id: str = _BUNDLE_ID) -> dict:
+    return {
+        "version": "candidate_lgbm_v1",
+        "bundle_id": bundle_id,
+        "train_start": "2026-01-01",
+        "train_end": "2026-05-01",
+        "feature_cols": ["feat_a", "feat_b"],
+        "label_horizon_bars": 5,
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
+        "metrics": {
+            "ic": 0.01,
+            "icir": 0.5,
+            "rank_ic": 0.02,
+            "arr": 0.1,
+            "ir": 1.0,
+            "mdd": -0.01,
+            "sr": 1.0,
+        },
+        "commit_hash": "abc1234",
+        "data_version": "unit-test",
+        "created_at": "2026-05-01T18:00:00+09:00",
+    }
+
+
+def _prepare_candidate_bundle(
+    root: Path,
+    bundle_id: str = _BUNDLE_ID,
+    include_ppo: bool = True,
+) -> Path:
+    """ModeBDeployer staging bundle fixture."""
+    bundle_root = root / "bundles" / bundle_id
+    for rel, payload in _REQUIRED_CANDIDATE_ARTIFACTS.items():
+        if rel == "ppo/latest_policy.pkl" and not include_ppo:
+            continue
+        path = bundle_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    metadata_path = bundle_root / "lgbm" / "latest_model_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as fh:
+        json.dump(_candidate_lgbm_metadata(bundle_id), fh, ensure_ascii=False, indent=2)
+    return bundle_root
+
+
+def _prepare_live_artifacts(root: Path) -> dict[str, bytes]:
+    """rollback/content 보존 검증용 live artifacts."""
+    live_payloads = {
+        "alpha_factor/factor_zoo.jsonl": b"LIVE_FACTOR",
+        "lgbm/latest_model.pkl": b"LIVE_LGBM",
+        "lgbm/committee.pkl": b"LIVE_COMMITTEE",
+        "ppo/latest_policy.pkl": b"LIVE_PPO",
+    }
+    for rel, payload in live_payloads.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    return live_payloads
+
+
+def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) -> dict:
+    """Production deploy용 service-policy hard gate PASS fixture."""
+    import hashlib
+
+    report = {
+        "status": "PASS",
+        "bundle_id": bundle_id,
+        "gate": {"status": "PASS"},
+        "policy_checks": {
+            "deploy_candidate_by_service_policy": True,
+            "no_naked_short_exposure": True,
+            "order_caps_respected": True,
+            "cash_guard_respected": True,
+        },
+        "order_stats": {"naked_short_attempts": 0},
+    }
+    path = root / "artifacts" / "reports" / "service_policy_replay" / "pass.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "status": "PASS",
+        "bundle_id": bundle_id,
+        "service_policy_report_path": "artifacts/reports/service_policy_replay/pass.json",
+        "service_policy_report_sha256": digest,
+        "gate": dict(report["gate"]),
+        "policy_checks": dict(report["policy_checks"]),
+        "order_stats": dict(report["order_stats"]),
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -134,10 +233,11 @@ def test_deploy_pass_no_regression(tmp_path):
     """verdict=pass, flagged=False → deploy 성공. 기본 필드 검증."""
     from src.mode_b.deployer import RegressionRisk
 
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
         result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
+            bundle_id=_BUNDLE_ID,
             backtest_verdict="pass",
             sanity_check_result="ok",
             regression_risk=RegressionRisk(flagged=False),
@@ -147,9 +247,83 @@ def test_deploy_pass_no_regression(tmp_path):
     assert result["rollback_required"] is False
     assert result["regression_case_id"] is None
     assert result["human_approval_required"] is False
-    assert result["bundle_id"] == "BUNDLE-20260501-AABBCCDD"
+    assert result["bundle_id"] == _BUNDLE_ID
     assert "deployed_at" in result
     assert "deploy_id" in result
+    assert result["activated_model_version"] == "candidate_lgbm_v1"
+
+    registry = json.loads((tmp_path / "lgbm" / "registry.json").read_text())
+    assert registry["active_version"] == "candidate_lgbm_v1"
+    active = [v for v in registry["versions"] if v["version"] == "candidate_lgbm_v1"][0]
+    assert active["status"] == "active"
+    assert active["bundle_id"] == _BUNDLE_ID
+
+
+def test_deploy_missing_candidate_blocks_before_touching_live(tmp_path):
+    """candidate bundle 없으면 live artifact를 건드리지 않고 배포 차단."""
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
+
+    live_payloads = _prepare_live_artifacts(tmp_path)
+    deployer = _make_deployer(tmp_path)
+    with _mode_b_env():
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id=_BUNDLE_ID,
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=False),
+            )
+
+    assert exc_info.value.reason == "candidate_artifact_invalid"
+    for rel, payload in live_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+
+
+def test_deploy_replaces_live_with_candidate_and_rollback_restores_live(tmp_path):
+    """배포 성공은 candidate 내용으로 교체하고 rollback은 기존 live 내용을 복원한다."""
+    from src.mode_b.deployer import RegressionRisk
+
+    live_payloads = _prepare_live_artifacts(tmp_path)
+    _prepare_candidate_bundle(tmp_path)
+    deployer = _make_deployer(tmp_path)
+
+    with _mode_b_env():
+        result = deployer.deploy(
+            bundle_id=_BUNDLE_ID,
+            backtest_verdict="pass",
+            sanity_check_result="ok",
+            regression_risk=RegressionRisk(flagged=False),
+        )
+
+    for rel, candidate_payload in _REQUIRED_CANDIDATE_ARTIFACTS.items():
+        assert (tmp_path / rel).read_bytes() == candidate_payload
+        assert (tmp_path / rel).stat().st_size > 0
+
+    with _mode_b_env():
+        deployer.rollback(result["deploy_id"])
+
+    for rel, payload in live_payloads.items():
+        assert (tmp_path / rel).read_bytes() == payload
+
+
+def test_deploy_allows_missing_ppo_policy_and_keeps_existing_allocator(tmp_path):
+    """PPO 후보가 없으면 LGBM만 배포하고 기존 PPO/heuristic을 유지한다."""
+    from src.mode_b.deployer import RegressionRisk
+
+    _prepare_live_artifacts(tmp_path)
+    _prepare_candidate_bundle(tmp_path, include_ppo=False)
+    deployer = _make_deployer(tmp_path)
+
+    with _mode_b_env():
+        result = deployer.deploy(
+            bundle_id=_BUNDLE_ID,
+            backtest_verdict="pass",
+            sanity_check_result="ok",
+            regression_risk=RegressionRisk(flagged=False),
+        )
+
+    assert "ppo_policy" not in result["swapped_components"]
+    assert (tmp_path / "lgbm" / "registry.json").exists()
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -157,27 +331,27 @@ def test_deploy_pass_no_regression(tmp_path):
 # ────────────────────────────────────────────────────────────────────────
 
 def test_deploy_pass_regression_low(tmp_path):
-    """verdict=pass + flagged=True + severity=low → deploy 진행 + rgc_id != None."""
-    from src.mode_b.deployer import RegressionRisk
+    """verdict=pass + flagged=True + severity=low → deploy 차단 + rgc_id 기록."""
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
-        result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
-            backtest_verdict="pass",
-            sanity_check_result="ok",
-            regression_risk=RegressionRisk(
-                flagged=True,
-                severity="low",
-                evidence={"ic_drop": 0.02},
-                snapshot_metrics={"sharpe": 1.5},
-            ),
-        )
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id="BUNDLE-20260501-AABBCCDD",
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(
+                    flagged=True,
+                    severity="low",
+                    evidence=["ic_drop=0.02"],
+                    snapshot_metrics={"sharpe": 1.5},
+                ),
+            )
 
-    assert result["regression_case_id"] is not None
-    assert _RGC_ID_RE.match(result["regression_case_id"]), (
-        f"rgc_id 형식 불일치: {result['regression_case_id']}"
-    )
+    assert exc_info.value.reason == "regression_risk_flagged"
+    match = re.search(r"regression_case_id=(RGC-\d{8}-[0-9A-F]{8})", str(exc_info.value))
+    assert match, f"rgc_id 미기록: {exc_info.value}"
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -185,7 +359,7 @@ def test_deploy_pass_regression_low(tmp_path):
 # ────────────────────────────────────────────────────────────────────────
 
 def test_deploy_regression_high_blocked(tmp_path):
-    """severity=high (>= block=high) → DeployBlocked(regression_severity_blocked)."""
+    """severity=high → DeployBlocked(regression_risk_flagged)."""
     from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
     deployer = _make_deployer(tmp_path)
@@ -197,7 +371,7 @@ def test_deploy_regression_high_blocked(tmp_path):
                 sanity_check_result="ok",
                 regression_risk=RegressionRisk(flagged=True, severity="high"),
             )
-    assert exc_info.value.reason == "regression_severity_blocked"
+    assert exc_info.value.reason == "regression_risk_flagged"
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -275,6 +449,7 @@ def test_atomic_swap_rollback_on_failure(tmp_path):
     """_swap_single 중간 실패 시 PartialDeployRollback raise + 이전 단계 rollback."""
     from src.mode_b.deployer import PartialDeployRollback
 
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
 
     call_count = {"n": 0}
@@ -297,7 +472,7 @@ def test_atomic_swap_rollback_on_failure(tmp_path):
     with _mode_b_env():
         with pytest.raises(PartialDeployRollback) as exc_info:
             deployer.deploy(
-                bundle_id="BUNDLE-20260501-AABBCCDD",
+                bundle_id=_BUNDLE_ID,
                 backtest_verdict="pass",
                 sanity_check_result="ok",
             )
@@ -316,12 +491,13 @@ def test_rollback_standalone(tmp_path):
     """rollback() 단독 호출: metadata.json 준비 → status='rolled_back'."""
     from src.mode_b.deployer import RegressionRisk
 
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
 
     # 먼저 deploy 수행해서 backup 생성
     with _mode_b_env():
         result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
+            bundle_id=_BUNDLE_ID,
             backtest_verdict="pass",
             sanity_check_result="ok",
             regression_risk=RegressionRisk(flagged=False),
@@ -344,10 +520,11 @@ def test_rollback_standalone(tmp_path):
 
 def test_deploy_id_format(tmp_path):
     """deploy_id 형식 DEPLOY-yyyymmdd-UUID8 정규식 매치."""
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
         result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
+            bundle_id=_BUNDLE_ID,
             backtest_verdict="pass",
             sanity_check_result="ok",
         )
@@ -365,21 +542,16 @@ def test_regression_case_saved(tmp_path):
     from src.mode_b.deployer import RegressionRisk
 
     deployer = _make_deployer(tmp_path)
-    with _mode_b_env():
-        result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
-            backtest_verdict="pass",
-            sanity_check_result="ok",
-            regression_risk=RegressionRisk(
-                flagged=True,
-                severity="low",
-                evidence={"ic_diff": -0.05},
-                snapshot_metrics={"sharpe": 1.2, "mdd": -0.08},
-            ),
-        )
-
-    rgc_id = result["regression_case_id"]
-    assert rgc_id is not None
+    rgc_id = deployer._create_regression_case(  # noqa: SLF001
+        deploy_id="DEPLOY-20260501-AABBCCDD",
+        bundle_id="BUNDLE-20260501-AABBCCDD",
+        regression_risk=RegressionRisk(
+            flagged=True,
+            severity="low",
+            evidence=["ic_diff=-0.05"],
+            snapshot_metrics={"sharpe": 1.2, "mdd": -0.08},
+        ),
+    )
 
     case_path = tmp_path / "regression_cases" / f"{rgc_id}.jsonl"
     assert case_path.exists(), f"RegressionCase 파일 없음: {case_path}"
@@ -391,7 +563,7 @@ def test_regression_case_saved(tmp_path):
     assert payload["bundle_id"] == "BUNDLE-20260501-AABBCCDD"
     assert "occurred_at" in payload
     assert payload["severity"] == "low"
-    assert payload["evidence"] == {"ic_diff": -0.05}
+    assert payload["evidence"] == ["ic_diff=-0.05"]
     assert payload["snapshot_metrics"] == {"sharpe": 1.2, "mdd": -0.08}
 
 
@@ -401,10 +573,11 @@ def test_regression_case_saved(tmp_path):
 
 def test_backup_metadata_saved(tmp_path):
     """backup/{deploy_id}/metadata.json 저장 + 필수 필드 검증."""
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
         result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
+            bundle_id=_BUNDLE_ID,
             backtest_verdict="pass",
             sanity_check_result="ok",
         )
@@ -417,7 +590,7 @@ def test_backup_metadata_saved(tmp_path):
         metadata = json.load(fh)
 
     assert metadata["deploy_id"] == deploy_id
-    assert metadata["bundle_id"] == "BUNDLE-20260501-AABBCCDD"
+    assert metadata["bundle_id"] == _BUNDLE_ID
     assert "swapped_at" in metadata
     assert isinstance(metadata["swapped_components"], list)
 
@@ -428,10 +601,11 @@ def test_backup_metadata_saved(tmp_path):
 
 def test_swapped_components_all_four(tmp_path):
     """swapped_components에 4개 핵심 컴포넌트 모두 포함."""
+    _prepare_candidate_bundle(tmp_path)
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
         result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
+            bundle_id=_BUNDLE_ID,
             backtest_verdict="pass",
             sanity_check_result="ok",
         )
@@ -503,19 +677,42 @@ def test_forbidden_callers_mode_check(tmp_path):
 # Test 18: severity=medium < block=high → deploy 진행 (차단 안 됨)
 # ────────────────────────────────────────────────────────────────────────
 
-def test_deploy_medium_regression_passes(tmp_path):
-    """severity=medium, regression_severity_block=high → 차단 안 됨. deploy 진행."""
-    from src.mode_b.deployer import RegressionRisk
+def test_deploy_medium_regression_blocked(tmp_path):
+    """severity=medium이라도 flagged=True이면 C14 deploy gate에서 차단."""
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
     deployer = _make_deployer(tmp_path)
     with _mode_b_env():
-        result = deployer.deploy(
-            bundle_id="BUNDLE-20260501-AABBCCDD",
-            backtest_verdict="pass",
-            sanity_check_result="ok",
-            regression_risk=RegressionRisk(flagged=True, severity="medium"),
-        )
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id="BUNDLE-20260501-AABBCCDD",
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=True, severity="medium"),
+            )
 
-    # medium은 차단되지 않아야 함. rgc_id 생성
-    assert result["verdict"] == "pass"
-    assert result["regression_case_id"] is not None
+    assert exc_info.value.reason == "regression_risk_flagged"
+
+
+def test_service_policy_gate_requires_report_binding(tmp_path):
+    """Production service-policy gate는 embedded report path/hash 없으면 차단."""
+    from src.mode_b.deployer import DeployBlocked
+
+    deployer = _make_deployer(tmp_path)
+    evidence = _passing_service_policy_evidence(tmp_path)
+    evidence.pop("service_policy_report_sha256")
+
+    with pytest.raises(DeployBlocked) as exc_info:
+        deployer._check_service_policy_gate(evidence, bundle_id=_BUNDLE_ID)
+
+    assert exc_info.value.reason == "service_policy_gate_failed"
+    assert "service_policy_report_sha_missing" in str(exc_info.value)
+
+
+def test_service_policy_gate_accepts_bound_pass_report(tmp_path):
+    """Embedded path/hash가 있는 PASS service-policy evidence는 gate 통과."""
+    deployer = _make_deployer(tmp_path)
+    deployer._check_service_policy_gate(
+        _passing_service_policy_evidence(tmp_path),
+        bundle_id=_BUNDLE_ID,
+    )

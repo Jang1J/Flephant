@@ -149,6 +149,24 @@ def test_get_stat_data_real_api_success(client_real_mode, mock_rate_limiter):
     assert points[0].stat_code == "098Y001"
 
 
+def test_get_stat_data_real_api_appends_item_code(client_real_mode):
+    """ECOS item_code가 필요한 통계표는 URL 뒤에 항목 코드를 붙인다."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"StatisticSearch": {"row": []}}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("src.connectors.ecos_rest.requests.get", return_value=mock_resp) as get:
+        client_real_mode.get_stat_data(
+            "722Y001",
+            "20260419",
+            "20260421",
+            item_codes=("0101000",),
+        )
+
+    assert get.call_args is not None
+    assert get.call_args.args[0].endswith("/722Y001/D/20260419/20260421/0101000")
+
+
 def test_get_stat_data_real_api_empty_row(client_real_mode):
     """실 API 경로: row 없음 -> 빈 리스트."""
     mock_resp = MagicMock()

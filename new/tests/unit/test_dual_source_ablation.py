@@ -6,7 +6,7 @@
   3. _load_feature_cols: enabled_for_lgbm=True 시 9피처 반환, False 시 4피처 반환
   4. PerformanceAnalyzer ablation_components에 dual_source 등록 확인
   5. Ablation 리포트 형식 검증 (key 구조 + verdict 값)
-  6. DatasetBuilder join: 점수 파일 없으면 기본값 0.0 유지
+  6. DatasetBuilder join: 점수 파일 없으면 per-feature neutral default 유지
   7. run_dual_source_ablation: _compute_delta / _verdict 함수 단위 검증
 """
 from __future__ import annotations
@@ -291,7 +291,7 @@ def test_verdict_neutral() -> None:
 def test_join_dual_source_features_missing_file_uses_default(
     builder_ds_enabled: DatasetBuilder,
 ) -> None:
-    """load_latest_scores 빈 리스트 반환 시 5피처 기본값 0.0."""
+    """load_latest_scores 빈 리스트 반환 시 5피처 neutral 기본값."""
     panel = _make_mock_panel("005930", n_days=2)
 
     with patch("src.data.dataset_builder.load_latest_scores", return_value=[]):
@@ -299,7 +299,10 @@ def test_join_dual_source_features_missing_file_uses_default(
 
     for feat in DUAL_SOURCE_FEATURES:
         assert feat in result.columns
-        assert (result[feat] == 0.0).all(), f"{feat} 기본값 0.0 아님: {result[feat].values}"
+        expected = 1.0 if feat == "community_noise_multiplier" else 0.0
+        assert (result[feat] == expected).all(), (
+            f"{feat} neutral 기본값 {expected} 아님: {result[feat].values}"
+        )
 
 
 # ====================================================================== #

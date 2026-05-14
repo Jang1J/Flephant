@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+"""Cost-aware label horizon diagnostic.
+
+This script is read-only. It inspects existing 1m bar artifacts and compares
+candidate forward-return label horizons after the configured execution cost.
+It does not train, deploy, call KIS, or mutate any registry.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "new"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from src.data.dataset_builder import DatasetBuilder  # noqa: E402
+from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.ticker_utils import pad_ticker  # noqa: E402
+
+_KST = ZoneInfo("Asia/Seoul")
+_DATE_RE = re.compile(r"(20\d{6})")
+
+
+def _active_tickers() -> list[str]:
+    cfg = config_load("universe_config.yaml") or {}
+    tickers: list[str] = []
+    for sector in (cfg.get("sectors") or {}).values():
+        for row in sector.get("stocks", []) or []:
+            if str(row.get("status", "")).lower() == "active":
+                tickers.append(pad_ticker(str(row.get("ticker", ""))))
+    if tickers:
+        return sorted(set(tickers))
+    fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
+    return sorted({pad_ticker(str(t)) for t in fallback})
+
+
+def _extract_date(path: Path) -> date | None:
+    match = _DATE_RE.search(path.name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _available_dates(artifacts_dir: Path, tickers: list[str]) -> list[date]:
+    counts: dict[date, int] = {}
+    for ticker in tickers:
+        ticker_dir = artifacts_dir / ticker
+        if not ticker_dir.exists():
+            continue
+        seen_for_ticker: set[date] = set()
+        for file_path in ticker_dir.iterdir():
+            file_date = _extract_date(file_path)
+            if file_date is not None:
+                seen_for_ticker.add(file_date)
+        for file_date in seen_for_ticker:
+            counts[file_date] = counts.get(file_date, 0) + 1
+    required = len(tickers)
+    return sorted(day for day, count in counts.items() if count >= required)
+
+
+def _default_horizons() -> list[str]:
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    pre_cfg = config_load("risk_config.yaml", "preprocessor") or {}
+    horizons: list[int] = []
+    label_horizon = int(label_cfg.get("horizon_bars", 0) or 0)
+    if label_horizon > 0:
+        horizons.append(label_horizon)
+    for value in pre_cfg.get("multi_scale_windows", []) or []:
+        as_int = int(value)
+        if as_int > 1:
+            horizons.append(as_int)
+    deduped = [str(v) for v in sorted(set(horizons))]
+    return deduped + ["session_close"]
+
+
+def _cost_bps() -> float:
+    cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
+    components = cost_cfg.get("components") or {}
+    return float(components.get("commission_bps", 0.0)) + float(
+        components.get("slippage_bps", 0.0)
+    )
+
+
+def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, float]:
+    pos_cfg = config_load("risk_config.yaml", "position_limits") or {}
+    min_confidence = float(pos_cfg.get("min_confidence", 0.0))
+    return {
+        "min_mean_net_bps": float(total_cost_bps),
+        "min_positive_net_rate": min(1.0, 0.5 + min_confidence),
+    }
+
+
+def _infer_date_range(
+    artifacts_dir: Path,
+    tickers: list[str],
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[str, str, list[str]]:
+    warnings: list[str] = []
+    if start_date and end_date:
+        return start_date, end_date, warnings
+
+    dates = _available_dates(artifacts_dir, tickers)
+    if not dates:
+        raise RuntimeError(
+            f"no common artifact dates found for {len(tickers)} tickers in {artifacts_dir}"
+        )
+
+    wf_cfg = config_load("risk_config.yaml", "walk_forward") or {}
+    lookback = max(1, int(wf_cfg.get("test_window_days", 1)))
+    inferred_end = end_date or dates[-1].strftime("%Y%m%d")
+    end_dt = datetime.strptime(inferred_end, "%Y%m%d").date()
+    usable = [day for day in dates if day <= end_dt]
+    if not usable:
+        raise RuntimeError(f"no artifact dates <= end_date {inferred_end}")
+    selected = usable[-lookback:]
+    inferred_start = start_date or selected[0].strftime("%Y%m%d")
+    warnings.append(
+        "date_range_inferred_from_common_artifact_dates:"
+        f"{inferred_start}~{inferred_end}"
+    )
+    return inferred_start, inferred_end, warnings
+
+
+def _load_raw_panel(
+    *,
+    artifacts_dir: Path,
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+):
+    builder = DatasetBuilder(artifacts_dir=artifacts_dir, allow_synthetic_fallback=False)
+    frames = []
+    missing: list[str] = []
+    for ticker in tickers:
+        frame = builder._load_ticker_bars(ticker, start_date, end_date)
+        if frame is None or frame.empty:
+            missing.append(ticker)
+            continue
+        frames.append(frame)
+    if not frames:
+        raise RuntimeError("no bar frames loaded for label horizon scan")
+    pd = __import__("pandas")
+    panel = pd.concat(frames, axis=0, ignore_index=True)
+    panel["ticker"] = panel["ticker"].map(lambda value: pad_ticker(str(value)))
+    panel["ts_close"] = pd.to_datetime(panel["ts_close"])
+    if panel["ts_close"].dt.tz is None:
+        panel["ts_close"] = panel["ts_close"].dt.tz_localize(_KST)
+    else:
+        panel["ts_close"] = panel["ts_close"].dt.tz_convert(_KST)
+    panel = panel.sort_values(["ticker", "ts_close"]).reset_index(drop=True)
+    return panel, missing
+
+
+def _quantiles(values: np.ndarray) -> dict[str, float | None]:
+    if values.size == 0:
+        return {"p25": None, "p50": None, "p75": None, "p90": None}
+    return {
+        "p25": float(np.percentile(values, 25)),
+        "p50": float(np.percentile(values, 50)),
+        "p75": float(np.percentile(values, 75)),
+        "p90": float(np.percentile(values, 90)),
+    }
+
+
+def _horizon_returns(panel, horizon: str) -> np.ndarray:
+    df = panel.copy()
+    df["_session"] = df["ts_close"].dt.date
+    if horizon == "session_close":
+        grouped = df.groupby(["ticker", "_session"], sort=False)
+        future_close = grouped["close"].transform("last")
+        last_ts = grouped["ts_close"].transform("last")
+        mask = df["ts_close"] < last_ts
+    else:
+        bars = int(horizon)
+        grouped = df.groupby(["ticker", "_session"], sort=False)
+        future_close = grouped["close"].shift(-bars)
+        mask = future_close.notna()
+
+    close = df["close"].astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        returns = np.where(close > 1e-8, future_close.astype(float) / close - 1.0, np.nan)
+    values = np.asarray(returns[mask], dtype=float)
+    return values[np.isfinite(values)]
+
+
+def _summarize_horizon(
+    *,
+    panel,
+    horizon: str,
+    total_cost_bps: float,
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    returns = _horizon_returns(panel, horizon)
+    gross_bps = returns * 10000.0
+    net_bps = gross_bps - total_cost_bps
+    valid_rows = int(net_bps.size)
+    if valid_rows == 0:
+        return {
+            "horizon": horizon,
+            "status": "BLOCKED",
+            "valid_rows": 0,
+            "reason": "no_valid_rows",
+        }
+
+    mean_gross = float(gross_bps.mean())
+    mean_net = float(net_bps.mean())
+    positive_net_rate = float((net_bps > 0.0).mean())
+    above_cost_buffer_rate = float((net_bps > total_cost_bps).mean())
+    pass_mean = mean_net >= thresholds["min_mean_net_bps"]
+    pass_hit = positive_net_rate >= thresholds["min_positive_net_rate"]
+    status = "PASS" if pass_mean and pass_hit else "WARN"
+    return {
+        "horizon": horizon,
+        "status": status,
+        "valid_rows": valid_rows,
+        "mean_gross_bps": mean_gross,
+        "mean_net_bps": mean_net,
+        "positive_net_rate": positive_net_rate,
+        "above_cost_buffer_rate": above_cost_buffer_rate,
+        "gross_bps_quantiles": _quantiles(gross_bps),
+        "net_bps_quantiles": _quantiles(net_bps),
+        "pass_mean_net_threshold": bool(pass_mean),
+        "pass_positive_net_rate_threshold": bool(pass_hit),
+    }
+
+
+def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    artifacts_dir = Path(args.artifacts_dir)
+    if not artifacts_dir.is_absolute():
+        artifacts_dir = ROOT / artifacts_dir
+    tickers = (
+        [pad_ticker(t.strip()) for t in args.tickers.split(",") if t.strip()]
+        if args.tickers
+        else _active_tickers()
+    )
+    if not tickers:
+        raise RuntimeError("no active tickers resolved from universe_config.yaml")
+
+    start_date, end_date, warnings = _infer_date_range(
+        artifacts_dir,
+        tickers,
+        args.start_date,
+        args.end_date,
+    )
+    panel, missing_tickers = _load_raw_panel(
+        artifacts_dir=artifacts_dir,
+        tickers=tickers,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    horizons = (
+        [item.strip() for item in args.horizons.split(",") if item.strip()]
+        if args.horizons
+        else _default_horizons()
+    )
+    total_cost_bps = _cost_bps()
+    thresholds = _diagnostic_thresholds(total_cost_bps)
+    horizon_reports = [
+        _summarize_horizon(
+            panel=panel,
+            horizon=horizon,
+            total_cost_bps=total_cost_bps,
+            thresholds=thresholds,
+        )
+        for horizon in horizons
+    ]
+    valid_reports = [r for r in horizon_reports if r.get("valid_rows", 0)]
+    best = max(valid_reports, key=lambda r: float(r.get("mean_net_bps", -1e18)), default=None)
+    deployable = bool(best and best.get("status") == "PASS")
+    return {
+        "status": "PASS" if deployable else "WARN",
+        "action": "cost_aware_label_horizon_scan",
+        "generated_at": datetime.now(_KST).isoformat(),
+        "read_only": True,
+        "external_kis_api": False,
+        "registry_mutated": False,
+        "data": {
+            "artifacts_dir": str(artifacts_dir),
+            "start_date": start_date,
+            "end_date": end_date,
+            "ticker_count": len(tickers),
+            "loaded_rows": int(len(panel)),
+            "missing_tickers": missing_tickers,
+        },
+        "cost_model": {
+            "total_cost_bps": total_cost_bps,
+            "thresholds": thresholds,
+        },
+        "best_horizon": best.get("horizon") if best else None,
+        "deployable_label_recommendation": deployable,
+        "warnings": warnings,
+        "horizons": horizon_reports,
+    }
+
+
+def _write_report(report: dict[str, Any], output_dir: str | None) -> Path:
+    raw_dir = output_dir or "artifacts/reports/label_horizon_scan"
+    out_dir = Path(raw_dir)
+    if not out_dir.is_absolute():
+        out_dir = ROOT / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
+    path = out_dir / f"cost_aware_label_horizon_scan_{ts}.json"
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=2)
+    return path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifacts-dir", default="artifacts/data")
+    parser.add_argument("--tickers", default=None)
+    parser.add_argument("--start-date", default=None)
+    parser.add_argument("--end-date", default=None)
+    parser.add_argument("--horizons", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--no-write-report", action="store_true")
+    args = parser.parse_args(argv)
+
+    report = build_report(args)
+    if not args.no_write_report:
+        path = _write_report(report, args.output_dir)
+        report["report_path"] = str(path)
+        try:
+            report["report_path_relative"] = str(path.relative_to(ROOT))
+        except ValueError:
+            report["report_path_relative"] = str(path)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("status") in {"PASS", "WARN"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

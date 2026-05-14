@@ -60,7 +60,7 @@ assert "submit_order" not in dir(), (
 
 # 기본 경로
 _DYNAMIC_CONFIG_PATH_DEFAULT = (
-    Path(__file__).resolve().parents[3] / "config" / "dynamic_universe_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "dynamic_universe_config.yaml"
 )
 _ARTIFACTS_DIR_DEFAULT = (
     Path(__file__).resolve().parents[3] / "artifacts" / "dynamic_holdings"

@@ -16,12 +16,18 @@ Feature 이름 규약:
   DatasetBuilder/LightGBM 훈련과 동일한 feat_ prefix 사용 (feat_1m_close_robust_z,
   feat_5m_ret, feat_30m_vol, feat_60m_trend). Preprocessor(hot path 1-shot용)는 다른 이름
   규약을 쓰므로 여기서 직접 rolling feature 계산 (S1-0 preprocessor와 중복 최소화).
+
+Investor Flow side-channel:
+  KIS/KRX 수급 이벤트는 모델 feature로 조용히 섞지 않고, 최신 snapshot만 보관한다.
+  Cold Path/BE가 필요할 때 조회해 설명/이벤트 컨텍스트로 사용한다.
 """
 from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Any
+from datetime import datetime
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -38,6 +44,7 @@ from src.utils.logger import get_logger
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("quant_agent")
+_KST = ZoneInfo("Asia/Seoul")
 
 
 class QuantAgent(AgentBase):
@@ -62,6 +69,7 @@ class QuantAgent(AgentBase):
         self,
         registry: ModelRegistry | None = None,
         bar_buffer: BarBuffer | None = None,
+        dual_source_loader: Callable[[str | None], list[dict[str, Any]]] | None = None,
     ) -> None:
         # --- 설정 로드 (yaml 경유) ---
         qa_cfg = config_load("risk_config.yaml", "quant_agent")
@@ -73,11 +81,39 @@ class QuantAgent(AgentBase):
         )
         self._latency_window: int = int(qa_cfg["latency_window"])
         self._latency_p95_target_ms: float = float(qa_cfg["latency_p95_target_ms"])
+        self._investor_flow_stale_sec: int = int(qa_cfg["investor_flow_stale_sec"])
 
         self._multi_scale_windows: list[int] = list(pp_cfg["multi_scale_windows"])
         self._mad_constant: float = float(pp_cfg["mad_constant"])
         self._outlier_cap_z: float = float(pp_cfg["outlier_cap_z"])
-        self._feature_cols: list[str] = list(pp_cfg["feature_cols"])
+        self._base_feature_cols: list[str] = list(pp_cfg["feature_cols"])
+        self._dual_source_feature_cols: list[str] = []
+        ds_cfg = config_load("risk_config.yaml", "dual_source") or {}
+        if ds_cfg.get("enabled_for_lgbm", False):
+            self._dual_source_feature_cols = list(pp_cfg.get("dual_source_feature_cols", []))
+        self._exogenous_feature_cols: list[str] = []
+        self._exogenous_defaults: dict[str, float] = {}
+        exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
+        if exog_cfg.get("enabled_for_lgbm", False):
+            self._exogenous_feature_cols = list(pp_cfg.get("exogenous_feature_cols", []))
+            defaults = exog_cfg.get("neutral_defaults") or {}
+            self._exogenous_defaults = {
+                col: float(defaults.get(col, 0.0))
+                for col in self._exogenous_feature_cols
+            }
+        self._feature_cols: list[str] = list(self._base_feature_cols)
+        for col in self._dual_source_feature_cols:
+            if col not in self._feature_cols:
+                self._feature_cols.append(col)
+        for col in self._exogenous_feature_cols:
+            if col not in self._feature_cols:
+                self._feature_cols.append(col)
+        self._inference_feature_cols: list[str] = list(self._feature_cols)
+        self._dual_source_loader = dual_source_loader
+        self._dual_source_cache: dict[str, dict[str, dict[str, float]]] = {}
+        self._investor_flow_snapshot: dict[str, dict[str, Any]] = {}
+        self._exogenous_snapshot: dict[str, dict[str, float]] = {}
+        self._market_exogenous_snapshot: dict[str, float] = {}
 
         # --- 의존 컴포넌트 ---
         self._registry = registry or ModelRegistry()
@@ -93,9 +129,10 @@ class QuantAgent(AgentBase):
 
         logger.info(
             "[quant_agent] 초기화 완료. model_loaded=%s, warmup=%d, "
-            "anomaly_z=%.1f, latency_window=%d",
+            "anomaly_z=%.1f, latency_window=%d, investor_flow_stale_sec=%d",
             self.has_model, self._warmup_bars,
             self._anomaly_zscore_threshold, self._latency_window,
+            self._investor_flow_stale_sec,
         )
 
     # ================================================================== #
@@ -111,6 +148,83 @@ class QuantAgent(AgentBase):
     def model_metadata(self) -> dict[str, Any] | None:
         """로드된 모델 메타데이터 (version, feature_cols, metrics, ...)."""
         return self._model_metadata
+
+    def update_investor_flow_snapshot(
+        self,
+        ticker: str,
+        flow: dict[str, Any] | float | int,
+        received_at: datetime | str | None = None,
+    ) -> None:
+        """수급 side-channel snapshot 갱신.
+
+        exogenous_features.enabled_for_lgbm=true이면 foreign/institutional/retail
+        순매수 3필드가 LightGBM feature vector에도 주입된다. 그 외 수급 부가 필드는
+        RiskFast/Cold Path context로 보관한다.
+        """
+        ticker_padded = pad_ticker(str(ticker))
+        raw = flow if isinstance(flow, dict) else {"foreign_net_buy": flow}
+        received_dt = self._parse_snapshot_dt(received_at) if received_at else datetime.now(_KST)
+        self._investor_flow_snapshot[ticker_padded] = {
+            "ticker": ticker_padded,
+            "foreign_net_buy": self._float_or_none(raw.get("foreign_net_buy")),
+            "institutional_net_buy": self._float_or_none(raw.get("institutional_net_buy")),
+            "retail_net_buy": self._float_or_none(raw.get("retail_net_buy")),
+            "foreign_net_buy_qty": self._float_or_none(raw.get("foreign_net_buy_qty")),
+            "institutional_net_buy_qty": self._float_or_none(
+                raw.get("institutional_net_buy_qty")
+            ),
+            "retail_net_buy_qty": self._float_or_none(raw.get("retail_net_buy_qty")),
+            "provider": str(raw.get("provider") or raw.get("source") or "unknown"),
+            "received_at": received_dt,
+        }
+
+    def update_foreign_snapshot(
+        self,
+        ticker: str,
+        foreign_net_buy: float,
+        received_at: datetime | str | None = None,
+    ) -> None:
+        """이전 예경님 코드 호환용 alias. 내부적으로 side-channel snapshot을 갱신한다."""
+        self.update_investor_flow_snapshot(
+            ticker,
+            {"foreign_net_buy": foreign_net_buy, "provider": "foreign_snapshot"},
+            received_at=received_at,
+        )
+
+    def update_exogenous_snapshot(
+        self,
+        features: dict[str, Any],
+        ticker: str | None = None,
+    ) -> None:
+        """US overnight / macro / investor_flow 외생 feature snapshot 갱신."""
+        clean = {
+            col: float(features[col])
+            for col in self._exogenous_feature_cols
+            if col in features and features[col] is not None
+        }
+        if ticker:
+            self._exogenous_snapshot[pad_ticker(str(ticker))] = clean
+        else:
+            self._market_exogenous_snapshot.update(clean)
+
+    def get_investor_flow_snapshot(
+        self,
+        ticker: str,
+        asof: datetime | str | None = None,
+    ) -> dict[str, Any] | None:
+        """ticker별 최신 수급 snapshot + age/sec stale 여부 반환."""
+        ticker_padded = pad_ticker(str(ticker))
+        item = self._investor_flow_snapshot.get(ticker_padded)
+        if item is None:
+            return None
+        asof_dt = self._parse_snapshot_dt(asof) if asof else datetime.now(_KST)
+        received_dt = item["received_at"]
+        age_sec = max(0.0, (asof_dt - received_dt).total_seconds())
+        out = dict(item)
+        out["received_at"] = received_dt.isoformat()
+        out["age_sec"] = float(age_sec)
+        out["is_stale"] = age_sec > self._investor_flow_stale_sec
+        return out
 
     # ================================================================== #
     # Public API
@@ -168,15 +282,22 @@ class QuantAgent(AgentBase):
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
 
+        requires_dual_source = self._model_requires_dual_source()
+
         for ticker in padded_all:
             bars = bars_batch.get(ticker, [])
             if len(bars) < self._warmup_bars:
                 continue
-            feats = self._compute_features(bars)
+            feats = self._compute_features(
+                bars,
+                ticker=ticker,
+                asof=asof_str,
+                require_dual_source=requires_dual_source,
+            )
             if feats is None:
                 continue
             try:
-                feature_vec = [float(feats[c]) for c in self._feature_cols]
+                feature_vec = [float(feats[c]) for c in self._inference_feature_cols]
             except KeyError as e:
                 logger.warning(
                     "[quant_agent] %s feature 누락: %s. skip", ticker, e
@@ -300,12 +421,40 @@ class QuantAgent(AgentBase):
             )
             self._booster = None
             self._model_metadata = None
+            self._inference_feature_cols = list(self._feature_cols)
             return False
+
+        # Codex 권고 6 (2026-05-09): train/serve feature manifest 정합 검증.
+        # 이전: metadata 의 feature_cols 를 단순 로드만 → train (Dual-Source 포함) vs serve
+        # (preprocessor 만) feature set drift 방치. 발견 못 하면 silent prediction 오작동.
+        # 현재: train feature_cols 와 serve feature_cols 비교 + diff 시 warning + passive mode 전환.
+        train_feature_cols = set(metadata.get("feature_cols") or [])
+        serve_feature_cols = set(self._feature_cols)
+        missing_in_serve = train_feature_cols - serve_feature_cols
+        extra_in_serve = serve_feature_cols - train_feature_cols
+        if missing_in_serve or extra_in_serve:
+            action = "passive mode 전환" if missing_in_serve else "metadata feature_cols로 추론"
+            log_fn = logger.error if missing_in_serve else logger.warning
+            log_fn(
+                "[quant_agent] feature manifest mismatch: train→serve. "
+                "missing_in_serve=%s extra_in_serve=%s. %s.",
+                sorted(missing_in_serve), sorted(extra_in_serve), action,
+            )
+            # train 에 있지만 serve 에 없는 feature 존재 시 추론 불가 → passive
+            if missing_in_serve:
+                self._booster = None
+                self._model_metadata = None
+                self._inference_feature_cols = list(self._feature_cols)
+                return False
+            # serve 에 extra 만 있으면 추론 가능 (extra 무시) but warning
 
         self._booster = booster
         self._model_metadata = metadata
+        self._inference_feature_cols = (
+            list(metadata.get("feature_cols") or self._feature_cols)
+        )
         logger.info(
-            "[quant_agent] 모델 로드: version=%s, train_end=%s, feature_cols=%d",
+            "[quant_agent] 모델 로드: version=%s, train_end=%s, feature_cols=%d (train↔serve 정합 OK)",
             metadata.get("version"), metadata.get("train_end"),
             len(metadata.get("feature_cols", [])),
         )
@@ -315,7 +464,13 @@ class QuantAgent(AgentBase):
     # Internal: Feature 계산 (DatasetBuilder rolling feature 동일 규약)
     # ================================================================== #
 
-    def _compute_features(self, bars: list[dict[str, Any]]) -> dict[str, float] | None:
+    def _compute_features(
+        self,
+        bars: list[dict[str, Any]],
+        ticker: str | None = None,
+        asof: str | None = None,
+        require_dual_source: bool = False,
+    ) -> dict[str, float] | None:
         """단일 ticker 최근 60 bars → 4 피처 dict (feat_ prefix).
 
         DatasetBuilder._compute_rolling_features와 동일한 수식.
@@ -353,7 +508,7 @@ class QuantAgent(AgentBase):
             last_w30 = closes[-w30:]
             mean_30 = float(last_w30.mean())
             if mean_30 > 1e-8:
-                feat_30m_vol = float(last_w30.std(ddof=0) / mean_30)
+                feat_30m_vol = float(last_w30.std(ddof=1) / mean_30)
             else:
                 feat_30m_vol = 0.0
         else:
@@ -389,12 +544,125 @@ class QuantAgent(AgentBase):
             np.clip(z_raw, -self._outlier_cap_z, self._outlier_cap_z)
         )
 
-        return {
+        feats = {
             "feat_1m_close_robust_z": feat_1m_close_robust_z,
             "feat_5m_ret": feat_5m_ret,
             "feat_30m_vol": feat_30m_vol,
             "feat_60m_trend": feat_60m_trend,
         }
+        ds_values: dict[str, float] = {}
+        if self._dual_source_feature_cols and ticker is not None and asof is not None:
+            ds_values = self._load_dual_source_features(ticker=ticker, asof=asof)
+
+        for col in self._dual_source_feature_cols:
+            if col in ds_values:
+                feats[col] = float(ds_values[col])
+            elif require_dual_source:
+                logger.warning(
+                    "[quant_agent] %s Dual-Source feature 누락: %s. "
+                    "active inference skip",
+                    ticker,
+                    col,
+                )
+                return None
+            else:
+                feats.setdefault(col, 0.0)
+        exog_values = self._get_exogenous_features(ticker)
+        for col in self._exogenous_feature_cols:
+            feats[col] = float(exog_values.get(col, self._exogenous_defaults.get(col, 0.0)))
+        return feats
+
+    def _get_exogenous_features(self, ticker: str | None) -> dict[str, float]:
+        values = dict(self._market_exogenous_snapshot)
+        if ticker:
+            flow = self.get_investor_flow_snapshot(ticker)
+            if flow is not None:
+                for col in ("foreign_net_buy", "institutional_net_buy", "retail_net_buy"):
+                    if flow.get(col) is not None:
+                        values[col] = float(flow[col])
+            values.update(self._exogenous_snapshot.get(pad_ticker(str(ticker)), {}))
+        for col, default in self._exogenous_defaults.items():
+            values.setdefault(col, default)
+        return values
+
+    def _model_requires_dual_source(self) -> bool:
+        """로드된 모델 feature manifest가 Dual-Source 피처를 실제 입력으로 요구하는지."""
+        if not self._dual_source_feature_cols:
+            return False
+        train_cols = set(self._inference_feature_cols)
+        return any(col in train_cols for col in self._dual_source_feature_cols)
+
+    def _load_dual_source_features(self, ticker: str, asof: str) -> dict[str, float]:
+        """장전 배치 C3A 점수를 date+ticker 기준으로 로드.
+
+        파일이 없거나 해당 ticker가 없으면 빈 dict를 반환한다. Dual-Source 모델 추론에서는
+        호출자가 require_dual_source=True로 빈 dict를 active inference 차단 신호로 사용한다.
+        """
+        date_key = self._asof_to_yyyymmdd(asof)
+        if date_key not in self._dual_source_cache:
+            loader = self._dual_source_loader
+            if loader is None:
+                from src.data.dual_source_runner import load_latest_scores
+
+                loader = load_latest_scores
+            try:
+                records = loader(date_key)
+            except Exception as e:
+                logger.warning(
+                    "[quant_agent] Dual-Source score load 실패 date=%s: %s",
+                    date_key,
+                    e,
+                )
+                records = []
+            ticker_map: dict[str, dict[str, float]] = {}
+            for item in records:
+                padded = pad_ticker(str(item.get("ticker", "")))
+                if not padded or padded == "000000":
+                    continue
+                values: dict[str, float] = {}
+                for col in self._dual_source_feature_cols:
+                    if col in item:
+                        values[col] = float(item[col])
+                if values:
+                    ticker_map[padded] = values
+            self._dual_source_cache[date_key] = ticker_map
+
+        return self._dual_source_cache.get(date_key, {}).get(pad_ticker(ticker), {})
+
+    @staticmethod
+    def _asof_to_yyyymmdd(asof: str) -> str:
+        raw = str(asof)
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(_KST)
+            return dt.strftime("%Y%m%d")
+        except ValueError:
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if len(digits) >= 8:
+                return digits[:8]
+            return datetime.now(_KST).strftime("%Y%m%d")
+
+    @staticmethod
+    def _parse_snapshot_dt(value: datetime | str | None) -> datetime:
+        if value is None:
+            return datetime.now(_KST)
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.fromisoformat(str(value))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     # ================================================================== #
     # Internal: Anomaly detection

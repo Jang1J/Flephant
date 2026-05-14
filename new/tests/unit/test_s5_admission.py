@@ -67,6 +67,14 @@ def _make_universe_yaml(active_tickers: list[str]) -> dict:
     }
 
 
+def _make_watch_yaml(watch_tickers: list[str]) -> dict:
+    """watch_universe_kospi200.yaml 모사."""
+    return {
+        "watch_rules": {"exclude_trade_universe": True},
+        "tickers": [{"ticker": t, "name": f"감시{t}"} for t in watch_tickers],
+    }
+
+
 def _make_price_spike_event(ticker: str, return_pct: float = 0.06) -> dict:
     """price_spike_admission 조건 만족 이벤트."""
     return {
@@ -111,6 +119,7 @@ def _make_admission_rules() -> list[dict]:
 def _make_engine(
     tmp_path: Path,
     active_tickers: list[str] | None = None,
+    watch_tickers: list[str] | None = None,
     min_trigger_count: int = 1,
     cooldown_sec: int = 300,
     candidate_pool_max: int = 10,
@@ -120,9 +129,12 @@ def _make_engine(
 
     if active_tickers is None:
         active_tickers = [str(i).zfill(6) for i in range(1, 21)]  # active 20종목
+    if watch_tickers is None:
+        watch_tickers = [str(i).zfill(6) for i in range(1, 1000)]
 
     dynamic_cfg_path = tmp_path / "dynamic_universe_config.yaml"
     universe_yaml_path = tmp_path / "universe_config.yaml"
+    watch_yaml_path = tmp_path / "watch_universe_kospi200.yaml"
     artifacts_dir = tmp_path / "dynamic_holdings"
 
     with dynamic_cfg_path.open("w", encoding="utf-8") as fh:
@@ -136,6 +148,8 @@ def _make_engine(
         )
     with universe_yaml_path.open("w", encoding="utf-8") as fh:
         yaml.dump(_make_universe_yaml(active_tickers), fh)
+    with watch_yaml_path.open("w", encoding="utf-8") as fh:
+        yaml.dump(_make_watch_yaml(watch_tickers), fh)
 
     with patch(
         "src.utils.trigger_loader.config_load",
@@ -147,6 +161,7 @@ def _make_engine(
         engine = AdmissionEngine(
             dynamic_config_path=dynamic_cfg_path,
             trade_universe_path=universe_yaml_path,
+            watch_universe_path=watch_yaml_path,
             artifacts_dir=artifacts_dir,
         )
 
@@ -226,6 +241,83 @@ def test_admission_engine_rejects_non_watch_ticker(
     result = engine.handle_event(event)
 
     assert result is None, "trade_universe ticker 는 reject 해야 함"
+
+
+def test_admission_engine_rejects_outside_watch_universe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KOSPI200 watch universe 외 종목은 candidate_pool 편입 금지."""
+    monkeypatch.setenv("ELEPHANT_TEST_PIT_SKIP", "true")
+
+    engine = _make_engine(
+        tmp_path,
+        active_tickers=["000001", "000002"],
+        watch_tickers=["000100", "000200"],
+    )
+    engine._admission_rules = _make_admission_rules()
+
+    event = _make_price_spike_event("999999", return_pct=0.06)
+    result = engine.handle_event(event)
+
+    assert result is None, "watch_universe 외 ticker 는 reject 해야 함"
+
+
+def test_admission_engine_admits_c2_price_snapshot_scope_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2 price_snapshot scope/payload bridge가 C15 admission까지 이어져야 한다."""
+    monkeypatch.setenv("ELEPHANT_TEST_PIT_SKIP", "true")
+
+    engine = _make_engine(
+        tmp_path,
+        active_tickers=["000001", "000002"],
+        watch_tickers=["000200", "000300"],
+    )
+    engine._admission_rules = _make_admission_rules()
+
+    event = {
+        "event_type": "price_snapshot",
+        "scope": "ticker:000200",
+        "occurred_at": datetime.now(_KST).isoformat(),
+        "payload": {"day_change_pct": 0.061},
+    }
+    result = engine.handle_event(event)
+
+    assert result is not None
+    assert result["ticker"] == "000200"
+    assert "price_spike_admission" in result["trigger_ids"]
+
+
+def test_admission_engine_admits_market_snapshot_strongest_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """market-scoped C16 snapshots에서 가장 큰 변동 후보를 추출해 admit한다."""
+    monkeypatch.setenv("ELEPHANT_TEST_PIT_SKIP", "true")
+
+    engine = _make_engine(
+        tmp_path,
+        active_tickers=["000001", "000002"],
+        watch_tickers=["000200", "000300"],
+    )
+    engine._admission_rules = _make_admission_rules()
+
+    event = {
+        "event_type": "price_snapshot",
+        "scope": "market",
+        "occurred_at": datetime.now(_KST).isoformat(),
+        "payload": {
+            "watch_snapshot_id": "WS-20260509-AABBCCDD",
+            "snapshots": [
+                {"ticker": "000200", "day_change_pct": 0.02},
+                {"ticker": "000300", "day_change_pct": -0.07},
+            ],
+        },
+    }
+    result = engine.handle_event(event)
+
+    assert result is not None
+    assert result["ticker"] == "000300"
+    assert "price_spike_admission" in result["trigger_ids"]
 
 
 # ================================================================
@@ -329,12 +421,15 @@ def test_admission_engine_writes_admission_event_jsonl(
 
     dynamic_cfg_path = tmp_path / "dynamic_universe_config.yaml"
     universe_yaml_path = tmp_path / "universe_config.yaml"
+    watch_yaml_path = tmp_path / "watch_universe_kospi200.yaml"
 
     active_tickers = [str(i).zfill(6) for i in range(1, 21)]
     with dynamic_cfg_path.open("w", encoding="utf-8") as fh:
         yaml.dump(_make_dynamic_cfg(), fh)
     with universe_yaml_path.open("w", encoding="utf-8") as fh:
         yaml.dump(_make_universe_yaml(active_tickers), fh)
+    with watch_yaml_path.open("w", encoding="utf-8") as fh:
+        yaml.dump(_make_watch_yaml([watch_ticker]), fh)
 
     from src.dynamic_universe.admission_engine import AdmissionEngine
 
@@ -345,6 +440,7 @@ def test_admission_engine_writes_admission_event_jsonl(
         engine = AdmissionEngine(
             dynamic_config_path=dynamic_cfg_path,
             trade_universe_path=universe_yaml_path,
+            watch_universe_path=watch_yaml_path,
             artifacts_dir=artifacts_dir,
         )
 

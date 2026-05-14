@@ -32,9 +32,11 @@ logger = get_logger("gate")
 
 _KST = ZoneInfo("Asia/Seoul")
 
-# 기본 경로
+# 기본 경로 (Codex 권고 1, 2026-05-09 fix): parents[3] → parents[2].
+# 이전: /Elephant_Lab/config/risk_config.yaml (잘못된 root, 파일 없음).
+# 현재: /Elephant_Lab/new/config/risk_config.yaml (실제 yaml 위치).
 _RISK_CONFIG_PATH_DEFAULT = (
-    Path(__file__).resolve().parents[3] / "config" / "risk_config.yaml"
+    Path(__file__).resolve().parents[2] / "config" / "risk_config.yaml"
 )
 _GATE_TRANSITIONS_DIR_DEFAULT = (
     Path(__file__).resolve().parents[3] / "artifacts" / "dynamic_holdings"

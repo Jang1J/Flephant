@@ -6,18 +6,21 @@
 2. C18 API (Sprint 2+): log_entry(AuditLogEntry), backfill_label()
    Cold Path 에이전트 + PM + ExecutionGateway 의 18-필드 decision 기록 전용.
 
-C18 AgentPerformanceContract audit_log_schema 18 필드:
+C18 AgentPerformanceContract audit_log_schema 20 필드 (2026-05-09 P1 fix: backfill 메타 2개 추가):
     ts, decision_id, agent, event_type, ticker, reason_code,
     signal_score, anomaly_flag, target_weight, actual_weight,
     fill_price, snapshot_vwap, slippage_bps, sector,
-    llm_called, llm_model, label_t5_ret, price_t5_snapshot
+    llm_called, llm_model, label_t5_ret, price_t5_snapshot,
+    label_backfilled_at, label_backfill_source
 
 PIT-Safety (불변 원칙 1):
     label_t5_ret / price_t5_snapshot 은 장중 null 로 기록.
     18:00 KST 이후 배치 job 만 backfill 허용.
     장중 backfill 시도 시 RuntimeError.
+    backfill 시 label_backfilled_at (KST ISO8601) + label_backfill_source 메타 동시 기록.
+    cause_attribution._is_label_pit_safe() 가드의 SSOT 데이터 원천.
 
-SSOT: api_contracts.md v3.5 C18 audit_log_schema.
+SSOT: api_contracts.md C18 audit_log_schema (2026-05-09 backfill 메타 2필드 추가).
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
+from src.utils.label_meta import backfill_source_default
 from src.utils.logger import get_logger
 from src.utils.time_utils import now_kst
 
@@ -75,6 +79,11 @@ class AuditLogEntry:
     llm_model: str | None = None               # kanana-o | gpt-4o
     label_t5_ret: float | None = None          # post-hoc, 18:00 이후 backfill
     price_t5_snapshot: float | None = None     # post-hoc
+    # 2026-05-09 P1 fix (Critical MA-1): C18 backfill 메타 SSOT.
+    # cause_attribution._is_label_pit_safe() 가 이 두 필드로 PIT-Safety 검증.
+    # 장중 None, 18:00 KST 이후 backfill_label() 호출 시 채움.
+    label_backfilled_at: str | None = None     # backfill 실행 KST ISO8601 (post-hoc)
+    label_backfill_source: str | None = None   # mode_b_stage_1_rollup | synth_audit_log | manual
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -177,13 +186,22 @@ class AuditLogger:
                           (PIT-Safety 위반, 불변 원칙 1).
         """
         now = now_kst()
+        has_post_hoc_label = (
+            entry.label_t5_ret is not None or entry.price_t5_snapshot is not None
+        )
         if now.hour < self._pit_safe_hour:
-            if entry.label_t5_ret is not None or entry.price_t5_snapshot is not None:
+            if has_post_hoc_label:
                 raise RuntimeError(
                     f"PIT_SAFETY_VIOLATION: label_t5_ret/price_t5_snapshot 은 "
                     f"{self._pit_safe_hour}:00 KST 이후 backfill 전용. "
                     f"장중({now.strftime('%H:%M')}) 기록 시도 차단. 불변 원칙 1."
                 )
+        elif has_post_hoc_label:
+            # 18:00 이후 직접 label을 기록하는 수동 보정 경로도 C18 metadata를 남긴다.
+            if entry.label_backfilled_at is None:
+                entry.label_backfilled_at = now.isoformat()
+            if entry.label_backfill_source is None:
+                entry.label_backfill_source = backfill_source_default()
 
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
@@ -198,11 +216,25 @@ class AuditLogger:
         decision_id: str,
         label_t5_ret: float,
         price_t5_snapshot: float,
+        source: str = "mode_b_stage_1_rollup",
     ) -> int:
-        """장마감 18:00 이후 기존 entry 에 label/price 추가. 업데이트 건수 반환.
+        """장마감 18:00 이후 기존 entry 에 label/price + backfill 메타 추가.
 
-        PIT-Safety: 18:00 KST 이전 호출 시 RuntimeError.
-        JSONL 전수 읽기 + 수정 (작은 스케일 가정, Sprint 4 최적화 예정).
+        2026-05-09 P1 fix (Critical MA-1): label_backfilled_at + label_backfill_source 동시 기록.
+        cause_attribution._is_label_pit_safe() 가드가 이 두 필드를 검증한다.
+        이 두 필드 없으면 cause_attribution 이 모든 entry 를 pit_violation 으로 분류.
+
+        Args:
+            decision_id: 대상 entry id
+            label_t5_ret: t+5min forward return
+            price_t5_snapshot: t+5min price
+            source: backfill 원천 (mode_b_stage_1_rollup | synth_audit_log | manual). default 운영.
+
+        Returns:
+            업데이트된 entry 수.
+
+        Raises:
+            RuntimeError: 18:00 KST 이전 호출 (PIT-Safety 위반).
         """
         now = now_kst()
         if now.hour < self._pit_safe_hour:
@@ -215,6 +247,9 @@ class AuditLogger:
         if not self._log_path.exists():
             return 0
 
+        # 2026-05-09 P1 fix: backfill 시각 KST ISO8601 + source 메타.
+        backfilled_at_iso = now.isoformat()
+
         updated_lines = []
         update_count = 0
         with self._log_path.open("r", encoding="utf-8") as fh:
@@ -224,6 +259,9 @@ class AuditLogger:
                     if obj.get("decision_id") == decision_id:
                         obj["label_t5_ret"] = label_t5_ret
                         obj["price_t5_snapshot"] = price_t5_snapshot
+                        # 2026-05-09 P1 fix: 두 필드 동시 기록.
+                        obj["label_backfilled_at"] = backfilled_at_iso
+                        obj["label_backfill_source"] = source
                         update_count += 1
                     updated_lines.append(json.dumps(obj, ensure_ascii=False) + "\n")
                 except json.JSONDecodeError as e:

@@ -4,13 +4,15 @@
 
 ## 사용 패턴
     client = ECOSRestClient()
-    rate_data = client.get_stat_data("098Y001", start_date="20260101", end_date="20260421")
+    rate_data = client.get_stat_data(
+        "722Y001", start_date="20260101", end_date="20260421", item_codes=("0101000",)
+    )
     pack = client.get_macro_pack("20260421")
     # {'interest_rate': 3.50, 'usd_krw': 1340.5}
 
 ## 수집 대상 (C3 macro 2 피처)
-- 기준금리 (ECOS stat_code: 098Y001)
-- 원/달러 환율 (ECOS stat_code: 036Y001)
+- 기준금리 (ECOS stat_code: 722Y001, item_code: 0101000)
+- 원/달러 환율 (ECOS stat_code: 731Y001, item_code: 0000001)
 
 ## Mock 모드
 ECOS_API_KEY 미설정 시 mock 자동 분기. Sprint 2 구현 + Sprint 4 실 API 통합.
@@ -41,10 +43,14 @@ logger = get_logger("ecos_rest")
 _ECOS_BASE_URL = "https://ecos.bok.or.kr/api/StatisticSearch"
 _KST = ZoneInfo("Asia/Seoul")
 
-# ECOS 공식 stat_code (C3 macro 2 피처)
+# ECOS 공식 stat_code/item_code (C3 macro 2 피처)
 _STAT_CODES = {
-    "interest_rate": "098Y001",    # 기준금리
-    "usd_krw": "036Y001",          # 원/달러 환율
+    "interest_rate": "722Y001",    # 한국은행 기준금리 및 여수신금리
+    "usd_krw": "731Y001",          # 주요국 통화의 대원화환율
+}
+_STAT_ITEM_CODES = {
+    "interest_rate": ("0101000",),  # 한국은행 기준금리
+    "usd_krw": ("0000001",),        # 원/미국달러(매매기준율)
 }
 
 
@@ -52,7 +58,7 @@ _STAT_CODES = {
 class ECOSDatapoint:
     """ECOS API 단일 observation."""
 
-    stat_code: str        # 098Y001 등
+    stat_code: str        # 722Y001 등
     stat_name: str        # 기준금리
     date_str: str         # YYYYMMDD (ECOS 원본 형식)
     date: datetime        # tz-aware KST
@@ -99,6 +105,7 @@ class ECOSRestClient(BaseConnector):
         start_date: str,
         end_date: str,
         interval: str = "D",
+        item_codes: tuple[str, ...] | None = None,
     ) -> list[ECOSDatapoint]:
         """ECOS 통계 데이터 조회.
 
@@ -106,10 +113,12 @@ class ECOSRestClient(BaseConnector):
         미래 데이터 참조 금지. 호출자가 end_date 를 현재 날짜 이하로 설정해야 함.
 
         Args:
-            stat_code: 통계표 코드 (예: '098Y001' 기준금리)
+            stat_code: 통계표 코드 (예: '722Y001' 기준금리)
             start_date: 시작일 'YYYYMMDD'
             end_date: 종료일 'YYYYMMDD'
             interval: D(일) | M(월) | Q(분기) | A(연)
+            item_codes: 통계항목 코드. ECOS 일부 표는 item_code 없이 호출하면
+                여러 항목이 섞이거나 빈 row를 반환한다.
 
         Returns:
             ECOSDatapoint 리스트.
@@ -133,16 +142,30 @@ class ECOSRestClient(BaseConnector):
             return self._mock_data(stat_code, start_date, end_date, interval)
 
         self._rate_limiter.wait_and_acquire()
+        item_path = ""
+        if item_codes:
+            item_path = "/" + "/".join(str(code) for code in item_codes)
         url = (
             f"{_ECOS_BASE_URL}/{self._api_key}/json/kr/1/100"
-            f"/{stat_code}/{interval}/{start_date}/{end_date}"
+            f"/{stat_code}/{interval}/{start_date}/{end_date}{item_path}"
         )
         resp_json = self._http_get_with_retry(url)
         if resp_json is None:
             return []
 
         # ECOS 응답: {"StatisticSearch": {"list_total_count": N, "row": [{...}, ...]}}
-        search = resp_json.get("StatisticSearch", {})
+        search = resp_json.get("StatisticSearch")
+        if not isinstance(search, dict):
+            result = resp_json.get("RESULT", {})
+            logger.warning(
+                "[ecos_rest] StatisticSearch 없음. stat_code=%s item_codes=%s "
+                "result_code=%s message=%s",
+                stat_code,
+                item_codes,
+                result.get("CODE"),
+                result.get("MESSAGE"),
+            )
+            return []
         rows = search.get("row", [])
         return [self._parse_row(r, stat_code) for r in rows]
 
@@ -163,15 +186,22 @@ class ECOSRestClient(BaseConnector):
 
         result: dict[str, float] = {}
         for feature_name, stat_code in _STAT_CODES.items():
-            points = self.get_stat_data(stat_code, start_date, end_date)
+            item_codes = _STAT_ITEM_CODES.get(feature_name)
+            points = self.get_stat_data(
+                stat_code,
+                start_date,
+                end_date,
+                item_codes=item_codes,
+            )
             if points:
                 latest = max(points, key=lambda p: p.date_str)
                 result[feature_name] = latest.value
             else:
                 logger.warning(
-                    "[ecos_rest] %s (%s) 조회 실패. 0 fallback.",
+                    "[ecos_rest] %s (%s/%s) 조회 실패. 0 fallback.",
                     feature_name,
                     stat_code,
+                    ",".join(item_codes or ()),
                 )
                 result[feature_name] = 0.0
         return result
@@ -237,7 +267,12 @@ class ECOSRestClient(BaseConnector):
         """ECOS 응답 row 파싱."""
         date_str = raw.get("TIME", "")
         try:
-            date = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=_KST)
+            if len(date_str) == 8:
+                date = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=_KST)
+            elif len(date_str) == 6:
+                date = datetime.strptime(date_str, "%Y%m").replace(tzinfo=_KST)
+            else:
+                raise ValueError(f"unsupported TIME={date_str}")
         except ValueError:
             logger.debug("[ecos_rest] TIME 파싱 실패: %s", date_str)
             date = datetime.now(_KST)
@@ -292,6 +327,8 @@ class ECOSRestClient(BaseConnector):
         mock_values: dict[str, float] = {
             "098Y001": 3.50,    # 기준금리 3.5%
             "036Y001": 1340.5,  # 원/달러 1340.5원
+            "722Y001": 3.50,    # 한국은행 기준금리
+            "731Y001": 1340.5,  # 원/미국달러(매매기준율)
         }
         default_val = mock_values.get(stat_code, 100.0)
         return [

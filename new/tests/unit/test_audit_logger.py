@@ -1,7 +1,7 @@
-"""AuditLogger C18 18 필드 + PIT-Safety + backfill 테스트.
+"""AuditLogger C18 20 필드 (2026-05-09 P1 fix: backfill 메타 2개 추가) + PIT-Safety + backfill 테스트.
 
 coverage:
-  - AuditLogEntry 18 필드 완전성 (C18 schema)
+  - AuditLogEntry 20 필드 완전성 (C18 schema, 2026-05-09 backfilled_at + backfill_source 추가)
   - log_entry: 정상 기록 (장중 label None)
   - log_entry: 장중 label_t5_ret 기록 시도 → RuntimeError (PIT-Safety)
   - log_entry: 장중 price_t5_snapshot 기록 시도 → RuntimeError (PIT-Safety)
@@ -38,8 +38,12 @@ def _kst(hour: int, minute: int = 0) -> datetime:
 # ------------------------------------------------------------------ #
 
 
-def test_audit_entry_18_fields_c18_schema():
-    """AuditLogEntry 가 C18 18 필드 전부 지원 (required 5 + nullable 13)."""
+def test_audit_entry_20_fields_c18_schema():
+    """AuditLogEntry 가 C18 20 필드 전부 지원 (2026-05-09: backfill 메타 2개 추가).
+
+    P1 fix (2026-05-09): label_backfilled_at + label_backfill_source 추가.
+    cause_attribution._is_label_pit_safe() 가드의 SSOT 데이터 원천.
+    """
     from src.ops.audit_logger import AuditLogEntry
 
     entry_fields = {f.name for f in fields(AuditLogEntry)}
@@ -50,16 +54,18 @@ def test_audit_entry_18_fields_c18_schema():
         "fill_price", "snapshot_vwap", "slippage_bps",
         "sector", "llm_called", "llm_model",
         "label_t5_ret", "price_t5_snapshot",
+        # 2026-05-09 P1 fix
+        "label_backfilled_at", "label_backfill_source",
     }
     missing = expected - entry_fields
     extra = entry_fields - expected
     assert not missing, f"C18 누락 필드: {missing}"
     assert not extra, f"C18 예상 외 필드: {extra}"
-    assert len(entry_fields) == 18, f"필드 개수 {len(entry_fields)} != 18"
+    assert len(entry_fields) == 20, f"필드 개수 {len(entry_fields)} != 20"
 
 
-def test_audit_entry_to_dict_all_18_keys():
-    """AuditLogEntry.to_dict() 결과가 18 키 포함."""
+def test_audit_entry_to_dict_all_20_keys():
+    """AuditLogEntry.to_dict() 결과가 20 키 포함 (P1 fix 2026-05-09)."""
     from src.ops.audit_logger import AuditLogEntry
 
     entry = AuditLogEntry(
@@ -71,11 +77,14 @@ def test_audit_entry_to_dict_all_18_keys():
         signal_score=0.72,
     )
     d = entry.to_dict()
-    assert len(d) == 18
+    assert len(d) == 20
     assert d["ticker"] == "005930"
     assert d["signal_score"] == pytest.approx(0.72)
     assert d["label_t5_ret"] is None
     assert d["price_t5_snapshot"] is None
+    # 2026-05-09 P1 fix: backfill 메타 default None
+    assert d["label_backfilled_at"] is None
+    assert d["label_backfill_source"] is None
 
 
 # ------------------------------------------------------------------ #
@@ -84,7 +93,7 @@ def test_audit_entry_to_dict_all_18_keys():
 
 
 def test_log_entry_writes_jsonl(tmp_path: Path):
-    """log_entry: JSONL 파일에 18 필드 entry 기록."""
+    """log_entry: JSONL 파일에 20 필드 entry 기록 (P1 fix 2026-05-09)."""
     from src.ops.audit_logger import AuditLogger, AuditLogEntry
 
     log = AuditLogger(log_path=tmp_path / "audit.jsonl")
@@ -154,7 +163,7 @@ def test_log_entry_pit_safety_blocks_intraday_price_snapshot(tmp_path: Path):
 
 
 def test_log_entry_after_1800_allows_label(tmp_path: Path):
-    """18:00 이후 label_t5_ret 기록 허용."""
+    """18:00 이후 label_t5_ret 기록 시 C18 backfill metadata 자동 보강."""
     from src.ops.audit_logger import AuditLogger, AuditLogEntry
 
     log = AuditLogger(log_path=tmp_path / "audit.jsonl")
@@ -174,6 +183,8 @@ def test_log_entry_after_1800_allows_label(tmp_path: Path):
     lines = (tmp_path / "audit.jsonl").read_text().splitlines()
     rec = json.loads(lines[0])
     assert rec["label_t5_ret"] == pytest.approx(0.02)
+    assert rec["label_backfilled_at"] == "2026-04-21T19:00:00+09:00"
+    assert rec["label_backfill_source"] == "manual"
 
 
 # ------------------------------------------------------------------ #
@@ -210,6 +221,35 @@ def test_backfill_label_after_1800_kst(tmp_path: Path):
     target = next(e for e in entries if e["decision_id"] == "DEC-20260421-0001")
     assert target["label_t5_ret"] == pytest.approx(0.015)
     assert target["price_t5_snapshot"] == pytest.approx(71500.0)
+    # 2026-05-09 P1 fix (Critical MA-1): backfill 메타 SSOT 검증.
+    # cause_attribution._is_label_pit_safe() 가 이 두 필드로 PIT-Safety 판정.
+    assert target["label_backfilled_at"] is not None
+    assert target["label_backfilled_at"].startswith("2026-")
+    assert target["label_backfill_source"] == "mode_b_stage_1_rollup"  # default
+
+
+def test_backfill_label_with_custom_source(tmp_path: Path):
+    """2026-05-09 P1 fix: backfill source 파라미터 전달 검증."""
+    from src.ops.audit_logger import AuditLogger, AuditLogEntry
+
+    log = AuditLogger(log_path=tmp_path / "audit.jsonl")
+
+    entry = AuditLogEntry(
+        ts="2026-04-21T10:00:00+09:00",
+        decision_id="DEC-20260421-0001",
+        agent="quant",
+        event_type="signal",
+        ticker="005930",
+    )
+    with patch("src.ops.audit_logger.now_kst", return_value=_kst(10)):
+        log.log_entry(entry)
+
+    with patch("src.ops.audit_logger.now_kst", return_value=_kst(19)):
+        log.backfill_label("DEC-20260421-0001", 0.01, 70000.0, source="manual")
+
+    entries = log.read_entries()
+    target = entries[0]
+    assert target["label_backfill_source"] == "manual"
 
 
 def test_backfill_label_before_1800_raises(tmp_path: Path):

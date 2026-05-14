@@ -30,7 +30,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger("fda")
 
-_FDA_COLD_CALLER = "fda"
+_FDA_COLD_CALLER = "fda_cold_path"
 
 
 class MissingPortfolioPatchError(ValueError):

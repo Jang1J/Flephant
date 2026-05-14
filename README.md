@@ -14,7 +14,7 @@ Mode B 장마감 (18:00~22:00):
 ```
 
 - **6 시스템 에이전트**: News, Risk(Fast/Slow), Quant, Debate, FDA, Backtest(Mode B)
-- **18 API Contracts**: C1~C18 (`new/specs/api_contracts.md` = SSOT, v3.5 현행)
+- **18 API Contracts**: C1~C18 (`new/specs/api_contracts.md` = SSOT, v3.8 현행)
 - **Blackboard 통신**: Shared Message Pool + Pub/Sub (MetaGPT 기반)
 
 ## 핵심 차별점
@@ -49,7 +49,7 @@ Elephant_Lab/
 │   │   ├── execution/      #   Execution Gateway
 │   │   ├── portfolio/      #   Portfolio Manager
 │   │   └── ops/            #   AuditLogger (C18)
-│   ├── tests/              # pytest (920 passed, 1 skipped — Sprint 3 ship-ready)
+│   ├── tests/              # pytest 기반 contract/unit/integration 회귀 테스트
 │   ├── jobs/               # E2E / replay / backfill / Mode B 진입 스크립트
 │   └── artifacts/          # gitignored 런타임 산출물 (모델/팩터/오디트)
 ├── CLAUDE.md               # v3 기준 프로젝트 가이드

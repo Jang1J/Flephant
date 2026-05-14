@@ -75,10 +75,12 @@ class ModelMetadata:
     train_end: str
     feature_cols: list[str]
     label_horizon_bars: int
+    label_generation_version: str
+    label_session_scope: str
     metrics: dict[str, float]
     commit_hash: str
     data_version: str
-    status: str = "active"            # active | archived | rollback
+    status: str = "active"            # candidate | active | archived | rollback
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,7 +91,18 @@ class ModelMetadata:
 # ====================================================================== #
 
 
-_ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ARTIFACTS_ROOT = _REPO_ROOT / "artifacts"
+_DEPLOY_ACTIVATION_TOKEN = object()
+
+
+def _path_for_metadata(path: Path) -> str:
+    """Store repo-local artifact paths portably while keeping tmp paths absolute."""
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(_REPO_ROOT))
+    except ValueError:
+        return str(resolved)
 
 
 class ModelRegistry:
@@ -108,9 +121,16 @@ class ModelRegistry:
         if artifacts_dir is not None:
             self.base_dir: Path = Path(artifacts_dir)
         else:
-            # risk_config.yaml artifacts_dir: "artifacts/lgbm" → repo root 기준
-            repo_root = Path(__file__).resolve().parents[3]
-            self.base_dir = repo_root / self._dir_name
+            override_dir = os.getenv("ELEPHANT_LGBM_REGISTRY_DIR", "").strip()
+            if override_dir:
+                override_path = Path(override_dir)
+                self.base_dir = (
+                    override_path if override_path.is_absolute()
+                    else _REPO_ROOT / override_path
+                )
+            else:
+                # risk_config.yaml artifacts_dir: "artifacts/lgbm" → repo root 기준
+                self.base_dir = _REPO_ROOT / self._dir_name
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -135,9 +155,18 @@ class ModelRegistry:
         """
         # 1. 자동 주입 가능한 필드 먼저 채움
         enriched = dict(metadata)
+        if is_latest and enriched.get("bundle_id"):
+            raise ValueError(
+                "bundle_id가 있는 모델은 C12/C14 deploy gate 전 active/latest로 저장할 수 없다. "
+                "candidate 저장은 is_latest=False를 사용하라."
+            )
         enriched.setdefault("created_at", _now_iso())
         enriched.setdefault("commit_hash", _git_commit_hash())
-        enriched.setdefault("status", "active")
+        if is_latest:
+            enriched.setdefault("status", "active")
+        else:
+            # Candidate 저장은 deploy gate 전 단계다. active status는 gate 내부에서만 허용한다.
+            enriched["status"] = "candidate"
 
         # 2. required fields 검증 (자동 주입 후)
         self._assert_metadata_fields(enriched)
@@ -151,8 +180,8 @@ class ModelRegistry:
             pickle.dump(model, fh)
 
         # 4. metadata 경로 확정
-        enriched["model_path"] = str(pkl_path)
-        enriched["metadata_path"] = str(meta_path)
+        enriched["model_path"] = _path_for_metadata(pkl_path)
+        enriched["metadata_path"] = _path_for_metadata(meta_path)
 
         with meta_path.open("w", encoding="utf-8") as fh:
             json.dump(enriched, fh, ensure_ascii=False, indent=2)
@@ -298,6 +327,123 @@ class ModelRegistry:
         self._write_registry_index(registry)
         logger.info("[registry] rollback 완료: active=%s", version)
 
+    def activate_deployed_candidate(
+        self,
+        version: str,
+        *,
+        deploy_token: object | None = None,
+    ) -> dict[str, Any]:
+        """C14 deploy gate 통과 후 candidate version을 active로 승격한다.
+
+        일반 ``save(..., is_latest=True)`` 는 ``bundle_id``가 있는 후보를 막는다.
+        이 메서드는 ModeBDeployer가 C12/C14 검증을 끝낸 뒤에만 호출하는 승격 경로다.
+        """
+        if deploy_token is not _DEPLOY_ACTIVATION_TOKEN:
+            raise PermissionError(
+                "activate_deployed_candidate는 ModeBDeployer 내부 deploy token 경유로만 호출 가능"
+            )
+        version = str(version).strip()
+        if not version:
+            raise VersionNotFoundError("activate 대상 version이 비어 있음")
+
+        pkl_path = self.base_dir / f"{version}.pkl"
+        meta_path = self.base_dir / f"{version}_metadata.json"
+        if not pkl_path.exists():
+            raise VersionNotFoundError(f"activate 대상 version={version} pkl 없음")
+        if not meta_path.exists():
+            raise VersionNotFoundError(f"activate 대상 version={version} metadata 없음")
+
+        try:
+            with meta_path.open("r", encoding="utf-8") as fh:
+                metadata = json.load(fh)
+        except json.JSONDecodeError as e:
+            raise RegistryCorruptedError(
+                f"metadata JSON 파싱 실패 version={version}: {e}"
+            ) from e
+
+        metadata["status"] = "active"
+        metadata["model_path"] = _path_for_metadata(pkl_path)
+        metadata["metadata_path"] = _path_for_metadata(meta_path)
+        self._assert_metadata_fields(metadata)
+
+        self._update_latest_pointer(pkl_path)
+
+        registry = self._read_registry_index()
+        versions: list[dict[str, Any]] = list(registry.get("versions", []))
+        found = False
+        for entry in versions:
+            if entry.get("version") == version:
+                entry.update(metadata)
+                entry["status"] = "active"
+                found = True
+            elif entry.get("status") == "active":
+                entry["status"] = "rollback"
+        if not found:
+            versions.append(metadata)
+
+        registry["schema_version"] = self._schema_version
+        registry["active_version"] = version
+        registry["versions"] = versions
+        self._write_registry_index(registry)
+
+        with meta_path.open("w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, ensure_ascii=False, indent=2)
+
+        logger.info("[registry] deploy 승격 완료: active=%s", version)
+        return metadata
+
+    def restore_active_version(
+        self,
+        version: str | None,
+        *,
+        clear_latest_pointer: bool = True,
+    ) -> None:
+        """C14 rollback 시 registry active_version을 이전 상태로 복원한다."""
+        version_norm = str(version).strip() if version is not None else None
+        version_norm = version_norm or None
+
+        registry = self._read_registry_index()
+        versions: list[dict[str, Any]] = list(registry.get("versions", []))
+
+        if version_norm is None:
+            registry["active_version"] = None
+            for entry in versions:
+                if entry.get("status") == "active":
+                    entry["status"] = "candidate" if entry.get("bundle_id") else "rollback"
+            if clear_latest_pointer:
+                latest_path = self.base_dir / self._latest_name
+                if latest_path.exists() or latest_path.is_symlink():
+                    latest_path.unlink()
+            registry["versions"] = versions
+            self._write_registry_index(registry)
+            logger.info("[registry] active_version 비움")
+            return
+
+        pkl_path = self.base_dir / f"{version_norm}.pkl"
+        if not pkl_path.exists():
+            raise VersionNotFoundError(
+                f"restore 대상 version={version_norm} pkl 없음"
+            )
+
+        found = False
+        for entry in versions:
+            if entry.get("version") == version_norm:
+                entry["status"] = "active"
+                found = True
+            elif entry.get("status") == "active":
+                entry["status"] = "rollback"
+        if not found:
+            raise VersionNotFoundError(
+                f"restore 대상 version={version_norm} registry 항목 없음"
+            )
+
+        self._update_latest_pointer(pkl_path)
+        registry["schema_version"] = self._schema_version
+        registry["active_version"] = version_norm
+        registry["versions"] = versions
+        self._write_registry_index(registry)
+        logger.info("[registry] active_version 복원: %s", version_norm)
+
     # ================================================================== #
     # registry.json 관리
     # ================================================================== #
@@ -355,8 +501,6 @@ class ModelRegistry:
         registry["schema_version"] = self._schema_version
         registry["versions"] = versions
         if is_latest:
-            registry["active_version"] = version
-        elif not registry.get("active_version"):
             registry["active_version"] = version
         self._write_registry_index(registry)
 

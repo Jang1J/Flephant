@@ -11,6 +11,10 @@ C14 ModeBDeployer: 검증 통과 번들만 Hot Path에 반영.
   - Mode B 전용: @mode_b_only 데코레이터 강제.
 
 artifacts 경로 구조:
+  artifacts/bundles/{bundle_id}/alpha_factor/factor_zoo.jsonl
+  artifacts/bundles/{bundle_id}/lgbm/latest_model.pkl
+  artifacts/bundles/{bundle_id}/lgbm/committee.pkl
+  artifacts/bundles/{bundle_id}/ppo/latest_policy.pkl
   artifacts/backup/{deploy_id}/factor_zoo.jsonl.bak
   artifacts/backup/{deploy_id}/model_registry/lightgbm.pkl.bak
   artifacts/backup/{deploy_id}/model_registry/committee.pkl.bak
@@ -24,12 +28,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.models.registry import ModelRegistry, _DEPLOY_ACTIVATION_TOKEN
+from src.mode_b.service_policy_verifier import verify_service_policy_evidence
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_deploy_id, generate_regression_case_id
 from src.utils.logger import get_logger
@@ -82,7 +89,9 @@ class RegressionRisk:
 
     flagged: bool = False
     severity: str = "low"          # low | medium | high
-    evidence: dict[str, Any] = field(default_factory=dict)
+    # P1 fix (2026-05-09): C12 schema (api_contracts.md L885) evidence: [string] 정합.
+    # 이전 dict 타입 → list[str] 로 변경. ic_drop / ic_diff 등 수치는 문자열 직렬화.
+    evidence: list[str] = field(default_factory=list)
     snapshot_metrics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -90,7 +99,7 @@ class RegressionRisk:
 # ModeBDeployer
 # ────────────────────────────────────────────────────────────────────
 
-_ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "new" / "artifacts"
+_ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
 
 # 심각도 순위 (비교용)
 _SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
@@ -170,6 +179,8 @@ class ModeBDeployer:
         backtest_verdict: str,
         sanity_check_result: str,
         regression_risk: RegressionRisk | None = None,
+        service_policy_evidence: dict[str, Any] | None = None,
+        feature_quality: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """검증된 번들을 Hot Path 아티팩트에 atomic swap 배포.
 
@@ -178,6 +189,10 @@ class ModeBDeployer:
             backtest_verdict: "pass" | "warn" | "fail" (C12 verdict).
             sanity_check_result: "ok" (leakage_check + smoke_test 통합 결과).
             regression_risk: RegressionRisk 객체. None 이면 RegressionRisk() 기본값.
+            service_policy_evidence: service-policy replay evidence. Production
+                root deploy requires PASS.
+            feature_quality: C12 feature coverage telemetry. Production root
+                deploy requires configured non-neutral coverage.
 
         Returns:
             배포 결과 딕셔너리 (deploy_id, bundle_id, deployed_at, swapped_components,
@@ -203,39 +218,67 @@ class ModeBDeployer:
         # ── 2. Verdict 분기 ───────────────────────────────────────────
         self._check_verdict(backtest_verdict, deploy_id)
 
-        # ── 3. Atomic swap ────────────────────────────────────────────
-        backup_dir = self._root / "backup" / deploy_id
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        (backup_dir / "model_registry").mkdir(parents=True, exist_ok=True)
-
-        swapped: list[str] = []
-        try:
-            swapped = self._atomic_swap_all(deploy_id, backup_dir)
-        except Exception as swap_err:
-            logger.warning("[ModeBDeployer] swap 실패: %s. rollback 시작. swapped=%s", swap_err, swapped)
-            rolled_back = self._rollback_components(swapped, backup_dir)
-            raise PartialDeployRollback(
-                failed_step=str(swap_err),
-                rolled_back=rolled_back,
-            ) from swap_err
-
-        # ── 4. metadata.json 저장 ─────────────────────────────────────
-        self._save_backup_metadata(backup_dir, deploy_id, bundle_id, swapped)
-
-        # ── 5. RegressionCase 생성 (flagged=True 시) ──────────────────
-        rgc_id: str | None = None
+        # ── 3. Regression risk gate ───────────────────────────────────
         if regression_risk.flagged:
             rgc_id = self._create_regression_case(
                 deploy_id=deploy_id,
                 bundle_id=bundle_id,
                 regression_risk=regression_risk,
             )
-            logger.info("[ModeBDeployer] RegressionCase 생성: %s", rgc_id)
+            raise DeployBlocked(
+                "regression_risk_flagged",
+                (
+                    f"regression_risk.flagged=True severity={regression_risk.severity!r} "
+                    f"regression_case_id={rgc_id}"
+                ),
+            )
+
+        # ── 3b. C14 extended deploy gates ──────────────────────────────
+        # Unit tests and isolated temp roots may call deploy() directly. The
+        # production artifact root must still fail closed unless the caller
+        # supplies C12 feature-quality and service-policy evidence.
+        if self._root == _ARTIFACTS_ROOT:
+            self._check_feature_quality_gate(feature_quality or {})
+            self._check_service_policy_gate(service_policy_evidence or {}, bundle_id=bundle_id)
+
+        # ── 4. Atomic swap ────────────────────────────────────────────
+        self._validate_candidate_bundle(bundle_id)
+        previous_active_version = self._current_lgbm_active_version()
+        backup_dir = self._root / "backup" / deploy_id
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "model_registry").mkdir(parents=True, exist_ok=True)
+
+        swapped: list[str] = []
+        activated_model_version: str | None = None
+        try:
+            swapped = self._atomic_swap_all(bundle_id, backup_dir)
+            activated_model_version = self._activate_lgbm_registry(bundle_id)
+        except Exception as swap_err:
+            logger.warning("[ModeBDeployer] swap 실패: %s. rollback 시작. swapped=%s", swap_err, swapped)
+            rolled_back = self._rollback_components(swapped, backup_dir)
+            try:
+                self._restore_lgbm_registry(previous_active_version)
+            except Exception as registry_err:
+                logger.warning("[ModeBDeployer] registry rollback 실패: %s", registry_err)
+            raise PartialDeployRollback(
+                failed_step=str(swap_err),
+                rolled_back=rolled_back,
+            ) from swap_err
+
+        # ── 5. metadata.json 저장 ─────────────────────────────────────
+        self._save_backup_metadata(
+            backup_dir,
+            deploy_id,
+            bundle_id,
+            swapped,
+            previous_active_version=previous_active_version,
+            activated_model_version=activated_model_version,
+        )
 
         deployed_at = datetime.now(_KST).isoformat()
         logger.info(
             "[ModeBDeployer] 배포 완료: deploy_id=%s swapped=%s rgc_id=%s deployed_at=%s",
-            deploy_id, swapped, rgc_id, deployed_at,
+            deploy_id, swapped, None, deployed_at,
         )
 
         on_pass = self._gate_cfg.get("on_pass", {})
@@ -245,9 +288,10 @@ class ModeBDeployer:
             "deployed_at": deployed_at,
             "swapped_components": swapped,
             "rollback_required": False,
-            "regression_case_id": rgc_id,
+            "regression_case_id": None,
             "verdict": backtest_verdict,
             "human_approval_required": on_pass.get("human_approval_required", False),
+            "activated_model_version": activated_model_version,
         }
 
     @mode_b_only
@@ -279,6 +323,8 @@ class ModeBDeployer:
 
         swapped_components = metadata.get("swapped_components", [])
         restored = self._rollback_components(swapped_components, backup_dir)
+        if "previous_active_version" in metadata:
+            self._restore_lgbm_registry(metadata.get("previous_active_version"))
 
         rolled_back_at = datetime.now(_KST).isoformat()
         logger.info("[ModeBDeployer] rollback 완료: deploy_id=%s restored=%s", deploy_id, restored)
@@ -299,23 +345,53 @@ class ModeBDeployer:
         sanity_check_result: str,
         regression_risk: RegressionRisk,
     ) -> None:
-        """sanity_check_result 및 regression_severity_block 검증."""
+        """sanity_check_result 및 regression_risk 배포 조건 검증."""
         if sanity_check_result != "ok":
             raise DeployBlocked(
                 "sanity_check_failed",
                 f"sanity_check_result={sanity_check_result!r} (필요값: 'ok')",
             )
 
-        block_severity = self._gate_cfg.get("regression_severity_block", "high")
-        if (
-            regression_risk.flagged
-            and _SEVERITY_ORDER.get(regression_risk.severity, 0)
-            >= _SEVERITY_ORDER.get(block_severity, 2)
-        ):
+    def _check_feature_quality_gate(self, feature_quality: dict[str, Any]) -> None:
+        """Block production deploy when Phase 2 feature coverage is missing/neutral."""
+        gate_cfg = self._gate_cfg.get("feature_quality_gate", {}) or {}
+        min_dual = float(gate_cfg.get("min_dual_source_non_neutral_row_coverage", 0.8))
+        min_exog = float(gate_cfg.get("min_exogenous_non_neutral_row_coverage", 0.8))
+        dual_rows = int(feature_quality.get("dual_source_rows", 0) or 0)
+        dual_non_neutral = int(feature_quality.get("dual_source_non_neutral_rows", 0) or 0)
+        exog_rows = int(feature_quality.get("exogenous_rows", 0) or 0)
+        exog_non_neutral = int(feature_quality.get("exogenous_non_neutral_rows", 0) or 0)
+        dual_rate = dual_non_neutral / max(dual_rows, 1)
+        exog_rate = exog_non_neutral / max(exog_rows, 1)
+        if dual_rows <= 0 or exog_rows <= 0 or dual_rate < min_dual or exog_rate < min_exog:
             raise DeployBlocked(
-                "regression_severity_blocked",
-                f"regression severity={regression_risk.severity!r} >= block={block_severity!r}",
+                "feature_quality_gate_failed",
+                (
+                    f"dual_source_non_neutral={dual_non_neutral}/{dual_rows} "
+                    f"exogenous_non_neutral={exog_non_neutral}/{exog_rows}"
+                ),
             )
+
+    def _check_service_policy_gate(self, evidence: dict[str, Any], *, bundle_id: str) -> None:
+        """Block production deploy unless service-policy replay is PASS."""
+        verification = verify_service_policy_evidence(
+            evidence,
+            bundle_id=bundle_id,
+            repo_root=self._repo_root_for_evidence(),
+        )
+        if not verification.passed:
+            raise DeployBlocked(
+                "service_policy_gate_failed",
+                (
+                    f"service_policy_status={evidence.get('status')!r} "
+                    f"blockers={verification.blockers}"
+                ),
+            )
+
+    def _repo_root_for_evidence(self) -> Path:
+        if self._root.name == "artifacts":
+            return self._root.parent
+        return self._root
 
     def _check_verdict(self, backtest_verdict: str, deploy_id: str) -> None:
         """verdict 분기. warn/fail 시 DeployBlocked raise."""
@@ -348,33 +424,144 @@ class ModeBDeployer:
     # private: atomic swap
     # ────────────────────────────────────────────────────
 
-    def _atomic_swap_all(self, deploy_id: str, backup_dir: Path) -> list[str]:
+    def _atomic_swap_all(self, bundle_id: str, backup_dir: Path) -> list[str]:
         """4단계 순차 swap. 각 단계 실패 시 즉시 Exception raise."""
         swapped: list[str] = []
+        bundle_root = self._bundle_root(bundle_id)
 
         # Step A-D: 주요 컴포넌트
         for component_name, (src_rel, dest_rel, bak_name) in _COMPONENT_PATHS.items():
+            if component_name == "ppo_policy" and not (bundle_root / src_rel).exists():
+                logger.info("[ModeBDeployer] ppo_policy 후보 없음. 기존 PPO/heuristic 유지.")
+                continue
             self._swap_single(
                 component_name=component_name,
-                src_path=self._root / src_rel,
+                src_path=bundle_root / src_rel,
                 dest_path=self._root / dest_rel,
                 backup_path=backup_dir / bak_name,
             )
             swapped.append(component_name)
 
         # Step E: agent_constraints (있다면)
-        _, dest_rel_opt, bak_name_opt = _OPTIONAL_COMPONENT_PATH["agent_constraints"]
-        dest_path_opt = self._root / dest_rel_opt
-        if dest_path_opt.exists():
+        src_rel_opt, dest_rel_opt, bak_name_opt = _OPTIONAL_COMPONENT_PATH["agent_constraints"]
+        src_path_opt = bundle_root / src_rel_opt
+        if src_path_opt.exists():
             self._swap_single(
                 component_name="agent_constraints",
-                src_path=dest_path_opt,
-                dest_path=dest_path_opt,
+                src_path=src_path_opt,
+                dest_path=self._root / dest_rel_opt,
                 backup_path=backup_dir / bak_name_opt,
             )
             swapped.append("agent_constraints")
 
         return swapped
+
+    def _bundle_root(self, bundle_id: str) -> Path:
+        """검증 완료 candidate bundle staging root."""
+        return self._root / "bundles" / bundle_id
+
+    def _validate_candidate_bundle(self, bundle_id: str) -> None:
+        """live 파일을 건드리기 전에 candidate bundle 존재/무결성을 검증."""
+        bundle_root = self._bundle_root(bundle_id)
+        problems: list[str] = []
+
+        for component_name, (src_rel, dest_rel, _bak_name) in _COMPONENT_PATHS.items():
+            src_path = bundle_root / src_rel
+            dest_path = self._root / dest_rel
+            if component_name == "ppo_policy" and not src_path.exists():
+                continue
+            if src_path.resolve() == dest_path.resolve():
+                problems.append(f"{component_name}: source_equals_dest:{src_path}")
+                continue
+            if not src_path.is_file():
+                problems.append(f"{component_name}: missing:{src_path}")
+                continue
+            if src_path.stat().st_size <= 0:
+                problems.append(f"{component_name}: empty:{src_path}")
+
+        lgbm_metadata_path = bundle_root / "lgbm" / "latest_model_metadata.json"
+        if not lgbm_metadata_path.is_file():
+            problems.append(f"lgbm_model_metadata: missing:{lgbm_metadata_path}")
+        elif lgbm_metadata_path.stat().st_size <= 0:
+            problems.append(f"lgbm_model_metadata: empty:{lgbm_metadata_path}")
+        else:
+            try:
+                with lgbm_metadata_path.open("r", encoding="utf-8") as fh:
+                    lgbm_metadata = json.load(fh)
+                if not str(lgbm_metadata.get("version", "")).strip():
+                    problems.append("lgbm_model_metadata: missing_version")
+                if lgbm_metadata.get("bundle_id") != bundle_id:
+                    problems.append(
+                        "lgbm_model_metadata: bundle_id_mismatch:"
+                        f"{lgbm_metadata.get('bundle_id')!r}"
+                    )
+            except json.JSONDecodeError as e:
+                problems.append(f"lgbm_model_metadata: invalid_json:{e}")
+
+        src_rel_opt, dest_rel_opt, _bak_name_opt = _OPTIONAL_COMPONENT_PATH["agent_constraints"]
+        src_path_opt = bundle_root / src_rel_opt
+        if src_path_opt.exists():
+            dest_path_opt = self._root / dest_rel_opt
+            if src_path_opt.resolve() == dest_path_opt.resolve():
+                problems.append(f"agent_constraints: source_equals_dest:{src_path_opt}")
+            elif not src_path_opt.is_file():
+                problems.append(f"agent_constraints: not_file:{src_path_opt}")
+            elif src_path_opt.stat().st_size <= 0:
+                problems.append(f"agent_constraints: empty:{src_path_opt}")
+
+        if problems:
+            raise DeployBlocked(
+                "candidate_artifact_invalid",
+                (
+                    f"bundle_id={bundle_id} candidate artifact 검증 실패. "
+                    + "; ".join(problems)
+                ),
+            )
+
+    def _current_lgbm_active_version(self) -> str | None:
+        registry_path = self._root / "lgbm" / "registry.json"
+        if not registry_path.exists():
+            return None
+        try:
+            with registry_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            active = data.get("active_version")
+            return str(active) if active else None
+        except Exception as e:
+            logger.warning("[ModeBDeployer] registry active_version 읽기 실패: %s", e)
+            return None
+
+    def _activate_lgbm_registry(self, bundle_id: str) -> str:
+        metadata_path = self._bundle_root(bundle_id) / "lgbm" / "latest_model_metadata.json"
+        with metadata_path.open("r", encoding="utf-8") as fh:
+            metadata = json.load(fh)
+        version = str(metadata.get("version", "")).strip()
+        if not version:
+            raise DeployBlocked(
+                "candidate_artifact_invalid",
+                f"bundle_id={bundle_id} lgbm metadata version 없음",
+            )
+        live_lgbm_dir = self._root / "lgbm"
+        live_lgbm_dir.mkdir(parents=True, exist_ok=True)
+        version_pkl = live_lgbm_dir / f"{version}.pkl"
+        version_meta = live_lgbm_dir / f"{version}_metadata.json"
+        if not version_pkl.exists():
+            shutil.copy2(live_lgbm_dir / "latest_model.pkl", version_pkl)
+        metadata["model_path"] = str(version_pkl)
+        metadata["metadata_path"] = str(version_meta)
+        with version_meta.open("w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, ensure_ascii=False, indent=2)
+        ModelRegistry(artifacts_dir=live_lgbm_dir).activate_deployed_candidate(
+            version,
+            deploy_token=_DEPLOY_ACTIVATION_TOKEN,
+        )
+        return version
+
+    def _restore_lgbm_registry(self, previous_active_version: str | None) -> None:
+        ModelRegistry(artifacts_dir=self._root / "lgbm").restore_active_version(
+            previous_active_version,
+            clear_latest_pointer=False,
+        )
 
     def _swap_single(
         self,
@@ -387,8 +574,17 @@ class ModeBDeployer:
 
         1. dest_path 존재 시 backup_path로 백업 (os.replace).
         2. src_path 존재 시 dest_path로 atomic swap.
-        3. 없으면 빈 .bak 생성 (테스트 환경 mock 처리).
+        3. src_path를 dest_path로 atomic replace.
         """
+        if src_path.resolve() == dest_path.resolve():
+            raise ValueError(
+                f"{component_name}: candidate source and live dest are identical: {src_path}"
+            )
+        if not src_path.is_file():
+            raise FileNotFoundError(f"{component_name}: candidate artifact 없음: {src_path}")
+        if src_path.stat().st_size <= 0:
+            raise ValueError(f"{component_name}: candidate artifact 비어 있음: {src_path}")
+
         backup_path.parent.mkdir(parents=True, exist_ok=True)
 
         # backup 단계
@@ -396,21 +592,14 @@ class ModeBDeployer:
             os.replace(str(dest_path), str(backup_path))
             logger.info("[ModeBDeployer] 백업 완료: %s → %s", component_name, backup_path)
         else:
-            # 파일 없음: 빈 .bak 생성 (mock 환경)
+            # 원래 live 파일이 없던 상태를 rollback에서 복원하기 위한 marker.
             backup_path.write_bytes(b"")
             logger.info("[ModeBDeployer] 백업 스킵(파일 없음): %s → 빈 .bak 생성", component_name)
 
         # atomic swap 단계
-        if src_path.exists() and src_path != dest_path:
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(str(src_path), str(dest_path))
-            logger.info("[ModeBDeployer] swap 완료: %s → %s", component_name, dest_path)
-        else:
-            # src 없거나 in-place backup 케이스: dest에 빈 파일 생성 (mock)
-            if not dest_path.exists():
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                dest_path.write_bytes(b"")
-            logger.info("[ModeBDeployer] swap 스킵(src 없음): %s → mock 처리", component_name)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src_path), str(dest_path))
+        logger.info("[ModeBDeployer] swap 완료: %s → %s", component_name, dest_path)
 
     def _rollback_components(self, components: list[str], backup_dir: Path) -> list[str]:
         """지정된 컴포넌트 역순 rollback. 실패 시 DeployRollbackFailed raise."""
@@ -459,6 +648,8 @@ class ModeBDeployer:
         deploy_id: str,
         bundle_id: str,
         swapped_components: list[str],
+        previous_active_version: str | None = None,
+        activated_model_version: str | None = None,
     ) -> None:
         """backup 디렉토리에 metadata.json 저장."""
         metadata = {
@@ -466,6 +657,8 @@ class ModeBDeployer:
             "bundle_id": bundle_id,
             "swapped_at": datetime.now(_KST).isoformat(),
             "swapped_components": swapped_components,
+            "previous_active_version": previous_active_version,
+            "activated_model_version": activated_model_version,
         }
         metadata_path = backup_dir / "metadata.json"
         with metadata_path.open("w", encoding="utf-8") as fh:

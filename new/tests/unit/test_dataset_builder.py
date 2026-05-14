@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import src.data.dataset_builder as dataset_builder_module
 from src.data.dataset_builder import (
     DatasetBuildError,
     DatasetBuilder,
@@ -146,6 +147,58 @@ def test_init_loads_config(builder: DatasetBuilder) -> None:
     assert builder._outlier_cap_z > 0
 
 
+def test_join_exogenous_features_reads_daily_artifact(
+    builder: DatasetBuilder,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """exogenous artifact가 있으면 neutral default 대신 날짜/ticker 값을 join한다."""
+    exog_dir = tmp_path / "exogenous"
+    exog_dir.mkdir()
+    payload = {
+        "batch_date": "2026-05-08",
+        "features": {
+            "us_sp500_change": 0.012,
+            "us_vix": 18.5,
+        },
+        "per_ticker": {
+            "005930": {
+                "foreign_net_buy": 1200000.0,
+            }
+        },
+    }
+    (exog_dir / "20260508.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dataset_builder_module,
+        "DEFAULT_EXOGENOUS_ARTIFACT_DIR",
+        exog_dir,
+    )
+
+    frame = pd.DataFrame(
+        {
+            "ticker": ["005930", "000660"],
+            "ts_close": pd.to_datetime([
+                "2026-05-08T09:00:00+09:00",
+                "2026-05-08T09:00:00+09:00",
+            ]),
+            "close": [70000.0, 120000.0],
+        }
+    ).set_index(["ticker", "ts_close"])
+
+    joined = builder._join_exogenous_features(frame)
+
+    assert joined.loc[("005930", frame.index[0][1]), "us_sp500_change"] == pytest.approx(0.012)
+    assert joined.loc[("000660", frame.index[1][1]), "us_vix"] == pytest.approx(18.5)
+    assert joined.loc[("005930", frame.index[0][1]), "foreign_net_buy"] == pytest.approx(1200000.0)
+    assert joined.loc[("000660", frame.index[1][1]), "foreign_net_buy"] == pytest.approx(0.0)
+    stats = joined.attrs["exogenous_join_stats"]
+    assert stats["dates_found"] == 1
+    assert stats["rows_non_neutral"] == 2
+
+
 # ====================================================================== #
 # 2. 날짜 파싱 helper
 # ====================================================================== #
@@ -236,6 +289,54 @@ def test_generate_labels_drops_last_n(builder: DatasetBuilder) -> None:
     assert out["label_5m_ret"].iloc[0] == pytest.approx(5.0 / 100.0)
 
 
+def test_generate_labels_adds_cost_aware_auxiliary_labels(
+    builder: DatasetBuilder,
+) -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 10,
+            "ts_close": pd.date_range("2026-04-20 09:00:00+09:00", periods=10, freq="1min"),
+            "open": np.arange(100.0, 110.0),
+            "high": np.arange(100.0, 110.0) + 1,
+            "low": np.arange(100.0, 110.0) - 1,
+            "close": np.arange(100.0, 110.0),
+            "volume": np.ones(10) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+
+    assert "label_5m_net_bps" in out.columns
+    assert "label_5m_net_ret" in out.columns
+    assert "label_5m_tradeable" in out.columns
+    assert "label_session_close_ret" in out.columns
+    assert "label_session_close_net_bps" in out.columns
+    assert "label_session_close_net_ret" in out.columns
+    assert "label_session_close_tradeable" in out.columns
+
+    total_cost_bps = builder._label_total_cost_bps
+    min_expected_net_bps = builder._label_min_expected_net_bps
+
+    assert out["label_5m_net_bps"].iloc[0] == pytest.approx(
+        (105.0 / 100.0 - 1.0) * 10_000.0 - total_cost_bps
+    )
+    assert out["label_session_close_ret"].iloc[0] == pytest.approx(
+        109.0 / 100.0 - 1.0
+    )
+    assert out["label_session_close_net_bps"].iloc[0] == pytest.approx(
+        (109.0 / 100.0 - 1.0) * 10_000.0 - total_cost_bps
+    )
+    assert out["label_5m_net_ret"].iloc[0] == pytest.approx(
+        out["label_5m_net_bps"].iloc[0] / 10_000.0
+    )
+    assert out["label_session_close_net_ret"].iloc[0] == pytest.approx(
+        out["label_session_close_net_bps"].iloc[0] / 10_000.0
+    )
+    assert int(out["label_5m_tradeable"].iloc[0]) == int(
+        out["label_5m_net_bps"].iloc[0] >= min_expected_net_bps
+    )
+
+
 def test_generate_labels_too_short(builder: DatasetBuilder) -> None:
     df = pd.DataFrame(
         {
@@ -251,6 +352,86 @@ def test_generate_labels_too_short(builder: DatasetBuilder) -> None:
     out = builder._generate_labels(df)
     # n=3 < horizon=5 → 전부 drop 후 empty
     assert out.empty
+
+
+def test_generate_labels_never_crosses_trading_day(builder: DatasetBuilder) -> None:
+    ts_day1 = pd.date_range("2026-04-20 15:24:00+09:00", periods=7, freq="1min")
+    ts_day2 = pd.date_range("2026-04-21 09:00:00+09:00", periods=7, freq="1min")
+    closes = list(np.arange(100.0, 107.0)) + list(np.arange(200.0, 207.0))
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 14,
+            "ts_close": list(ts_day1) + list(ts_day2),
+            "open": closes,
+            "high": [value + 1.0 for value in closes],
+            "low": [value - 1.0 for value in closes],
+            "close": closes,
+            "volume": np.ones(14) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+    out_dates = out["ts_close"].dt.date
+
+    assert len(out) == 4
+    assert int((out_dates == date(2026, 4, 20)).sum()) == 2
+    assert int((out_dates == date(2026, 4, 21)).sum()) == 2
+    day1_labels = out.loc[out_dates == date(2026, 4, 20), "label_5m_ret"].to_numpy()
+    assert day1_labels[0] == pytest.approx(105.0 / 100.0 - 1.0)
+    assert day1_labels[1] == pytest.approx(106.0 / 101.0 - 1.0)
+    assert day1_labels.max() < 0.06
+    day1_session_close = out.loc[
+        out_dates == date(2026, 4, 20), "label_session_close_ret"
+    ].to_numpy()
+    assert day1_session_close[0] == pytest.approx(106.0 / 100.0 - 1.0)
+    assert day1_session_close.max() < 0.07
+
+
+def test_generate_labels_drops_short_irregular_session(builder: DatasetBuilder) -> None:
+    ts_day1 = pd.date_range("2026-04-20 15:27:00+09:00", periods=4, freq="1min")
+    ts_day2 = pd.date_range("2026-04-21 09:00:00+09:00", periods=8, freq="1min")
+    closes = list(np.arange(100.0, 104.0)) + list(np.arange(200.0, 208.0))
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 12,
+            "ts_close": list(ts_day1) + list(ts_day2),
+            "open": closes,
+            "high": [value + 1.0 for value in closes],
+            "low": [value - 1.0 for value in closes],
+            "close": closes,
+            "volume": np.ones(12) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+
+    assert len(out) == 3
+    assert set(out["ts_close"].dt.date) == {date(2026, 4, 21)}
+    assert out["label_5m_ret"].iloc[0] == pytest.approx(205.0 / 200.0 - 1.0)
+
+
+def test_generate_labels_groups_by_ticker_and_localizes_naive_kst(
+    builder: DatasetBuilder,
+) -> None:
+    ts = list(pd.date_range("2026-04-20 09:00:00", periods=6, freq="1min"))
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 6 + ["000660"] * 6,
+            "ts_close": ts + ts,
+            "open": [100.0] * 6 + [1000.0] * 6,
+            "high": [106.0] * 6 + [1006.0] * 6,
+            "low": [99.0] * 6 + [999.0] * 6,
+            "close": list(np.arange(100.0, 106.0)) + list(np.arange(1000.0, 1006.0)),
+            "volume": np.ones(12) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+    by_ticker = dict(zip(out["ticker"], out["label_5m_ret"], strict=True))
+
+    assert out["ts_close"].dt.tz is not None
+    assert by_ticker["005930"] == pytest.approx(105.0 / 100.0 - 1.0)
+    assert by_ticker["000660"] == pytest.approx(1005.0 / 1000.0 - 1.0)
 
 
 # ====================================================================== #
@@ -287,6 +468,31 @@ def test_cross_sectional_rank_basic(builder: DatasetBuilder) -> None:
     # relevance 0~3 분포 확인
     rel = out["relevance"].to_numpy()
     assert sorted(rel.astype(int).tolist()) == [0, 1, 2, 3]
+
+
+def test_relabel_panel_for_cost_aware_target(builder: DatasetBuilder) -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["000001", "000002", "000003", "000004"],
+            "ts_close": [pd.Timestamp("2026-04-20 10:00:00+09:00")] * 4,
+            "open": [100.0] * 4,
+            "high": [101.0] * 4,
+            "low": [99.0] * 4,
+            "close": [100.0] * 4,
+            "volume": [1000.0] * 4,
+            "label_5m_ret": [0.04, 0.03, 0.02, 0.01],
+            "label_session_close_net_ret": [0.01, 0.02, 0.03, 0.04],
+        }
+    )
+    panel = builder._cross_sectional_rank(df)
+
+    relabeled = builder.relabel_panel_for_target(
+        panel,
+        "label_session_close_net_ret",
+    )
+
+    assert relabeled.loc[("000001", pd.Timestamp("2026-04-20 10:00:00+09:00")), "relevance"] == 0
+    assert relabeled.loc[("000004", pd.Timestamp("2026-04-20 10:00:00+09:00")), "relevance"] == 3
 
 
 def test_cross_sectional_group_too_small(builder: DatasetBuilder) -> None:
@@ -543,8 +749,48 @@ def test_dual_source_join_vectorized_no_scores(tmp_path: Path) -> None:
     with patch("src.data.dataset_builder.load_latest_scores", return_value=[]):
         result = b._join_dual_source_features(panel, "20260420", "20260420")
 
-    from src.data.dataset_builder import DUAL_SOURCE_FEATURES
+    from src.data.dataset_builder import DUAL_SOURCE_DEFAULTS, DUAL_SOURCE_FEATURES
     for feat in DUAL_SOURCE_FEATURES:
         assert feat in result.columns
         vals = result[feat].to_numpy()
-        assert all(abs(v) < 1e-9 for v in vals), f"{feat}: 0.0 기본값 불일치 {vals}"
+        expected = DUAL_SOURCE_DEFAULTS[feat]
+        assert all(abs(v - expected) < 1e-9 for v in vals), (
+            f"{feat}: neutral default 불일치 {vals}"
+        )
+
+
+def test_dual_source_join_missing_rows_use_multiplier_neutral(tmp_path: Path) -> None:
+    """partial Dual-Source 파일에서 미매칭 행은 multiplier=1.0 neutral 유지."""
+    from unittest.mock import patch
+
+    b = DatasetBuilder(artifacts_dir=tmp_path)
+    b._ds_enabled_for_lgbm = True
+
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=2, freq="1min")
+    rows = {
+        "open": [100.0] * 4, "high": [101.0] * 4,
+        "low": [99.0] * 4, "close": [100.0] * 4,
+        "volume": [1000.0] * 4,
+        "label_5m_ret": [0.01] * 4, "cs_rank": [0.5] * 4, "relevance": [1.0] * 4,
+    }
+    idx = pd.MultiIndex.from_tuples(
+        [("005930", t) for t in ts] + [("000660", t) for t in ts],
+        names=["ticker", "ts_close"],
+    )
+    panel = pd.DataFrame(rows, index=idx)
+
+    mock_scores = [{
+        "ticker": "005930",
+        "news_score_t": 0.0,
+        "comm_score_t_1": 0.0,
+        "comm_score_t_2": 0.0,
+        "news_comm_divergence": 0.0,
+        "community_noise_multiplier": 1.0,
+    }]
+
+    with patch("src.data.dataset_builder.load_latest_scores", return_value=mock_scores):
+        result = b._join_dual_source_features(panel, "20260420", "20260420")
+
+    missing_rows = result.loc["000660"]
+    assert (missing_rows["community_noise_multiplier"] == 1.0).all()
+    assert result.attrs["dual_source_join_stats"]["rows_non_neutral"] == 0

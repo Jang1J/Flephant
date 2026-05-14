@@ -28,10 +28,14 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, time
+from collections import defaultdict
+from datetime import datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.connectors.community import CommunityCrawler, CommunityPost
+from src.connectors.naver_rest import NaverNewsClient, NaverNewsItem
 from src.data.dual_source_scorer import DualSourceScorer
 from src.utils.config_loader import load as config_load
 from src.utils.pit_guard import PITViolationError, assert_pit_safe
@@ -68,14 +72,47 @@ def _is_in_batch_window(now: datetime) -> bool:
     return start <= now.timetz().replace(tzinfo=None) <= end
 
 
-def _load_active_tickers() -> list[str]:
-    """universe_config.yaml 에서 active 20종목 코드 로드.
+def _load_active_universe() -> list[dict[str, Any]]:
+    """universe_config.yaml 에서 active 종목 메타데이터 로드.
 
-    반환값: 6자리 zero-padded 종목코드 리스트.
+    과거 구조(cfg["active"])와 현행 sectors 구조를 모두 지원한다.
     """
     cfg = config_load("universe_config.yaml")
-    active = cfg.get("active", [])
-    return [str(item.get("ticker", "")).zfill(6) for item in active if item.get("ticker")]
+    universe: list[dict[str, Any]] = []
+
+    for item in cfg.get("active", []) or []:
+        ticker = str(item.get("ticker", "")).zfill(6)
+        if ticker and ticker != "000000":
+            universe.append({
+                "ticker": ticker,
+                "name": item.get("name") or ticker,
+                "aliases": list(item.get("aliases", []) or []),
+            })
+
+    if universe:
+        return universe
+
+    sectors = cfg.get("sectors", {}) or {}
+    for sector in sectors.values():
+        if not isinstance(sector, dict) or sector.get("status") != "confirmed":
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict) or stock.get("status") != "active":
+                continue
+            ticker = str(stock.get("ticker", "")).zfill(6)
+            if ticker and ticker != "000000":
+                universe.append({
+                    "ticker": ticker,
+                    "name": stock.get("name") or ticker,
+                    "aliases": list(stock.get("aliases", []) or []),
+                })
+
+    return universe
+
+
+def _load_active_tickers() -> list[str]:
+    """universe_config.yaml 에서 active 20종목 코드 로드."""
+    return [item["ticker"] for item in _load_active_universe()]
 
 
 def _build_mock_inputs(ticker: str, today: datetime) -> dict:
@@ -100,6 +137,128 @@ def _build_mock_inputs(ticker: str, today: datetime) -> dict:
         "historical_volumes": [80.0, 90.0, 100.0, 85.0, 95.0, 110.0, 88.0],
         "data_ts": today.replace(hour=7, minute=50).isoformat(),  # 07:50 KST (배치 전 수집)
     }
+
+
+def _as_kst(dt: datetime) -> datetime:
+    """datetime을 KST tz-aware로 정규화."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_KST)
+    return dt.astimezone(_KST)
+
+
+def _load_news_window_hours() -> int:
+    """dual_source.yaml news.score_window_hours 로드."""
+    cfg = config_load("dual_source.yaml") or {}
+    return int((cfg.get("news", {}) or {}).get("score_window_hours", 12))
+
+
+def _news_text(item: NaverNewsItem) -> str:
+    """NaverNewsItem을 scorer 입력 텍스트로 변환."""
+    return f"{item.title} {item.description}".strip()
+
+
+def _post_text(post: CommunityPost) -> str:
+    """CommunityPost를 scorer 입력 텍스트로 변환."""
+    return f"{post.title} {post.content}".strip()
+
+
+def _collect_real_inputs(
+    universe_meta: list[dict[str, Any]],
+    snapshot_ts: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Naver/Community 실 커넥터로 Dual-Source 입력을 구성한다.
+
+    Community는 공식 API가 없어 현재 실 스크래핑이 꺼져 있을 수 있다. 그 경우
+    mock 데이터를 섞지 않고 빈 커뮤니티 입력으로 둔다. 이렇게 해야 실데이터 학습
+    metadata가 mock 커뮤니티에 오염되지 않는다.
+    """
+    news_client = NaverNewsClient()
+    community = CommunityCrawler()
+    window_hours = _load_news_window_hours()
+    news_window_start = snapshot_ts - timedelta(hours=window_hours)
+    tickers = [item["ticker"] for item in universe_meta]
+
+    posts_by_ticker: dict[str, list[CommunityPost]] = defaultdict(list)
+    community_mode = "real"
+    community_error = ""
+    if getattr(community, "_is_mock", False):
+        community_mode = "unavailable_empty"
+        community_error = "COMMUNITY_SCRAPE_ENABLED is not enabled; mock community data was not used"
+    else:
+        try:
+            posts = community.poll(tickers, window_minutes=5)
+            for post in posts:
+                post_ts = _as_kst(post.timestamp)
+                if post_ts <= snapshot_ts:
+                    posts_by_ticker[str(post.ticker).zfill(6)].append(post)
+        except NotImplementedError as e:
+            community_mode = "unavailable_empty"
+            community_error = str(e)
+        except Exception as e:
+            community_mode = "error_empty"
+            community_error = str(e)
+
+    rows: list[dict[str, Any]] = []
+    news_mode = "unavailable_empty" if getattr(news_client, "_is_mock", False) else "real"
+    news_error = (
+        "NAVER_CLIENT_ID/SECRET not available; mock news data was not used"
+        if news_mode == "unavailable_empty" else ""
+    )
+
+    source_stats: dict[str, Any] = {
+        "news_mode": news_mode,
+        "news_error": news_error,
+        "community_mode": community_mode,
+        "community_error": community_error,
+        "news_window_hours": window_hours,
+        "per_ticker": {},
+    }
+
+    for item in universe_meta:
+        ticker = item["ticker"]
+        name = str(item.get("name") or ticker)
+        query = name
+
+        news_texts: list[str] = []
+        news_timestamps: list[datetime] = []
+        if news_mode == "real":
+            try:
+                news_items = news_client.search_news(query)
+                for news_item in news_items:
+                    pub_dt = _as_kst(news_item.pub_date)
+                    if not (news_window_start <= pub_dt <= snapshot_ts):
+                        continue
+                    text = _news_text(news_item)
+                    if text:
+                        news_texts.append(text)
+                        news_timestamps.append(pub_dt)
+            except Exception as e:
+                source_stats["per_ticker"].setdefault(ticker, {})["news_error"] = str(e)
+
+        ticker_posts = posts_by_ticker.get(ticker, [])
+        comm_texts = [_post_text(post) for post in ticker_posts if _post_text(post)]
+        comm_timestamps = [_as_kst(post.timestamp) for post in ticker_posts]
+
+        data_ts_candidates = news_timestamps + comm_timestamps
+        data_ts = max(data_ts_candidates) if data_ts_candidates else snapshot_ts
+        assert_pit_safe(data_ts, snapshot_ts)
+
+        rows.append({
+            "ticker": ticker,
+            "news_texts": news_texts,
+            "comm_texts_t1": comm_texts,
+            "comm_texts_t2": [],
+            "current_volume": float(len(comm_texts)),
+            "historical_volumes": [],
+            "data_ts": data_ts.isoformat(),
+        })
+        source_stats["per_ticker"].setdefault(ticker, {}).update({
+            "query": query,
+            "news_count": len(news_texts),
+            "community_count": len(comm_texts),
+        })
+
+    return rows, source_stats
 
 
 def run_dual_source_batch(
@@ -137,16 +296,19 @@ def run_dual_source_batch(
             snap_dt = _dt.fromisoformat(snapshot_ts)
         else:
             snap_dt = snapshot_ts
+    snap_dt = _as_kst(snap_dt)
+    batch_date = snap_dt.date()
 
     logger.info(
-        "[dual_source] 배치 시작: today=%s snapshot_ts=%s use_mock=%s",
-        today.isoformat(),
+        "[dual_source] 배치 시작: batch_date=%s snapshot_ts=%s use_mock=%s",
+        batch_date.isoformat(),
         snap_dt.isoformat(),
         use_mock,
     )
 
     # active 20종목 로드
-    tickers = _load_active_tickers()
+    universe_meta = _load_active_universe()
+    tickers = [item["ticker"] for item in universe_meta]
     if not tickers:
         logger.warning("[dual_source] active 종목 없음. universe_config.yaml 확인 필요.")
         return []
@@ -154,18 +316,16 @@ def run_dual_source_batch(
     logger.info("[dual_source] active 종목 %d개 처리 시작", len(tickers))
 
     # 종목별 입력 데이터 구성
-    universe: list[dict] = []
-    for ticker in tickers:
-        if use_mock:
-            item = _build_mock_inputs(ticker, now_kst)
-        else:
-            # 실 커넥터 경로 (Sprint 4 S4-6 이후 구현)
-            # from src.connectors.naver_rest import NaverNewsClient
-            # from src.connectors.community import CommunityCrawler
-            raise NotImplementedError(
-                "실 커넥터 경로는 Sprint 4 S4-6 이후 구현. use_mock=True 사용 권장."
-            )
-        universe.append(item)
+    source_stats: dict[str, Any]
+    if use_mock:
+        universe: list[dict] = []
+        for ticker in tickers:
+            item = _build_mock_inputs(ticker, snap_dt)
+            universe.append(item)
+        source_stats = {"input_mode": "mock"}
+    else:
+        universe, source_stats = _collect_real_inputs(universe_meta, snap_dt)
+        source_stats["input_mode"] = "real"
 
     # DualSourceScorer 5피처 생성
     scorer = DualSourceScorer()
@@ -173,13 +333,14 @@ def run_dual_source_batch(
 
     # 결과 저장 (new/artifacts/dual_source/YYYYMMDD.json)
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = _ARTIFACT_DIR / f"{today.strftime('%Y%m%d')}.json"
+    out_path = _ARTIFACT_DIR / f"{batch_date.strftime('%Y%m%d')}.json"
 
     payload = {
-        "batch_date": today.isoformat(),
+        "batch_date": batch_date.isoformat(),
         "snapshot_ts": snap_dt.isoformat(),
         "generated_at": now_kst.isoformat(),
         "ticker_count": len(results),
+        "source_stats": source_stats,
         "scores": results,
     }
     with out_path.open("w", encoding="utf-8") as fh:

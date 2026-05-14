@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +35,11 @@ class MockBooster:
     def __init__(self, scores=None):
         self._scores = scores
         self.predict_calls = 0
+        self.last_X = None
 
     def predict(self, X):
         self.predict_calls += 1
+        self.last_X = np.asarray(X, dtype=float)
         n = len(X)
         if self._scores is None:
             return np.linspace(0.1, 0.9, n).astype(float)
@@ -96,6 +99,41 @@ def populated_registry(tmp_path: Path) -> ModelRegistry:
             "feat_60m_trend",
         ],
         "label_horizon_bars": 5,
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
+        "metrics": {"ic": 0.01, "icir": 0.5, "rank_ic": 0.012,
+                    "arr": 0.1, "ir": 1.0, "mdd": -0.08, "sr": 1.0},
+        "data_version": "v1",
+    }
+    reg.save(mock, metadata, is_latest=True)
+    return reg
+
+
+@pytest.fixture
+def populated_dual_source_registry(tmp_path: Path) -> ModelRegistry:
+    """Dual-Source 5피처까지 요구하는 Mock booster registry."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_ds")
+    mock = MockBooster(scores=None)
+    feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_5m_ret",
+        "feat_30m_vol",
+        "feat_60m_trend",
+        "news_score_t",
+        "comm_score_t_1",
+        "comm_score_t_2",
+        "news_comm_divergence",
+        "community_noise_multiplier",
+    ]
+    metadata = {
+        "version": "dual-source-v1",
+        "bundle_id": None,
+        "train_start": "20260101",
+        "train_end": "20260419",
+        "feature_cols": feature_cols,
+        "label_horizon_bars": 5,
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
         "metrics": {"ic": 0.01, "icir": 0.5, "rank_ic": 0.012,
                     "arr": 0.1, "ir": 1.0, "mdd": -0.08, "sr": 1.0},
         "data_version": "v1",
@@ -128,18 +166,34 @@ def test_init_active_mode_loads_model(agent_active: QuantAgent) -> None:
     assert agent_active.has_model is True
     assert agent_active.model_metadata is not None
     assert agent_active.model_metadata["version"] == "baseline"
+    assert agent_active._inference_feature_cols == agent_active.model_metadata["feature_cols"]
 
 
 def test_init_config_values(agent_passive: QuantAgent) -> None:
     assert agent_passive._warmup_bars == 60
     assert agent_passive._anomaly_zscore_threshold == 3.0
     assert agent_passive._latency_window == 1000
+    assert agent_passive._investor_flow_stale_sec == 1800
     assert agent_passive._multi_scale_windows == [1, 5, 30, 60]
     assert agent_passive._feature_cols == [
         "feat_1m_close_robust_z",
         "feat_5m_ret",
         "feat_30m_vol",
         "feat_60m_trend",
+        "news_score_t",
+        "comm_score_t_1",
+        "comm_score_t_2",
+        "news_comm_divergence",
+        "community_noise_multiplier",
+        "us_sp500_change",
+        "us_nasdaq_change",
+        "us_vix",
+        "us_soxx_change",
+        "foreign_net_buy",
+        "institutional_net_buy",
+        "retail_net_buy",
+        "interest_rate",
+        "usd_krw",
     ]
 
 
@@ -175,6 +229,56 @@ def test_on_bar_pads_ticker(agent_passive: QuantAgent) -> None:
     agent_passive.on_bar(bar)
     # 6자리 padding 된 ticker로 저장됨
     assert "005930" in agent_passive._bar_buffer.tickers
+
+
+def test_investor_flow_snapshot_tracks_age_and_stale(agent_passive: QuantAgent) -> None:
+    """수급 snapshot은 모델 feature가 아니라 side-channel context로 보관된다."""
+    agent_passive.update_investor_flow_snapshot(
+        "5930",
+        {
+            "foreign_net_buy": -2538322,
+            "institutional_net_buy": 285970,
+            "retail_net_buy": 2200059,
+            "provider": "kis_investor_trade_by_stock_daily",
+        },
+        received_at="2026-04-20T10:00:00+09:00",
+    )
+
+    fresh = agent_passive.get_investor_flow_snapshot(
+        "005930",
+        asof="2026-04-20T10:20:00+09:00",
+    )
+    stale = agent_passive.get_investor_flow_snapshot(
+        "005930",
+        asof="2026-04-20T10:31:00+09:00",
+    )
+
+    assert fresh is not None
+    assert fresh["ticker"] == "005930"
+    assert fresh["foreign_net_buy"] == pytest.approx(-2538322.0)
+    assert fresh["age_sec"] == pytest.approx(1200.0)
+    assert fresh["is_stale"] is False
+    assert stale is not None
+    assert stale["is_stale"] is True
+
+
+def test_update_foreign_snapshot_alias(agent_passive: QuantAgent) -> None:
+    """예경님 코드 호환 alias는 새 수급 side-channel로 연결된다."""
+    agent_passive.update_foreign_snapshot(
+        "660",
+        -123.0,
+        received_at=datetime.fromisoformat("2026-04-20T10:00:00+09:00"),
+    )
+
+    snap = agent_passive.get_investor_flow_snapshot(
+        "000660",
+        asof="2026-04-20T10:00:10+09:00",
+    )
+
+    assert snap is not None
+    assert snap["foreign_net_buy"] == pytest.approx(-123.0)
+    assert snap["provider"] == "foreign_snapshot"
+    assert snap["age_sec"] == pytest.approx(10.0)
 
 
 # ====================================================================== #
@@ -244,6 +348,80 @@ def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> No
     assert result["latency_ms"] < 50.0, f"latency={result['latency_ms']}ms"
 
 
+def test_score_cross_section_uses_dual_source_scores(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """Dual-Source 모델은 serve 시 C3A 배치 점수를 feature vector에 주입한다."""
+    loader_calls: list[str | None] = []
+
+    def loader(date_str: str | None) -> list[dict[str, Any]]:
+        loader_calls.append(date_str)
+        return [{
+            "ticker": "005930",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "active"
+    assert loader_calls == ["20260420"]
+    assert agent._booster.last_X is not None
+    ds_values = agent._booster.last_X[0, 4:9].tolist()
+    assert ds_values == pytest.approx([0.7, 0.3, 0.1, 0.4, 0.8])
+
+
+def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """Dual-Source feature가 필요한 모델은 점수 파일 누락 시 active 추론하지 않는다."""
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=lambda _date: [],
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+    assert result["n_tickers"] == 0
+
+
+def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """Dual-Source loader 오류는 Hot Path 예외 대신 해당 ticker skip으로 처리한다."""
+    def failing_loader(_date: str | None) -> list[dict[str, Any]]:
+        raise RuntimeError("dual source store unavailable")
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=failing_loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+
+
 # ====================================================================== #
 # 4. compute_features
 # ====================================================================== #
@@ -258,7 +436,25 @@ def test_compute_features_returns_feat_prefix(agent_active: QuantAgent) -> None:
         "feat_5m_ret",
         "feat_30m_vol",
         "feat_60m_trend",
+        "news_score_t",
+        "comm_score_t_1",
+        "comm_score_t_2",
+        "news_comm_divergence",
+        "community_noise_multiplier",
+        "us_sp500_change",
+        "us_nasdaq_change",
+        "us_vix",
+        "us_soxx_change",
+        "foreign_net_buy",
+        "institutional_net_buy",
+        "retail_net_buy",
+        "interest_rate",
+        "usd_krw",
     }
+    for col in agent_active._dual_source_feature_cols:
+        assert feats[col] == pytest.approx(0.0)
+    for col in agent_active._exogenous_feature_cols:
+        assert feats[col] == pytest.approx(0.0)
     for v in feats.values():
         assert isinstance(v, float)
         assert np.isfinite(v)

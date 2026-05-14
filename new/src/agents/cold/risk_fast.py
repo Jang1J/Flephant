@@ -53,6 +53,22 @@ class RiskAgentFast(AgentBase):
         # SLA: risk_config.yaml risk_fast.sla_ms 경유 (불변 원칙 5)
         self._sla_ms = self._load_sla_ms()
 
+    def _publish_to_bus(self, channel: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """AgentBase 메시지를 만들고, PubSubBroker가 있으면 실제 MessagePool에 발행."""
+        msg = self.publish(channel, payload)
+        if self._pubsub is None:
+            return msg
+        try:
+            msg["message_id"] = self._pubsub.publish(channel, msg)
+        except Exception as e:
+            msg["publish_error"] = str(e)
+            logger.warning(
+                "[risk_fast_cold] pubsub publish 실패: channel=%s error=%s",
+                channel,
+                e,
+            )
+        return msg
+
     def _load_trigger_rules(self) -> list[dict[str, Any]]:
         """trigger_catalog.rules 로드. trigger_loader 에 위임 (S5-2 DRY refactor).
 
@@ -195,12 +211,13 @@ class RiskAgentFast(AgentBase):
                 divergence,
             )
             # uncertainty_signal publish (Dual-Source divergence → FDA 연계)
-            self.publish(
+            self._publish_to_bus(
                 "uncertainty_signal",
                 {
                     "source": "risk_fast_cold",
                     "trigger": "news_comm_divergence_strong",
                     "ts": datetime.now(_KST).isoformat(),
+                    "reasoning": "뉴스-커뮤니티 방향 불일치로 불확실성 신호 발행",
                 },
             )
 
@@ -238,7 +255,8 @@ class RiskAgentFast(AgentBase):
             "fast_rule_match": triggered if triggered else None,
             "triggered_rules": [t["rule_id"] for t in triggered],
             "recommended_action": recommended_action,
-            "fast_rule_count": len(triggered),
+            # P1-1 fix (2026-05-09): fast_rule_count 제거. C5 schema 미정의 extra 필드.
+            # consumer 가 len(triggered_rules) 로 동등 계산 가능.
             "latency_ms": round(latency_ms, 2),
         }
 
@@ -249,7 +267,7 @@ class RiskAgentFast(AgentBase):
                 f"[risk_fast_cold] report_type={report_type} 미지원. "
                 "RiskAgentFast(Cold)는 risk_warning만 발행."
             )
-        msg = self.publish("risk_warning", payload)
+        msg = self._publish_to_bus("risk_warning", payload)
         msg["report_type"] = report_type
         msg["ts"] = datetime.now(timezone.utc).isoformat()
         return msg

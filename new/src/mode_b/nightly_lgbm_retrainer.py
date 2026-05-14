@@ -21,8 +21,11 @@ Note:
 """
 from __future__ import annotations
 
+import json
 import re
+import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -32,6 +35,7 @@ from src.utils.mode_guard import mode_b_only
 
 logger = get_logger("nightly_lgbm_retrainer")
 _KST = ZoneInfo("Asia/Seoul")
+_ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
 
 
 class NightlyLGBMRetrainer:
@@ -49,10 +53,16 @@ class NightlyLGBMRetrainer:
         self._tickers: list[str] = list(cfg.get("tickers", []))
         self._lookback_days: int = int(cfg.get("lookback_days", 30))
         self._max_alpha_factors: int = int(cfg.get("max_alpha_factors", 5))
+        self._synthetic_fallback_enabled: bool = bool(
+            cfg.get("synthetic_fallback_enabled", False)
+        )
+        self._synthetic_seed: int = int(cfg.get("synthetic_seed", 42))
         logger.info(
-            "[nightly_lgbm_retrainer] 초기화. lookback_days=%d max_alpha_factors=%d",
+            "[nightly_lgbm_retrainer] 초기화. lookback_days=%d max_alpha_factors=%d "
+            "synthetic_fallback=%s",
             self._lookback_days,
             self._max_alpha_factors,
+            self._synthetic_fallback_enabled,
         )
 
     # ================================================================== #
@@ -101,12 +111,25 @@ class NightlyLGBMRetrainer:
 
         # 3. 날짜 범위 결정
         resolved_tickers = tickers if tickers is not None else self._tickers
-        end_dt = end_date or datetime.now(_KST).strftime("%Y-%m-%d")
-        start_dt = start_date or self._compute_start_date(end_dt)
+        if not resolved_tickers:
+            resolved_tickers = self._load_default_tickers()
+        end_raw = end_date or datetime.now(_KST).strftime("%Y-%m-%d")
+        start_raw = start_date or self._compute_start_date(end_raw)
+        end_dt = self._normalize_yyyymmdd(end_raw)
+        start_dt = self._normalize_yyyymmdd(start_raw)
 
         # 4. LGBMTrainer 구성 + alpha feature 추가
-        trainer = LGBMTrainer()
+        from src.data.dataset_builder import DatasetBuilder
+
+        trainer = LGBMTrainer(
+            dataset_builder=DatasetBuilder(
+                allow_synthetic_fallback=self._synthetic_fallback_enabled,
+                synthetic_seed=self._synthetic_seed,
+            )
+        )
         if alpha_feature_cols:
+            if hasattr(trainer.builder, "add_neutral_feature_columns"):
+                trainer.builder.add_neutral_feature_columns(alpha_feature_cols)
             trainer.feature_cols = trainer.feature_cols + alpha_feature_cols
             logger.info(
                 "[nightly_lgbm_retrainer] alpha factor 피처 %d개 추가: %s",
@@ -129,10 +152,33 @@ class NightlyLGBMRetrainer:
             end_date=end_dt,
             version=next_version,
             bundle_id=bundle_id,
+            is_latest=bundle_id is None,
         )
 
         result["alpha_factors_used"] = len(alpha_feature_cols)
         result["bundle_id"] = bundle_id
+        result["candidate_pending_deploy"] = bundle_id is not None
+        if bundle_id is not None:
+            if bool(result.get("synthetic_fallback")) or result.get("missing_tickers"):
+                stage_info = {
+                    "candidate_bundle_staged": False,
+                    "candidate_bundle_path": str(_ARTIFACTS_ROOT / "bundles" / bundle_id / "lgbm"),
+                    "candidate_bundle_reason": "synthetic_or_missing_real_data",
+                    "candidate_bundle_blockers": {
+                        "synthetic_fallback": bool(result.get("synthetic_fallback")),
+                        "missing_tickers": list(result.get("missing_tickers", [])),
+                    },
+                }
+                logger.warning(
+                    "[nightly_lgbm_retrainer] candidate bundle staging 차단. "
+                    "bundle_id=%s synthetic=%s missing_tickers=%s",
+                    bundle_id,
+                    bool(result.get("synthetic_fallback")),
+                    list(result.get("missing_tickers", [])),
+                )
+            else:
+                stage_info = self._stage_candidate_bundle(bundle_id, result)
+            result.update(stage_info)
 
         logger.info(
             "[nightly_lgbm_retrainer] 재학습 완료. version=%s model_path=%s metrics=%s",
@@ -205,6 +251,111 @@ class NightlyLGBMRetrainer:
 
         PIT-Safety: end_date는 호출 시점 이전 날짜여야 한다 (LGBMTrainer 내부 검증).
         """
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        end_norm = self._normalize_yyyymmdd(end_date)
+        end_dt = datetime.strptime(end_norm, "%Y%m%d")
         start_dt = end_dt - timedelta(days=self._lookback_days)
-        return start_dt.strftime("%Y-%m-%d")
+        return start_dt.strftime("%Y-%m-%d" if "-" in str(end_date) else "%Y%m%d")
+
+    @staticmethod
+    def _normalize_yyyymmdd(value: str) -> str:
+        raw = str(value)
+        for fmt in ("%Y%m%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt).strftime("%Y%m%d")
+            except ValueError:
+                continue
+        raise ValueError(f"날짜 형식 오류: {value!r} (expected YYYYMMDD or YYYY-MM-DD)")
+
+    @staticmethod
+    def _load_default_tickers() -> list[str]:
+        """nightly_retrainer.tickers가 비어있을 때 universe_config SSOT에서 active 종목 로드."""
+        cfg = config_load("universe_config.yaml") or {}
+        tickers: list[str] = []
+        for item in cfg.get("active", []):
+            ticker = item.get("ticker") if isinstance(item, dict) else None
+            if ticker:
+                tickers.append(str(ticker).zfill(6))
+        sectors = cfg.get("sectors", {})
+        if not tickers and isinstance(sectors, dict):
+            for sector in sectors.values():
+                if not isinstance(sector, dict) or sector.get("status") != "confirmed":
+                    continue
+                for stock in sector.get("stocks", []):
+                    if isinstance(stock, dict) and stock.get("status") == "active":
+                        tickers.append(str(stock.get("ticker", "")).zfill(6))
+        return [ticker for ticker in tickers if ticker and ticker != "000000"]
+
+    @staticmethod
+    def _stage_candidate_bundle(bundle_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        """C14 deploy/backtest가 참조하는 bundle staging 경로에 LightGBM 후보를 복사."""
+        bundle_lgbm_dir = _ARTIFACTS_ROOT / "bundles" / bundle_id / "lgbm"
+        bundle_root = _ARTIFACTS_ROOT / "bundles" / bundle_id
+        model_src = Path(str(result.get("model_path", "")))
+        if not model_src.is_file():
+            logger.warning(
+                "[nightly_lgbm_retrainer] candidate bundle staging skip: model_path 없음: %s",
+                model_src,
+            )
+            return {
+                "candidate_bundle_staged": False,
+                "candidate_bundle_path": str(bundle_lgbm_dir),
+                "candidate_bundle_reason": "model_path_missing",
+            }
+
+        bundle_lgbm_dir.mkdir(parents=True, exist_ok=True)
+        model_dest = bundle_lgbm_dir / "latest_model.pkl"
+        shutil.copy2(model_src, model_dest)
+        committee_dest = bundle_lgbm_dir / "committee.pkl"
+        shutil.copy2(model_src, committee_dest)
+        factor_zoo_dest = bundle_root / "alpha_factor" / "factor_zoo.jsonl"
+        factor_zoo_dest.parent.mkdir(parents=True, exist_ok=True)
+        live_factor_zoo = _ARTIFACTS_ROOT / "alpha_factor" / "factor_zoo.jsonl"
+        if live_factor_zoo.is_file():
+            shutil.copy2(live_factor_zoo, factor_zoo_dest)
+        else:
+            factor_zoo_dest.write_text(
+                json.dumps(
+                    {
+                        "bundle_id": bundle_id,
+                        "status": "empty_factor_zoo",
+                        "created_at": datetime.now(_KST).isoformat(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        version = str(result.get("version", ""))
+        metadata_src = model_src.with_name(f"{version}_metadata.json") if version else None
+        metadata_dest = bundle_lgbm_dir / "latest_model_metadata.json"
+        if metadata_src is not None and metadata_src.is_file():
+            shutil.copy2(metadata_src, metadata_dest)
+        else:
+            with metadata_dest.open("w", encoding="utf-8") as fh:
+                json.dump(result, fh, ensure_ascii=False, indent=2)
+
+        manifest = {
+            "bundle_id": bundle_id,
+            "component": "lgbm",
+            "model_path": str(model_dest),
+            "metadata_path": str(metadata_dest),
+            "staged_at": datetime.now(_KST).isoformat(),
+            "source_model_path": str(model_src),
+            "committee_path": str(committee_dest),
+            "committee_artifact_type": "lightgbm_alias",
+            "committee_deprecated": True,
+            "committee_reason": (
+                "No validated CNN/MetaFuser committee candidate is staged; "
+                "committee.pkl is a backward-compatible LightGBM alias."
+            ),
+            "factor_zoo_path": str(factor_zoo_dest),
+        }
+        with (bundle_lgbm_dir / "candidate_manifest.json").open("w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+
+        return {
+            "candidate_bundle_staged": True,
+            "candidate_bundle_path": str(bundle_lgbm_dir),
+            "candidate_model_path": str(model_dest),
+        }

@@ -859,7 +859,7 @@ input:
 output:
   backtest_report:
     bundle_id: "string"
-    run_id: "string"
+    backtest_id: "BT-{yyyymmdd}-{UUID8}"   # SHIP-fix R-4 (2026-05-06): identity backtest_run_id 와 동일 의미. 코드 일관성 위해 backtest_id 채택
     started_at: "ISO8601"
     finished_at: "ISO8601"
     verdict: "pass|fail|warn"
@@ -910,6 +910,26 @@ output:
       replay_unit: "1m"
       leakage_detected: "bool"
       verdict: "pass|fail"
+    feature_quality:                  # C14 deploy 필수 evidence
+      dual_source_rows: "int"
+      dual_source_non_neutral_rows: "int"
+      exogenous_rows: "int"
+      exogenous_non_neutral_rows: "int"
+    service_policy_replay:            # C14 deploy 필수 evidence (read-only KIS paper policy replay)
+      status: "PASS|BLOCKED|MISSING|UNREADABLE"
+      service_policy_report_path: "string"
+      service_policy_report_sha256: "string"
+      gate:
+        status: "PASS|BLOCKED"
+        blockers: "[string]"
+      policy_checks:
+        deploy_candidate_by_service_policy: "bool"
+        no_naked_short_exposure: "bool"
+        order_caps_respected: "bool"
+        cash_guard_respected: "bool"
+      order_stats:
+        total_orders: "int"
+        naked_short_attempts: "int"
 
 memory:
   type: "backtest_history"
@@ -927,7 +947,13 @@ rules:
   can_intervene_hot_path: false             # 장중 실시간 매매 루프 완전 차단
   can_write_to_production: false            # 배포는 별도 게이트 (operator 승인 포함 가능)
   deploy_decision_gate:
-    condition: "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass'"  # v3 leakage 조건 추가
+    condition: "verdict == 'pass' AND regression_risk.flagged == false AND minute_bar_leakage_check.verdict == 'pass' AND feature_quality gate pass AND service_policy_replay.status == 'PASS'"  # v3 leakage + C14 evidence 조건 추가
+    # SHIP-fix MA-4 (2026-05-06): verdict 계산 임계값 SSOT = risk_config.yaml backtest_agent.deploy_decision_gate
+    # pass_sr_threshold (default 0.0): SR >= 임계값 AND IC >= pass_ic_threshold → "pass"
+    # pass_ic_threshold (default 0.0)
+    # warn_sr_threshold (default -0.5): SR >= 임계값 OR IC >= warn_ic_threshold → "warn", 그 외 "fail"
+    # warn_ic_threshold (default -0.1)
+    # severity 임계값 SSOT = risk_config.yaml backtest_agent.deploy_decision_gate (severity_*_sr_threshold 3개)
     on_fail: "Mode B 22:00 배포 차단 + dead_letter_log 기록 + 다음 날 baseline 유지"
     on_warn: "operator 수동 확인 필요 (human_approval: true)"
     on_pass: "자동 배포 승인 (human_approval: false) OR operator 승인 (human_approval: true)"
@@ -1217,7 +1243,9 @@ sub_components:
       bundle_id: string
       backtest_verdict: "pass"
       sanity_check_result: "ok"
+      candidate_bundle_root: "artifacts/bundles/{bundle_id}"
     actions:
+      - validate_candidate_bundle       # live artifact 변경 전 required 4종 존재/비어있지 않음 확인
       - atomic_swap_factor_zoo
       - model_registry_replace          # LightGBM 모델 교체
       - committee_model_replace         # v3.5 추가: AlphaGAT Stage II Committee (S3-8)
@@ -1226,8 +1254,24 @@ sub_components:
       - rollback_on_failure
     rules:
       called_only_if_verdict_pass: true
+      candidate_source_must_not_equal_live_dest: true
+      missing_candidate_blocks_before_backup: true
       rollback_on_failure: true
       human_approval_for_warn: true
+  - name: EvalRunner
+    role: "L3 평가 지표 일별 산출자 (W2 P1, 2026-05-09 SHIP)"
+    invocation: "stage_1 이후 Mode B 18:02 KST batch (또는 별도 cron)"
+    sub_modules:
+      - "new/src/eval/cause_attribution.py"      # cause_attribution_accuracy
+      - "new/src/eval/reason_code_stats.py"      # reason_code_distribution + Top-3 coverage
+    inputs:
+      - "artifacts/audit_log.jsonl (C18 18 필드, label_t5_ret post-hoc backfilled)"
+      - "risk_config.yaml system_os_metrics 임계값"
+    outputs:
+      - "artifacts/metrics/cause_attribution_YYYYMMDD.json"
+      - "artifacts/metrics/reason_code_stats_YYYYMMDD.json"
+    pit_safety: "label_t5_ret None entry 자동 skip (장중 backfill 위반 방지)"
+    critical_block: false  # L3 산출 실패는 alert만, 배포 차단 X
 
 forbidden_permissions:
   - hot_path_intervention
@@ -1311,7 +1355,8 @@ input:
 output:
   dynamic_candidate_pool:
     max_size: 10
-    current: "[{ticker, admitted_at, trigger_ids, ttl}]"
+    # P1-2 fix (2026-05-09): ttl → ttl_sec (단위 명시, dynamic_universe_config.yaml SSOT 정합).
+    current: "[{ticker, admitted_at, trigger_ids, ttl_sec}]"
   dynamic_holdings:
     max_size: 5
     current: "[{ticker, weight, admitted_at, exit_policy}]"
@@ -1413,7 +1458,7 @@ storage:
 registry_schema:
   # registry.json 구조
   schema_version: "1.0.0"
-  active_version: "string"                  # "baseline" | "v{n}"
+  active_version: "string|null"             # "baseline" | "v{n}" | null (candidate only registry)
   versions:
     - version: "string"                     # "baseline" | "v2" | "v3" ...
       bundle_id: "string|null"              # C12 bundle_id (v2+ 있음)
@@ -1424,6 +1469,8 @@ registry_schema:
       train_end: "YYYY-MM-DD"
       feature_cols: "[string]"
       label_horizon_bars: "int"             # 5 (S1-0 Batch B 기준)
+      label_generation_version: "string"    # label 생성 알고리즘 버전 (risk_config.yaml label.generation_version)
+      label_session_scope: "string"         # ticker_trading_day 등 label session 범위
       metrics:                              # C12/C13 metrics 7종 준수
         ic: "float"
         icir: "float"
@@ -1434,13 +1481,16 @@ registry_schema:
         sr: "float"
       commit_hash: "string"                 # git rev-parse HEAD
       data_version: "string"                # parquet 파일 범위 hash
-      status: "active|archived|rollback"
+      status: "candidate|active|archived|rollback"
 
 api:
   save:
     input: "(model: lgb.Booster, metadata: dict, is_latest: bool)"
     output: "Path (저장된 pkl 경로)"
-    atomicity: "pkl + metadata JSON 완전 저장 후 registry.json + symlink 갱신"
+    atomicity: "pkl + metadata JSON 완전 저장 후 registry.json 갱신. is_latest=true일 때만 latest symlink + active_version 갱신"
+    rules:
+      is_latest_false_status: "candidate"
+      is_latest_false_active_version_mutation: "forbidden"
 
   load_latest:
     input: "()"
@@ -1524,9 +1574,12 @@ audit_log_schema:
     sector: "string|null"                         # KRX 업종 분류
     llm_called: "bool|null"                       # News/Risk/Debate only
     llm_model: "string|null"                      # kanana-o|gpt-4o
-    # PIT-Safety critical: 아래 2 필드는 장중 null, 18:00 이후 batch backfill
+    # PIT-Safety critical: 아래 4 필드는 장중 null, 18:00 이후 batch backfill
     label_t5_ret: "float|null"                    # t+5min forward return (post-hoc, batch only)
     price_t5_snapshot: "float|null"               # t+5min price (post-hoc, batch only)
+    # P1 fix (2026-05-09): backfill 메타. C-2 cause_attribution _is_label_pit_safe() 가드 SSOT.
+    label_backfilled_at: "ISO8601|null"           # backfill 실행 KST 시각. snapshot_hour(18 KST) 이후만 valid. null = 장중 미backfill
+    label_backfill_source: "string|null"          # backfill 원천 (mode_b_stage_1_rollup|synth_audit_log|manual)
 
 aggregation:
   trigger: "Mode B stage_1_data_rollup, 18:00 KST"

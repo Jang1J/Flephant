@@ -314,6 +314,25 @@ def test_krx_investor_flow_ticker_zero_padded() -> None:
     assert out["payload"]["ticker"] == "005930"
 
 
+def test_price_snapshot_preserves_snapshots_and_single_ticker_scope() -> None:
+    """C16 price_snapshot → C15 admission bridge용 ticker/return_pct 보존."""
+    n = EventNormalizer()
+    raw = {
+        "watch_snapshot_id": "WS-20260509-AABBCCDD",
+        "ts": _PAST_TS,
+        "snapshots": [
+            {"ticker": "200", "day_change_pct": 0.061, "last_price": 12000},
+        ],
+    }
+    out = n.normalize(raw, source="price_snapshot")
+
+    assert out["event_type"] == "price_snapshot"
+    assert out["scope"] == "ticker:000200"
+    assert out["payload"]["ticker"] == "000200"
+    assert out["payload"]["return_pct"] == pytest.approx(0.061)
+    assert out["payload"]["snapshots"] == raw["snapshots"]
+
+
 # ------------------------------------------------------------------ #
 # 16. expires_at > occurred_at
 # ------------------------------------------------------------------ #

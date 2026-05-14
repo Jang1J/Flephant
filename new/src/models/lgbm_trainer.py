@@ -59,6 +59,13 @@ def _load_feature_cols() -> list[str]:
             if col not in base_cols:
                 base_cols.append(col)
 
+    exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
+    if exog_cfg.get("enabled_for_lgbm", False):
+        exog_cols: list[str] = list(cfg.get("exogenous_feature_cols", []))
+        for col in exog_cols:
+            if col not in base_cols:
+                base_cols.append(col)
+
     return base_cols
 
 
@@ -96,6 +103,8 @@ class LGBMTrainer:
         end_date: str,
         version: str = "baseline",
         bundle_id: str | None = None,
+        is_latest: bool = True,
+        target_col_override: str | None = None,
     ) -> dict[str, Any]:
         """전체 파이프라인 실행. 학습된 booster를 registry에 save.
 
@@ -110,16 +119,38 @@ class LGBMTrainer:
             "n_val_rows": int,
           }
         """
-        # lightgbm lazy import (ranking_loss와 동일 패턴)
-        lgb = get_lightgbm()
+        resolved_bundle_id = str(bundle_id).strip() if bundle_id is not None else None
+        resolved_bundle_id = resolved_bundle_id or None
+        effective_is_latest = bool(is_latest)
+        if resolved_bundle_id and effective_is_latest:
+            logger.warning(
+                "[lgbm_trainer] bundle_id=%s 후보는 deploy gate 전 active/latest로 저장하지 않음.",
+                resolved_bundle_id,
+            )
+            effective_is_latest = False
+
+        start_date_norm = self._normalize_yyyymmdd(start_date)
+        end_date_norm = self._normalize_yyyymmdd(end_date)
+
+        effective_target_col = str(target_col_override or self.target_col)
 
         # 1. Panel 생성
         logger.info(
             "[lgbm_trainer] panel 생성 시작: tickers=%d, %s~%s",
-            len(tickers), start_date, end_date,
+            len(tickers), start_date_norm, end_date_norm,
         )
-        panel = self.builder.build_training_frame(tickers, start_date, end_date)
+        panel = self.builder.build_training_frame(tickers, start_date_norm, end_date_norm)
+        if effective_target_col != self.target_col:
+            panel = self.builder.relabel_panel_for_target(panel, effective_target_col)
+            if panel.empty:
+                raise RuntimeError(
+                    "target_col_override 적용 후 panel empty: "
+                    f"target_col={effective_target_col}"
+                )
         logger.info("[lgbm_trainer] panel rows=%d", len(panel))
+        data_source = dict(getattr(panel, "attrs", {}) or {})
+        self._assert_requested_tickers_present(panel, tickers, data_source)
+        self._assert_feature_manifest(panel)
 
         # 2. Fold 분할
         folds = list(self.splitter.split(panel))
@@ -132,6 +163,8 @@ class LGBMTrainer:
         logger.info("[lgbm_trainer] %d fold 생성", len(folds))
 
         # 3. fold별 학습
+        # lightgbm lazy import: 데이터/manifest/fold guard를 먼저 통과한 뒤 실제 학습 직전에만 로드.
+        lgb = get_lightgbm()
         params = build_lgbm_params()
         tc = get_training_control()
         fold_metrics: list[dict[str, float]] = []
@@ -148,7 +181,12 @@ class LGBMTrainer:
             val_panel = val_panel.sort_index(level="ts_close")
 
             booster, metrics = self._train_fold(
-                train_panel, val_panel, params, tc, lgb
+                train_panel,
+                val_panel,
+                params,
+                tc,
+                lgb,
+                target_col=effective_target_col,
             )
             fold_metrics.append({"fold": fold_idx, **metrics})
             logger.info(
@@ -162,20 +200,48 @@ class LGBMTrainer:
 
         # 4. 평균 metrics 계산 (fold별 평균)
         avg_metrics = self._aggregate_fold_metrics(fold_metrics)
+        metric_scope = {
+            "scope": "trainer_validation_proxy",
+            "deploy_quality": False,
+            "reason": "Trainer fold metrics are diagnostic only; C12 real backtest is required before deploy.",
+        }
 
         # 5. Registry 저장
         if last_booster is None:
             raise RuntimeError("학습 실패: last_booster None")
 
+        preprocessor_cfg = config_load("risk_config.yaml", "preprocessor")
+        feature_set = set(self.feature_cols)
         metadata = {
             "version": version,
-            "bundle_id": bundle_id,
-            "train_start": start_date,
-            "train_end": end_date,
+            "bundle_id": resolved_bundle_id,
+            "train_start": self._yyyymmdd_to_iso(start_date_norm),
+            "train_end": self._yyyymmdd_to_iso(end_date_norm),
             "feature_cols": self.feature_cols,
+            "feature_manifest": {
+                "feature_cols": list(self.feature_cols),
+                "panel_columns_checked": True,
+                "requires_dual_source": bool(
+                    feature_set
+                    & set(preprocessor_cfg.get("dual_source_feature_cols", []))
+                ),
+                "requires_exogenous": bool(
+                    feature_set
+                    & set(preprocessor_cfg.get("exogenous_feature_cols", []))
+                ),
+            },
             "label_horizon_bars": self.builder.horizon_bars,
+            "label_generation_version": self.builder.label_generation_version,
+            "label_session_scope": self.builder.label_session_scope,
+            "target_col": effective_target_col,
             "metrics": avg_metrics,
-            "data_version": self._compute_data_version(tickers, start_date, end_date),
+            "data_version": self._compute_data_version(tickers, start_date_norm, end_date_norm),
+            "data_source": data_source.get("data_source", "artifact_bars"),
+            "synthetic_fallback": bool(data_source.get("synthetic_fallback", False)),
+            "requested_tickers": list(data_source.get("requested_tickers", tickers)),
+            "loaded_tickers": list(data_source.get("loaded_tickers", [])),
+            "missing_tickers": list(data_source.get("missing_tickers", [])),
+            "synthetic_tickers": list(data_source.get("synthetic_tickers", [])),
             "n_folds": len(folds),
             "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
@@ -183,8 +249,13 @@ class LGBMTrainer:
             "n_tickers": len(tickers),
             "lgbm_params": params,
             "training_control": tc,
+            "metric_scope": metric_scope,
         }
-        pkl_path = self.registry.save(last_booster, metadata, is_latest=True)
+        pkl_path = self.registry.save(
+            last_booster,
+            metadata,
+            is_latest=effective_is_latest,
+        )
 
         logger.info(
             "[lgbm_trainer] 학습 완료. version=%s, pkl=%s, avg_IC=%.4f",
@@ -199,6 +270,14 @@ class LGBMTrainer:
             "fold_metrics": fold_metrics,
             "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
+            "is_latest": effective_is_latest,
+            "data_source": data_source.get("data_source", "artifact_bars"),
+            "synthetic_fallback": bool(data_source.get("synthetic_fallback", False)),
+            "missing_tickers": list(data_source.get("missing_tickers", [])),
+            "label_generation_version": self.builder.label_generation_version,
+            "label_session_scope": self.builder.label_session_scope,
+            "target_col": effective_target_col,
+            "metric_scope": metric_scope,
         }
 
     # ================================================================== #
@@ -212,6 +291,7 @@ class LGBMTrainer:
         params: dict[str, Any],
         tc: dict[str, int],
         lgb,
+        target_col: str,
     ):
         """단일 fold 학습 + validation 메트릭 계산."""
         train_ds = make_lgbm_dataset(train_panel, feature_cols=self.feature_cols)
@@ -237,7 +317,7 @@ class LGBMTrainer:
         # 메트릭 계산용 그룹핑 (target_col / top_k_fraction 모두 yaml 경유)
         y_true_by_group, y_pred_by_group, daily_pnl = self._group_for_metrics(
             val_panel, val_pred,
-            target_col=self.target_col,
+            target_col=target_col,
             top_k_fraction=self.top_k_fraction,
         )
 
@@ -247,6 +327,58 @@ class LGBMTrainer:
             daily_pnl=daily_pnl,
         )
         return booster, bundle.to_dict()
+
+    def _assert_feature_manifest(self, panel) -> None:
+        """훈련 feature manifest와 실제 panel columns를 강제 일치시킨다."""
+        panel_cols = set(panel.columns)
+        missing = [col for col in self.feature_cols if col not in panel_cols]
+        if missing:
+            raise RuntimeError(
+                "feature manifest mismatch: DatasetBuilder panel에 학습 feature가 없음. "
+                f"missing={missing}"
+            )
+
+    @staticmethod
+    def _assert_requested_tickers_present(
+        panel,
+        requested_tickers: list[str],
+        data_source: dict[str, Any],
+    ) -> None:
+        """요청한 ticker 일부가 조용히 skip된 모델 학습을 차단한다."""
+        requested = {str(ticker).zfill(6) for ticker in requested_tickers}
+        present = {
+            str(ticker).zfill(6)
+            for ticker in panel.index.get_level_values("ticker").unique().tolist()
+        }
+        missing = sorted(requested - present)
+        if missing:
+            data_source["missing_tickers"] = sorted(
+                set(data_source.get("missing_tickers", [])) | set(missing)
+            )
+        if data_source.get("synthetic_fallback"):
+            return
+        if data_source.get("missing_tickers"):
+            raise RuntimeError(
+                "missing requested ticker data: "
+                f"{sorted(set(data_source['missing_tickers']))}. "
+                "실데이터 학습은 요청 universe 전 종목 artifact가 필요하다."
+            )
+
+    @staticmethod
+    def _normalize_yyyymmdd(value: str) -> str:
+        """YYYYMMDD / YYYY-MM-DD 입력을 DatasetBuilder 표준 YYYYMMDD로 정규화."""
+        raw = str(value)
+        for fmt in ("%Y%m%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(raw, fmt).strftime("%Y%m%d")
+            except ValueError:
+                continue
+        raise ValueError(f"날짜 형식 오류: {value!r} (expected YYYYMMDD or YYYY-MM-DD)")
+
+    @staticmethod
+    def _yyyymmdd_to_iso(value: str) -> str:
+        """YYYYMMDD를 C17 metadata 표준 YYYY-MM-DD로 변환."""
+        return datetime.strptime(str(value), "%Y%m%d").date().isoformat()
 
     @staticmethod
     def _group_for_metrics(
@@ -362,6 +494,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="C12 bundle_id (S3-6 재학습 시)",
     )
+    p.add_argument(
+        "--target-col-override",
+        type=str,
+        default=None,
+        help="실험용 label 컬럼 override (예: label_session_close_net_ret)",
+    )
     return p.parse_args(argv)
 
 
@@ -376,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
             end_date=args.end,
             version=args.version,
             bundle_id=args.bundle_id,
+            target_col_override=args.target_col_override,
         )
     except Exception as e:
         logger.error("[lgbm_trainer] 학습 실패: %s", e)

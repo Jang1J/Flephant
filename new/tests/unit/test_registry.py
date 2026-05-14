@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.models.registry import (
+    _DEPLOY_ACTIVATION_TOKEN,
     ModelMetadata,
     ModelRegistry,
     RegistryCorruptedError,
@@ -32,6 +33,8 @@ def _make_metadata(version: str = "baseline", **overrides) -> dict:
         "train_end": "2026-04-19",
         "feature_cols": ["feat_a", "feat_b", "feat_c"],
         "label_horizon_bars": 5,
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
         "metrics": {
             "ic": 0.01, "icir": 0.5, "rank_ic": 0.012,
             "arr": 0.15, "ir": 1.2, "mdd": -0.08, "sr": 1.1,
@@ -80,6 +83,16 @@ def test_load_latest_no_active_raises(registry: ModelRegistry) -> None:
     # registry.json 없는 상태
     with pytest.raises(VersionNotFoundError):
         registry.load_latest()
+
+
+def test_registry_dir_env_override(monkeypatch, tmp_path: Path) -> None:
+    """paper-only rehearsal은 production registry 대신 env override를 사용할 수 있다."""
+    override = tmp_path / "lgbm_paper"
+    monkeypatch.setenv("ELEPHANT_LGBM_REGISTRY_DIR", str(override))
+
+    overridden = ModelRegistry()
+
+    assert overridden.base_dir == override
 
 
 # ====================================================================== #
@@ -180,6 +193,115 @@ def test_save_non_latest_is_latest_false(registry: ModelRegistry) -> None:
     # baseline이 여전히 latest
     assert latest_meta["version"] == "baseline"
 
+    versions = {v["version"]: v for v in registry.list_versions()}
+    assert versions["v2"]["status"] == "candidate"
+
+
+def test_save_non_latest_without_active_does_not_set_active(registry: ModelRegistry) -> None:
+    """candidate 저장만으로 active_version/latest pointer가 생기면 deploy gate 우회다."""
+    registry.save({"x": 2}, _make_metadata("v2"), is_latest=False)
+
+    reg_path = registry.base_dir / "registry.json"
+    with reg_path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    assert data.get("active_version") is None
+    assert data["versions"][0]["status"] == "candidate"
+    assert not (registry.base_dir / "latest_model.pkl").exists()
+    with pytest.raises(VersionNotFoundError):
+        registry.load_latest()
+
+
+def test_save_bundle_candidate_cannot_be_active_latest(registry: ModelRegistry) -> None:
+    """bundle 후보는 C12/C14 deploy gate 전 active/latest로 승격되면 안 된다."""
+    meta = _make_metadata("candidate", bundle_id="BUNDLE-TEST")
+
+    with pytest.raises(ValueError, match="active/latest"):
+        registry.save({"x": 2}, meta, is_latest=True)
+
+    assert not (registry.base_dir / "registry.json").exists()
+    assert not (registry.base_dir / "latest_model.pkl").exists()
+
+
+def test_activate_deployed_candidate_promotes_bundle_after_gate(
+    registry: ModelRegistry,
+) -> None:
+    registry.save({"x": 1}, _make_metadata("baseline"), is_latest=True)
+    registry.save(
+        {"x": 2},
+        _make_metadata("v_bundle", bundle_id="BUNDLE-TEST"),
+        is_latest=False,
+    )
+
+    activated = registry.activate_deployed_candidate(
+        "v_bundle",
+        deploy_token=_DEPLOY_ACTIVATION_TOKEN,
+    )
+
+    assert activated["status"] == "active"
+    assert activated["bundle_id"] == "BUNDLE-TEST"
+    model, meta = registry.load_latest()
+    assert model == {"x": 2}
+    assert meta["version"] == "v_bundle"
+    assert meta["status"] == "active"
+
+    versions = {v["version"]: v for v in registry.list_versions()}
+    assert versions["baseline"]["status"] == "rollback"
+
+
+def test_activate_deployed_candidate_requires_deploy_token(
+    registry: ModelRegistry,
+) -> None:
+    registry.save(
+        {"x": 2},
+        _make_metadata("v_bundle", bundle_id="BUNDLE-TEST"),
+        is_latest=False,
+    )
+
+    with pytest.raises(PermissionError, match="ModeBDeployer"):
+        registry.activate_deployed_candidate("v_bundle")
+
+
+def test_restore_active_version_can_return_to_previous(
+    registry: ModelRegistry,
+) -> None:
+    registry.save({"x": 1}, _make_metadata("baseline"), is_latest=True)
+    registry.save(
+        {"x": 2},
+        _make_metadata("v_bundle", bundle_id="BUNDLE-TEST"),
+        is_latest=False,
+    )
+    registry.activate_deployed_candidate(
+        "v_bundle",
+        deploy_token=_DEPLOY_ACTIVATION_TOKEN,
+    )
+
+    registry.restore_active_version("baseline")
+
+    model, meta = registry.load_latest()
+    assert model == {"x": 1}
+    assert meta["version"] == "baseline"
+
+
+def test_restore_active_version_none_clears_latest(registry: ModelRegistry) -> None:
+    registry.save(
+        {"x": 2},
+        _make_metadata("v_bundle", bundle_id="BUNDLE-TEST"),
+        is_latest=False,
+    )
+    registry.activate_deployed_candidate(
+        "v_bundle",
+        deploy_token=_DEPLOY_ACTIVATION_TOKEN,
+    )
+
+    registry.restore_active_version(None)
+
+    data = json.loads((registry.base_dir / "registry.json").read_text())
+    assert data["active_version"] is None
+    assert not (registry.base_dir / "latest_model.pkl").exists()
+    with pytest.raises(VersionNotFoundError):
+        registry.load_latest()
+
 
 # ====================================================================== #
 # ModelMetadata dataclass
@@ -197,6 +319,8 @@ def test_model_metadata_to_dict() -> None:
         train_end="2026-04-19",
         feature_cols=["a", "b"],
         label_horizon_bars=5,
+        label_generation_version="session_local_v2",
+        label_session_scope="ticker_trading_day",
         metrics={"ic": 0.01},
         commit_hash="abc",
         data_version="v1",

@@ -544,6 +544,17 @@ class TestPITGuard:
         with pytest.raises(PITViolationError):
             runner.run_daily(date=_TEST_DATE, skip_pit_guard=False)
 
+    def test_run_daily_non_trading_day_skips_after_pit_cutoff(self):
+        """비거래일 직접 실행은 커넥터 측정 대신 SKIP한다."""
+        dt_after = datetime(2026, 5, 2, 18, 1, 0, tzinfo=_KST)
+        runner = DQRRunner(now=dt_after)
+
+        report = runner.run_daily(date="2026-05-02", skip_pit_guard=False)
+
+        assert report["status"] == "SKIP"
+        assert report["reason"] == "weekend"
+        assert report["connectors"] == {}
+
 
 # ======================================================================
 # Test 6: C-R3 신규 — 주말/공휴일 skip + MAD=0 fallback

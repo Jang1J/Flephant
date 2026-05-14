@@ -6,7 +6,11 @@ config_load: monkeypatch로 실제 yaml 경유 없이 고정값 주입.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -88,6 +92,64 @@ def scheduler(tmp_audit_path: Path, mock_state_machine, monkeypatch):
     return s
 
 
+def _install_fast_candidate_stages(
+    scheduler,
+    *,
+    factor_candidates: list | None = None,
+    model_candidates: list | None = None,
+    allocator_candidates: list | None = None,
+) -> None:
+    from src.utils.id_factory import generate_bundle_id
+
+    def _s3_fast():
+        scheduler._bundle_id = generate_bundle_id()
+        return {
+            "status": "done",
+            "bundle_id": scheduler._bundle_id,
+            "factor_candidates": factor_candidates or ["f1"],
+        }
+
+    def _s4_fast():
+        return {
+            "status": "done",
+            "model_candidates": model_candidates or [{"version": "v2"}],
+            "allocator_candidates": allocator_candidates or [],
+        }
+
+    def _s2_fast():
+        return {
+            "status": "done",
+            "direction": "model_evolution",
+            "selected_strategies": ["model_evolution"],
+            "thompson_posteriors": {},
+        }
+
+    class _FastBacktestAgent:
+        def run(self, bundle_id):
+            return {
+                "backtest_id": "BT-MOCK",
+                "bundle_id": bundle_id,
+                "metrics": {"sr": 1.0, "ic": 0.1},
+                "verdict": "pass",
+                "regression_severity": "low",
+                "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": {"status": "PASS"},
+            }
+
+    scheduler.stage_2_direction_selection = _s2_fast
+    scheduler.stage_3_factor_evolution = _s3_fast
+    scheduler.stage_4_model_evolution = _s4_fast
+    if scheduler._backtest_agent is None:
+        scheduler._backtest_agent = _FastBacktestAgent()
+
+
 # --------------------------------------------------------------------------- #
 # 1. FORBIDDEN_PERMISSIONS 상수 검증
 # --------------------------------------------------------------------------- #
@@ -150,14 +212,7 @@ def test_run_pipeline_returns_bundle_id(scheduler, monkeypatch):
     """
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     result = scheduler.run_pipeline(date="2026-04-27")
     assert "bundle_id" in result
     assert result["bundle_id"] is not None
@@ -175,17 +230,33 @@ def test_run_pipeline_all_stages_executed(scheduler, monkeypatch):
     """
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1", "f2"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1", "f2"])
     result = scheduler.run_pipeline(date="2026-04-27")
     # S4-5: stage_0 DQR 추가로 전체 8단계 (stage_0~7)
     assert len(result["stages"]) == 8
+
+
+def test_run_pipeline_blocks_before_backtest_on_stage_timeout(scheduler, monkeypatch):
+    """stage_1~5 timeout/error는 C12/deploy 진입 전 fail-closed."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    scheduler._stage_timeouts["stage_1"] = 0
+
+    def _slow_stage_1():
+        time.sleep(0.05)
+        return {"status": "done"}
+
+    def _stage_6_should_not_run():
+        raise AssertionError("stage_6 must not run after predeploy timeout")
+
+    scheduler.stage_1_performance_analysis = _slow_stage_1
+    scheduler.stage_6_backtest_validation = _stage_6_should_not_run
+
+    result = scheduler.run_pipeline(date="2026-04-27")
+
+    assert result["pipeline_status"] == "blocked"
+    assert result["deploy_status"] == "skipped"
+    assert result["blocked_stage"] == "stage_1"
+    assert [stage["stage"] for stage in result["stages"]] == ["stage_0", "stage_1"]
 
 
 # --------------------------------------------------------------------------- #
@@ -197,14 +268,7 @@ def test_audit_log_written_per_stage(scheduler, tmp_audit_path, monkeypatch):
     """run_pipeline 후 audit_log.jsonl에 7개 stage 항목 기록."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     scheduler.run_pipeline(date="2026-04-27")
 
     assert tmp_audit_path.exists()
@@ -223,14 +287,7 @@ def test_audit_log_required_fields(scheduler, tmp_audit_path, monkeypatch):
     """각 audit_log entry에 C14 명세 8개 필드 전부 포함."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     scheduler.run_pipeline(date="2026-04-27")
 
     required = {
@@ -254,14 +311,7 @@ def test_state_transition_called(scheduler, mock_state_machine, monkeypatch):
     """run_pipeline 실행 시 state_machine.transition이 최소 2번 호출됨."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     scheduler.run_pipeline(date="2026-04-27")
     assert mock_state_machine.transition.call_count >= 2
 
@@ -284,6 +334,14 @@ def test_verdict_pass_triggers_deploy(scheduler, monkeypatch):
                 "metrics": {"sharpe_ratio": 1.5, "max_drawdown": -0.05, "win_rate": 0.55},
                 "verdict": "pass",
                 "regression_severity": "none",
+                "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+                "minute_bar_leakage_check": {
+                    "verdict": "pass",
+                    "leakage_detected": False,
+                    "purge_bars_used": 5,
+                    "embargo_bars_used": 5,
+                    "replay_unit": "1m",
+                },
             }
 
         def report(self, report_type, payload):
@@ -296,14 +354,7 @@ def test_verdict_pass_triggers_deploy(scheduler, monkeypatch):
 
     scheduler._backtest_agent = _MockBacktestAgent()
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     result = scheduler.run_pipeline(date="2026-04-27")
 
     assert result["verdict"] == "pass"
@@ -313,6 +364,92 @@ def test_verdict_pass_triggers_deploy(scheduler, monkeypatch):
     s7 = next(s for s in result["stages"] if s["stage"] == "stage_7")
     # stub deployer 없으므로 deploy_result는 stub_no_deployer
     assert s7.get("deploy_result") == "stub_no_deployer"
+    assert result["deploy_status"] == "not_configured"
+    assert result["pipeline_status"] == "failed"
+    assert s7.get("error") == "deployer_not_configured"
+
+
+def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch):
+    """stage_6의 feature/service-policy evidence가 stage_7 deployer 호출로 전달된다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    feature_quality = {
+        "dual_source_rows": 100,
+        "dual_source_non_neutral_rows": 90,
+        "exogenous_rows": 100,
+        "exogenous_non_neutral_rows": 90,
+    }
+    service_policy_replay = {
+        "status": "PASS",
+        "service_policy_report_path": "artifacts/reports/service_policy_replay/test.json",
+        "service_policy_report_sha256": "a" * 64,
+        "gate": {"status": "PASS"},
+        "policy_checks": {
+            "deploy_candidate_by_service_policy": True,
+            "no_naked_short_exposure": True,
+            "order_caps_respected": True,
+            "cash_guard_respected": True,
+        },
+        "order_stats": {"naked_short_attempts": 0},
+    }
+
+    class _MockBacktestAgent:
+        def run(self, bundle_id):
+            return {
+                "backtest_id": "BT-MOCK",
+                "bundle_id": bundle_id,
+                "metrics": {"sr": 1.0, "ic": 0.1},
+                "verdict": "pass",
+                "regression_severity": "low",
+                "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": feature_quality,
+                "service_policy_replay": service_policy_replay,
+            }
+
+    class _MockDeployer:
+        def __init__(self):
+            self.kwargs = None
+
+        def deploy(self, **kwargs):
+            self.kwargs = kwargs
+            return {"status": "deployed", "deploy_status": "deployed", "bundle_id": kwargs["bundle_id"]}
+
+    deployer = _MockDeployer()
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._backtest_agent = _MockBacktestAgent()
+    scheduler._deployer = deployer
+
+    stage_6 = scheduler.stage_6_backtest_validation()
+    scheduler._current_verdict = stage_6["verdict"]
+    stage_7 = scheduler.stage_7_deploy()
+
+    assert stage_7["deploy_status"] == "deployed"
+    assert deployer.kwargs["feature_quality"] == feature_quality
+    assert deployer.kwargs["service_policy_evidence"] == service_policy_replay
+
+
+def test_stage_7_blocks_when_c12_deploy_evidence_missing(scheduler, monkeypatch):
+    """C14 deployer가 있어도 C12 evidence가 없으면 deploy 호출 전 BLOCKED."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    class _MockDeployer:
+        def deploy(self, **kwargs):
+            raise AssertionError("deploy should not be called without C12 evidence")
+
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._current_verdict = "pass"
+    scheduler._current_sanity_check_result = "ok"
+    scheduler._current_regression_risk = {"flagged": False, "severity": "low", "evidence": []}
+    scheduler._current_feature_quality = {}
+    scheduler._current_service_policy_evidence = {}
+    scheduler._deployer = _MockDeployer()
+
+    result = scheduler.stage_7_deploy()
+
+    assert result["deploy_status"] == "blocked"
+    assert result["deploy_result"] == "c12_deploy_evidence_missing"
+    assert result["missing_evidence"] == ["feature_quality", "service_policy_replay"]
 
 
 # --------------------------------------------------------------------------- #
@@ -364,14 +501,7 @@ def test_get_status_reads_audit_log(scheduler, monkeypatch):
     """get_status()로 run_pipeline에서 발급된 bundle_id 조회 시 found=True."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidates():
-        r = original_s3()
-        r["factor_candidates"] = ["f1"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidates
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
     result = scheduler.run_pipeline(date="2026-04-27")
     bid = result["bundle_id"]
 
@@ -423,14 +553,7 @@ def test_verdict_warn_operator_review(scheduler, monkeypatch):
     scheduler.stage_6_backtest_validation = _warn_s6
 
     # stage_3_factor_evolution에 candidates 주입: Backtest 건너뜀 방지
-    original_s3 = scheduler.stage_3_factor_evolution
-
-    def _s3_with_candidate():
-        r = original_s3()
-        r["factor_candidates"] = ["dummy_factor"]
-        return r
-
-    scheduler.stage_3_factor_evolution = _s3_with_candidate
+    _install_fast_candidate_stages(scheduler, factor_candidates=["dummy_factor"])
 
     result = scheduler.run_pipeline(date="2026-04-27")
 
@@ -541,18 +664,44 @@ def test_idea_agent_generate_mode_a_rejected(tmp_path, monkeypatch):
 
 
 @pytest.mark.no_mode_b
-def test_factor_agent_implement_mode_a_rejected(monkeypatch):
-    """FactorAgent.implement()가 Mode A에서 RuntimeError raise."""
-    from src.mode_b.alpha_factor.factor_agent import FactorAgent
-    from src.mode_b.alpha_factor.idea_agent import Hypothesis
+def test_factor_agent_implement_mode_a_rejected():
+    """FactorAgent.implement()가 Mode A에서 RuntimeError raise.
 
-    cfg = {"factor_zoo_path": "/tmp/_test_zoo.jsonl", "max_retries": 1, "max_ast_complexity": 10}
-    monkeypatch.setenv("ELEPHANT_MODE", "mode_a")
-    with patch("src.mode_b.alpha_factor.factor_agent.config_load", return_value=cfg):
-        agent = FactorAgent()
-        hyp = Hypothesis(
-            observation="test", knowledge="test", justification="test",
-            specification="test", hypothesis_id="HYP-20260501-TESTMODE",
-        )
-        with pytest.raises(RuntimeError, match="Mode B 전용"):
-            agent.implement(hyp)
+    FactorAgent imports numpy/pandas at module import time. In the full unit
+    suite those native modules can already be loaded by other tests, so this
+    mode-guard assertion is isolated in a fresh interpreter and checks only the
+    contract being tested.
+    """
+    code = """
+from unittest.mock import patch
+from src.mode_b.alpha_factor.factor_agent import FactorAgent
+from src.mode_b.alpha_factor.idea_agent import Hypothesis
+
+cfg = {"factor_zoo_path": "/tmp/_test_zoo.jsonl", "max_retries": 1, "max_ast_complexity": 10}
+with patch("src.mode_b.alpha_factor.factor_agent.config_load", return_value=cfg):
+    agent = FactorAgent()
+    hyp = Hypothesis(
+        observation="test",
+        knowledge="test",
+        justification="test",
+        specification="test",
+        hypothesis_id="HYP-20260501-TESTMODE",
+    )
+    try:
+        agent.implement(hyp)
+    except RuntimeError as exc:
+        if "Mode B 전용" in str(exc):
+            raise SystemExit(0)
+        raise
+raise SystemExit("FactorAgent.implement accepted Mode A")
+"""
+    env = {**os.environ, "ELEPHANT_MODE": "mode_a", "PYTHONPATH": "new"}
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

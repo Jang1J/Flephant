@@ -14,6 +14,30 @@ Message Pool 채널(실시간 broadcast), report_types는 에이전트 산출물
 """
 from __future__ import annotations
 
+from typing import Any
+
+from src.utils.time_utils import now_kst
+
+_CHANNEL_ACTION_TYPE = {
+    "news_signal": "signal",
+    "dart_alert": "alert",
+    "sentiment_update": "signal",
+    "theme_score": "signal",
+    "risk_warning": "alert",
+    "regime_change": "regime_change",
+    "veto_recommendation": "veto_recommendation",
+    "quant_signal": "signal",
+    "quant_alert": "alert",
+    "anomaly_detected": "alert",
+    "investor_flow_alert": "alert",
+    "debate_resolution": "resolution",
+    "pairwise_ranking": "resolution",
+    "final_decision": "resolution",
+    "uncertainty_signal": "signal",
+}
+
+_VALID_MESSAGE_RISK_LEVELS = {"low", "medium", "high", None}
+
 
 class AgentBase:
     """모든 에이전트의 공통 부모.
@@ -73,7 +97,7 @@ class AgentBase:
     def publish(self, channel: str, payload: dict) -> dict:
         """Message Pool publish 헬퍼. ALLOWED_PUBLISH_CHANNELS subset 검증.
 
-        Returns: {"channel": ..., "agent": <class>, "payload": ...}
+        Returns: C4 MessagePool 필수 필드를 포함한 publishable dict.
         """
         cls_name = type(self).__name__
         # 1. Subclass가 ALLOWED_PUBLISH_CHANNELS 선언했는가
@@ -94,8 +118,35 @@ class AgentBase:
                 f"{cls_name}.publish: channel={channel} not allowed. "
                 f"허용: {sorted(self.ALLOWED_PUBLISH_CHANNELS)}"
             )
-        return {
+        message = {
             "channel": channel,
             "agent": cls_name,
             "payload": payload,
+            "content": self._content_from_payload(payload),
+            "cause_by": cls_name,
+            "sent_from": cls_name,
+            "priority": str(payload.get("priority", "normal")),
+            "confidence": float(payload.get("confidence", 0.5)),
+            "reasoning": str(
+                payload.get("reasoning")
+                or payload.get("narrative")
+                or payload.get("description")
+                or ""
+            ),
+            "scope": str(payload.get("scope") or payload.get("ticker") or "market"),
+            "action_type": _CHANNEL_ACTION_TYPE.get(channel, "signal"),
+            "timestamp": str(payload.get("timestamp") or payload.get("ts") or now_kst().isoformat()),
         }
+        risk_level = payload.get("risk_level")
+        if risk_level in _VALID_MESSAGE_RISK_LEVELS:
+            message["risk_level"] = risk_level
+        return message
+
+    @staticmethod
+    def _content_from_payload(payload: dict[str, Any]) -> str:
+        """MessagePool `content`를 payload에서 안정적으로 구성."""
+        for key in ("content", "narrative", "reasoning", "title", "summary"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+        return str(payload)
