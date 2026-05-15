@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 
 def _load_script_module():
@@ -295,8 +297,13 @@ def test_smoke_passes_us_overnight_with_real_source(monkeypatch):
     class FakeCommunity:
         _is_mock = False
 
-        def poll_and_normalize(self, tickers):
-            return [{"event_id": "COMM"}]
+        def poll(self, tickers):
+            return [
+                SimpleNamespace(
+                    ticker=tickers[0],
+                    timestamp=datetime(2026, 5, 8, 12, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+                )
+            ]
 
     class FakeECOS:
         _is_mock = False
@@ -333,8 +340,8 @@ def test_smoke_passes_us_overnight_with_real_source(monkeypatch):
     assert result["us_overnight"]["indices"]["as_of_date"] == "2026-05-07"
 
 
-def test_smoke_accepts_community_raw_posts_filtered_by_pit(monkeypatch):
-    """장마감 이후 real community raw post가 PIT guard에 막힌 경우 connector smoke는 PASS."""
+def test_smoke_keeps_community_raw_posts_out_of_historical_c2_evidence(monkeypatch):
+    """과거 as_of smoke는 현재 community raw post를 C2 event evidence로 세지 않는다."""
     readiness = _load_script_module()
 
     class FakeKIS:
@@ -384,11 +391,14 @@ def test_smoke_accepts_community_raw_posts_filtered_by_pit(monkeypatch):
     class FakeCommunity:
         _is_mock = False
 
-        def poll_and_normalize(self, tickers):
-            self._last_raw_post_count = 3
-            self._last_normalize_fail_count = 3
-            self._last_normalize_pit_fail_count = 3
-            return []
+        def poll(self, tickers):
+            return [
+                SimpleNamespace(
+                    ticker=tickers[0],
+                    timestamp=datetime(2026, 5, 16, 2, i, tzinfo=ZoneInfo("Asia/Seoul")),
+                )
+                for i in range(3)
+            ]
 
     class FakeECOS:
         _is_mock = False
@@ -422,7 +432,10 @@ def test_smoke_accepts_community_raw_posts_filtered_by_pit(monkeypatch):
     assert result["community"]["status"] == "PASS"
     assert result["community"]["event_count"] == 0
     assert result["community"]["raw_post_count"] == 3
-    assert result["community"]["pit_filtered_only"] is True
+    assert result["community"]["as_of_date"] == "20260508"
+    assert result["community"]["as_of_aligned_post_count"] == 0
+    assert result["community"]["as_of_mismatch_count"] == 3
+    assert result["community"]["normalized_in_smoke"] is False
 
 
 def test_write_report_persists_report_path(monkeypatch, tmp_path):

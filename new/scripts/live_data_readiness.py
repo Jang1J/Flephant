@@ -126,6 +126,25 @@ def _iso_date_str(yyyymmdd: str) -> str:
     return datetime.strptime(yyyymmdd, "%Y%m%d").strftime("%Y-%m-%d")
 
 
+def _community_post_date(post: Any) -> str | None:
+    """Community raw post timestamp를 YYYYMMDD 문자열로 추출."""
+    raw_ts = getattr(post, "timestamp", None)
+    if raw_ts is None and isinstance(post, dict):
+        raw_ts = post.get("timestamp") or post.get("posted_at")
+
+    if isinstance(raw_ts, datetime):
+        ts = raw_ts
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_KST)
+        return ts.astimezone(_KST).strftime("%Y%m%d")
+
+    if raw_ts:
+        token = str(raw_ts)[:10].replace("-", "")
+        if len(token) == 8 and token.isdigit():
+            return token
+    return None
+
+
 def _load_active_tickers(max_tickers: int | None) -> list[str]:
     with _UNIVERSE_PATH.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
@@ -433,34 +452,26 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
         if blocked is not None:
             result["community"] = blocked
         else:
-            events = community.poll_and_normalize(tickers[: min(3, len(tickers))])
-            raw_post_count = int(getattr(community, "_last_raw_post_count", len(events)) or 0)
-            normalize_fail_count = int(
-                getattr(community, "_last_normalize_fail_count", 0) or 0
-            )
-            pit_fail_count = int(
-                getattr(community, "_last_normalize_pit_fail_count", 0) or 0
-            )
-            pit_filtered_only = (
-                raw_post_count > 0
-                and len(events) == 0
-                and normalize_fail_count > 0
-                and pit_fail_count == normalize_fail_count
-            )
+            posts = community.poll(tickers[: min(3, len(tickers))])
+            raw_post_count = len(posts)
+            post_dates = [_community_post_date(post) for post in posts]
+            as_of_aligned_post_count = sum(1 for post_date in post_dates if post_date == as_of_date)
+            unknown_date_count = sum(1 for post_date in post_dates if post_date is None)
+            as_of_mismatch_count = raw_post_count - as_of_aligned_post_count - unknown_date_count
             result["community"] = _status(
-                bool(events) or pit_filtered_only,
+                raw_post_count > 0,
                 {
-                    "event_count": len(events),
+                    "event_count": 0,
                     "raw_post_count": raw_post_count,
-                    "normalize_fail_count": normalize_fail_count,
-                    "pit_filtered_count": pit_fail_count,
-                    "pit_filtered_only": pit_filtered_only,
+                    "as_of_date": as_of_date,
+                    "as_of_aligned_post_count": as_of_aligned_post_count,
+                    "as_of_mismatch_count": as_of_mismatch_count,
+                    "unknown_post_date_count": unknown_date_count,
+                    "normalized_in_smoke": False,
                     "is_mock": getattr(community, "_is_mock", None),
                     "note": (
-                        "raw community posts were reachable, but C2 normalization "
-                        "blocked them by PIT snapshot guard"
-                        if pit_filtered_only
-                        else "community smoke requires real normalized events or PIT-filtered raw posts"
+                        "community connector raw posts are reachable; live readiness "
+                        "does not C2-normalize raw posts to avoid historical as_of drift"
                     ),
                 },
             )
