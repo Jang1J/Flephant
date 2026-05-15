@@ -24,7 +24,7 @@ def test_c05_valid_report_types() -> None:
 
 
 def test_c05_news_report_payload_matches_contract() -> None:
-    """NewsAgent C5 payload excludes C4-only confidence/scope fields."""
+    """NewsAgent C5 payload preserves C4 propagation confidence/scope."""
     agent = NewsAgent(llm_router=_NoopRouter())
 
     report = agent.report(
@@ -42,6 +42,8 @@ def test_c05_news_report_payload_matches_contract() -> None:
     assert report["report_type"] == "news_signal"
     assert report["payload"] == {
         "stance": "buy",
+        "confidence": 0.91,
+        "scope": "ticker:005930",
         "impacted_tickers": ["005930"],
         "impacted_sectors": ["반도체"],
         "narrative": "실적 개선 기대",

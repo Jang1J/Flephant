@@ -248,7 +248,12 @@ class HotRunner:
         # 5. RiskFast sidecar (PM 이후, FDA 이전, S4-4 stage timer)
         ts_dt = datetime.now(tz=timezone.utc)
         try:
-            ts_dt = datetime.fromisoformat(asof).replace(tzinfo=timezone.utc) if asof else ts_dt
+            if asof:
+                parsed_asof = datetime.fromisoformat(asof)
+                if parsed_asof.tzinfo is None:
+                    ts_dt = parsed_asof.replace(tzinfo=timezone.utc)
+                else:
+                    ts_dt = parsed_asof.astimezone(timezone.utc)
         except ValueError:
             pass  # asof 파싱 실패 시 now() 사용
 

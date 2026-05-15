@@ -24,7 +24,8 @@ from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_order_plan_id
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.safe_cast import safe_bool
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("execution_gateway")
 
@@ -102,14 +103,33 @@ class ExecutionGateway:
         t0 = time.perf_counter()
         order_plan_id = generate_order_plan_id()
         decision_id = str(final_decision.get("decision_id", ""))
-        approved = bool(final_decision.get("approved", False))
-        order_deltas = list(final_decision.get("order_deltas", []))
+        approved = safe_bool(final_decision.get("approved", False), default=False)
+        order_deltas, validation_errors = self._normalize_order_deltas(
+            final_decision.get("order_deltas", [])
+        )
+        if validation_errors:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                f"invalid_order_deltas: {validation_errors}",
+                order_deltas,
+                t0,
+            )
 
         # 1. approved=False → no order
         if not approved:
             reason = f"veto ({final_decision.get('reason_code', 'UNKNOWN')})"
             return self._rejected(
                 order_plan_id, decision_id, reason, order_deltas, t0,
+            )
+
+        if not order_deltas:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "no_order_deltas",
+                order_deltas,
+                t0,
             )
 
         # 2. Kill Switch
@@ -264,14 +284,13 @@ class ExecutionGateway:
         estimated_cost = 0.0
 
         for od in order_deltas:
-            ticker_raw = od.get("ticker", "")
-            ticker = pad_ticker(str(ticker_raw))
+            ticker = str(od.get("ticker", ""))
             side = str(od.get("side", "")).lower()
             qty = int(od.get("qty", 0) or 0)
             price = float(od.get("price", 0.0) or 0.0)
             order_type = str(od.get("order_type", "00") or "00")
 
-            if ticker == "000000" or side not in {"buy", "sell"} or qty <= 0:
+            if not self._valid_order_delta(ticker, side, qty, price, order_type):
                 rejections.append({
                     "ticker": ticker,
                     "side": side,
@@ -370,6 +389,75 @@ class ExecutionGateway:
             "latency_ms": elapsed_ms,
             "n_fills": len(fills),
         }
+
+    @staticmethod
+    def _normalize_order_deltas(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Validate and normalize C10 order_deltas before any execution mode."""
+        if raw is None:
+            return [], []
+        if not isinstance(raw, list):
+            return [], [{"reason": "order_deltas_must_be_list", "type": type(raw).__name__}]
+
+        normalized: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for idx, od in enumerate(raw):
+            if not isinstance(od, dict):
+                errors.append({
+                    "index": idx,
+                    "reason": "order_delta_must_be_dict",
+                    "type": type(od).__name__,
+                })
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
+            try:
+                qty = int(od.get("qty", 0) or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            try:
+                price = float(od.get("price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
+            order_type = str(od.get("order_type", "00") or "00")
+            if not ExecutionGateway._valid_order_delta(ticker, side, qty, price, order_type):
+                errors.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "order_type": order_type,
+                    "reason": "invalid_order_delta",
+                })
+                continue
+            normalized_od = dict(od)
+            normalized_od.update({
+                "ticker": ticker,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "order_type": order_type,
+            })
+            normalized.append(normalized_od)
+        return normalized, errors
+
+    @staticmethod
+    def _valid_order_delta(
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str,
+    ) -> bool:
+        if ticker == "000000" or not is_valid_ticker(ticker):
+            return False
+        if side not in {"buy", "sell"}:
+            return False
+        if qty <= 0:
+            return False
+        if order_type != "01" and price <= 0:
+            return False
+        return True
 
     def _submit_broker_order(
         self,

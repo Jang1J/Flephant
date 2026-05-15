@@ -247,11 +247,12 @@ def test_execute_no_audit_logger_works(tmp_path: Path) -> None:
     assert result["execution_report"]["status"] == "filled"
 
 
-def test_execute_empty_order_deltas_still_filled(gateway: ExecutionGateway) -> None:
-    """order_deltas 비어있어도 approved=True면 filled 상태."""
+def test_execute_empty_order_deltas_rejected(gateway: ExecutionGateway) -> None:
+    """approved=True여도 주문 후보가 없으면 filled evidence로 과장하지 않는다."""
     fd = _final_decision(approved=True, order_deltas=[])
     result = gateway.execute(fd)
-    assert result["execution_report"]["status"] == "filled"
+    assert result["execution_report"]["status"] == "rejected"
+    assert result["execution_report"]["rejection_reason"] == "no_order_deltas"
     assert result["execution_report"]["fills"] == []
     assert result["n_fills"] == 0
 
@@ -417,3 +418,37 @@ def test_execute_mode_override_routes_to_paper_and_passes_order_type(
         "price": 70000.0,
         "order_type": "00",
     }]
+
+
+def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) -> None:
+    """BE/direct 입력의 approved='false'를 True로 오판하지 않는다."""
+    fd = _final_decision(
+        approved="false",
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gateway.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "veto" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_rejects_non_list_order_deltas(gateway: ExecutionGateway) -> None:
+    fd = _final_decision(approved=True, order_deltas={"ticker": "005930"})
+
+    result = gateway.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "order_deltas_must_be_list" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_mock_rejects_invalid_order_delta(gateway: ExecutionGateway) -> None:
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "ABC", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gateway.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_delta" in result["execution_report"]["rejection_reason"]

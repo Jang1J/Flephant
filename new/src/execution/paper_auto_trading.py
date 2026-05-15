@@ -18,7 +18,8 @@ from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.safe_cast import safe_bool
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_auto_trading")
 _KST = ZoneInfo("Asia/Seoul")
@@ -291,14 +292,21 @@ class PaperAutoTrader:
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
-        if not bool(final_decision.get("approved")):
+        if not safe_bool(final_decision.get("approved"), default=False):
             return {
                 "status": "SKIP",
                 "safe_skip": True,
                 "reason": "fda_veto",
                 "reason_code": final_decision.get("reason_code"),
             }
-        order_deltas = list(final_decision.get("order_deltas", []))
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return {
+                "status": "FAIL",
+                "reason": "order_deltas_must_be_list",
+                "type": type(raw_order_deltas).__name__,
+            }
+        order_deltas = list(raw_order_deltas)
         if not order_deltas:
             return {
                 "status": "SKIP",
@@ -314,19 +322,46 @@ class PaperAutoTrader:
             }
         violations: list[dict[str, Any]] = []
         for od in order_deltas:
+            if not isinstance(od, dict):
+                violations.append({
+                    "ticker": None,
+                    "reason": "order_delta_must_be_dict",
+                    "type": type(od).__name__,
+                })
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
             qty = int(od.get("qty", 0) or 0)
             order_type = str(od.get("order_type", "00") or "00")
+            price = float(od.get("price", 0.0) or 0.0)
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "invalid_ticker",
+                })
+            if side not in {"buy", "sell"}:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "side_must_be_buy_or_sell",
+                    "side": side,
+                })
             if qty <= 0:
                 violations.append({
-                    "ticker": od.get("ticker"),
+                    "ticker": ticker,
                     "reason": "qty_out_of_limit",
                     "qty": qty,
                     "max_order_qty_per_order": self._max_order_qty_per_order,
                 })
             if order_type == "01" and not self._allow_market_order:
                 violations.append({
-                    "ticker": od.get("ticker"),
+                    "ticker": ticker,
                     "reason": "market_order_not_allowed",
+                })
+            if order_type != "01" and price <= 0:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "positive_price_required",
+                    "price": price,
                 })
         if violations:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
@@ -370,6 +405,13 @@ class PaperAutoTrader:
                 "order_id": str(fill.get("broker_order_id") or ""),
                 "execution_filter": "all",
             }
+            if not query["order_id"]:
+                failures.append({
+                    "query": query,
+                    "error_code": "BROKER_ORDER_ID_MISSING",
+                    "reason": "broker_order_id_missing",
+                })
+                continue
             try:
                 try:
                     history = self._kis_client.get_order_history(**query)
@@ -381,9 +423,15 @@ class PaperAutoTrader:
                     )
                 orders = list(history.get("orders", []))
                 matched = self._filter_history_matches(orders, query)
+                if not matched:
+                    failures.append({
+                        "query": query,
+                        "error_code": "BROKER_ORDER_ID_NOT_FOUND_IN_HISTORY",
+                        "matched_order_count": 0,
+                    })
                 queries.append({
                     "query": query,
-                    "status": "PASS",
+                    "status": "PASS" if matched else "FAIL",
                     "matched_order_count": len(matched),
                     "matched_orders": matched,
                 })
@@ -437,6 +485,9 @@ class PaperAutoTrader:
                 str(order.get("odno") or ""),
             }
             if query.get("order_id") and query["order_id"] not in order_ids:
+                continue
+            if query.get("order_id") and query["order_id"] in order_ids:
+                matched.append(order)
                 continue
             if pad_ticker(str(order.get("ticker", ""))) != query.get("ticker"):
                 continue

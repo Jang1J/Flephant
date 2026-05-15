@@ -23,7 +23,7 @@ from src.ops.safety_guards import SafetyGuards
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_trading")
 
@@ -171,6 +171,18 @@ class PaperTradingRunner:
                 ),
                 "result": result,
             }
+            if report["stages"]["execution"]["status"] == "PASS" and not broker_order_ids:
+                report["stages"]["order_id_guard"] = {
+                    "status": "FAIL",
+                    "error_code": "BROKER_ORDER_ID_MISSING",
+                    "reason": "broker_order_id_missing",
+                    "message": "KIS paper evidence requires broker_order_id before order-history verification.",
+                }
+            else:
+                report["stages"]["order_id_guard"] = {
+                    "status": "PASS",
+                    "broker_order_ids": broker_order_ids,
+                }
             report["stages"]["order_history"] = self._read_order_history_stage(
                 ticker=ticker,
                 side=side,
@@ -241,6 +253,13 @@ class PaperTradingRunner:
                 "required_phrase": self._confirm_phrase,
             }
         side_norm = str(side).lower()
+        ticker_norm = pad_ticker(str(ticker))
+        if ticker_norm == "000000" or not is_valid_ticker(ticker_norm):
+            return {
+                "status": "FAIL",
+                "reason": "invalid_ticker",
+                "ticker": ticker_norm,
+            }
         if side_norm not in {"buy", "sell"}:
             return {"status": "FAIL", "reason": "side_must_be_buy_or_sell"}
         qty_int = int(qty)
@@ -258,7 +277,7 @@ class PaperTradingRunner:
             return {"status": "FAIL", "reason": "positive_price_required"}
         return {
             "status": "PASS",
-            "ticker": pad_ticker(str(ticker)),
+            "ticker": ticker_norm,
             "side": side_norm,
             "qty": qty_int,
             "price": float(price or 0.0),
@@ -384,6 +403,9 @@ class PaperTradingRunner:
                 str(order.get("odno") or ""),
             }
             if order_id and order_id not in ids:
+                continue
+            if order_id and order_id in ids:
+                matched.append(order)
                 continue
             if ticker and pad_ticker(str(order.get("ticker", ""))) != ticker:
                 continue

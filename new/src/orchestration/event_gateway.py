@@ -129,7 +129,12 @@ class EventGateway:
         handler = self._handlers.get(etype)
         if handler is None:
             logger.warning("[event_gateway] 핸들러 없음: event_type=%s. skip.", etype)
-            return None
+            self._admission._write_dead_letter(event, f"NO_HANDLER:{etype}")
+            return {
+                "event_id": event.get("event_id"),
+                "status": "no_handler",
+                "event_type": etype,
+            }
 
         try:
             result = handler(event)

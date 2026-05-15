@@ -207,6 +207,31 @@ def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
     assert result["n_bars_consumed"] == 5
 
 
+def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
+    """timezone-aware KST asof를 UTC로 변환하고 replace로 덮어쓰지 않는다."""
+    runner.start()
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(snapshot, ts):
+        captured["ts"] = ts
+        return {
+            "risk_level": "low",
+            "severity": "low",
+            "fast_rule_match": None,
+            "triggered_rules": [],
+            "affected_tickers": [],
+            "recommended_action": "pass",
+            "stance": "neutral",
+            "rationale": "ok",
+            "latency_ms": 0.0,
+        }
+
+    runner._risk_fast.evaluate = fake_evaluate  # type: ignore[method-assign]
+    runner.run_once(tickers=["005930"], bars_batch=[], asof="2026-05-15T09:00:00+09:00")
+
+    assert captured["ts"].isoformat() == "2026-05-15T00:00:00+00:00"
+
+
 def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     """잘못된 bar 하나가 들어와도 전체 루프는 중단되지 않음."""
     runner.start()

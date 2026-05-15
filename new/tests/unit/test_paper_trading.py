@@ -82,6 +82,28 @@ class FakePaperKISNoOrderHistoryMatch(FakePaperKIS):
         }
 
 
+class FakePaperKISNoBrokerOrderId(FakePaperKIS):
+    def submit_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> dict:
+        self.orders.append({
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {
+            "status": "submitted",
+            "price": price,
+        }
+
+
 def test_paper_balance_reconciliation_pass(tmp_path: Path) -> None:
     runner = PaperTradingRunner(
         kis_client=FakePaperKIS(),
@@ -188,6 +210,39 @@ def test_paper_submit_probe_fails_without_broker_history_match(tmp_path: Path) -
     assert report["stages"]["order_history"]["status"] == "FAIL"
     assert report["stages"]["order_history"]["matched_order_count"] == 0
     assert report["stages"]["order_history"]["reason"] == "broker_order_id_not_found_in_history"
+
+
+def test_paper_submit_probe_fails_without_broker_order_id(tmp_path: Path) -> None:
+    runner = PaperTradingRunner(kis_client=FakePaperKISNoBrokerOrderId(), report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_id_guard"]["status"] == "FAIL"
+    assert report["stages"]["order_id_guard"]["error_code"] == "BROKER_ORDER_ID_MISSING"
+
+
+def test_paper_submit_probe_rejects_invalid_ticker(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="ABC",
+        side="buy",
+        qty=1,
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "invalid_ticker"
+    assert client.orders == []
 
 
 def test_paper_submit_probe_rejects_real_mode(tmp_path: Path) -> None:

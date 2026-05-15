@@ -108,6 +108,39 @@ class FakePaperKISRejects(FakePaperKIS):
         }
 
 
+class FakePaperKISNoHistoryMatch(FakePaperKIS):
+    def get_order_history(
+        self,
+        ticker: str = "",
+        order_id: str = "",
+        side: str = "all",
+        execution_filter: str = "all",
+    ) -> dict[str, Any]:
+        return {"orders": [], "summary": {}, "_mode": self.mode}
+
+
+class FakePaperKISNoBrokerOrderId(FakePaperKIS):
+    def submit_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> dict[str, Any]:
+        self.orders.append({
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {
+            "status": "submitted",
+            "price": price,
+        }
+
+
 class FakeHotRunner:
     def __init__(self, qty: int = 1, approved: bool = True) -> None:
         self.state = SimpleNamespace(value="BOOTSTRAP")
@@ -212,6 +245,52 @@ def test_paper_auto_broker_rejection_fails_cycle(tmp_path: Path) -> None:
     assert cycle["status"] == "FAIL"
     assert cycle["execution"]["execution_report"]["status"] == "rejected"
     assert cycle["broker_blockers"][0]["error_code"] == "BROKER_MARKET_CLOSED"
+
+
+def test_paper_auto_fails_when_broker_order_id_not_in_history(tmp_path: Path) -> None:
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKISNoHistoryMatch(),
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_history_verification"]["status"] == "FAIL"
+    assert cycle["order_history_verification"]["failures"][0]["error_code"] == (
+        "BROKER_ORDER_ID_NOT_FOUND_IN_HISTORY"
+    )
+
+
+def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKISNoBrokerOrderId(),
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_history_verification"]["status"] == "FAIL"
+    assert cycle["order_history_verification"]["failures"][0]["error_code"] == (
+        "BROKER_ORDER_ID_MISSING"
+    )
 
 
 def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:

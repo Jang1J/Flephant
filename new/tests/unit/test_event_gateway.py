@@ -152,7 +152,7 @@ def test_register_handler_and_dispatch(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------------
-# 5. dispatch_next: 핸들러 없는 event_type 은 None 반환
+# 5. dispatch_next: 핸들러 없는 event_type 은 dead-letter 기록
 # ------------------------------------------------------------------
 
 def test_dispatch_next_no_handler_skips(tmp_path: Path) -> None:
@@ -163,10 +163,12 @@ def test_dispatch_next_no_handler_skips(tmp_path: Path) -> None:
     assert gw.backlog_size() == 1
 
     result = gw.dispatch_next()
-    # 핸들러 없으면 None 반환 (skip)
-    assert result is None
+    assert result["status"] == "no_handler"
+    assert result["event_type"] == "dart"
     # backlog 에서는 pop 됨
     assert gw.backlog_size() == 0
+    dead_letter = tmp_path / "dl.jsonl"
+    assert "NO_HANDLER:dart" in dead_letter.read_text(encoding="utf-8")
 
 
 # ------------------------------------------------------------------

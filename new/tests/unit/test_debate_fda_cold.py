@@ -129,6 +129,32 @@ def test_debate_conflict_criteria_respects_yaml_rules() -> None:
     ]
 
 
+def test_debate_conflict_detects_multiple_same_channel_signals() -> None:
+    """같은 channel의 마지막 payload만 남겨 충돌을 놓치지 않는다."""
+    debate = _make_debate()
+    debate._conflict_criteria = [
+        {"signal_a": "news_sell", "signal_b": "quant_top5"},
+    ]
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {"top10_candidates": ["005930", "000660"]},
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    news_sell = _signal("news_agent", "news_signal", "sell")
+    news_neutral = _signal("news_agent", "news_signal", "neutral")
+
+    result = debate.run_debate(
+        [quant_sig, news_sell, news_neutral],
+        candidates=["005930", "000660"],
+    )
+
+    assert result["conflict_detected"] is True
+    assert result["debate_resolution_msg"]["payload"]["conflict_patterns"] == [
+        "news_sell vs quant_top5"
+    ]
+
+
 def test_debate_max_pairwise_respected() -> None:
     """C6 max_pairwise=45 초과 쌍은 truncate."""
     debate = _make_debate()
@@ -285,6 +311,25 @@ def test_fda_cold_veto_debate_conflict() -> None:
     assert fd["reason_code"] == "DEBATE_CONFLICT"
 
 
+def test_fda_cold_debate_uncertainty_string_no_crash() -> None:
+    """Debate uncertainty_delta 문자열도 안전하게 float 변환한다."""
+    fda = _make_fda(with_router=False)
+    result = fda.decide(
+        portfolio_patch_ref="PP-20260426-002",
+        target_weights={"005930": 0.1},
+        mode="cold",
+        risk_warnings=[],
+        debate_result={
+            "conflict_detected": True,
+            "uncertainty_delta": "0.91",
+            "winner_view": "mixed",
+        },
+    )
+    fd = _fd(result)
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "DEBATE_CONFLICT"
+
+
 def test_fda_cold_veto_risk_warning() -> None:
     """Cold Path: risk_warning veto_recommendation stance → RISK_FAST_TRIGGER veto."""
     fda = _make_fda(with_router=False)
@@ -328,6 +373,7 @@ def test_fda_cold_llm_approve() -> None:
     fd = _fd(result)
     assert fd["approved"] is True
     assert fd["reason_code"] == "NORMAL_APPROVE"
+    assert fd["confidence"] == pytest.approx(0.85)
 
 
 def test_fda_cold_llm_string_false_vetoes() -> None:

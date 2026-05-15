@@ -478,6 +478,48 @@ def test_score_cross_section_ignores_future_investor_flow(tmp_path: Path) -> Non
     assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
 
 
+def test_score_cross_section_ignores_stale_exogenous_snapshot(tmp_path: Path) -> None:
+    """received_at 메타가 있는 stale generic exogenous snapshot은 추론 입력에서 제외한다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_stale_exog")
+    mock = MockBooster(scores=None)
+    feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_5m_ret",
+        "feat_30m_vol",
+        "feat_60m_trend",
+        "us_sp500_change",
+    ]
+    reg.save(
+        mock,
+        {
+            "version": "stale-exog-v1",
+            "bundle_id": None,
+            "train_start": "20260101",
+            "train_end": "20260419",
+            "feature_cols": feature_cols,
+            "label_horizon_bars": 5,
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+    agent.update_exogenous_snapshot(
+        {"us_sp500_change": 0.99},
+        received_at="2026-04-20T09:00:00+09:00",
+        max_age_sec=60,
+    )
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:30:00+09:00")
+
+    assert result["mode"] == "active"
+    assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
+
+
 def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     populated_dual_source_registry: ModelRegistry,
 ) -> None:
