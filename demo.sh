@@ -17,7 +17,7 @@
 set -e
 set -u
 
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
 DEMO_TYPE="${1:-all}"
 SCENARIO="${SCENARIO:-week1_basic.yaml}"
 
