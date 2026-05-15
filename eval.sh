@@ -4,14 +4,15 @@
 
 set -e
 
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 echo "[eval] 독립 검증 시작..."
 echo "[eval] python=$PYTHON"
-echo "[eval] thread caps: OMP=$OMP_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS MKL=$MKL_NUM_THREADS"
+echo "[eval] thread caps: OMP=$OMP_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS MKL=$MKL_NUM_THREADS NUMEXPR=$NUMEXPR_NUM_THREADS"
 
 # 1. smoke test 먼저
 ./smoke.sh || { echo "[eval] ✗ smoke test 실패 — 기본 환경 문제"; exit 1; }

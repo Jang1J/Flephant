@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from datetime import datetime
+import math
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -88,9 +89,14 @@ class QuantAgent(AgentBase):
         self._outlier_cap_z: float = float(pp_cfg["outlier_cap_z"])
         self._base_feature_cols: list[str] = list(pp_cfg["feature_cols"])
         self._dual_source_feature_cols: list[str] = []
+        self._dual_source_defaults: dict[str, float] = {}
         ds_cfg = config_load("risk_config.yaml", "dual_source") or {}
         if ds_cfg.get("enabled_for_lgbm", False):
             self._dual_source_feature_cols = list(pp_cfg.get("dual_source_feature_cols", []))
+            self._dual_source_defaults = {
+                col: (1.0 if col == "community_noise_multiplier" else 0.0)
+                for col in self._dual_source_feature_cols
+            }
         self._exogenous_feature_cols: list[str] = []
         self._exogenous_defaults: dict[str, float] = {}
         exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
@@ -219,11 +225,14 @@ class QuantAgent(AgentBase):
             return None
         asof_dt = self._parse_snapshot_dt(asof) if asof else datetime.now(_KST)
         received_dt = item["received_at"]
-        age_sec = max(0.0, (asof_dt - received_dt).total_seconds())
+        raw_age_sec = (asof_dt - received_dt).total_seconds()
+        is_future = raw_age_sec < 0
+        age_sec = max(0.0, raw_age_sec)
         out = dict(item)
         out["received_at"] = received_dt.isoformat()
         out["age_sec"] = float(age_sec)
-        out["is_stale"] = age_sec > self._investor_flow_stale_sec
+        out["is_future"] = bool(is_future)
+        out["is_stale"] = bool(is_future or age_sec > self._investor_flow_stale_sec)
         return out
 
     # ================================================================== #
@@ -288,16 +297,18 @@ class QuantAgent(AgentBase):
             bars = bars_batch.get(ticker, [])
             if len(bars) < self._warmup_bars:
                 continue
-            feats = self._compute_features(
+            all_feats = self._compute_features(
                 bars,
                 ticker=ticker,
                 asof=asof_str,
                 require_dual_source=requires_dual_source,
             )
-            if feats is None:
+            if all_feats is None:
                 continue
             try:
-                feature_vec = [float(feats[c]) for c in self._inference_feature_cols]
+                feature_vec = [
+                    float(all_feats[c]) for c in self._inference_feature_cols
+                ]
             except KeyError as e:
                 logger.warning(
                     "[quant_agent] %s feature 누락: %s. skip", ticker, e
@@ -471,7 +482,7 @@ class QuantAgent(AgentBase):
         asof: str | None = None,
         require_dual_source: bool = False,
     ) -> dict[str, float] | None:
-        """단일 ticker 최근 60 bars → 4 피처 dict (feat_ prefix).
+        """단일 ticker 최근 60 bars → LightGBM 추론 피처 dict.
 
         DatasetBuilder._compute_rolling_features와 동일한 수식.
         단건 계산 목적이므로 numpy only (pandas 미사용).
@@ -566,17 +577,21 @@ class QuantAgent(AgentBase):
                 )
                 return None
             else:
-                feats.setdefault(col, 0.0)
-        exog_values = self._get_exogenous_features(ticker)
+                feats.setdefault(col, self._dual_source_defaults.get(col, 0.0))
+        exog_values = self._get_exogenous_features(ticker, asof=asof)
         for col in self._exogenous_feature_cols:
             feats[col] = float(exog_values.get(col, self._exogenous_defaults.get(col, 0.0)))
         return feats
 
-    def _get_exogenous_features(self, ticker: str | None) -> dict[str, float]:
+    def _get_exogenous_features(
+        self,
+        ticker: str | None,
+        asof: str | None = None,
+    ) -> dict[str, float]:
         values = dict(self._market_exogenous_snapshot)
         if ticker:
-            flow = self.get_investor_flow_snapshot(ticker)
-            if flow is not None:
+            flow = self.get_investor_flow_snapshot(ticker, asof=asof)
+            if flow is not None and not flow.get("is_future") and not flow.get("is_stale"):
                 for col in ("foreign_net_buy", "institutional_net_buy", "retail_net_buy"):
                     if flow.get(col) is not None:
                         values[col] = float(flow[col])
@@ -621,8 +636,9 @@ class QuantAgent(AgentBase):
                     continue
                 values: dict[str, float] = {}
                 for col in self._dual_source_feature_cols:
-                    if col in item:
-                        values[col] = float(item[col])
+                    value = self._float_or_none(item.get(col))
+                    if value is not None:
+                        values[col] = value
                 if values:
                     ticker_map[padded] = values
             self._dual_source_cache[date_key] = ticker_map
@@ -660,9 +676,12 @@ class QuantAgent(AgentBase):
         if value is None or value == "":
             return None
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
 
     # ================================================================== #
     # Internal: Anomaly detection

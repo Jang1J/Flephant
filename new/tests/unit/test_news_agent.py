@@ -189,6 +189,8 @@ class TestAnalyze:
         _, kwargs = llm.call.call_args
         assert kwargs.get("mode") == "cold" or llm.call.call_args[0][1] == "cold"
         assert kwargs.get("caller") == "news_agent" or llm.call.call_args[0][2] == "news_agent"
+        prompt = llm.call.call_args[0][0]
+        assert '"confidence": 0.0' in prompt
 
     def test_analyze_news_event_returns_news_signal_channel(self):
         """news event_type → channel=news_signal."""
@@ -201,6 +203,22 @@ class TestAnalyze:
             "event_id": "E-1",
         })
         assert result["channel"] == "news_signal"
+        for key in ("cause_by", "sent_from", "priority", "action_type", "timestamp"):
+            assert key in result
+        assert result["scope"] == "ticker:005930"
+        assert "confidence" not in result["payload"]
+
+    def test_analyze_tickers_string_uses_full_code(self):
+        """event.tickers가 문자열이어도 첫 글자만 쓰지 않고 6자리 코드를 유지한다."""
+        agent = _make_agent()
+        result = agent.analyze({
+            "event_type": "news",
+            "tickers": "005930",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-string-ticker",
+        })
+        assert result["scope"] == "ticker:005930"
 
     def test_analyze_dart_event_returns_dart_alert_channel(self):
         """dart event_type → channel=dart_alert."""
@@ -314,6 +332,39 @@ class TestParseLlmContent:
         parsed = agent._parse_llm_content("neutral content")
         assert isinstance(parsed["impacted_tickers"], list)
         assert isinstance(parsed["impacted_sectors"], list)
+
+    def test_parse_llm_json_array_falls_back_without_crash(self):
+        """JSON array 응답은 object parser 오류 후 heuristic fallback으로 처리된다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content("[]")
+        assert parsed["stance"] == "neutral"
+        assert parsed["confidence"] == pytest.approx(0.5)
+
+    def test_parse_llm_content_preserves_json_confidence(self):
+        """LLM JSON confidence는 C5 payload가 아니라 C4 top-level confidence로 전달된다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content(
+            '{"stance":"buy","impacted_tickers":["005930"],'
+            '"impacted_sectors":["반도체"],"narrative":"호재",'
+            '"confidence":0.82}'
+        )
+        rpt = agent.report("news_signal", parsed)
+        assert parsed["confidence"] == pytest.approx(0.82)
+        assert "confidence" not in rpt["payload"]
+
+    def test_parse_confidence_clamps_invalid_values(self):
+        """confidence는 finite 0.0~1.0 값으로 정규화된다."""
+        assert NewsAgent._parse_confidence(1.7) == pytest.approx(1.0)
+        assert NewsAgent._parse_confidence(-0.2) == pytest.approx(0.0)
+        assert NewsAgent._parse_confidence("nan") == pytest.approx(0.5)
+        assert NewsAgent._parse_confidence("bad") == pytest.approx(0.5)
+
+    def test_publish_confidence_is_safe_clamped(self):
+        """C4 publish confidence도 비수치/범위초과 값을 안전하게 정규화한다."""
+        agent = _make_agent()
+        assert agent.publish("news_signal", {"confidence": "high"})["confidence"] == pytest.approx(0.5)
+        assert agent.publish("news_signal", {"confidence": 2.0})["confidence"] == pytest.approx(1.0)
+        assert agent.publish("news_signal", {"confidence": float("nan")})["confidence"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------

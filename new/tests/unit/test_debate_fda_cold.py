@@ -97,6 +97,38 @@ def test_debate_conflict_triggers_pairwise() -> None:
     assert payload["wins"][0]["ticker"] == "005930"
 
 
+def test_debate_conflict_criteria_respects_yaml_rules() -> None:
+    """C6 conflict_criteria가 하드코딩 패턴이 아니라 로드된 규칙을 따른다."""
+    debate = _make_debate()
+    debate._conflict_criteria = [
+        {
+            "signal_a": "news_sell",
+            "signal_b": "quant_top5",
+            "reason": "test-only criterion",
+        }
+    ]
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {
+            "stance": "neutral",
+            "top10_candidates": ["005930", "000660", "035420"],
+        },
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+    news_sig = _signal("news_agent", "news_signal", "sell")
+
+    no_match = debate.run_debate([quant_sig, risk_sig], candidates=["005930", "000660"])
+    matched = debate.run_debate([quant_sig, news_sig], candidates=["005930", "000660"])
+
+    assert no_match["conflict_detected"] is False
+    assert matched["conflict_detected"] is True
+    assert matched["debate_resolution_msg"]["payload"]["conflict_patterns"] == [
+        "news_sell vs quant_top5"
+    ]
+
+
 def test_debate_max_pairwise_respected() -> None:
     """C6 max_pairwise=45 초과 쌍은 truncate."""
     debate = _make_debate()
@@ -155,6 +187,45 @@ def test_debate_llm_failure_heuristic_fallback() -> None:
     risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
     result = debate.run_debate([quant_sig, risk_sig])
     assert result["conflict_detected"]  # heuristic으로도 완료
+
+
+def test_debate_batch_invalid_confidence_does_not_crash() -> None:
+    """LLM batch confidence가 비수치여도 fallback 0.5로 정규화된다."""
+    mock = _make_router(
+        '{"results":[{"pair":["005930","000660"],"winner":"005930",'
+        '"confidence":"high","reasoning":"비수치 confidence"}]}'
+    )
+    debate = DebateAgent(llm_router=mock, pubsub=None)
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {"stance": "neutral", "top10_candidates": ["005930", "000660"]},
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+
+    result = debate.run_debate([quant_sig, risk_sig])
+
+    assert result["conflict_detected"] is True
+    assert result["completed_comparisons"] == 1
+
+
+def test_debate_llm_json_array_falls_back_without_crash() -> None:
+    """LLM이 JSON array를 반환해도 DebateAgent는 heuristic fallback으로 완료한다."""
+    mock = _make_router("[]")
+    debate = DebateAgent(llm_router=mock, pubsub=None)
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {"stance": "neutral", "top10_candidates": ["005930", "000660"]},
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+
+    result = debate.run_debate([quant_sig, risk_sig])
+
+    assert result["conflict_detected"] is True
+    assert result["completed_comparisons"] >= 1
 
 
 def test_debate_allowed_channels() -> None:
@@ -257,6 +328,41 @@ def test_fda_cold_llm_approve() -> None:
     fd = _fd(result)
     assert fd["approved"] is True
     assert fd["reason_code"] == "NORMAL_APPROVE"
+
+
+def test_fda_cold_llm_string_false_vetoes() -> None:
+    """LLM approved='false' 문자열은 Python truthy가 아니라 False로 해석한다."""
+    router = _make_router(
+        '{"approved":"false","reason_code":"NEWS_DIVERGENCE",'
+        '"veto_reason":"뉴스 괴리","confidence":0.6}'
+    )
+    fda = FDAAgent(llm_router=router)
+    result = fda.decide(
+        portfolio_patch_ref="PP-20260426-005",
+        target_weights={"005930": 0.05},
+        mode="cold",
+        risk_warnings=[],
+        agent_signals=[_signal("news_agent", "news_signal", "sell")],
+        debate_result={"conflict_detected": False},
+    )
+    fd = _fd(result)
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+
+
+def test_fda_cold_llm_json_array_falls_back_without_crash() -> None:
+    """JSON array 응답은 crash 없이 heuristic fallback으로 처리된다."""
+    fda = FDAAgent(llm_router=_make_router("[]"))
+    result = fda.decide(
+        portfolio_patch_ref="PP-20260426-006",
+        target_weights={"005930": 0.05},
+        mode="cold",
+        risk_warnings=[],
+        agent_signals=[],
+        debate_result={"conflict_detected": False},
+    )
+    fd = _fd(result)
+    assert fd["approved"] is True
 
 
 def test_fda_cold_can_change_weight_still_false() -> None:

@@ -436,6 +436,15 @@ class LLMRouter:
         성공 시 budget.record() 호출.
         API 키 누락 시 graceful failure (RuntimeError 미발생).
         """
+        if self._allow_mock_provider:
+            return self._mock_provider_result(
+                model=LLMModel.KANANA_O.value,
+                prompt=prompt,
+                caller=caller,
+                cost_usd=self._kanana_cost_placeholder,
+                is_fallback=False,
+                record_budget=True,
+            )
         if self._kanana_key is None:
             logger.warning("KANANA_API_KEY 미설정: Kanana-o 호출 불가")
             return LLMCallResult(
@@ -445,15 +454,6 @@ class LLMRouter:
                 latency_ms=0.0,
                 error="KANANA_API_KEY_MISSING",
                 circuit_state=self._kanana_cb.state,
-            )
-        if self._allow_mock_provider:
-            return self._mock_provider_result(
-                model=LLMModel.KANANA_O.value,
-                prompt=prompt,
-                caller=caller,
-                cost_usd=self._kanana_cost_placeholder,
-                is_fallback=False,
-                record_budget=True,
             )
         if not self._kanana_api_url:
             logger.warning("KANANA_API_URL 미설정: Kanana-o 실 호출 불가")
@@ -526,6 +526,15 @@ class LLMRouter:
 
         API 키 누락 또는 circuit OPEN 시 graceful failure.
         """
+        if self._allow_mock_provider:
+            return self._mock_provider_result(
+                model=LLMModel.GPT_4O.value,
+                prompt=prompt,
+                caller=caller,
+                cost_usd=self._gpt4o_cost_placeholder,
+                is_fallback=is_fallback,
+                record_budget=False,
+            )
         if self._openai_key is None:
             logger.warning("OPENAI_API_KEY 미설정: GPT-4o 호출 불가")
             return LLMCallResult(
@@ -536,15 +545,6 @@ class LLMRouter:
                 error="OPENAI_API_KEY_MISSING",
                 circuit_state=self._gpt4o_cb.state,
                 fallback_used=is_fallback,
-            )
-        if self._allow_mock_provider:
-            return self._mock_provider_result(
-                model=LLMModel.GPT_4O.value,
-                prompt=prompt,
-                caller=caller,
-                cost_usd=self._gpt4o_cost_placeholder,
-                is_fallback=is_fallback,
-                record_budget=False,
             )
 
         if not self._gpt4o_cb.can_attempt():

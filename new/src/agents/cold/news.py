@@ -8,6 +8,7 @@ cache: S4-7 Persistent Cache. key=news:{ticker}:{event_id}. TTL=risk_config.yaml
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -87,6 +88,12 @@ class NewsAgent(AgentBase):
         Raises:
             ValueError: payload 검증 실패 (stance 범위 이탈, narrative 누락 등).
         """
+        if report_type != "news_signal":
+            raise ValueError(
+                f"[news_agent] report_type={report_type!r} 미지원. "
+                "C5 AgentReportContract report_type은 news_signal 고정."
+            )
+
         # stance 검증
         stance = payload.get("stance")
         if stance not in self.VALID_STANCES:
@@ -152,11 +159,18 @@ class NewsAgent(AgentBase):
         payload = event.get("payload") or {}
         scope = str(event.get("scope") or "")
         scope_ticker = scope.split(":", 1)[1] if scope.startswith("ticker:") else None
+        event_tickers = event.get("tickers")
+        if isinstance(event_tickers, list):
+            first_event_ticker = event_tickers[0] if event_tickers else None
+        elif isinstance(event_tickers, str):
+            first_event_ticker = event_tickers
+        else:
+            first_event_ticker = None
         raw_ticker = (
             event.get("ticker")
             or payload.get("ticker")
             or scope_ticker
-            or (event.get("tickers") or [None])[0]
+            or first_event_ticker
         )
         ticker = str(raw_ticker).zfill(6) if raw_ticker else ""
 
@@ -182,11 +196,12 @@ class NewsAgent(AgentBase):
             f"제목: {title}\n"
             f"내용: {summary}\n\n"
             "투자 관점에서 매수(buy)/매도(sell)/중립(neutral) 중 하나와 "
-            "간단한 근거를 한국어로 답하세요.\n\n"
+            "간단한 근거와 confidence(0.0~1.0)를 한국어로 답하세요.\n\n"
             'Respond strictly in JSON: {"stance": "buy|sell|neutral", '
             '"impacted_tickers": ["005930"], '
             '"impacted_sectors": ["반도체"], '
-            '"narrative": "한국어 1~3문장"}'
+            '"narrative": "한국어 1~3문장", '
+            '"confidence": 0.0}'
         )
 
         # Cold Path LLM 호출 (Hot Path에서 호출 금지. mode='cold' 강제.)
@@ -211,6 +226,7 @@ class NewsAgent(AgentBase):
                 "narrative": f"LLM 호출 실패: {error_msg}"[: self._narrative_max_chars],
                 "impacted_tickers": [],
                 "impacted_sectors": [],
+                "confidence": 0.5,
             }
             llm_fallback = True
 
@@ -220,6 +236,8 @@ class NewsAgent(AgentBase):
 
         # C5 report 생성
         rpt = self.report("news_signal", parsed)
+        parsed_confidence = self._parse_confidence(parsed.get("confidence", 0.5))
+        message_scope = f"ticker:{ticker}" if ticker else "market"
 
         # micro memory 저장
         if ticker:
@@ -235,6 +253,11 @@ class NewsAgent(AgentBase):
                 },
             )
 
+        message = self.publish(publish_channel, rpt["payload"])
+        message["confidence"] = parsed_confidence
+        message["scope"] = message_scope
+        message["timestamp"] = rpt["ts"]
+
         result = {
             "channel": publish_channel,
             "payload": rpt["payload"],
@@ -242,11 +265,10 @@ class NewsAgent(AgentBase):
             "agent": rpt["agent"],
             "ts": rpt["ts"],
             "llm_fallback": llm_fallback,
-            "content": rpt["payload"]["narrative"],
-            "scope": f"ticker:{ticker}" if ticker else "market",
-            "confidence": float(parsed.get("confidence", 0.5)),
-            "reasoning": rpt["payload"]["narrative"],
+            **message,
         }
+        if not llm_fallback:
+            result["message"] = message
 
         # S4-7 캐시 저장 (LLM fallback이 아닌 정상 분석 결과만)
         if cache_key and self._cache is not None and not llm_fallback:
@@ -265,8 +287,9 @@ class NewsAgent(AgentBase):
         # llm_fallback 시 publish 안 함 (neutral 결과로 풀 오염 방지).
         if self._pubsub is not None and not llm_fallback:
             try:
-                publish_msg = self.publish(publish_channel, rpt["payload"])
-                self._pubsub.publish(publish_channel, publish_msg)
+                msg_id = self._pubsub.publish(publish_channel, message)
+                result["message_id"] = msg_id
+                result["published_by_agent"] = True
             except Exception as e:
                 logger.warning(
                     "[news_agent] C4 publish 실패. event_id=%s channel=%s error=%s",
@@ -362,6 +385,9 @@ class NewsAgent(AgentBase):
                 "narrative": narrative,
                 "impacted_tickers": impacted_tickers,
                 "impacted_sectors": impacted_sectors,
+                "confidence": self._parse_confidence(
+                    parsed_json.get("confidence", 0.5)
+                ),
             }
 
         except (json.JSONDecodeError, ValueError, TypeError):
@@ -395,7 +421,19 @@ class NewsAgent(AgentBase):
             "narrative": narrative,
             "impacted_tickers": impacted_tickers,
             "impacted_sectors": [],
+            "confidence": 0.5,
         }
+
+    @staticmethod
+    def _parse_confidence(value: Any) -> float:
+        """LLM confidence를 0.0~1.0 범위 float로 정규화."""
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        if not math.isfinite(confidence):
+            return 0.5
+        return max(0.0, min(1.0, confidence))
 
     # ------------------------------------------------------------------
     # Memory 저장

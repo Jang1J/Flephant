@@ -5,7 +5,11 @@
 set -e
 set -u
 
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 PASS=0
 FAIL=0
 
@@ -13,6 +17,8 @@ _pass() { echo "[smoke] ✓ $1"; PASS=$((PASS+1)); }
 _fail() { echo "[smoke] ✗ $1" >&2; FAIL=$((FAIL+1)); }
 
 echo "[smoke] Elephant Lab v3 Smoke Test 시작..."
+echo "[smoke] python=$PYTHON"
+echo "[smoke] thread caps: OMP=$OMP_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS MKL=$MKL_NUM_THREADS NUMEXPR=$NUMEXPR_NUM_THREADS"
 echo ""
 
 # ===========================================================================

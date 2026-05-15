@@ -12,7 +12,7 @@ pairwise 비교 최대 45쌍 (C(10,2))을 1회 batch 요청. Kanana-o 100회/일
 from __future__ import annotations
 
 import json
-import re
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -220,6 +220,8 @@ class DebateAgent(AgentBase):
                 all_pair_results = self._heuristic_fallback(pairs)
             else:
                 all_pair_results = self._batch_pairwise_compare(pairs, signals, conflict)
+                if time.perf_counter() >= deadline:
+                    deadline_hit = True
 
         # C6 pairwise_ranking: 집계 후 1회 publish
         win_counts: dict[str, int] = {ticker: 0 for ticker in ranked_base}
@@ -238,6 +240,11 @@ class DebateAgent(AgentBase):
             "total_pairs": len(pairs),  # legacy field, C6 clients should read comparison_count.
             "ts": datetime.now(_KST).isoformat(),
         })
+        if self._pubsub is not None:
+            try:
+                self._pubsub.publish("pairwise_ranking", pr_msg)
+            except Exception as e:
+                logger.warning("[debate] pairwise_ranking publish 실패: %s", e)
         pairwise_msgs.append(pr_msg)
 
         wins = win_counts
@@ -271,6 +278,11 @@ class DebateAgent(AgentBase):
             ),
         }
         resolution_msg = self.report("debate_resolution", resolution_payload)
+        if self._pubsub is not None:
+            try:
+                self._pubsub.publish("debate_resolution", resolution_msg)
+            except Exception as e:
+                logger.warning("[debate] debate_resolution publish 실패: %s", e)
 
         # memory 저장
         self._save_debate_history(debate_id, resolution_payload)
@@ -301,37 +313,51 @@ class DebateAgent(AgentBase):
           - quant_buy vs risk_high
           - news_sell vs quant_top5
         """
-        channels = {s.get("channel", ""): s for s in signals}
         payloads = {s.get("channel", ""): s.get("payload", {}) for s in signals}
 
         detected_patterns: list[str] = []
 
-        # 패턴 1: quant_signal Top10이 있는데 risk_warning이 veto_recommendation
-        if "quant_signal" in channels and "risk_warning" in channels:
-            quant_top10 = payloads.get("quant_signal", {}).get("top10_candidates", [])
-            risk_stance = payloads.get("risk_warning", {}).get("stance", "neutral")
-            if quant_top10 and risk_stance == "veto_recommendation":
-                detected_patterns.append("quant_top10 vs agent_veto_recommendation")
-
-        # 패턴 2: quant_signal Top5 buy와 risk_warning risk_level=high 동시
-        if "quant_signal" in channels and "risk_warning" in channels:
-            top5 = payloads.get("quant_signal", {}).get("top10_candidates", [])[:5]
-            risk_level = payloads.get("risk_warning", {}).get("risk_level", "low")
-            if top5 and risk_level == "high":
-                detected_patterns.append("quant_buy vs risk_high")
-
-        # 패턴 3: news_signal sell과 quant top5 동시
-        if "news_signal" in channels and "quant_signal" in channels:
-            news_stance = payloads.get("news_signal", {}).get("stance", "neutral")
-            quant_top5 = payloads.get("quant_signal", {}).get("top10_candidates", [])[:5]
-            if news_stance == "sell" and quant_top5:
-                detected_patterns.append("news_sell vs quant_top5")
+        for criterion in self._conflict_criteria:
+            signal_a = str(criterion.get("signal_a", ""))
+            signal_b = str(criterion.get("signal_b", ""))
+            if self._condition_present(signal_a, payloads) and self._condition_present(
+                signal_b, payloads
+            ):
+                detected_patterns.append(f"{signal_a} vs {signal_b}")
 
         return {
             "detected": len(detected_patterns) > 0,
             "patterns": detected_patterns,
             "reason": "no_conflict" if not detected_patterns else "conflict",
         }
+
+    @staticmethod
+    def _condition_present(
+        condition: str,
+        payloads: dict[str, dict[str, Any]],
+    ) -> bool:
+        """risk_config.yaml debate.conflict_criteria 조건명을 runtime payload로 평가."""
+        quant_payload = payloads.get("quant_signal", {})
+        risk_payload = payloads.get("risk_warning", {})
+        news_payload = payloads.get("news_signal", {})
+
+        if condition == "quant_top10":
+            return bool(quant_payload.get("top10_candidates", []))
+        if condition == "quant_top5":
+            return bool(quant_payload.get("top10_candidates", [])[:5])
+        if condition == "quant_buy":
+            return (
+                str(quant_payload.get("stance", "")).lower() == "buy"
+                or bool(quant_payload.get("top10_candidates", [])[:5])
+            )
+        if condition == "veto_recommendation":
+            return str(risk_payload.get("stance", "")) == "veto_recommendation"
+        if condition == "risk_high":
+            return str(risk_payload.get("risk_level", "")) == "high"
+        if condition == "news_sell":
+            return str(news_payload.get("stance", "")).lower() == "sell"
+        logger.warning("[debate] 알 수 없는 conflict condition 무시: %s", condition)
+        return False
 
     # ------------------------------------------------------------------
     # Pairwise 비교
@@ -451,7 +477,7 @@ class DebateAgent(AgentBase):
             parsed_by_pair[frozenset((left, right))] = {
                 "pair": [left, right],
                 "winner": winner,
-                "confidence": float(item.get("confidence", 0.5) or 0.5),
+                "confidence": self._parse_confidence(item.get("confidence", 0.5)),
                 "reasoning": str(item.get("reasoning", "")),
             }
 
@@ -497,6 +523,17 @@ class DebateAgent(AgentBase):
             key=lambda ticker: (-win_counts.get(ticker, 0), original_order[ticker]),
         )
 
+    @staticmethod
+    def _parse_confidence(value: Any) -> float:
+        """LLM pairwise confidence를 0.0~1.0 범위 finite float로 정규화."""
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        if not math.isfinite(confidence):
+            return 0.5
+        return max(0.0, min(1.0, confidence))
+
     def _infer_winner_view(self, signals: list[dict[str, Any]]) -> str:
         """C6 winner_view enum 산출. ticker reranking과 agent-view enum을 분리한다."""
         has_quant = False
@@ -522,66 +559,6 @@ class DebateAgent(AgentBase):
         if has_quant:
             return "quant"
         return "mixed"
-
-    def _pairwise_compare(
-        self,
-        s1: dict[str, Any],
-        s2: dict[str, Any],
-        conflict_ctx: dict[str, Any],
-    ) -> dict[str, Any]:
-        """두 신호 간 Kanana-o 1:1 비교. legacy tests/backward compatibility용."""
-        prompt = (
-            f"두 에이전트 신호를 비교하여 어느 쪽이 더 신뢰할 수 있는지 판단하세요.\n\n"
-            f"신호 A ({s1.get('agent', '?')}, 채널: {s1.get('channel', '?')}):\n"
-            f"{json.dumps(s1.get('payload', {}), ensure_ascii=False)}\n\n"
-            f"신호 B ({s2.get('agent', '?')}, 채널: {s2.get('channel', '?')}):\n"
-            f"{json.dumps(s2.get('payload', {}), ensure_ascii=False)}\n\n"
-            f"충돌 맥락: {', '.join(conflict_ctx.get('patterns', []))}\n\n"
-            "JSON으로 응답: "
-            '{"winner": "A_agent|B_agent|tied", "confidence": 0.0~1.0, "reasoning": "한국어 1문장"}'
-        )
-
-        llm_result = self._llm_router.call(
-            prompt, mode="cold", caller=_CALLER
-        )
-
-        if not llm_result.success:
-            # heuristic: 리스크 신호 우선
-            winner = s1.get("agent", "quant")
-            if "risk" in s2.get("agent", "").lower():
-                winner = s2.get("agent", winner)
-            return {"winner": winner, "reasoning": "[LLM 실패, heuristic fallback]"}
-
-        return self._parse_comparison(llm_result.content, s1, s2)
-
-    def _parse_comparison(
-        self,
-        content: str,
-        s1: dict[str, Any],
-        s2: dict[str, Any],
-    ) -> dict[str, Any]:
-        """LLM 비교 응답 파싱."""
-        try:
-            parsed = parse_llm_json(content)
-            winner_raw = str(parsed.get("winner", "tied"))
-            # A_agent → s1 agent 이름으로 해석
-            if winner_raw.startswith("A") or winner_raw == s1.get("agent"):
-                winner = s1.get("agent", "quant")
-            elif winner_raw.startswith("B") or winner_raw == s2.get("agent"):
-                winner = s2.get("agent", "risk")
-            else:
-                winner = "mixed"
-            return {
-                "winner": winner,
-                "confidence": float(parsed.get("confidence", 0.5)),
-                "reasoning": str(parsed.get("reasoning", "")),
-            }
-        except (json.JSONDecodeError, ValueError):
-            return {
-                "winner": s1.get("agent", "quant"),
-                "confidence": 0.5,
-                "reasoning": content[:100],
-            }
 
     # ------------------------------------------------------------------
     # Memory 저장

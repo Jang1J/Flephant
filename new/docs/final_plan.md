@@ -10,14 +10,25 @@
 
 | 항목 | 값 |
 |---|---|
-| 버전 | **v1.3 (2026-05-09 SSOT 충돌 해소: analysis/ → eval/)** |
+| 버전 | **v1.4 (2026-05-15 KIS paper broker evidence PASS 반영)** |
 | 작성 | Claude Code (사용자 confirm 후 SHIP) |
 | 기반 | GPT Pro 1차+2차 권고 (1순위) + Claude 자기 감사 + 코드 실측 fact 정정 |
 | 적용 범위 | 학기말 발표 (D-5~7주 추정) |
-| 학기 진척 | 55/57 (96.5%), 미완 2건 모두 KIS 키 의존 |
+| 학기 진척 | 56/57 (98.2%), 미완 1건은 1주 paper 운영 리포트 |
 | pytest | 1124 passed, 12 fail (numpy 1.x→2.x ABI 충돌) |
-| 미push commit | 5건 (`33d9902 → 0ae7adf`) |
+| 미push commit | 정리 완료. 팀 공유 `ai-1`은 2026-05-15 단일 squash commit 반영 |
 | Mode B fail | 4단계 cascade root cause (GPT 2차 정정) |
+
+### v1.4 상태 정정 (2026-05-15 장중 evidence)
+
+| 항목 | 상태 |
+|---|---|
+| KIS virtual balance/reconciliation | PASS |
+| KIS virtual probe order + order-history match | PASS |
+| Paper auto service rehearsal | PASS, external KIS virtual |
+| Service readiness | PASS (`deploy_quality=PASS`, `broker_evidence=PASS`, `registry_mutated=false`) |
+| Production registry | `active_version=null`, 실계좌 전환 차단 유지 |
+| 남은 항목 | 1주 paper 운영 리포트 |
 
 ---
 

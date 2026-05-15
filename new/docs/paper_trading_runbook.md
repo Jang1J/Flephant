@@ -33,7 +33,7 @@ export KIS_ACCOUNT_PRODUCT_CODE="$KIS_PAPER_ACCOUNT_PRODUCT_CODE"
 Check sanitized readiness:
 
 ```bash
-python new/scripts/print_env_readiness.py
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/print_env_readiness.py
 ```
 
 The output must show `status=PASS`; it prints presence and length only, never
@@ -42,7 +42,9 @@ secret values.
 ## Balance And Reconciliation
 
 ```bash
-python new/scripts/paper_trading_smoke.py --action balance
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/paper_trading_smoke.py \
+  --action balance \
+  --assume-empty-system-positions
 ```
 
 Expected report:
@@ -64,12 +66,12 @@ Run this only after balance/reconciliation PASS. Choose a conservative limit
 price from the current KIS virtual quote path.
 
 ```bash
-python new/scripts/paper_trading_smoke.py \
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/paper_trading_smoke.py \
   --action submit-probe \
   --ticker 005930 \
   --side buy \
   --qty 1 \
-  --price <LIMIT_PRICE> \
+  --auto-price \
   --order-type 00 \
   --confirm-phrase PAPER_ORDER_OK
 ```
@@ -81,24 +83,36 @@ Pass criteria:
 - broker response contains an accepted/submitted order identifier
 - order history/fill lookup is recorded
 
+KIS OAuth token issuance is rate-limited. If `EGW00133` appears, wait at least
+75 seconds and rerun the same command. Do not change credentials.
+
 ## One-Cycle Paper Auto
 
 Run this only after:
 
 - C12 real backtest PASS for the candidate bundle
-- C14 deploy promotes the candidate to active
-- prelive gate PASS
+- C14 service-policy replay PASS
 - KIS virtual balance/reconciliation/probe PASS
 
 ```bash
-python new/scripts/paper_auto_trade.py \
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/paper_auto_service_rehearsal.py \
+  --registry-dir artifacts/lgbm_paper \
   --tickers 005930 \
   --cycles 1 \
   --interval-sec 0 \
-  --confirm-phrase PAPER_AUTO_OK \
-  --end-date 20260508 \
-  --business-days 80
+  --confirm-phrase PAPER_AUTO_OK
 ```
 
 The final report must show hot decision, FDA approve/veto reason, paper
 execution response, and reconciliation evidence while `live_enabled=false`.
+
+## 2026-05-15 Evidence Snapshot
+
+- `paper_trading_balance_reconciliation_20260515_134605.json`: PASS.
+- `paper_trading_submit_probe_order_20260515_134857.json`: PASS, order-history
+  matched count 1.
+- `paper_auto_service_rehearsal_20260515_135618.json`: PASS, external KIS
+  virtual, paper auto cycle PASS.
+- `service_readiness_BUNDLE-20260512-0AEEE37A_20260515_135651.json`: PASS,
+  `deploy_quality=PASS`, `broker_evidence=PASS`, `registry_mutated=false`,
+  `live_trading_allowed=false`.

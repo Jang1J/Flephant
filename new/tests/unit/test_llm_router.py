@@ -294,6 +294,8 @@ def test_missing_kanana_key_returns_failure(
 ) -> None:
     """KANANA_API_KEY 미설정 시 graceful failure + GPT-4o fallback."""
     monkeypatch.delenv("KANANA_API_KEY", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "o")
     router = LLMRouter(config=minimal_config)
 
@@ -309,6 +311,8 @@ def test_missing_openai_key_returns_failure(
     """OPENAI_API_KEY 미설정 + Kanana circuit OPEN: 최종 failure."""
     monkeypatch.setenv("KANANA_API_KEY", "k")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
     router = LLMRouter(config=minimal_config)
 
     # Kanana circuit OPEN → GPT-4o fallback 시도 → 키 없음
@@ -387,6 +391,24 @@ def test_force_model_gpt4o_bypasses_kanana(
     assert not result.fallback_used  # 강제 지정이므로 fallback 아님
     # Kanana 예산 소모 없음
     assert router.budget_remaining() == before
+
+
+def test_allow_mock_provider_without_api_keys(monkeypatch, minimal_config: dict) -> None:
+    """명시적 mock provider는 API key 없이도 cold/mode_b smoke를 허용한다."""
+    monkeypatch.delenv("KANANA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("ELEPHANT_ALLOW_LLM_MOCK", "1")
+    minimal_config["llm_budget"]["allow_mock_provider"] = True
+
+    router = LLMRouter(config=minimal_config)
+    cold = router.call("test", mode="cold", caller="news_analysis")
+    mode_b = router.call("test", mode="mode_b", caller="backtest_reasoning")
+
+    assert cold.success is True
+    assert cold.model_used == LLMModel.KANANA_O.value
+    assert mode_b.success is True
+    assert mode_b.model_used == LLMModel.GPT_4O.value
 
 
 def test_llm_call_result_dataclass() -> None:

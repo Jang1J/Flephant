@@ -716,3 +716,16 @@ def test_service_policy_gate_accepts_bound_pass_report(tmp_path):
         _passing_service_policy_evidence(tmp_path),
         bundle_id=_BUNDLE_ID,
     )
+
+
+def test_service_policy_gate_uses_relative_fallback_when_absolute_path_stale(tmp_path):
+    """Portable C14 gate: stale producer absolute path falls back to repo-relative path."""
+    deployer = _make_deployer(tmp_path)
+    evidence = _passing_service_policy_evidence(tmp_path)
+    relative_path = evidence["service_policy_report_path"]
+    evidence["service_policy_report_path"] = "/producer/machine/missing/pass.json"
+    evidence["service_policy_report_path_relative"] = relative_path
+    evidence["report_path"] = "/producer/machine/missing/pass.json"
+    evidence["report_path_relative"] = relative_path
+
+    deployer._check_service_policy_gate(evidence, bundle_id=_BUNDLE_ID)

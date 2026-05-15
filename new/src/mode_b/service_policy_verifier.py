@@ -39,9 +39,8 @@ def verify_service_policy_evidence(
     if evidence_bundle not in (None, "", bundle_id):
         blockers.append("service_policy_bundle_mismatch")
 
-    report_path_raw = evidence.get("service_policy_report_path") or evidence.get("report_path")
     expected_sha = str(evidence.get("service_policy_report_sha256") or "")
-    report_path = _resolve_report_path(report_path_raw, root)
+    report_path = _resolve_report_path(evidence, root)
     report: dict[str, Any] = {}
     actual_sha = ""
 
@@ -119,13 +118,32 @@ def service_policy_gate_pass(
     ).passed
 
 
-def _resolve_report_path(value: Any, root: Path) -> Path | None:
-    if value in (None, ""):
-        return None
-    path = Path(str(value))
-    if path.is_absolute():
-        return path
-    return root / path
+def _resolve_report_path(evidence: dict[str, Any], root: Path) -> Path | None:
+    """Resolve persisted service-policy report path with portable fallbacks.
+
+    Older C12 reports embed both an absolute path from the producer machine and
+    a repo-relative path.  A sanitized zip or another checkout may not have the
+    absolute path, so try every declared candidate and prefer the first existing
+    file.  If none exists, return the first syntactically valid path so callers
+    can still report `service_policy_report_missing`.
+    """
+    candidates: list[Path] = []
+    for key in (
+        "service_policy_report_path",
+        "service_policy_report_path_relative",
+        "report_path",
+        "report_path_relative",
+    ):
+        raw = evidence.get(key)
+        if raw in (None, ""):
+            continue
+        path = Path(str(raw))
+        candidates.append(path if path.is_absolute() else root / path)
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0] if candidates else None
 
 
 def _merge_mapping(primary: Any, fallback: Any) -> dict[str, Any]:

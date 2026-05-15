@@ -14,6 +14,7 @@ Message Pool 채널(실시간 broadcast), report_types는 에이전트 산출물
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from src.utils.time_utils import now_kst
@@ -126,7 +127,7 @@ class AgentBase:
             "cause_by": cls_name,
             "sent_from": cls_name,
             "priority": str(payload.get("priority", "normal")),
-            "confidence": float(payload.get("confidence", 0.5)),
+            "confidence": self._safe_confidence(payload.get("confidence", 0.5)),
             "reasoning": str(
                 payload.get("reasoning")
                 or payload.get("narrative")
@@ -150,3 +151,14 @@ class AgentBase:
             if value:
                 return str(value)
         return str(payload)
+
+    @staticmethod
+    def _safe_confidence(value: Any, default: float = 0.5) -> float:
+        """C4 confidence를 finite 0.0~1.0으로 정규화한다."""
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(x):
+            return default
+        return max(0.0, min(1.0, x))
