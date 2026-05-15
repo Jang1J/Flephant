@@ -311,6 +311,72 @@ class TestOneDayModeB:
         assert mode_b_result.get("stage_count", 0) >= 7
         assert mode_b_result["verdict"] in ("pass", "warn", "blocked", "skipped_no_candidates")
 
+    def test_mode_b_stage_error_blocks_backtest_and_deploy(self, monkeypatch) -> None:
+        """pre-backtest stage 오류는 stage_6/7 PASS로 덮지 않는다."""
+        from src.mode_b.scheduler import ModeBScheduler
+
+        def fake_stage_0_dqr(self, date: str) -> dict:
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": "forced_dqr_failure",
+            }
+
+        monkeypatch.setattr(ModeBScheduler, "stage_0_dqr", fake_stage_0_dqr)
+
+        sm = StateMachine()
+        sm.transition(PipelineState.HOT_RUNNING)
+        sm.transition(PipelineState.MODE_B_IDLE)
+
+        runner = E2EScenarioRunner(
+            scenario_file="week1_basic.yaml",
+            short_mode=True,
+            skip_mode_b=False,
+        )
+        mode_b_result = runner._run_mode_b_sim(sm, "2026-05-04")
+
+        assert mode_b_result["verdict"] == "blocked"
+        assert mode_b_result["errors"], "stage_0 오류가 errors에 반영되어야 한다"
+        assert any(
+            s.get("stage") == "stage_6_backtest_validation"
+            and s.get("status") == "skipped_stage_failure"
+            for s in mode_b_result["stages"]
+        )
+        assert any(
+            s.get("stage") == "stage_7_deploy"
+            and s.get("status") == "skipped"
+            for s in mode_b_result["stages"]
+        )
+        assert sm.state == PipelineState.MODE_B_IDLE
+
+    def test_mode_b_errors_propagate_to_scenario_summary(self, monkeypatch) -> None:
+        """Mode B 내부 오류는 day summary total_errors에 포함된다."""
+        from src.mode_b.scheduler import ModeBScheduler
+
+        def fake_stage_0_dqr(self, date: str) -> dict:
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": "forced_dqr_failure",
+            }
+
+        monkeypatch.setattr(ModeBScheduler, "stage_0_dqr", fake_stage_0_dqr)
+
+        runner = E2EScenarioRunner(
+            scenario_file="week1_basic.yaml",
+            short_mode=True,
+            skip_mode_b=False,
+        )
+        result = runner.run()
+        summary = result.summary()
+
+        assert summary["total_errors"] == summary["total_days"]
+        assert all(v == "blocked" for v in summary["mode_b_verdicts"])
+
     def test_mode_b_state_machine_transitions(self) -> None:
         """Mode B: MODE_B_IDLE → EVOLVING → BACKTEST → DEPLOY/BLOCKED → IDLE."""
         sm = StateMachine()

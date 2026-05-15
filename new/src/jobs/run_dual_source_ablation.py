@@ -30,13 +30,13 @@ Configuration B (w/ dual_source, baseline + 5피처) 비교.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 # 프로젝트 루트를 sys.path에 추가 (scripts 직접 실행 시)
@@ -44,7 +44,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT / "new"))
 
-from src.data.dataset_builder import DatasetBuilder
+from src.data.dataset_builder import DatasetBuildError, DatasetBuilder
 from src.models.lgbm_trainer import LGBMTrainer, _load_feature_cols
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
@@ -54,10 +54,58 @@ logger = get_logger("dual_source_ablation")
 _KST = ZoneInfo("Asia/Seoul")
 _ABLATION_DIR = _PROJECT_ROOT / "new" / "artifacts" / "ablation"
 
-# 합성 데이터 ticker 목록 (S1-0에서 생성한 mock bar 6종목)
-_DEFAULT_TICKERS = ["005930", "000660", "035420", "005380", "051910", "035720"]
+_FALLBACK_TICKERS = ["005930", "000660", "042700", "403870", "051910"]
 _DEFAULT_START = "20260101"
 _DEFAULT_END = "20260419"
+_DATA_ROOT = _PROJECT_ROOT / "artifacts" / "data"
+
+
+def _load_default_tickers() -> list[str]:
+    """universe_config.yaml의 active 종목을 ablation 기본 universe로 사용."""
+    cfg = config_load("universe_config.yaml") or {}
+    sectors = cfg.get("sectors", {}) if isinstance(cfg, dict) else {}
+    tickers: list[str] = []
+    for sector in sectors.values():
+        if not isinstance(sector, dict):
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict) or stock.get("status") != "active":
+                continue
+            ticker = str(stock.get("ticker", "")).zfill(6)
+            if ticker.isdigit() and len(ticker) == 6:
+                tickers.append(ticker)
+    return tickers or list(_FALLBACK_TICKERS)
+
+
+def _infer_artifact_date_range(tickers: list[str]) -> tuple[str | None, str | None]:
+    """저장된 1분봉 artifact에서 cross-sectional 학습 가능 날짜 범위를 추론."""
+    date_counts: dict[str, int] = {}
+    for ticker in tickers:
+        ticker_dir = _DATA_ROOT / ticker
+        if not ticker_dir.exists():
+            continue
+        for path in ticker_dir.glob("bars_1m_*.parquet"):
+            date = path.stem.replace("bars_1m_", "")
+            if date.isdigit() and len(date) == 8:
+                date_counts[date] = date_counts.get(date, 0) + 1
+        for path in ticker_dir.glob("bars_1m_*.jsonl"):
+            date = path.stem.replace("bars_1m_", "")
+            if date.isdigit() and len(date) == 8:
+                date_counts[date] = date_counts.get(date, 0) + 1
+
+    # DatasetBuilder cross-sectional rank는 최소 4종목 그룹을 요구한다.
+    usable_dates = sorted(date for date, count in date_counts.items() if count >= 4)
+    if not usable_dates:
+        return None, None
+    return usable_dates[0], usable_dates[-1]
+
+
+def _resolve_output_dir(path: Path | str | None) -> Path:
+    """CLI relative output-dir를 repo root 기준 절대 경로로 정규화."""
+    if path is None:
+        return _ABLATION_DIR
+    resolved = Path(path)
+    return resolved if resolved.is_absolute() else _PROJECT_ROOT / resolved
 
 
 def _compute_ndcg5(y_true_by_group: dict, y_pred_by_group: dict) -> float:
@@ -107,6 +155,7 @@ def _run_config(
     end_date: str,
     enabled_for_lgbm: bool,
     version: str,
+    registry_dir: Path,
 ) -> dict[str, Any]:
     """단일 Configuration 학습 + 메트릭 반환.
 
@@ -145,7 +194,10 @@ def _run_config(
     from src.models.splitter import WalkForwardSplitter
     from src.models.registry import ModelRegistry
 
-    trainer = LGBMTrainer(dataset_builder=builder)
+    trainer = LGBMTrainer(
+        dataset_builder=builder,
+        registry=ModelRegistry(artifacts_dir=registry_dir / config_label),
+    )
     # feature_cols override (enabled_for_lgbm=false 시 4피처만)
     trainer.feature_cols = feature_cols
 
@@ -154,6 +206,7 @@ def _run_config(
         start_date=start_date,
         end_date=end_date,
         version=version,
+        is_latest=False,
     )
 
     metrics = result.get("metrics", {})
@@ -212,6 +265,8 @@ def run_ablation(
     tickers: list[str] | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    output_dir: Path | None = None,
+    write_report: bool = True,
 ) -> dict[str, Any]:
     """Dual-Source Ablation 실행 진입점.
 
@@ -219,9 +274,12 @@ def run_ablation(
         ablation 결과 딕셔너리 (dual_source_YYYYMMDD.json 저장).
     """
     today = datetime.now(_KST).strftime("%Y%m%d")
-    tickers = tickers or _DEFAULT_TICKERS
-    start_date = start_date or _DEFAULT_START
-    end_date = end_date or _DEFAULT_END
+    tickers = tickers or _load_default_tickers()
+    inferred_start, inferred_end = _infer_artifact_date_range(tickers)
+    start_date = start_date or inferred_start or _DEFAULT_START
+    end_date = end_date or inferred_end or _DEFAULT_END
+    output_dir = _resolve_output_dir(output_dir)
+    scratch_registry_dir = output_dir / "models"
 
     # verdict 임계값 yaml 로드 (하드코딩 금지)
     pa_cfg = config_load("risk_config.yaml", "validation_tools.performance_analyzer") or {}
@@ -232,25 +290,52 @@ def run_ablation(
         len(tickers), start_date, end_date,
     )
 
-    # Configuration A: w/o dual_source (baseline)
-    baseline_result = _run_config(
-        config_label="baseline",
-        tickers=tickers,
-        start_date=start_date,
-        end_date=end_date,
-        enabled_for_lgbm=False,
-        version="baseline",
-    )
+    try:
+        # Configuration A: w/o dual_source (baseline)
+        baseline_result = _run_config(
+            config_label="baseline",
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            enabled_for_lgbm=False,
+            version="baseline",
+            registry_dir=scratch_registry_dir,
+        )
 
-    # Configuration B: w/ dual_source
-    with_ds_result = _run_config(
-        config_label="with_dual_source",
-        tickers=tickers,
-        start_date=start_date,
-        end_date=end_date,
-        enabled_for_lgbm=True,
-        version="baseline_with_dual_source",
-    )
+        # Configuration B: w/ dual_source
+        with_ds_result = _run_config(
+            config_label="with_dual_source",
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            enabled_for_lgbm=True,
+            version="baseline_with_dual_source",
+            registry_dir=scratch_registry_dir,
+        )
+    except (DatasetBuildError, RuntimeError) as exc:
+        blocker = "dataset_build_error"
+        if isinstance(exc, RuntimeError) and "fold 0개" in str(exc):
+            blocker = "walk_forward_fold_unavailable"
+        payload = {
+            "status": "BLOCKED",
+            "ablation_name": "dual_source",
+            "date": today,
+            "tickers": tickers,
+            "train_range": {"start": start_date, "end": end_date},
+            "blockers": [blocker],
+            "error": str(exc),
+            "registry_mutated": False,
+            "scratch_registry_dir": str(scratch_registry_dir),
+        }
+        if write_report:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            out_path = output_dir / f"dual_source_{today}_blocked.json"
+            with out_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            payload["report_path"] = str(out_path)
+            payload["report_path_relative"] = str(out_path.relative_to(_PROJECT_ROOT))
+        logger.warning("[ablation] BLOCKED(%s): %s", blocker, exc)
+        return payload
 
     # delta 계산
     delta = _compute_delta(baseline_result, with_ds_result)
@@ -258,12 +343,13 @@ def run_ablation(
 
     payload: dict[str, Any] = {
         "ablation_name": "dual_source",
+        "status": "PASS",
         "date": today,
         "tickers": tickers,
         "train_range": {"start": start_date, "end": end_date},
         "data_note": (
-            "합성 데이터 (mock bar 6 ticker x 108일). "
-            "실 IC/Sharpe 개선은 S4-6 paper trading 이후 측정."
+            "artifacts/data의 1분봉 active universe 기준 trainer_validation_proxy. "
+            "C12 real backtest 또는 1주 paper 결과 전까지 deploy-quality 성능으로 해석하지 않는다."
         ),
         "baseline": {
             "ic": baseline_result["ic"],
@@ -286,23 +372,60 @@ def run_ablation(
         "delta": delta,
         "verdict": verdict,
         "threshold_sharpe_used": threshold_sharpe,
+        "registry_mutated": False,
+        "scratch_registry_dir": str(scratch_registry_dir),
     }
 
     # 저장
-    _ABLATION_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = _ABLATION_DIR / f"dual_source_{today}.json"
-    with out_path.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    if write_report:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / f"dual_source_{today}.json"
+        with out_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        payload["report_path"] = str(out_path)
+        payload["report_path_relative"] = str(out_path.relative_to(_PROJECT_ROOT))
+    else:
+        out_path = None
 
     logger.info(
-        "[ablation] 완료. verdict=%s delta_sharpe=%s → %s",
-        verdict, delta["sharpe"], out_path,
+        "[ablation] 완료. verdict=%s delta_sharpe=%s report=%s",
+        verdict, delta["sharpe"], out_path or "no-write",
     )
 
     return payload
 
 
-if __name__ == "__main__":
+def _parse_tickers(raw: str | None) -> list[str] | None:
+    if raw is None or raw.strip() == "":
+        return None
+    return [item.strip().zfill(6) for item in raw.split(",") if item.strip()]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run S4-2 Dual-Source ablation with trainable artifact data.",
+    )
+    parser.add_argument("--tickers", help="comma-separated tickers. 기본은 universe_config active 종목")
+    parser.add_argument("--start-date", help="YYYYMMDD. 생략 시 artifacts/data에서 자동 추론")
+    parser.add_argument("--end-date", help="YYYYMMDD. 생략 시 artifacts/data에서 자동 추론")
+    parser.add_argument("--output-dir", default=str(_ABLATION_DIR))
+    parser.add_argument("--no-write-report", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    result = run_ablation()
+    result = run_ablation(
+        tickers=_parse_tickers(args.tickers),
+        start_date=args.start_date,
+        end_date=args.end_date,
+        output_dir=Path(args.output_dir),
+        write_report=not args.no_write_report,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("status") == "PASS" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

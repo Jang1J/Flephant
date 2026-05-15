@@ -154,7 +154,7 @@ def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
         demo_id="hot",
         caveats=[
             "Synthetic scenario bars are used for demo ticks.",
-            "Hot Path latency is a smoke metric; active LGBM inference requires registry.active_version after C14 deploy.",
+            "Hot Path latency is a smoke metric; paper registry is used when available.",
         ],
     )
     _summary_failures(summary, require_sla=True)
@@ -167,6 +167,7 @@ def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
     print(f"  Hot Path p95 (ms)  : {sla.get('p95_ms', 'N/A')}")
     print(f"  Hot Path p99 (ms)  : {sla.get('p99_ms', 'N/A')}")
     print(f"  SLA 준수 (<{sla.get('target_p95_ms', 100)}ms): {sla.get('sla_ok', False)}")
+    print(f"  Quant 모델 로드 일수 : {summary.get('quant_model_loaded_days', 0)}")
     print(f"  PIT 위반           : {summary.get('pit_violations', 0)}")
     print(f"  FDA reason_code 누락 : {summary.get('fda_missing_reason_code', 0)}")
     print(f"  에러 합계          : {summary.get('total_errors', 0)}")

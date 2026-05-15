@@ -43,6 +43,7 @@ import yaml
 from src.agents.fda import FDAAgent
 from src.agents.hot.quant import QuantAgent
 from src.agents.hot.risk_fast import RiskFastAgent
+from src.models.registry import ModelRegistry
 from src.models.ppo_allocator import PPOAllocator
 from src.ops.profiler import HotPathProfiler
 from src.ops.state_machine import PipelineState, StateMachine
@@ -60,7 +61,8 @@ logger = get_logger("e2e_scenario_runner")
 _KST = ZoneInfo("Asia/Seoul")
 
 _SCENARIOS_DIR = Path(__file__).resolve().parents[2] / "config" / "scenarios"
-_AUDIT_DIR = Path(__file__).resolve().parents[3] / "artifacts" / "audit"
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_AUDIT_DIR = _PROJECT_ROOT / "artifacts" / "audit"
 _AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -161,6 +163,9 @@ class ScenarioResult:
             "mode_b_verdicts": [
                 d.get("mode_b", {}).get("verdict") for d in self.days
             ],
+            "quant_model_loaded_days": sum(
+                1 for d in self.days if d.get("quant_model_loaded") is True
+            ),
         }
 
 
@@ -182,6 +187,7 @@ class E2EScenarioRunner:
         scenario_file: str = "week1_basic.yaml",
         short_mode: bool = True,
         skip_mode_b: bool = False,
+        quant_registry_dir: str | Path | None = "artifacts/lgbm_paper",
     ) -> None:
         scenario_path = _SCENARIOS_DIR / scenario_file
         with scenario_path.open("r", encoding="utf-8") as f:
@@ -189,6 +195,7 @@ class E2EScenarioRunner:
 
         self._short_mode = short_mode
         self._skip_mode_b = skip_mode_b
+        self._quant_registry_dir = self._resolve_repo_path(quant_registry_dir)
         self._scenario_name: str = self._scenario.get("scenario_name", "unknown")
         self._tickers: list[str] = [
             pad_ticker(t) for t in self._scenario.get("universe_tickers", [])
@@ -236,6 +243,13 @@ class E2EScenarioRunner:
             len(self._tickers),
             short_mode,
         )
+
+    @staticmethod
+    def _resolve_repo_path(path: str | Path | None) -> Path | None:
+        if path is None:
+            return None
+        resolved = Path(path)
+        return resolved if resolved.is_absolute() else _PROJECT_ROOT / resolved
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -296,8 +310,14 @@ class E2EScenarioRunner:
         # 1. 컴포넌트 초기화 (Day마다 새 StateMachine)
         sm = StateMachine(initial=PipelineState.BOOTSTRAP)
         profiler = HotPathProfiler()
+        quant_registry = (
+            ModelRegistry(artifacts_dir=self._quant_registry_dir)
+            if self._quant_registry_dir is not None
+            else None
+        )
+        quant_agent = QuantAgent(registry=quant_registry)
         runner = HotRunner(
-            quant=QuantAgent(),
+            quant=quant_agent,
             ppo=PPOAllocator(),
             pm=PortfolioManager(),
             fda=FDAAgent(),
@@ -420,6 +440,7 @@ class E2EScenarioRunner:
         mode_b_result: dict[str, Any] = {"verdict": "skipped", "stages": []}
         if not self._skip_mode_b:
             mode_b_result = self._run_mode_b_sim(sm, day_date_str)
+            errors.extend(mode_b_result.get("errors", []))
         mode_b_audit_path = _AUDIT_DIR / f"mode_b_{day_date_str.replace('-', '')}.jsonl"
         self._flush_jsonl([mode_b_result], mode_b_audit_path)
 
@@ -436,6 +457,7 @@ class E2EScenarioRunner:
             "pit_violations": pit_violations,
             "fda_missing_reason_code": fda_missing_reason_code,
             "mode_b": mode_b_result,
+            "quant_model_loaded": quant_agent.has_model,
             "errors": errors,
             "next_state": next_state,
             "state_history": sm.history,
@@ -592,6 +614,15 @@ class E2EScenarioRunner:
                     result["duration_sec"] = round(time.perf_counter() - t0, 3)
                     stages.append(result)
                     logger.info("[e2e_scenario_runner] %s 완료: status=%s", stage_name, result.get("status"))
+                    if self._is_mode_b_stage_blocking(result):
+                        err_msg = (
+                            f"{stage_name} blocked: "
+                            f"status={result.get('status')} "
+                            f"critical_alert={result.get('critical_alert', False)} "
+                            f"error={result.get('error')}"
+                        )
+                        errors.append(err_msg)
+                        break
                 except Exception as e:
                     err_msg = f"{stage_name} 오류: {e}"
                     errors.append(err_msg)
@@ -602,6 +633,41 @@ class E2EScenarioRunner:
                         "error": str(e),
                         "duration_sec": round(time.perf_counter() - t0, 3),
                     })
+                    break
+
+            if errors:
+                verdict = "blocked"
+                if sm.state == PipelineState.MODE_B_EVOLVING:
+                    sm.transition(PipelineState.MODE_B_BACKTEST)
+                sm.transition(PipelineState.MODE_B_BLOCKED)
+                stages.append({
+                    "stage": "stage_6_backtest_validation",
+                    "status": "skipped_stage_failure",
+                    "verdict": verdict,
+                    "blockers": errors,
+                })
+                stages.append({
+                    "stage": "stage_7_deploy",
+                    "status": "skipped",
+                    "verdict": verdict,
+                    "blockers": errors,
+                })
+                sm.transition(PipelineState.MODE_B_IDLE)
+                logger.info(
+                    "[e2e_scenario_runner] Mode B 시뮬 차단: date=%s blockers=%d bundle_id=%s",
+                    date_str, len(errors), bundle_id,
+                )
+                return {
+                    "date": date_str,
+                    "bundle_id": bundle_id,
+                    "verdict": verdict,
+                    "simulation_only": bool(self._short_mode),
+                    "production_ready": False,
+                    "production_gate_required": "ModeBScheduler.run_pipeline + C12 real backtest + C14 deploy",
+                    "stages": stages,
+                    "errors": errors,
+                    "stage_count": len(stages),
+                }
 
             # candidate 존재 여부 판단
             s3 = next((s for s in stages if s.get("stage") == "stage_3_factor_evolution"), {})
@@ -667,6 +733,14 @@ class E2EScenarioRunner:
                 os.environ.pop("ELEPHANT_MODE", None)
             else:
                 os.environ["ELEPHANT_MODE"] = previous_mode
+
+    @staticmethod
+    def _is_mode_b_stage_blocking(result: dict[str, Any]) -> bool:
+        """Return True when a pre-backtest Mode B stage must stop the demo flow."""
+        status = str(result.get("status", "")).lower()
+        if status in {"error", "fail", "failed", "blocked"}:
+            return True
+        return bool(result.get("critical_alert") is True)
 
     # ------------------------------------------------------------------ #
     # IO helpers
