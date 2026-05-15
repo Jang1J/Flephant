@@ -22,20 +22,20 @@ Mode B 장마감 (18:00~22:00):
 
 ## 현재 상태 (2026-05-15 기준)
 
-### Sprint 진행률: **55 / 57 (96.5%)**
+### Sprint 진행률: **56 / 57 (98.2%)**
 
 | Sprint | 상태 | 비고 |
 |---|---|---|
 | S0 기본 인프라 | done (8/8) | new/src/ 16 디렉토리 + 커넥터 7개 + init/smoke |
-| S1 Hot Path | done 10/11, blocked 1 | LightGBM + PPO + FDA. S1-8 KIS broker evidence 대기 |
+| S1 Hot Path | done (11/11) | LightGBM + PPO + FDA + KIS virtual broker evidence |
 | S2 Cold Path | done (13/13) | News/Risk Fast/Slow/Debate + Blackboard + Event Gateway |
 | S3 Mode B | done (12/12) | Alpha Factor Engine + Co-STEER + Backtest Agent |
-| S4 통합 + Dual-Source | done 8/9, blocked 1 | S4-6 paper trading 1주 report 대기 |
+| S4 통합 + Dual-Source | done 8/9, ongoing 1 | S4-6 external KIS evidence PASS, 1주 paper 운영 report 대기 |
 | S5 동적 유니버스 | done (4/4) | KOSPI200 watch → admission/exit lifecycle |
 
-남은 2건은 외부 KIS broker evidence 의존 (5/15 09:00~15:30 KST 장중 paper probe 시도 예정).
+남은 1건은 1주 paper 운영 리포트다. 외부 KIS virtual broker evidence는 2026-05-15 장중 확보 완료.
 
-팀 공유 요약: 실계좌 전환 제외, 데이터 수집-피처화-Mode B 검증-C12 deploy gate-paper balance까지는 동작 확인 완료. 남은 것은 장중 KIS paper 주문 체결 evidence와 1주 paper 운영 리포트다.
+팀 공유 요약: 실계좌 전환 제외, 데이터 수집-피처화-Mode B 검증-C12 deploy gate-C14 service replay-KIS virtual broker evidence까지 PASS 확인 완료. production registry는 비활성 유지했고, paper registry만 사용했다. 남은 것은 1주 paper 운영 리포트다.
 
 ### Prelive Validation
 
@@ -46,8 +46,9 @@ Mode B 장마감 (18:00~22:00):
 | **Dual-Source 80일 archive** | coverage=`1.0` (Naver+DART, FinBERT 5피처) |
 | **Exogenous 80일 archive** | coverage=`1.0` (interest_rate, usd_krw, US 지수, 수급) |
 | **Feature quality** | 90,230/90,230 non-neutral rows (dual-source + exogenous) |
-| **KIS paper binding** | balance reconciliation PASS, JTI/app_key/account 일치 |
-| **service_readiness** | `PARTIAL` (deploy_quality=PASS, broker_evidence=BLOCKED until market hours) |
+| **KIS paper binding** | balance reconciliation PASS, probe order PASS, order-history match PASS |
+| **KIS paper auto cycle** | external KIS virtual, paper_auto_cycle PASS, filled sell evidence matched |
+| **service_readiness** | `PASS` (deploy_quality=PASS, broker_evidence=PASS, registry_mutated=false) |
 
 성능 (`backtest_BUNDLE-20260512-0AEEE37A_20260514_202334.json`):
 - IC=0.058, RankIC=0.077 (1분봉 cross-sectional ranking SOTA 범위 내)
@@ -56,7 +57,7 @@ Mode B 장마감 (18:00~22:00):
 
 ### 다음 작업
 
-1. **5/15 09:00~15:30 KST**: KIS paper probe order 1회 + order-history matched evidence → service_readiness PASS 재확인.
+1. **1주 paper 운영**: KIS virtual broker 기반 일별 paper report 누적 + Sharpe/MDD 운영 리포트 생성.
 2. **Deflated Sharpe** (Bailey & Lopez de Prado 2014) 공식 산출 + full 8-fold walk-forward OOS 재검증.
 3. **cost-aware retraining**: session-close 라벨 실험 (`cost_aware_retraining_plan_*.json` recommended_experiment 참조). `do_not_auto_deploy=true` 존중.
 
@@ -110,7 +111,7 @@ PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/service_readi
 연구형 / 모의운용형 MVP. **mock → replay → paper-trading** 단계로 검증.
 
 - 실거래 (KIS real account) 는 Phase 2 이후. 현재는 paper (virtual) broker 만.
-- production registry active version 승격 금지 유지 (paper broker evidence 완료까지).
+- production registry active version 승격 금지 유지 (1주 paper 운영 리포트 완료 전까지).
 - broker action UI / live order action 차단 (`safe_to_enable_live_actions=false`).
 
 ## 프로젝트 구조

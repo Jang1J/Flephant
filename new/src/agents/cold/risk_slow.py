@@ -225,11 +225,13 @@ class RiskAgentSlow(AgentBase):
             return {
                 "stance": stance,
                 "risk_level": str(parsed_json.get("risk_level", "medium")),
-                "regime_signal": bool(parsed_json.get("regime_signal", False)),
-                "affected_tickers": list(parsed_json.get("affected_tickers", [])),
+                "regime_signal": self._safe_bool(parsed_json.get("regime_signal", False)),
+                "affected_tickers": self._safe_ticker_list(
+                    parsed_json.get("affected_tickers", [])
+                ),
                 "narrative": str(parsed_json.get("narrative", content[:self._narrative_max_chars])),
             }
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
         # 2차: 키워드 fallback
@@ -250,6 +252,39 @@ class RiskAgentSlow(AgentBase):
             "affected_tickers": list(dict.fromkeys(tickers)),
             "narrative": content[:self._narrative_max_chars],
         }
+
+    @staticmethod
+    def _safe_bool(value: Any, default: bool = False) -> bool:
+        """LLM bool-like 값을 문자열까지 안전하게 해석한다."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "y", "1", "regime", "regime_change", "체제", "변화"}:
+                return True
+            if normalized in {"false", "no", "n", "0", "none", "null", "없음", "아님"}:
+                return False
+        return default
+
+    @staticmethod
+    def _safe_ticker_list(value: Any) -> list[str]:
+        """문자열/리스트 ticker 입력을 6자리 코드 리스트로 정규화한다."""
+        raw_items = value if isinstance(value, list) else [value]
+        tickers: list[str] = []
+        for item in raw_items:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            match = re.search(r"\d{1,6}", text)
+            if match:
+                tickers.append(match.group(0).zfill(6))
+        return list(dict.fromkeys(tickers))
 
     def _choose_publish_channel(self, parsed: dict[str, Any]) -> str:
         """분석 결과에 따라 publish channel 선택.

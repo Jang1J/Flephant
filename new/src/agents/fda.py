@@ -17,6 +17,7 @@ reason_code enum (S2-9 완료, 최종 확정):
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -570,15 +571,43 @@ class FDAAgent(AgentBase):
             if rc not in self._valid_reason_codes:
                 rc = "NORMAL_APPROVE"
             return {
-                "approved": bool(parsed.get("approved", True)),
+                "approved": self._safe_bool(parsed.get("approved", True), default=True),
                 "reason_code": rc,
                 "veto_reason": parsed.get("veto_reason"),
-                "confidence": float(parsed.get("confidence", 0.7)),
+                "confidence": self._safe_confidence(parsed.get("confidence", 0.7), default=0.7),
             }
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             lower = content.lower()
             approved = "veto" not in lower and "거부" not in lower
             return {"approved": approved, "reason_code": "NORMAL_APPROVE" if approved else "NEWS_DIVERGENCE"}
+
+    @staticmethod
+    def _safe_bool(value: Any, default: bool = True) -> bool:
+        """LLM bool-like 값을 문자열까지 안전하게 해석한다."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "y", "1", "approve", "approved", "승인"}:
+                return True
+            if normalized in {"false", "no", "n", "0", "veto", "reject", "rejected", "거부"}:
+                return False
+        return default
+
+    @staticmethod
+    def _safe_confidence(value: Any, default: float = 0.7) -> float:
+        """FDA confidence를 finite 0.0~1.0으로 정규화한다."""
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(x):
+            return default
+        return max(0.0, min(1.0, x))
 
     # ================================================================== #
     # AgentBase API

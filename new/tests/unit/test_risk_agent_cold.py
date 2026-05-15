@@ -218,6 +218,25 @@ def test_slow_analyze_llm_failure_fallback() -> None:
     assert result["payload"]["stance"] == "risk_reduce"
 
 
+def test_slow_parse_string_bool_and_string_ticker() -> None:
+    """LLM이 문자열 bool/ticker를 반환해도 regime/ticker를 안정적으로 파싱한다."""
+    slow = _make_slow()
+    parsed = slow._parse_llm_content(
+        '{"stance":"risk_reduce","risk_level":"medium",'
+        '"regime_signal":"false","affected_tickers":"005930","narrative":"위험"}'
+    )
+    assert parsed["regime_signal"] is False
+    assert parsed["affected_tickers"] == ["005930"]
+
+
+def test_slow_parse_llm_json_array_falls_back_without_crash() -> None:
+    """JSON array 응답은 crash 없이 fallback으로 처리된다."""
+    slow = _make_slow()
+    parsed = slow._parse_llm_content("[]")
+    assert parsed["stance"] == "neutral"
+    assert parsed["affected_tickers"] == []
+
+
 def test_slow_allowed_channels() -> None:
     """ALLOWED_PUBLISH_CHANNELS에 3개 채널 포함."""
     assert "risk_warning" in RiskAgentSlow.ALLOWED_PUBLISH_CHANNELS

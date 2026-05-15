@@ -151,16 +151,24 @@ class EventGateway:
                 "reason": str(e),
             }
 
-        # auto_publish: handler 반환 dict + content 존재 + channel 등록 + pubsub 주입
+        # auto_publish: handler 반환 dict + C4 message 존재 + channel 등록 + pubsub 주입.
+        # Agent가 이미 직접 publish했거나 LLM fallback neutral 결과이면 중복/오염 방지를 위해 skip한다.
         publish_channel = self._auto_publish.get(etype)
+        publish_message = result.get("message") if isinstance(result, dict) else None
+        if not isinstance(publish_message, dict):
+            publish_message = result if isinstance(result, dict) else None
         if (
             self._pubsub is not None
             and publish_channel is not None
             and isinstance(result, dict)
-            and result.get("content")
+            and isinstance(publish_message, dict)
+            and publish_message.get("content")
+            and not result.get("llm_fallback", False)
+            and not result.get("published_by_agent", False)
+            and "message_id" not in result
         ):
             try:
-                msg_id = self._pubsub.publish(publish_channel, result)
+                msg_id = self._pubsub.publish(publish_channel, publish_message)
                 result["message_id"] = msg_id
                 logger.debug(
                     "[event_gateway] auto_publish: channel=%s message_id=%s",

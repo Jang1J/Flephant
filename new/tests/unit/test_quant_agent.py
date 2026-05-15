@@ -382,6 +382,102 @@ def test_score_cross_section_uses_dual_source_scores(
     assert ds_values == pytest.approx([0.7, 0.3, 0.1, 0.4, 0.8])
 
 
+def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None:
+    """수급 side-channel 피처가 LightGBM 추론 feature vector에 반영된다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_flow")
+    mock = MockBooster(scores=None)
+    feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_5m_ret",
+        "feat_30m_vol",
+        "feat_60m_trend",
+        "foreign_net_buy",
+        "institutional_net_buy",
+        "retail_net_buy",
+    ]
+    reg.save(
+        mock,
+        {
+            "version": "flow-v1",
+            "bundle_id": None,
+            "train_start": "20260101",
+            "train_end": "20260419",
+            "feature_cols": feature_cols,
+            "label_horizon_bars": 5,
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+    agent.update_investor_flow_snapshot(
+        "005930",
+        {
+            "foreign_net_buy": -2538322,
+            "institutional_net_buy": 285970,
+            "retail_net_buy": 2200059,
+        },
+        received_at="2026-04-20T10:00:00+09:00",
+    )
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "active"
+    assert agent._booster.last_X is not None
+    flow_values = agent._booster.last_X[0, 4:7].tolist()
+    assert flow_values == pytest.approx([-2538322.0, 285970.0, 2200059.0])
+
+
+def test_score_cross_section_ignores_future_investor_flow(tmp_path: Path) -> None:
+    """asof 이후 수신된 수급 snapshot은 PIT-safety상 추론 feature에 섞지 않는다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_future_flow")
+    mock = MockBooster(scores=None)
+    feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_5m_ret",
+        "feat_30m_vol",
+        "feat_60m_trend",
+        "foreign_net_buy",
+    ]
+    reg.save(
+        mock,
+        {
+            "version": "future-flow-v1",
+            "bundle_id": None,
+            "train_start": "20260101",
+            "train_end": "20260419",
+            "feature_cols": feature_cols,
+            "label_horizon_bars": 5,
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+    agent.update_investor_flow_snapshot(
+        "005930",
+        {"foreign_net_buy": 999999},
+        received_at="2026-04-20T10:01:00+09:00",
+    )
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "active"
+    assert agent.get_investor_flow_snapshot(
+        "005930",
+        asof="2026-04-20T10:00:00+09:00",
+    )["is_future"] is True
+    assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
+
+
 def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     populated_dual_source_registry: ModelRegistry,
 ) -> None:
@@ -422,6 +518,34 @@ def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
     assert result["scores"] == {}
 
 
+def test_score_cross_section_blocks_dual_source_model_when_values_invalid(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """Dual-Source artifact 값이 비수치면 Hot Path 예외 대신 해당 ticker skip."""
+    def invalid_loader(_date: str | None) -> list[dict[str, Any]]:
+        return [{
+            "ticker": "005930",
+            "news_score_t": "N/A",
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=invalid_loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+
+
 # ====================================================================== #
 # 4. compute_features
 # ====================================================================== #
@@ -452,7 +576,8 @@ def test_compute_features_returns_feat_prefix(agent_active: QuantAgent) -> None:
         "usd_krw",
     }
     for col in agent_active._dual_source_feature_cols:
-        assert feats[col] == pytest.approx(0.0)
+        expected = 1.0 if col == "community_noise_multiplier" else 0.0
+        assert feats[col] == pytest.approx(expected)
     for col in agent_active._exogenous_feature_cols:
         assert feats[col] == pytest.approx(0.0)
     for v in feats.values():

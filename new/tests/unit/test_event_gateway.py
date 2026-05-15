@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -271,6 +272,130 @@ def test_dispatch_next_auto_publish_success(tmp_path: Path) -> None:
     active = pool.get_active_messages("news_signal")
     assert len(active) == 1
     assert active[0]["content"] == "뉴스 분석 결과"
+
+
+def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> None:
+    """NewsAgent attach_to_gateway 결과가 EventGateway auto_publish C4 schema를 만족한다."""
+    from src.agents.cold.news import NewsAgent
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    router = MagicMock()
+    router_result = MagicMock()
+    router_result.success = True
+    router_result.content = (
+        '{"stance":"buy","impacted_tickers":["005930"],'
+        '"impacted_sectors":[],"narrative":"호재","confidence":0.82}'
+    )
+    router.call.return_value = router_result
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+    NewsAgent(llm_router=router).attach_to_gateway(gw)
+
+    gw.ingest(
+        {
+            "title": "삼성전자 호재",
+            "summary": "영업이익 증가",
+            "published_at": _recent_ts(),
+            "ticker": "005930",
+        },
+        source="naver_news",
+    )
+    result = gw.dispatch_next()
+
+    assert result is not None
+    assert "publish_error" not in result
+    assert isinstance(result.get("message"), dict)
+    messages = pool.get_active_messages("news_signal")
+    assert len(messages) == 1
+    assert messages[0]["confidence"] == pytest.approx(0.82)
+    assert messages[0]["scope"] == "ticker:005930"
+
+
+def test_news_agent_gateway_skips_fallback_neutral_publish(tmp_path: Path) -> None:
+    """NewsAgent LLM 실패 fallback neutral 결과는 MessagePool에 auto-publish하지 않는다."""
+    from src.agents.cold.news import NewsAgent
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    router = MagicMock()
+    router_result = MagicMock()
+    router_result.success = False
+    router_result.content = None
+    router_result.error = "timeout"
+    router.call.return_value = router_result
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+    NewsAgent(llm_router=router).attach_to_gateway(gw)
+
+    gw.ingest(
+        {
+            "title": "삼성전자 중립",
+            "summary": "LLM 실패 테스트",
+            "published_at": _recent_ts(),
+            "ticker": "005930",
+        },
+        source="naver_news",
+    )
+    result = gw.dispatch_next()
+
+    assert result is not None
+    assert result["llm_fallback"] is True
+    assert "message" not in result
+    assert "message_id" not in result
+    assert pool.pool_size() == 0
+
+
+def test_news_agent_gateway_avoids_duplicate_publish_when_agent_has_pubsub(tmp_path: Path) -> None:
+    """Agent 내부 publish가 선행된 경우 EventGateway auto_publish는 중복 게시하지 않는다."""
+    from src.agents.cold.news import NewsAgent
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    router = MagicMock()
+    router_result = MagicMock()
+    router_result.success = True
+    router_result.content = (
+        '{"stance":"buy","impacted_tickers":["005930"],'
+        '"impacted_sectors":[],"narrative":"호재","confidence":0.81}'
+    )
+    router.call.return_value = router_result
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+    NewsAgent(llm_router=router, pubsub=pubsub).attach_to_gateway(gw)
+
+    gw.ingest(
+        {
+            "title": "삼성전자 호재",
+            "summary": "중복 publish 방지 테스트",
+            "published_at": _recent_ts(),
+            "ticker": "005930",
+        },
+        source="naver_news",
+    )
+    result = gw.dispatch_next()
+
+    assert result is not None
+    assert result["published_by_agent"] is True
+    assert "publish_error" not in result
+    messages = pool.get_active_messages("news_signal")
+    assert len(messages) == 1
+    assert messages[0]["confidence"] == pytest.approx(0.81)
 
 
 # ------------------------------------------------------------------
