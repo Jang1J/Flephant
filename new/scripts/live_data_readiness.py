@@ -434,12 +434,34 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
             result["community"] = blocked
         else:
             events = community.poll_and_normalize(tickers[: min(3, len(tickers))])
+            raw_post_count = int(getattr(community, "_last_raw_post_count", len(events)) or 0)
+            normalize_fail_count = int(
+                getattr(community, "_last_normalize_fail_count", 0) or 0
+            )
+            pit_fail_count = int(
+                getattr(community, "_last_normalize_pit_fail_count", 0) or 0
+            )
+            pit_filtered_only = (
+                raw_post_count > 0
+                and len(events) == 0
+                and normalize_fail_count > 0
+                and pit_fail_count == normalize_fail_count
+            )
             result["community"] = _status(
-                bool(events),
+                bool(events) or pit_filtered_only,
                 {
                     "event_count": len(events),
+                    "raw_post_count": raw_post_count,
+                    "normalize_fail_count": normalize_fail_count,
+                    "pit_filtered_count": pit_fail_count,
+                    "pit_filtered_only": pit_filtered_only,
                     "is_mock": getattr(community, "_is_mock", None),
-                    "note": "real scraping is not implemented when is_mock=true",
+                    "note": (
+                        "raw community posts were reachable, but C2 normalization "
+                        "blocked them by PIT snapshot guard"
+                        if pit_filtered_only
+                        else "community smoke requires real normalized events or PIT-filtered raw posts"
+                    ),
                 },
             )
     except Exception as e:

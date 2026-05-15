@@ -265,6 +265,9 @@ class CommunityCrawler(BaseConnector):
             post_title (= post.title), posted_at (= post.timestamp.isoformat())
         """
         posts = self.poll(tickers, window_minutes)
+        self._last_raw_post_count = len(posts)
+        self._last_normalize_fail_count = 0
+        self._last_normalize_pit_fail_count = 0
         events: list[dict[str, Any]] = []
         for post in posts:
             raw = {
@@ -284,6 +287,9 @@ class CommunityCrawler(BaseConnector):
                 event = self._normalizer.normalize(raw, source="community")
                 events.append(event)
             except Exception as e:
+                self._last_normalize_fail_count += 1
+                if "PIT" in str(e) or "snapshot" in str(e):
+                    self._last_normalize_pit_fail_count += 1
                 logger.warning(
                     "[community] 정규화 실패 skip: post_id=%s err=%s",
                     post.post_id,

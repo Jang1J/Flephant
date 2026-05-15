@@ -333,6 +333,98 @@ def test_smoke_passes_us_overnight_with_real_source(monkeypatch):
     assert result["us_overnight"]["indices"]["as_of_date"] == "2026-05-07"
 
 
+def test_smoke_accepts_community_raw_posts_filtered_by_pit(monkeypatch):
+    """장마감 이후 real community raw post가 PIT guard에 막힌 경우 connector smoke는 PASS."""
+    readiness = _load_script_module()
+
+    class FakeKIS:
+        mode = "virtual"
+        auth = object()
+
+        def investor_trade_by_stock_daily(self, ticker, as_of_date):
+            return [{
+                "ticker": ticker,
+                "date": "2026-05-08T15:30:00+09:00",
+                "foreign_net_buy": 1.0,
+                "institutional_net_buy": 2.0,
+                "retail_net_buy": -3.0,
+            }]
+
+        def get_price_snapshot(self, tickers):
+            return [{"ticker": ticker, "last_price": 1.0} for ticker in tickers]
+
+    class FakeKRX:
+        _is_mock = False
+
+        def __init__(self, auth=None):
+            self.auth = auth
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            return [{
+                "payload": {
+                    "ticker": ticker,
+                    "foreign_net_buy": 1.0,
+                    "institutional_net_buy": 2.0,
+                    "retail_net_buy": -3.0,
+                }
+            }]
+
+    class FakeDART:
+        _is_mock = False
+
+        def list_disclosures(self, bgn_de, end_de, page_count):
+            return [{"event_id": "EVT"}]
+
+    class FakeNaver:
+        _is_mock = False
+
+        def search_news(self, query, display):
+            return [{"title": query}]
+
+    class FakeCommunity:
+        _is_mock = False
+
+        def poll_and_normalize(self, tickers):
+            self._last_raw_post_count = 3
+            self._last_normalize_fail_count = 3
+            self._last_normalize_pit_fail_count = 3
+            return []
+
+    class FakeECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, as_of_date):
+            return {"interest_rate": 2.5, "usd_krw": 1450.8}
+
+    class FakeUSMarketClient:
+        _is_mock = False
+
+        def get_indices(self, as_of=None):
+            return SimpleNamespace(
+                us_sp500_change=-0.003,
+                us_nasdaq_change=-0.001,
+                us_vix=17.1,
+                us_soxx_change=-0.02,
+                as_of_date="2026-05-07",
+                source="yfinance",
+            )
+
+    monkeypatch.setattr(readiness, "KISRestClient", FakeKIS)
+    monkeypatch.setattr(readiness, "KRXRestClient", FakeKRX)
+    monkeypatch.setattr(readiness, "DARTRestClient", FakeDART)
+    monkeypatch.setattr(readiness, "NaverNewsClient", FakeNaver)
+    monkeypatch.setattr(readiness, "CommunityCrawler", FakeCommunity)
+    monkeypatch.setattr(readiness, "ECOSRestClient", FakeECOS)
+    monkeypatch.setattr(readiness, "USMarketClient", FakeUSMarketClient)
+
+    result = readiness.run_smoke(["005930"], "20260508", allow_mock=False)
+
+    assert result["community"]["status"] == "PASS"
+    assert result["community"]["event_count"] == 0
+    assert result["community"]["raw_post_count"] == 3
+    assert result["community"]["pit_filtered_only"] is True
+
+
 def test_write_report_persists_report_path(monkeypatch, tmp_path):
     """stdout JSON과 저장 JSON의 report_path가 어긋나지 않는다."""
     readiness = _load_script_module()
