@@ -251,6 +251,53 @@ def test_join_exogenous_features_reads_daily_artifact(
     assert stats["rows_non_neutral"] == 2
 
 
+def test_join_exogenous_features_reads_injected_artifact_dir(tmp_path: Path) -> None:
+    """DatasetBuilder는 주입된 root artifact dir에서 exogenous JSON을 읽는다."""
+    exog_dir = tmp_path / "exogenous"
+    exog_dir.mkdir()
+    payload = {
+        "batch_date": "2026-05-08",
+        "snapshot_ts": "2026-05-08T08:30:00+09:00",
+        "source_stats": {
+            "input_mode": "real",
+            "provider_availability": {
+                "us_market_real": True,
+                "ecos_real": True,
+                "kis_investor_real": True,
+            },
+            "us_market_source": "yfinance",
+        },
+        "features": {"us_sp500_change": 0.012},
+        "per_ticker": {"005930": {"foreign_net_buy": 1200000.0}},
+    }
+    (exog_dir / "20260508.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    b = DatasetBuilder(
+        artifacts_dir=tmp_path / "data",
+        exogenous_artifact_dir=exog_dir,
+    )
+    frame = pd.DataFrame(
+        {
+            "ticker": ["005930", "000660"],
+            "ts_close": pd.to_datetime([
+                "2026-05-08T09:00:00+09:00",
+                "2026-05-08T09:00:00+09:00",
+            ]),
+            "close": [70000.0, 120000.0],
+        }
+    ).set_index(["ticker", "ts_close"])
+
+    joined = b._join_exogenous_features(frame)
+
+    assert joined.attrs["exogenous_join_stats"]["artifact_dir"] == str(exog_dir)
+    assert joined.attrs["exogenous_join_stats"]["dates_found"] == 1
+    assert joined.attrs["exogenous_join_stats"]["rows_non_neutral"] == 2
+    assert joined.loc[("005930", frame.index[0][1]), "foreign_net_buy"] == pytest.approx(1200000.0)
+    assert joined.loc[("000660", frame.index[1][1]), "us_sp500_change"] == pytest.approx(0.012)
+
+
 def test_join_exogenous_features_rejects_rehearsal_artifact(
     builder: DatasetBuilder,
     tmp_path: Path,

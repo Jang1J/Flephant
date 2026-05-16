@@ -469,16 +469,28 @@ class ServicePolicyReplayEngine:
             "missing_probability": 0,
             "model_loaded": trade_probability_model is not None,
         }
+        panel_flat = panel.drop(
+            columns=[
+                col for col in ("ticker", "ts_close")
+                if col in panel.columns and col in panel.index.names
+            ],
+            errors="ignore",
+        ).reset_index()
+        iter_cols = ["ticker", "close", target_col, *feature_cols]
 
-        for cycle_idx, (ts_close, ts_group) in enumerate(panel.groupby(level="ts_close", sort=True)):
+        for cycle_idx, (ts_close, ts_group) in enumerate(
+            panel_flat.groupby("ts_close", sort=True)
+        ):
             bar_preds: list[tuple[str, float, float, float]] = []
             trade_probs_by_ticker: dict[str, float] = {}
-            for (ticker, _), row in ts_group.iterrows():
+            valid_rows: list[tuple[str, list[float], float, float]] = []
+            for row in ts_group[iter_cols].itertuples(index=False, name=None):
+                ticker, price_raw, actual_ret_raw, *raw_features = row
                 ticker_s = pad_ticker(ticker)
                 try:
-                    features = [float(row[col]) for col in feature_cols]
-                    actual_ret = float(row[target_col])
-                    price = float(row["close"])
+                    features = [float(value) for value in raw_features]
+                    actual_ret = float(actual_ret_raw)
+                    price = float(price_raw)
                 except Exception as e:
                     raise DataUnavailable(
                         f"invalid replay row ticker={ticker_s} ts={ts_close}: {e}"
@@ -490,17 +502,30 @@ class ServicePolicyReplayEngine:
                     or price <= 0
                 ):
                     continue
-                pred = float(model_callable(features))
+                valid_rows.append((ticker_s, features, actual_ret, price))
+
+            if not valid_rows:
+                continue
+
+            feature_matrix = [features for _, features, _, _ in valid_rows]
+            predictions = self._predict_model_batch(model_callable, feature_matrix)
+            trade_probabilities = self._predict_trade_probabilities(
+                trade_probability_model,
+                feature_matrix,
+            )
+            for (ticker_s, features, actual_ret, price), pred_raw, trade_prob in zip(
+                valid_rows,
+                predictions,
+                trade_probabilities,
+                strict=True,
+            ):
+                pred = float(pred_raw)
                 if math.isnan(pred):
                     raise NaNInMetrics(
                         f"service replay prediction NaN: ticker={ticker_s} ts={ts_close}"
                     )
                 latest_prices[ticker_s] = price
                 bar_preds.append((ticker_s, pred, actual_ret, price))
-                trade_prob = self._predict_trade_probability(
-                    trade_probability_model,
-                    features,
-                )
                 if trade_prob is not None:
                     trade_probs_by_ticker[ticker_s] = trade_prob
                 predicted_signals.append(pred)
@@ -740,6 +765,21 @@ class ServicePolicyReplayEngine:
         }
 
     @staticmethod
+    def _predict_model_batch(model_callable: Any, feature_matrix: list[list[float]]) -> list[float]:
+        if not feature_matrix:
+            return []
+        batch_predict = getattr(model_callable, "batch_predict", None)
+        if callable(batch_predict):
+            raw = np.asarray(batch_predict(feature_matrix), dtype=float).reshape(-1)
+            if raw.size != len(feature_matrix):
+                raise NaNInMetrics(
+                    "service replay batch prediction length mismatch: "
+                    f"expected={len(feature_matrix)} actual={raw.size}"
+                )
+            return [float(value) for value in raw]
+        return [float(model_callable(features)) for features in feature_matrix]
+
+    @staticmethod
     def _predict_trade_probability(
         trade_probability_model: Any | None,
         features: list[float],
@@ -757,6 +797,38 @@ class ServicePolicyReplayEngine:
         if len(raw) < 1 or not math.isfinite(float(raw[0])):
             return None
         return safe_float(float(raw[0]), default=0.0, min_value=0.0, max_value=1.0)
+
+    @staticmethod
+    def _predict_trade_probabilities(
+        trade_probability_model: Any | None,
+        feature_matrix: list[list[float]],
+    ) -> list[float | None]:
+        if trade_probability_model is None:
+            return [None] * len(feature_matrix)
+        try:
+            raw = np.asarray(trade_probability_model.predict(feature_matrix), dtype=float)
+        except Exception as e:
+            _ = e
+            return [
+                ServicePolicyReplayEngine._predict_trade_probability(
+                    trade_probability_model,
+                    features,
+                )
+                for features in feature_matrix
+            ]
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if raw.size != len(feature_matrix):
+            return [None] * len(feature_matrix)
+        out: list[float | None] = []
+        for value in raw:
+            value_f = float(value)
+            if not math.isfinite(value_f):
+                out.append(None)
+                continue
+            out.append(safe_float(value_f, default=0.0, min_value=0.0, max_value=1.0))
+        return out
 
     @staticmethod
     def _apply_trade_probability_gate(

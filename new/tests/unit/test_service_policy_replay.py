@@ -337,12 +337,14 @@ def test_trade_probability_gate_filters_service_replay_candidate() -> None:
 
 def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:
     """service replay는 후보 모델이 학습한 target_col로 실제 수익률을 평가한다."""
+    builder_kwargs: dict[str, object] = {}
 
     class _FakeBuilder:
         target_col = "label_5m_ret"
 
         def __init__(self, *args, **kwargs) -> None:
-            _ = args, kwargs
+            _ = args
+            builder_kwargs.update(kwargs)
 
         def relabel_panel_for_target(self, panel, target_col: str):
             assert target_col == "label_30m_net_ret"
@@ -392,6 +394,10 @@ def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:
     assert result["model_version"] == ""
     assert result["signal_quality"]["prediction_count"] == 1
     assert result["orders"][0]["ticker"] == "005930"
+    repo_root = Path(__file__).resolve().parents[3]
+    assert builder_kwargs["artifacts_dir"] == repo_root / "artifacts" / "data"
+    assert builder_kwargs["dual_source_artifact_dir"] == repo_root / "artifacts" / "dual_source"
+    assert builder_kwargs["exogenous_artifact_dir"] == repo_root / "artifacts" / "exogenous"
 
 
 def test_run_materializes_neutral_alpha_factor_features(monkeypatch) -> None:

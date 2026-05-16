@@ -1185,6 +1185,18 @@ class BacktestEngine:
                 raise NaNInMetrics("candidate model predict 결과가 비어있음")
             return float(arr[0])
 
+        def _batch_call(rows: list[list[float]]) -> list[float]:
+            x = np.asarray(rows, dtype=float)
+            pred = model.predict(x)
+            arr = np.asarray(pred, dtype=float).reshape(-1)
+            if arr.size != len(rows):
+                raise NaNInMetrics(
+                    "candidate model batch predict 길이 불일치: "
+                    f"expected={len(rows)} actual={arr.size}"
+                )
+            return [float(value) for value in arr]
+
+        _call.batch_predict = _batch_call  # type: ignore[attr-defined]
         return _call
 
     # ────────────────────────────────────────────────────
