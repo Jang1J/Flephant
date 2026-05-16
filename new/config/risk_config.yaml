@@ -939,6 +939,10 @@ cost_aware_retraining:
     min_expected_net_alpha_bps_from_service_policy: true
     require_phase2_non_neutral_coverage: true
     require_service_policy_replay_before_deploy: true
+  trade_probability_gate:
+    enabled: false
+    min_probability: 0.50
+    apply_to_policy: "heuristic_only"
   label_horizon_gate:
     min_mean_net_bps: 2.5
     min_positive_net_rate: 0.53
