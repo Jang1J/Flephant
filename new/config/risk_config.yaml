@@ -815,6 +815,15 @@ live_data_readiness:
   max_bar_gap_minutes: 5             # 중간 구간 누락/큰 timestamp jump artifact 차단
   allow_closing_auction_gap: true     # KIS 1분봉은 15:19 이후 단일 15:30 종가 bar가 정상
   max_closing_auction_gap_minutes: 15
+  known_market_halt_intervals:
+    - date: "20260304"                # KRX KOSPI/KOSDAQ circuit breaker; 11:17~11:48 거래정지/단일가 구간
+      start: "11:17"
+      end: "11:48"
+      reason: "KRX KOSPI/KOSDAQ circuit breaker"
+    - date: "20260309"                # KRX circuit breaker; 10:32~11:01 거래정지/단일가 구간
+      start: "10:32"
+      end: "11:01"
+      reason: "KRX circuit breaker"
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
   max_consecutive_backfill_failed_dates: 3

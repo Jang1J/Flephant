@@ -259,6 +259,7 @@ def _saved_file_summary(
         max_gap_ok_by_date: dict[str, bool | None] = {}
         unexpected_max_gap_minutes_by_date: dict[str, float | None] = {}
         allowed_closing_auction_gap_counts: dict[str, int | None] = {}
+        allowed_market_halt_gap_counts: dict[str, int | None] = {}
         missing_ohlcv_counts: dict[str, int | None] = {}
         non_finite_ohlcv_counts: dict[str, int | None] = {}
         invalid_ohlcv_counts: dict[str, int | None] = {}
@@ -307,6 +308,9 @@ def _saved_file_summary(
                 allowed_closing_auction_gap_counts[date_part] = inspection.get(
                     "allowed_closing_auction_gap_count"
                 )
+                allowed_market_halt_gap_counts[date_part] = inspection.get(
+                    "allowed_market_halt_gap_count"
+                )
                 missing_ohlcv_counts[date_part] = inspection.get("missing_ohlcv_count")
                 non_finite_ohlcv_counts[date_part] = inspection.get("non_finite_ohlcv_count")
                 invalid_ohlcv_counts[date_part] = inspection.get("invalid_ohlcv_count")
@@ -344,6 +348,7 @@ def _saved_file_summary(
             "max_gap_ok": max_gap_ok_by_date,
             "unexpected_max_gap_minutes": unexpected_max_gap_minutes_by_date,
             "allowed_closing_auction_gap_counts": allowed_closing_auction_gap_counts,
+            "allowed_market_halt_gap_counts": allowed_market_halt_gap_counts,
             "missing_ohlcv_counts": missing_ohlcv_counts,
             "non_finite_ohlcv_counts": non_finite_ohlcv_counts,
             "invalid_ohlcv_counts": invalid_ohlcv_counts,
@@ -390,6 +395,10 @@ def _artifact_date_quality(
                 "allowed_closing_auction_gap_counts",
                 {},
             )
+            allowed_market_halt_gap_counts = info.get(
+                "allowed_market_halt_gap_counts",
+                {},
+            )
             missing_ohlcv_counts = info.get("missing_ohlcv_counts", {})
             non_finite_ohlcv_counts = info.get("non_finite_ohlcv_counts", {})
             invalid_ohlcv_counts = info.get("invalid_ohlcv_counts", {})
@@ -416,6 +425,9 @@ def _artifact_date_quality(
                     "unexpected_max_gap_minutes": unexpected_max_gap_minutes.get(day),
                     "allowed_closing_auction_gap_count": (
                         allowed_closing_auction_gap_counts.get(day)
+                    ),
+                    "allowed_market_halt_gap_count": (
+                        allowed_market_halt_gap_counts.get(day)
                     ),
                     "missing_ohlcv_count": missing_ohlcv_counts.get(day),
                     "non_finite_ohlcv_count": non_finite_ohlcv_counts.get(day),
@@ -507,6 +519,7 @@ def _inspect_bar_file(
         "max_gap_ok": None,
         "unexpected_max_gap_minutes": None,
         "allowed_closing_auction_gap_count": None,
+        "allowed_market_halt_gap_count": None,
         "missing_ohlcv_count": None,
         "non_finite_ohlcv_count": None,
         "invalid_ohlcv_count": None,
@@ -573,12 +586,20 @@ def _inspect_bar_file(
     max_closing_auction_gap = float(
         readiness_cfg.get("max_closing_auction_gap_minutes", 15)
     )
+    known_halt_intervals = [
+        interval
+        for interval in readiness_cfg.get("known_market_halt_intervals", [])
+        if isinstance(interval, dict) and str(interval.get("date")) == yyyymmdd
+    ]
     gap_minutes = []
     unexpected_gap_minutes = []
     allowed_closing_auction_gap_count = 0
+    allowed_market_halt_gap_count = 0
     for left, right in zip(sorted_timestamps, sorted_timestamps[1:]):
         gap = (right - left).total_seconds() / 60.0
         gap_minutes.append(gap)
+        missing_start = left + timedelta(minutes=1)
+        missing_end = right - timedelta(minutes=1)
         is_closing_auction_gap = (
             allow_closing_auction_gap
             and left.date() == right.date()
@@ -586,8 +607,15 @@ def _inspect_bar_file(
             and right.time() == market_close
             and gap <= max_closing_auction_gap
         )
+        is_market_halt_gap = _is_known_market_halt_gap(
+            known_halt_intervals,
+            missing_start=missing_start,
+            missing_end=missing_end,
+        )
         if is_closing_auction_gap:
             allowed_closing_auction_gap_count += 1
+        elif is_market_halt_gap:
+            allowed_market_halt_gap_count += 1
         elif gap > 1.0:
             unexpected_gap_minutes.append(gap)
     max_gap_minutes = max(gap_minutes) if gap_minutes else (0.0 if sorted_timestamps else None)
@@ -661,10 +689,30 @@ def _inspect_bar_file(
         "max_gap_ok": max_gap_ok,
         "unexpected_max_gap_minutes": unexpected_max_gap_minutes,
         "allowed_closing_auction_gap_count": allowed_closing_auction_gap_count,
+        "allowed_market_halt_gap_count": allowed_market_halt_gap_count,
         "missing_ohlcv_count": missing_ohlcv_count,
         "non_finite_ohlcv_count": non_finite_ohlcv_count,
         "invalid_ohlcv_count": invalid_ohlcv_count,
     }
+
+
+def _is_known_market_halt_gap(
+    intervals: list[dict[str, Any]],
+    *,
+    missing_start: datetime,
+    missing_end: datetime,
+) -> bool:
+    if missing_end < missing_start:
+        return False
+    for interval in intervals:
+        try:
+            halt_start = time.fromisoformat(str(interval.get("start", "")))
+            halt_end = time.fromisoformat(str(interval.get("end", "")))
+        except ValueError:
+            continue
+        if halt_start <= missing_start.time() and missing_end.time() <= halt_end:
+            return True
+    return False
 
 
 def _bar_file_date_matches(file_path: Path, yyyymmdd: str) -> bool | None:

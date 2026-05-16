@@ -436,6 +436,35 @@ def test_artifact_date_quality_allows_closing_auction_gap(monkeypatch, tmp_path)
     assert summary["005930"]["allowed_closing_auction_gap_counts"]["20260508"] == 1
 
 
+def test_artifact_date_quality_allows_known_market_halt_gap(monkeypatch, tmp_path):
+    """문서화된 KRX circuit breaker 구간의 market-wide gap은 artifact 결함으로 보지 않는다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260304",
+        rows=332,
+        gap_after=139,
+        gap_minutes=29,
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930"],
+        "20260304",
+        "20260304",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260304"]["is_valid"] is True
+    summary = readiness._saved_file_summary(["005930"], "20260304", "20260304", 300)
+    assert summary["005930"]["valid_dates"]["20260304"] is True
+    assert summary["005930"]["max_gap_minutes"]["20260304"] == 30.0
+    assert summary["005930"]["unexpected_max_gap_minutes"]["20260304"] == 0.0
+    assert summary["005930"]["allowed_market_halt_gap_counts"]["20260304"] == 1
+
+
 def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
     """row 수만 맞춘 중복 timestamp artifact는 학습 가능 날짜가 아니다."""
     readiness = _load_script_module()

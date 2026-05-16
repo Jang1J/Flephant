@@ -305,6 +305,28 @@ def test_80_day_artifact_gate_allows_closing_auction_gap(monkeypatch, tmp_path):
     assert result["status"] == "PASS"
 
 
+def test_80_day_artifact_gate_allows_known_market_halt_gap(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(
+        tmp_path,
+        "005930",
+        "20260304",
+        rows=332,
+        gap_after=139,
+        gap_minutes=29,
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260304",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "PASS"
+
+
 def test_80_day_artifact_gate_rejects_invalid_ohlcv(monkeypatch, tmp_path):
     import pandas as pd
 
