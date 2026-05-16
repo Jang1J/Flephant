@@ -22,6 +22,7 @@ if str(NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(NEW_ROOT))
 
 from scripts import prelive_gate  # noqa: E402
+from scripts.phase2_feature_backfill import run_phase2_feature_backfill  # noqa: E402
 from scripts.service_policy_replay import run_service_policy_replay  # noqa: E402
 from src.execution.paper_trading import PaperTradingRunner  # noqa: E402
 from src.jobs.run_backtest import run_backtest  # noqa: E402
@@ -122,6 +123,41 @@ def _final_training_tickers(max_tickers: int) -> list[str]:
     )
 
 
+def _final_feature_coverage_status(end_date: str, business_days: int) -> dict[str, Any]:
+    """Fail closed unless final-window Dual-Source/exogenous coverage is deployable."""
+    try:
+        coverage = run_phase2_feature_backfill(
+            end_date=end_date,
+            business_days=business_days,
+            write_neutral_placeholders=False,
+            artifacts_dir=REPO_ROOT / "artifacts" / "data",
+            output_dir=REPO_ROOT / "artifacts" / "reports" / "phase2_feature_backfill",
+        )
+    except Exception as e:
+        return _stage(
+            "FAIL",
+            "Final-window feature coverage audit failed before training.",
+            {"error": str(e), "error_type": type(e).__name__},
+        )
+
+    return _stage(
+        "PASS" if coverage.get("status") == "PASS" else "BLOCKED",
+        "Final-window Dual-Source/exogenous feature coverage checked before training.",
+        {
+            "result": {
+                "status": coverage.get("status"),
+                "date_range": coverage.get("date_range"),
+                "artifact_date_coverage": coverage.get("artifact_date_coverage"),
+                "coverage": coverage.get("coverage", {}),
+                "blockers": coverage.get("blockers", []),
+                "report_path": coverage.get("report_path"),
+                "report_path_relative": coverage.get("report_path_relative"),
+            },
+            "blockers": coverage.get("blockers", []),
+        },
+    )
+
+
 def run_pipeline(
     *,
     end_date: str,
@@ -196,6 +232,20 @@ def run_pipeline(
         )
         report["status"] = "BLOCKED"
         report["blockers"] = ["02_lgbm_bundle"]
+        return report
+
+    stages["02_feature_coverage"] = _final_feature_coverage_status(
+        end_date,
+        business_days,
+    )
+    if stages["02_feature_coverage"]["status"] != "PASS":
+        stages["02_lgbm_bundle"] = _stage(
+            "SKIP",
+            "Final-window feature coverage gate is not PASS yet.",
+            {"upstream_blockers": stages["02_feature_coverage"].get("blockers", [])},
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["02_feature_coverage"]
         return report
 
     try:

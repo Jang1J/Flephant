@@ -70,6 +70,28 @@ def _service_policy_pass(bundle_id: str, write_report: bool = True) -> dict:
     }
 
 
+def _feature_coverage(status: str = "PASS") -> dict:
+    blockers = [] if status == "PASS" else ["dual_source_non_neutral_coverage_below_threshold"]
+    return {
+        "status": status,
+        "date_range": {"start": "20250509", "end": "20260515"},
+        "artifact_date_coverage": {
+            "expected_date_count": 249,
+            "selected_date_count": 249,
+            "missing_date_count": 0,
+        },
+        "coverage": {
+            "dual_source_file_coverage": 1.0,
+            "dual_source_non_neutral_date_coverage": 1.0 if status == "PASS" else 80 / 249,
+            "exogenous_file_coverage": 1.0,
+            "exogenous_non_neutral_date_coverage": 1.0,
+        },
+        "blockers": blockers,
+        "report_path": "artifacts/reports/phase2_feature_backfill/test.json",
+        "report_path_relative": "artifacts/reports/phase2_feature_backfill/test.json",
+    }
+
+
 def test_business_start_date_uses_krx_calendar():
     mod = _load_script_module()
 
@@ -162,6 +184,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         return FakeLGBM()
 
     monkeypatch.setattr(mod, "NightlyLGBMRetrainer", fake_retrainer_factory)
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(
         mod,
@@ -194,6 +217,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     )
 
     assert report["status"] == "PASS"
+    assert report["stages"]["02_feature_coverage"]["status"] == "PASS"
     assert report["stages"]["02_lgbm_bundle"]["status"] == "PASS"
     assert report["stages"]["03_service_policy_replay"]["status"] == "PASS"
     assert report["stages"]["04_backtest"]["status"] == "PASS"
@@ -241,6 +265,53 @@ def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
     assert report["training_ticker_count"] == 0
 
 
+def test_pipeline_blocks_before_training_when_feature_coverage_blocked(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(mod.prelive_gate, "build_report", lambda **kwargs: _gate("PASS"))
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: ["005930", "105560"],
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_phase2_feature_backfill",
+        lambda **kwargs: _feature_coverage("BLOCKED"),
+    )
+
+    class FakeLGBM:
+        def retrain(self, **kwargs):
+            _ = kwargs
+            raise AssertionError("training must not start when final feature coverage blocks")
+
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+
+    report = mod.run_pipeline(
+        end_date="20260515",
+        business_days=249,
+        max_tickers=30,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=1.0,
+        confirm_phrase=None,
+        order_type="00",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["02_feature_coverage"]
+    assert report["stages"]["02_feature_coverage"]["status"] == "BLOCKED"
+    assert report["stages"]["02_lgbm_bundle"]["status"] == "SKIP"
+    assert "dual_source_non_neutral_coverage_below_threshold" in (
+        report["stages"]["02_lgbm_bundle"]["upstream_blockers"]
+    )
+
+
 def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
     mod = _load_script_module()
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
@@ -255,6 +326,7 @@ def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
             }
 
     monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",
@@ -299,6 +371,7 @@ def test_pipeline_stops_when_service_policy_replay_blocks(monkeypatch):
             }
 
     monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(
         mod,
         "run_service_policy_replay",
@@ -343,6 +416,7 @@ def test_pipeline_blocks_backtest_pass_with_regression_flag(monkeypatch):
             }
 
     monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",
