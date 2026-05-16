@@ -305,7 +305,7 @@ class HotRunner:
         t_fda = self._profiler.start_stage("fda")
         fda_result = self._fda.decide(
             portfolio_patch_ref=portfolio_patch["portfolio_patch_id"],
-            target_weights=target_weights,
+            target_weights=portfolio_patch["target_weights"],
             order_deltas=portfolio_patch["order_deltas"],
             dependency_status=dependency_status or {
                 "news": "done", "risk": "done", "quant": "done", "debate": "skipped"

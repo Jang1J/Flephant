@@ -291,6 +291,36 @@ def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
         assert result["final_decision"]["approved"] is False
 
 
+def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> None:
+    """FDA echo는 PPO 원본이 아니라 PM이 실제 주문에 맞춘 target_weights를 사용한다."""
+    runner.start()
+
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "passive",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: [  # type: ignore[method-assign]
+        {"ticker": "005930", "reason": "forced_exit"}
+    ]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.10}}
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 8, "weight": 0.20}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["pm_result"]["portfolio_patch"]["target_weights"]["005930"] == 0.0
+    assert result["final_decision"]["target_weights"]["005930"] == 0.0
+    assert result["final_decision"]["order_deltas"][0]["reason"] == "risk_reduce"
+
+
 def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930"]
