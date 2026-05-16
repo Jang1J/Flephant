@@ -555,19 +555,56 @@ def _latest_lgbm_metadata(
     return str(latest.get("version")), latest
 
 
+def _staged_lgbm_metadata(
+    bundle_id: str,
+) -> tuple[str | None, dict[str, Any] | None, Path, Path]:
+    bundle_lgbm_dir = REPO_ROOT / "artifacts" / "bundles" / bundle_id / "lgbm"
+    metadata_path = bundle_lgbm_dir / "latest_model_metadata.json"
+    model_path = bundle_lgbm_dir / "latest_model.pkl"
+    if not metadata_path.exists():
+        return None, None, metadata_path, model_path
+    meta = _load_json(metadata_path)
+    if not isinstance(meta, dict):
+        return None, None, metadata_path, model_path
+    version = str(meta.get("version") or "staged_bundle")
+    return version, meta, metadata_path, model_path
+
+
 def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     requested_bundle_id = str(bundle_id or "").strip()
-    version, meta = _latest_lgbm_metadata(requested_bundle_id or None)
+    metadata_source = "production_registry"
+    staged_metadata_path: Path | None = None
+    staged_model_path: Path | None = None
+    if requested_bundle_id:
+        version, meta, staged_metadata_path, staged_model_path = _staged_lgbm_metadata(
+            requested_bundle_id
+        )
+        metadata_source = "staged_bundle"
+    else:
+        version, meta = _latest_lgbm_metadata(None)
     if not meta:
         detail = (
-            {"requested_bundle_id": requested_bundle_id}
+            {
+                "requested_bundle_id": requested_bundle_id,
+                "metadata_source": metadata_source,
+                "metadata_path": (
+                    str(staged_metadata_path.relative_to(REPO_ROOT))
+                    if staged_metadata_path is not None
+                    else None
+                ),
+                "model_path": (
+                    str(staged_model_path.relative_to(REPO_ROOT))
+                    if staged_model_path is not None
+                    else None
+                ),
+            }
             if requested_bundle_id
             else None
         )
         return _stage(
             "BLOCKED",
             (
-                "No LightGBM registry metadata was found for the requested bundle id."
+                "No staged LightGBM metadata was found for the requested bundle id."
                 if requested_bundle_id
                 else "No LightGBM registry metadata was found."
             ),
@@ -577,6 +614,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     label_cfg = risk_cfg.get("label") or {}
     required_label_version = label_cfg.get("generation_version")
     required_label_scope = label_cfg.get("session_scope")
+    required_target_col = label_cfg.get("target_col")
     if not required_label_version:
         return _stage(
             "BLOCKED",
@@ -587,16 +625,30 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "BLOCKED",
             "risk_config.yaml label.session_scope is required for real LightGBM gate.",
         )
-    model_path = meta.get("model_path")
-    model_exists = bool(model_path and (REPO_ROOT / str(model_path)).exists())
+    if not required_target_col:
+        return _stage(
+            "BLOCKED",
+            "risk_config.yaml label.target_col is required for real LightGBM gate.",
+        )
+    if staged_model_path is not None:
+        model_path = str(staged_model_path.relative_to(REPO_ROOT))
+        model_exists = staged_model_path.exists() and staged_model_path.stat().st_size > 0
+    else:
+        model_path = meta.get("model_path")
+        model_exists = bool(model_path and (REPO_ROOT / str(model_path)).exists())
     synthetic = safe_bool(meta.get("synthetic_fallback"), default=False)
     data_source = meta.get("data_source")
     real_data_source = data_source == "artifact_bars"
     bundle_id = meta.get("bundle_id")
+    bundle_id_matches_request = (
+        bundle_id == requested_bundle_id if requested_bundle_id else None
+    )
     actual_label_version = meta.get("label_generation_version")
     actual_label_scope = meta.get("label_session_scope")
+    actual_target_col = meta.get("target_col")
     label_version_ok = actual_label_version == required_label_version
     label_scope_ok = actual_label_scope == required_label_scope
+    target_col_ok = actual_target_col == required_target_col
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
     status = (
         "PASS"
@@ -605,13 +657,21 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         and real_data_source
         and label_version_ok
         and label_scope_ok
+        and target_col_ok
+        and (bundle_id_matches_request is not False)
         else "BLOCKED"
     )
     message = "Latest LightGBM artifact inspected."
-    if not label_version_ok:
+    if bundle_id_matches_request is False:
+        message = "Staged LightGBM artifact bundle_id does not match the requested bundle id."
+    elif not model_exists:
+        message = "Staged LightGBM model file is missing or empty." if requested_bundle_id else "Latest LightGBM model file is missing."
+    elif not label_version_ok:
         message = "Latest LightGBM artifact has stale or missing label generation metadata."
     elif not label_scope_ok:
         message = "Latest LightGBM artifact has stale or missing label session scope metadata."
+    elif not target_col_ok:
+        message = "Latest LightGBM artifact target_col does not match risk_config.yaml label.target_col."
     elif not real_data_source:
         message = "Latest LightGBM artifact is not marked as artifact_bars real data."
     return _stage(
@@ -620,11 +680,15 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         {
             "version": version,
             "requested_bundle_id": requested_bundle_id or None,
+            "metadata_source": metadata_source,
+            "metadata_path": (
+                str(staged_metadata_path.relative_to(REPO_ROOT))
+                if staged_metadata_path is not None
+                else None
+            ),
             "bundle_id": bundle_id,
             "candidate_bundle_id": bundle_id,
-            "bundle_id_matches_request": (
-                bundle_id == requested_bundle_id if requested_bundle_id else None
-            ),
+            "bundle_id_matches_request": bundle_id_matches_request,
             "registry_status": meta.get("status"),
             "model_path": model_path,
             "model_exists": model_exists,
@@ -635,6 +699,8 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "required_label_generation_version": required_label_version,
             "label_session_scope": actual_label_scope,
             "required_label_session_scope": required_label_scope,
+            "target_col": actual_target_col,
+            "required_target_col": required_target_col,
             "n_train_rows": meta.get("n_train_rows"),
             "train_start": meta.get("train_start"),
             "train_end": meta.get("train_end"),

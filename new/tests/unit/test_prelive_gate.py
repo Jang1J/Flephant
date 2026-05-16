@@ -28,6 +28,44 @@ def _required_label_session_scope(gate) -> str:
     return str(cfg["label"]["session_scope"])
 
 
+def _required_target_col(gate) -> str:
+    cfg = gate._load_yaml(gate.NEW_ROOT / "config" / "risk_config.yaml")
+    return str(cfg["label"]["target_col"])
+
+
+def _write_staged_lgbm_bundle(
+    root: Path,
+    gate,
+    bundle_id: str,
+    *,
+    metadata: dict | None = None,
+    model_bytes: bytes = b"staged-model",
+) -> dict:
+    bundle_dir = root / "artifacts" / "bundles" / bundle_id / "lgbm"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "latest_model.pkl").write_bytes(model_bytes)
+    payload = {
+        "version": "staged",
+        "status": "candidate",
+        "bundle_id": bundle_id,
+        "model_path": f"artifacts/bundles/{bundle_id}/lgbm/latest_model.pkl",
+        "created_at": "2026-05-12T09:00:00+09:00",
+        "synthetic_fallback": False,
+        "data_source": "artifact_bars",
+        "n_train_rows": 1000,
+        "label_generation_version": _required_label_generation_version(gate),
+        "label_session_scope": _required_label_session_scope(gate),
+        "target_col": _required_target_col(gate),
+    }
+    if metadata:
+        payload.update(metadata)
+    (bundle_dir / "latest_model_metadata.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _service_policy_evidence(
     root: Path,
     *,
@@ -323,6 +361,7 @@ def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -351,6 +390,7 @@ def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },
@@ -374,6 +414,7 @@ def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -394,6 +435,7 @@ def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },
@@ -413,6 +455,7 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -444,6 +487,7 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
                         "n_train_rows": 454639,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },
@@ -464,30 +508,21 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
 
 def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
     gate = _load_script_module()
-    label_version = _required_label_generation_version(gate)
-    label_scope = _required_label_session_scope(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
-    (lgbm_dir / "requested.pkl").write_bytes(b"requested")
     (lgbm_dir / "newer.pkl").write_bytes(b"newer")
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"version": "requested"},
+    )
     (lgbm_dir / "registry.json").write_text(
         json.dumps(
             {
                 "active_version": None,
                 "versions": [
-                    {
-                        "version": "requested",
-                        "status": "candidate",
-                        "bundle_id": "BUNDLE-REQUESTED",
-                        "model_path": "artifacts/lgbm/requested.pkl",
-                        "created_at": "2026-05-12T09:00:00+09:00",
-                        "synthetic_fallback": False,
-                        "data_source": "artifact_bars",
-                        "n_train_rows": 1000,
-                        "label_generation_version": label_version,
-                        "label_session_scope": label_scope,
-                    },
                     {
                         "version": "newer",
                         "status": "candidate",
@@ -497,8 +532,9 @@ def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
                         "synthetic_fallback": False,
                         "data_source": "artifact_bars",
                         "n_train_rows": 1000,
-                        "label_generation_version": label_version,
-                        "label_session_scope": label_scope,
+                        "label_generation_version": _required_label_generation_version(gate),
+                        "label_session_scope": _required_label_session_scope(gate),
+                        "target_col": _required_target_col(gate),
                     },
                 ],
             },
@@ -515,6 +551,8 @@ def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
     assert result["requested_bundle_id"] == "BUNDLE-REQUESTED"
     assert result["candidate_bundle_id"] == "BUNDLE-REQUESTED"
     assert result["bundle_id_matches_request"] is True
+    assert result["metadata_source"] == "staged_bundle"
+    assert result["model_path"] == "artifacts/bundles/BUNDLE-REQUESTED/lgbm/latest_model.pkl"
 
 
 def test_lgbm_real_train_blocks_unknown_requested_bundle(monkeypatch, tmp_path):
@@ -535,10 +573,47 @@ def test_lgbm_real_train_blocks_unknown_requested_bundle(monkeypatch, tmp_path):
     assert "requested bundle id" in result["message"]
 
 
+def test_lgbm_real_train_blocks_staged_bundle_id_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"bundle_id": "BUNDLE-OTHER"},
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["metadata_source"] == "staged_bundle"
+    assert result["bundle_id_matches_request"] is False
+
+
+def test_lgbm_real_train_blocks_target_col_override_candidate(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"target_col": "label_session_close_net_ret"},
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["target_col"] == "label_session_close_net_ret"
+    assert result["required_target_col"] == _required_target_col(gate)
+
+
 def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -559,6 +634,7 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "data_source": "artifact_bars",
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                     {
                         "version": "utc_time",
@@ -570,6 +646,7 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "data_source": "artifact_bars",
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },
@@ -626,6 +703,7 @@ def test_lgbm_real_train_blocks_missing_real_data_source(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -645,6 +723,7 @@ def test_lgbm_real_train_blocks_missing_real_data_source(monkeypatch, tmp_path):
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },

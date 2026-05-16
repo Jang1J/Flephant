@@ -223,6 +223,7 @@ class NightlyLGBMRetrainer:
                 synthetic_seed=self._synthetic_seed,
             ),
             registry=registry,
+            allow_production_candidate_write=self._allow_production_candidate_write,
         )
 
     @staticmethod

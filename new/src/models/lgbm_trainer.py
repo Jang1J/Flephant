@@ -83,11 +83,13 @@ class LGBMTrainer:
         splitter: WalkForwardSplitter | None = None,
         registry: ModelRegistry | None = None,
         allow_production_active_write: bool = False,
+        allow_production_candidate_write: bool = False,
     ) -> None:
         self.builder = dataset_builder or DatasetBuilder()
         self.splitter = splitter or WalkForwardSplitter()
         self.registry = registry or ModelRegistry()
         self._allow_production_active_write = bool(allow_production_active_write)
+        self._allow_production_candidate_write = bool(allow_production_candidate_write)
 
         self.feature_cols: list[str] = _load_feature_cols()
         # target_col / top_k_fraction은 yaml 경유 (불변 원칙 5).
@@ -146,6 +148,15 @@ class LGBMTrainer:
         end_date_norm = self._normalize_yyyymmdd(end_date)
 
         effective_target_col = str(target_col_override or self.target_col)
+        if (
+            target_col_override
+            and self._uses_production_registry()
+            and not self._allow_production_candidate_write
+        ):
+            raise RuntimeError(
+                "target_col_override candidate write는 production registry에 직접 저장할 수 없음. "
+                "research registry 또는 allow_production_candidate_write=True 필요"
+            )
         target_horizon_bars, target_horizon_kind = self._target_horizon_metadata(
             effective_target_col,
             default_horizon=int(self.builder.horizon_bars),
@@ -662,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
     trainer = LGBMTrainer(
         registry=registry,
         allow_production_active_write=bool(args.allow_production_active_write),
+        allow_production_candidate_write=bool(args.allow_production_candidate_write),
     )
     try:
         result = trainer.train(

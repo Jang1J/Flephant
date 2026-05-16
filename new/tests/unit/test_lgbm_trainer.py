@@ -286,6 +286,28 @@ def test_train_blocks_production_active_write_without_explicit_approval(
         )
 
 
+def test_train_blocks_target_override_bundle_candidate_on_production_registry(
+    trainer_small: LGBMTrainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target_col_override + bundle_id 후보도 production registry direct write를 막는다."""
+    monkeypatch.setattr(
+        trainer_module,
+        "_PRODUCTION_LGBM_DIR",
+        trainer_small.registry.base_dir,
+    )
+
+    with pytest.raises(RuntimeError, match="target_col_override candidate write"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="cost-aware",
+            bundle_id="BUNDLE-COST",
+            target_col_override="label_session_close_net_ret",
+        )
+
+
 def test_cli_blocks_target_override_on_production_registry() -> None:
     """cost-aware 실험 label은 명시 research registry 없이 CLI에서 production에 저장하지 않는다."""
     result = trainer_module.main(
