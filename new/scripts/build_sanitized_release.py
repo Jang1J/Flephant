@@ -205,9 +205,15 @@ def build_release(output: Path, manifest_path: Path | None = None) -> dict[str, 
             zf.write(ROOT / rel_path, arcname=rel_path)
 
     zip_scan = _scan_zip_names(output)
-    status = "PASS" if not zip_scan["forbidden_entries"] else "FAIL"
+    blockers: list[str] = []
+    if zip_scan["forbidden_entries"]:
+        blockers.append("forbidden_entries_in_zip")
+    if skipped_invalid_json:
+        blockers.append("invalid_json_evidence")
+    status = "PASS" if not blockers else "FAIL"
     manifest = {
         "status": status,
+        "blockers": blockers,
         "generated_at": datetime.now(_KST).isoformat(),
         "release_zip": str(output),
         "release_zip_relative": _display_path(output),

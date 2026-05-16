@@ -68,3 +68,35 @@ def test_sanitized_release_includes_root_scripts_and_excludes_forbidden(
     )
     assert ".env" not in names
     assert not any(name.startswith(".git/") for name in names)
+
+
+def test_sanitized_release_fails_on_invalid_json_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_release_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    monkeypatch.setattr(module, "_git_file_candidates", lambda: [])
+
+    invalid_report = (
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "prelive_gate"
+        / "prelive_gate_invalid.json"
+    )
+    invalid_report.parent.mkdir(parents=True, exist_ok=True)
+    invalid_report.write_text("{invalid-json", encoding="utf-8")
+
+    zip_path = tmp_path / "release.zip"
+    manifest_path = tmp_path / "release.manifest.json"
+
+    manifest = module.build_release(zip_path, manifest_path)
+
+    assert manifest["status"] == "FAIL"
+    assert "invalid_json_evidence" in manifest["blockers"]
+    assert manifest["skipped_invalid_json_artifacts"] == [
+        "artifacts/reports/prelive_gate/prelive_gate_invalid.json"
+    ]
+    with zipfile.ZipFile(zip_path) as zf:
+        assert "artifacts/reports/prelive_gate/prelive_gate_invalid.json" not in zf.namelist()
