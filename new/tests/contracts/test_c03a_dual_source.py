@@ -1,20 +1,62 @@
-"""C3A DualSourceFeatureContract 계약 테스트 스켈레톤. S0-1 body=pass."""
+"""C3A DualSourceScoreContract contract tests."""
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from src.data.dual_source_scorer import DualSourceScorer
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
-def test_c03a_five_features_shape() -> None:
-    """DualSourceScorer 출력이 5피처 키를 모두 포함하는지 검증.
+@pytest.fixture
+def scorer() -> DualSourceScorer:
+    import src.data.dual_source_scorer as mod
 
-    필수 키: news_score_t, comm_score_t_1, comm_score_t_2, divergence, velocity.
-    Sprint 2 구현 후 실제 assert 추가.
-    """
-    pass
+    mod._FINBERT_AVAILABLE = False
+    return DualSourceScorer()
 
 
-def test_c03a_divergence_range() -> None:
-    """divergence 값이 [0, 1] 범위인지 검증.
+def _score(scorer: DualSourceScorer) -> dict:
+    snapshot_ts = datetime.now(_KST).replace(hour=18, minute=0, second=0, microsecond=0)
+    data_ts = datetime.now(_KST).replace(hour=7, minute=50, second=0, microsecond=0)
+    return scorer.score(
+        ticker="5930",
+        news_texts=["삼성전자 실적 호조 상한가 기대"],
+        comm_texts_t1=["떡상 기대되는 종목 매수 좋아요"],
+        comm_texts_t2=["상한가 기대되는 종목입니다"],
+        current_volume=120.0,
+        historical_volumes=[80.0, 90.0, 85.0, 88.0],
+        data_ts=data_ts,
+        snapshot_ts=snapshot_ts,
+    )
 
-    Sprint 2 구현 후 실제 assert 추가.
-    """
-    pass
+
+def test_c03a_scores_include_contract_fields(scorer: DualSourceScorer) -> None:
+    """C3A output.scores 항목은 SSOT 8개 필드를 포함한다."""
+    result = _score(scorer)
+
+    assert set(result) >= {
+        "ticker",
+        "asof",
+        "news_score_t",
+        "comm_score_t_1",
+        "comm_score_t_2",
+        "news_comm_divergence",
+        "community_noise_multiplier",
+        "source_notes",
+    }
+    assert result["ticker"] == "005930"
+
+
+def test_c03a_score_numeric_ranges(scorer: DualSourceScorer) -> None:
+    """C3A numeric fields stay in their documented ranges."""
+    result = _score(scorer)
+
+    assert -1.0 <= result["news_score_t"] <= 1.0
+    assert -1.0 <= result["comm_score_t_1"] <= 1.0
+    assert -1.0 <= result["comm_score_t_2"] <= 1.0
+    assert 0.0 <= result["news_comm_divergence"] <= 2.0
+    assert 0.0 <= result["community_noise_multiplier"] <= 1.0
