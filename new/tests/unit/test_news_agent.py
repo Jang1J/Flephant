@@ -244,6 +244,20 @@ class TestAnalyze:
         })
         assert result["scope"] == "ticker:005930"
 
+    def test_analyze_direct_suffix_ticker_normalized(self):
+        """event.ticker suffix 입력도 C5 payload/scope에서 6자리 코드로 정규화한다."""
+        agent = _make_agent()
+        result = agent.analyze({
+            "event_type": "news",
+            "ticker": "005930.KS",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-suffix-ticker",
+        })
+        assert result["scope"] == "ticker:005930"
+        assert result["payload"]["ticker"] == "005930"
+        assert result["payload"]["impacted_tickers"] == ["005930"]
+
     def test_analyze_cache_hit_republishes_message(self):
         """cache hit이어도 pubsub가 주입된 direct path에서는 message를 다시 publish한다."""
         cache = _DictCache()
@@ -442,6 +456,15 @@ class TestParseLlmContent:
         rpt = agent.report("news_signal", parsed)
         assert parsed["confidence"] == pytest.approx(0.82)
         assert rpt["payload"]["confidence"] == pytest.approx(0.82)
+
+    def test_parse_llm_json_impacted_tickers_normalized(self):
+        """LLM JSON impacted_tickers도 suffix/짧은 코드를 6자리로 정규화한다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content(
+            '{"stance":"buy","impacted_tickers":["5930","005930.KS","000660.KS"],'
+            '"impacted_sectors":["반도체"],"narrative":"호재","confidence":0.7}'
+        )
+        assert parsed["impacted_tickers"] == ["005930", "000660"]
 
     def test_parse_confidence_clamps_invalid_values(self):
         """confidence는 finite 0.0~1.0 값으로 정규화된다."""

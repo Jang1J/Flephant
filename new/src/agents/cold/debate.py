@@ -25,7 +25,8 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.pit_guard import assert_pit_safe
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("debate")
 
@@ -165,9 +166,11 @@ class DebateAgent(AgentBase):
               skipped_reason: str | None,
             }
         """
+        self._assert_signals_pit_safe(signals)
         conflict = self._detect_conflict(signals)
 
         if not conflict["detected"]:
+            ranked_base = self._resolve_candidates(candidates, signals)
             logger.info(
                 "[debate] 충돌 없음. debate skip. skipped_reason=%s",
                 conflict.get("reason", "no_conflict"),
@@ -176,7 +179,7 @@ class DebateAgent(AgentBase):
                 "conflict_detected": False,
                 "debate_id": None,
                 "winner_view": None,
-                "ranked_tickers": candidates or [],
+                "ranked_tickers": ranked_base,
                 "uncertainty_delta": 0.0,
                 "comparison_count": 0,
                 "debate_resolution_msg": None,
@@ -301,6 +304,33 @@ class DebateAgent(AgentBase):
             "skipped_reason": None,
         }
 
+    def _assert_signals_pit_safe(self, signals: list[dict[str, Any]]) -> None:
+        """Direct-call Debate inputs must not contain future observations."""
+        for signal in signals:
+            if not isinstance(signal, dict):
+                continue
+            payload = signal.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            asof = (
+                signal.get("asof")
+                or signal.get("snapshot_ts")
+                or payload.get("asof")
+                or payload.get("snapshot_ts")
+            )
+            if not asof:
+                continue
+            data_ts = (
+                signal.get("occurred_at")
+                or signal.get("timestamp")
+                or signal.get("ts")
+                or payload.get("occurred_at")
+                or payload.get("timestamp")
+                or payload.get("ts")
+            )
+            if data_ts:
+                assert_pit_safe(data_ts, snapshot_ts=asof)
+
     # ------------------------------------------------------------------
     # 충돌 감지
     # ------------------------------------------------------------------
@@ -382,8 +412,8 @@ class DebateAgent(AgentBase):
         resolved: list[str] = []
         seen: set[str] = set()
         for raw in raw_candidates:
-            ticker = pad_ticker(str(raw))
-            if not ticker.isdigit() or ticker in seen:
+            ticker = normalize_ticker(raw)
+            if not ticker or ticker in seen:
                 continue
             resolved.append(ticker)
             seen.add(ticker)
@@ -473,11 +503,11 @@ class DebateAgent(AgentBase):
             raw_pair = item.get("pair", [])
             if not isinstance(raw_pair, list) or len(raw_pair) != 2:
                 continue
-            left = pad_ticker(str(raw_pair[0]))
-            right = pad_ticker(str(raw_pair[1]))
-            if not left.isdigit() or not right.isdigit():
+            left = normalize_ticker(raw_pair[0])
+            right = normalize_ticker(raw_pair[1])
+            if not left or not right:
                 continue
-            winner = pad_ticker(str(item.get("winner", "")))
+            winner = normalize_ticker(item.get("winner", ""))
             if winner not in {left, right}:
                 winner = left
             parsed_by_pair[frozenset((left, right))] = {

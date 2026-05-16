@@ -7,6 +7,7 @@ import pytest
 
 from src.agents.cold.debate import DebateAgent
 from src.agents.fda import FDAAgent
+from src.utils.pit_guard import PITViolationError
 
 
 # ------------------------------------------------------------------ #
@@ -71,6 +72,37 @@ def test_debate_no_conflict_skip() -> None:
     assert debate._llm_router.call.call_count == 0  # LLM 미호출
 
 
+def test_debate_no_conflict_normalizes_ranked_tickers() -> None:
+    """충돌이 없어도 output ranked_tickers는 6자리 KRX 코드로 정규화한다."""
+    debate = _make_debate()
+    signals = [
+        _signal("news_agent", "news_signal", "buy"),
+        _signal("quant", "quant_signal", "neutral"),
+    ]
+
+    result = debate.run_debate(signals, candidates=["5930", "005930.KS", "000660"])
+
+    assert result["conflict_detected"] is False
+    assert result["ranked_tickers"] == ["005930", "000660"]
+    assert debate._llm_router.call.call_count == 0
+
+
+def test_debate_direct_call_rejects_future_signal_before_llm() -> None:
+    """직접 호출 경로도 signal timestamp > asof면 LLM 전에 차단한다."""
+    debate = _make_debate()
+    future_signal = {
+        "agent": "news_agent",
+        "channel": "news_signal",
+        "payload": {"stance": "sell"},
+        "ts": "2026-04-26T10:01:00+09:00",
+        "asof": "2026-04-26T10:00:00+09:00",
+    }
+
+    with pytest.raises(PITViolationError):
+        debate.run_debate([future_signal], candidates=["005930"])
+    debate._llm_router.call.assert_not_called()
+
+
 def test_debate_conflict_triggers_pairwise() -> None:
     """veto_recommendation vs quant_top10 충돌 → pairwise 실행."""
     debate = _make_debate()
@@ -95,6 +127,27 @@ def test_debate_conflict_triggers_pairwise() -> None:
     payload = result["pairwise_msgs"][0]["payload"]
     assert payload["comparison_count"] == 3
     assert payload["wins"][0]["ticker"] == "005930"
+
+
+def test_debate_suffix_candidates_are_not_dropped() -> None:
+    """suffix ticker 후보도 충돌 path에서 drop하지 않고 pairwise 대상에 넣는다."""
+    debate = _make_debate()
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {
+            "stance": "neutral",
+            "top10_candidates": ["005930.KS", "000660.KS"],
+        },
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+
+    result = debate.run_debate([quant_sig, risk_sig], candidates=["005930.KS", "000660.KS"])
+
+    assert result["conflict_detected"] is True
+    assert result["comparison_count"] == 1
+    assert set(result["ranked_tickers"]) == {"005930", "000660"}
 
 
 def test_debate_conflict_criteria_respects_yaml_rules() -> None:

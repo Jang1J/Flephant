@@ -22,6 +22,7 @@ from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 from src.utils.pit_guard import assert_pit_safe
 from src.utils.safe_cast import safe_bool
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("news_agent")
 
@@ -116,18 +117,23 @@ class NewsAgent(AgentBase):
             raise ValueError("[news_agent] payload.impacted_tickers는 list이어야 합니다.")
         if not isinstance(sectors, list):
             raise ValueError("[news_agent] payload.impacted_sectors는 list이어야 합니다.")
+        impacted_tickers = self._normalize_ticker_list(tickers)
+        ticker = normalize_ticker(payload.get("ticker")) if payload.get("ticker") else ""
+        scope = payload.get("scope")
+        if ticker:
+            scope = f"ticker:{ticker}"
 
         ts = datetime.now(_KST).isoformat()
         return {
             "report_type": report_type,
             "payload": {
                 "stance": stance,
-                "impacted_tickers": tickers,
+                "impacted_tickers": impacted_tickers,
                 "impacted_sectors": sectors,
                 "narrative": narrative,
                 "confidence": self._parse_confidence(payload.get("confidence", 0.5)),
-                **({"scope": payload["scope"]} if payload.get("scope") else {}),
-                **({"ticker": payload["ticker"]} if payload.get("ticker") else {}),
+                **({"scope": scope} if scope else {}),
+                **({"ticker": ticker} if ticker else {}),
                 **({"event_id": payload["event_id"]} if payload.get("event_id") else {}),
                 **({"occurred_at": payload["occurred_at"]} if payload.get("occurred_at") else {}),
                 **({"asof": payload["asof"]} if payload.get("asof") else {}),
@@ -183,7 +189,7 @@ class NewsAgent(AgentBase):
             or scope_ticker
             or first_event_ticker
         )
-        ticker = str(raw_ticker).zfill(6) if raw_ticker else ""
+        ticker = normalize_ticker(raw_ticker)
 
         title = event.get("title", "")
         summary = event.get("summary", "")
@@ -365,7 +371,7 @@ class NewsAgent(AgentBase):
         ctx = context or {}
         event = {
             "event_type": ctx.get("event_type", "news"),
-            "ticker": str(ticker).zfill(6),
+            "ticker": normalize_ticker(ticker),
             "title": ctx.get("title", ""),
             "summary": ctx.get("summary", text_pack),
             "event_id": ctx.get("event_id", ""),
@@ -419,7 +425,11 @@ class NewsAgent(AgentBase):
 
             tickers_raw = parsed_json.get("impacted_tickers", [])
             sectors_raw = parsed_json.get("impacted_sectors", [])
-            impacted_tickers = tickers_raw if isinstance(tickers_raw, list) else []
+            impacted_tickers = (
+                self._normalize_ticker_list(tickers_raw)
+                if isinstance(tickers_raw, list)
+                else []
+            )
             impacted_sectors = sectors_raw if isinstance(sectors_raw, list) else []
 
             narrative_raw = parsed_json.get("narrative", "") or ""
@@ -480,6 +490,18 @@ class NewsAgent(AgentBase):
             return 0.5
         return max(0.0, min(1.0, confidence))
 
+    @staticmethod
+    def _normalize_ticker_list(values: list[Any]) -> list[str]:
+        """Ticker-like list를 6자리 KRX 코드로 정규화하고 순서를 보존한다."""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            ticker = normalize_ticker(value)
+            if ticker and ticker not in seen:
+                normalized.append(ticker)
+                seen.add(ticker)
+        return normalized
+
     # ------------------------------------------------------------------
     # Memory 저장
     # ------------------------------------------------------------------
@@ -493,7 +515,10 @@ class NewsAgent(AgentBase):
             content: 저장할 dict.
         """
         today = datetime.now(_KST).strftime("%Y%m%d")
-        padded_ticker = str(ticker).zfill(6)
+        padded_ticker = normalize_ticker(ticker)
+        if not padded_ticker:
+            logger.warning("[news_agent] memory 저장 skip: invalid ticker=%s", ticker)
+            return
 
         if note_type == "micro":
             path = self._memory_root / "news_agent" / padded_ticker / f"{today}.jsonl"
