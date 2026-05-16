@@ -256,6 +256,9 @@ def _label_scan_pretraining_blockers(
         expected_ticker_count = len(final_tickers)
         if int(data.get("ticker_count") or 0) != expected_ticker_count:
             blockers.append("label_horizon_scan_ticker_mismatch")
+    missing_tickers = data.get("missing_tickers")
+    if isinstance(missing_tickers, list) and any(str(t).strip() for t in missing_tickers):
+        blockers.append("label_horizon_scan_missing_tickers")
     return sorted(set(blockers))
 
 

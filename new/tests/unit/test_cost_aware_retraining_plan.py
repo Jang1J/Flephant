@@ -387,6 +387,79 @@ def test_cost_aware_plan_blocks_stale_label_scan_window_and_universe(
     assert "label_horizon_scan_ticker_mismatch" in plan["blockers"]
 
 
+def test_cost_aware_plan_blocks_label_scan_missing_tickers(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("cost_aware_retraining_plan")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "phase2_feature_backfill"
+        / "phase2_feature_backfill.json",
+        {"status": "PASS", "coverage": {}},
+    )
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "label_horizon_scan"
+        / "cost_aware_label_horizon_scan.json",
+        {
+            "status": "WARN",
+            "best_horizon": "session_close",
+            "data": {
+                "start_date": "20250509",
+                "end_date": "20260515",
+                "ticker_count": 2,
+                "missing_tickers": ["105560"],
+            },
+            "horizons": [
+                {"horizon": "5", "mean_net_bps": -1.0, "positive_net_rate": 0.45},
+                {"horizon": "session_close", "mean_net_bps": 1.0, "positive_net_rate": 0.55},
+            ],
+        },
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if file == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "semis": {
+                        "status": "confirmed",
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                            {"ticker": "105560", "status": "active"},
+                        ],
+                    },
+                },
+            }
+        if key == "backtest_agent":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "expected_start_date": "20250509",
+                        "expected_end_date": "20260515",
+                        "min_tickers": 2,
+                    },
+                },
+            }
+        if key == "label":
+            return {"horizon_bars": 5, "target_col": "label_5m_ret"}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
+
+    assert plan["status"] == "BLOCKED"
+    assert "label_horizon_scan_missing_tickers" in plan["blockers"]
+    assert "label_horizon_scan_ticker_mismatch" not in plan["blockers"]
+
+
 def test_cost_aware_objective_string_false(monkeypatch, tmp_path):
     """objective 설정 문자열 false를 Python truthiness로 True 처리하지 않는다."""
     mod = _load_script("cost_aware_retraining_plan")
