@@ -207,6 +207,34 @@ def _staged_retrain_gate_command(
     return " ".join(parts)
 
 
+def _research_training_command(
+    *,
+    bundle_id: str,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+    target_col_override: str | None,
+) -> str:
+    registry_dir = _research_registry_dir(bundle_id)
+    version = "cost-aware-research"
+    if target_col_override:
+        version = target_col_override.replace("label_", "cost-aware-").replace("_net_ret", "")
+    parts = [
+        "ELEPHANT_MODE=mode_b PYTHONPATH=new python -m src.models.lgbm_trainer",
+        f"--tickers {','.join(tickers)}",
+        f"--version {version}",
+        f"--bundle-id {bundle_id}",
+        f"--registry-dir {registry_dir}",
+    ]
+    if start_date:
+        parts.append(f"--start {start_date}")
+    if end_date:
+        parts.append(f"--end {end_date}")
+    if target_col_override:
+        parts.append(f"--target-col-override {target_col_override}")
+    return " ".join(parts)
+
+
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
     if not isinstance(label_scan, dict):
         return {}
@@ -301,6 +329,7 @@ def _phase2_price_backfill_ready(
     phase2: dict[str, Any] | None,
     *,
     final_tickers: list[str],
+    final_window: dict[str, str | None],
 ) -> bool:
     """Return True when KIS bar coverage is complete enough for research training.
 
@@ -314,6 +343,23 @@ def _phase2_price_backfill_ready(
         return False
     artifact_coverage = phase2.get("artifact_date_coverage")
     if not isinstance(artifact_coverage, dict):
+        return False
+    expected_tickers = phase2.get("expected_tickers")
+    if not isinstance(expected_tickers, list):
+        return False
+    observed_tickers = sorted({
+        pad_ticker(str(ticker))
+        for ticker in expected_tickers
+        if str(ticker).strip()
+    })
+    if observed_tickers != sorted(final_tickers):
+        return False
+    date_range = phase2.get("date_range")
+    if not isinstance(date_range, dict):
+        return False
+    if final_window.get("start_date") and str(date_range.get("start")) != str(final_window["start_date"]):
+        return False
+    if final_window.get("end_date") and str(date_range.get("end")) != str(final_window["end_date"]):
         return False
     expected_dates = safe_int(
         artifact_coverage.get("expected_date_count"),
@@ -364,6 +410,7 @@ def build_retraining_plan(
     phase2_price_backfill_ready = _phase2_price_backfill_ready(
         phase2,
         final_tickers=final_tickers,
+        final_window=final_window,
     )
     if not phase2_pass:
         if phase2_price_backfill_ready:
@@ -533,6 +580,13 @@ def build_retraining_plan(
                 start_date=final_window["start_date"],
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
+            ),
+            _research_training_command(
+                bundle_id=bundle_id,
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+                target_col_override=target_col_override,
             ),
             _staged_retrain_gate_command(
                 bundle_id=bundle_id,
