@@ -297,6 +297,48 @@ def _label_scan_pretraining_blockers(
     return sorted(set(blockers))
 
 
+def _phase2_price_backfill_ready(
+    phase2: dict[str, Any] | None,
+    *,
+    final_tickers: list[str],
+) -> bool:
+    """Return True when KIS bar coverage is complete enough for research training.
+
+    Phase 2 feature backfill can be BLOCKED because Dual-Source/exogenous
+    non-neutral artifacts are unavailable. DatasetBuilder can still train a
+    research model with neutral DS/exog defaults if the KIS price panel itself
+    is complete. Prelive deploy remains blocked until the full Phase 2 report
+    is PASS.
+    """
+    if not isinstance(phase2, dict):
+        return False
+    artifact_coverage = phase2.get("artifact_date_coverage")
+    if not isinstance(artifact_coverage, dict):
+        return False
+    expected_dates = safe_int(
+        artifact_coverage.get("expected_date_count"),
+        default=0,
+        min_value=0,
+    )
+    selected_dates = safe_int(
+        artifact_coverage.get("selected_date_count"),
+        default=0,
+        min_value=0,
+    )
+    missing_dates = safe_int(
+        artifact_coverage.get("missing_date_count"),
+        default=0,
+        min_value=0,
+    )
+    ticker_count = safe_int(phase2.get("ticker_count"), default=0, min_value=0)
+    return (
+        expected_dates > 0
+        and selected_dates >= expected_dates
+        and missing_dates == 0
+        and ticker_count >= len(final_tickers)
+    )
+
+
 def build_retraining_plan(
     *,
     bundle_id: str,
@@ -319,8 +361,15 @@ def build_retraining_plan(
     pretraining_blockers: list[str] = []
     predeploy_blockers: list[str] = []
     phase2_pass = (phase2 or {}).get("status") == "PASS"
+    phase2_price_backfill_ready = _phase2_price_backfill_ready(
+        phase2,
+        final_tickers=final_tickers,
+    )
     if not phase2_pass:
-        pretraining_blockers.append("phase2_feature_backfill_not_pass")
+        if phase2_price_backfill_ready:
+            predeploy_blockers.append("phase2_feature_backfill_not_pass")
+        else:
+            pretraining_blockers.append("phase2_feature_backfill_not_pass")
 
     phase2_input_blocking = bool(phase2_input and phase2_input.get("status") != "PASS")
     phase2_input_superseded = bool(
@@ -442,6 +491,10 @@ def build_retraining_plan(
                 "status": (phase2 or {}).get("status"),
                 "report_path": _repo_relative(phase2_path),
                 "coverage": (phase2 or {}).get("coverage", {}),
+                "artifact_date_coverage": (phase2 or {}).get("artifact_date_coverage", {}),
+                "price_backfill_ready_for_research": phase2_price_backfill_ready,
+                "blocking": not phase2_price_backfill_ready,
+                "predeploy_blocking": not phase2_pass,
                 "blockers": (phase2 or {}).get("blockers", []),
             },
             "phase2_input_readiness": {

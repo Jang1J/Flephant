@@ -411,6 +411,118 @@ def test_cost_aware_plan_allows_research_trainable_warn_label_scan(
     assert plan["recommended_experiment"]["target_col_override"] == "label_30m_net_ret"
 
 
+def test_cost_aware_plan_allows_research_training_with_neutral_phase2_features(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("cost_aware_retraining_plan")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "phase2_feature_backfill"
+        / "phase2_feature_backfill.json",
+        {
+            "status": "BLOCKED",
+            "artifact_date_coverage": {
+                "expected_date_count": 249,
+                "selected_date_count": 249,
+                "missing_date_count": 0,
+            },
+            "ticker_count": 2,
+            "coverage": {
+                "dual_source_file_coverage": 0.0,
+                "exogenous_file_coverage": 0.0,
+            },
+            "blockers": [
+                "dual_source_ticker_coverage_below_threshold",
+                "exogenous_ticker_coverage_below_threshold",
+            ],
+        },
+    )
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "label_horizon_scan"
+        / "cost_aware_label_horizon_scan.json",
+        {
+            "status": "WARN",
+            "best_horizon": "30",
+            "deployable_label_recommendation": False,
+            "research_trainable_label_recommendation": True,
+            "data": {
+                "start_date": "20250509",
+                "end_date": "20260515",
+                "ticker_count": 2,
+                "missing_tickers": [],
+            },
+            "horizons": [
+                {
+                    "horizon": "5",
+                    "mean_net_bps": -10.0,
+                    "positive_net_rate": 0.45,
+                },
+                {
+                    "horizon": "30",
+                    "mean_net_bps": -5.0,
+                    "positive_net_rate": 0.48,
+                    "selection_impact": {
+                        "rank_equivalent_to_active_horizon": False,
+                        "selection_changes": 10,
+                    },
+                    "label_topk": {
+                        "mean_net_bps": 40.0,
+                        "positive_net_rate": 0.80,
+                    },
+                },
+            ],
+        },
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if file == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "semis": {
+                        "status": "confirmed",
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                            {"ticker": "105560", "status": "active"},
+                        ],
+                    },
+                },
+            }
+        if key == "backtest_agent":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "expected_start_date": "20250509",
+                        "expected_end_date": "20260515",
+                        "min_tickers": 2,
+                    },
+                },
+            }
+        if key == "label":
+            return {"horizon_bars": 5, "target_col": "label_5m_ret"}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
+
+    assert plan["status"] == "READY"
+    assert "phase2_feature_backfill_not_pass" not in plan["pretraining_blockers"]
+    assert "phase2_feature_backfill_not_pass" in plan["predeploy_blockers"]
+    phase2_evidence = plan["evidence"]["phase2_feature_backfill"]
+    assert phase2_evidence["price_backfill_ready_for_research"] is True
+    assert phase2_evidence["blocking"] is False
+    assert phase2_evidence["predeploy_blocking"] is True
+    assert plan["recommended_experiment"]["target_col_override"] == "label_30m_net_ret"
+
+
 def test_cost_aware_plan_blocks_stale_label_scan_window_and_universe(
     monkeypatch,
     tmp_path,
