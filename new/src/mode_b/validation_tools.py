@@ -907,6 +907,8 @@ class BacktestEngine:
                 end_date = end_dt.strftime("%Y%m%d")
             builder = DatasetBuilder(
                 artifacts_dir=self._artifacts_root / "data",
+                dual_source_artifact_dir=self._artifacts_root / "dual_source",
+                exogenous_artifact_dir=self._artifacts_root / "exogenous",
             )
             add_neutral_candidate_alpha_features(builder, feature_cols)
             panel = self._build_replay_panel(builder, universe, start_date, end_date)

@@ -38,7 +38,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from src.data.dual_source_runner import load_latest_scores
+from src.data.dual_source_runner import (
+    DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+    load_latest_scores,
+)
 from src.data.exogenous_feature_store import (
     DEFAULT_EXOGENOUS_ARTIFACT_DIR,
     is_non_neutral,
@@ -132,10 +135,14 @@ class DatasetBuilder:
     def __init__(
         self,
         artifacts_dir: Path | None = None,
+        dual_source_artifact_dir: Path | None = None,
+        exogenous_artifact_dir: Path | None = None,
         allow_synthetic_fallback: bool = False,
         synthetic_seed: int | None = None,
     ) -> None:
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_ROOT
+        self._dual_source_artifact_dir = dual_source_artifact_dir
+        self._exogenous_artifact_dir = exogenous_artifact_dir
         self._allow_synthetic_fallback = safe_bool(
             allow_synthetic_fallback,
             default=False,
@@ -458,17 +465,20 @@ class DatasetBuilder:
     def _join_exogenous_features(self, panel):
         """C3 외생 feature_manifest 컬럼을 panel에 추가.
 
-        daily exogenous artifact(new/artifacts/exogenous/YYYYMMDD.json)가 있으면
+        daily exogenous artifact(artifacts/exogenous/YYYYMMDD.json)가 있으면
         날짜/ticker 기준으로 join한다. 파일 또는 ticker별 값이 없으면
         risk_config.yaml exogenous_features.neutral_defaults로 채운다.
         """
+        exogenous_artifact_dir = (
+            self._exogenous_artifact_dir or DEFAULT_EXOGENOUS_ARTIFACT_DIR
+        )
         panel = panel.copy()
         for col in self._exog_feature_cols:
             panel[col] = float(self._exog_defaults.get(col, 0.0))
 
         if panel.empty:
             panel.attrs["exogenous_join_stats"] = {
-                "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+                "artifact_dir": str(exogenous_artifact_dir),
                 "dates_found": 0,
                 "dates_missing": 0,
                 "rows_total": 0,
@@ -496,7 +506,7 @@ class DatasetBuilder:
                 date_key,
                 feature_cols=self._exog_feature_cols,
                 defaults=self._exog_defaults,
-                artifact_dir=DEFAULT_EXOGENOUS_ARTIFACT_DIR,
+                artifact_dir=exogenous_artifact_dir,
             )
             if stats["status"] == "found":
                 blockers = self._exogenous_artifact_blockers(date_key, stats)
@@ -540,7 +550,7 @@ class DatasetBuilder:
 
         rows_total = int(len(panel))
         panel.attrs["exogenous_join_stats"] = {
-            "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+            "artifact_dir": str(exogenous_artifact_dir),
             "dates_found": dates_found,
             "dates_missing": dates_missing,
             "rows_total": rows_total,
@@ -1015,6 +1025,9 @@ class DatasetBuilder:
         pd = _import_pandas()
         start = _parse_yyyymmdd(start_date)
         end = _parse_yyyymmdd(end_date)
+        dual_source_artifact_dir = (
+            self._dual_source_artifact_dir or DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
+        )
 
         # 날짜 범위 내 모든 날짜의 Dual-Source 점수를 미리 로드
         # {date_str: {ticker: {feat: val}}}
@@ -1023,7 +1036,10 @@ class DatasetBuilder:
         current = start
         while current <= end:
             date_str = current.strftime("%Y%m%d")
-            scores_list: list[dict] = load_latest_scores(date_str)
+            scores_list: list[dict] = load_latest_scores(
+                date_str,
+                artifact_dir=dual_source_artifact_dir,
+            )
             if scores_list:
                 blockers = self._dual_source_artifact_blockers(date_str, scores_list)
                 if blockers:
@@ -1057,6 +1073,7 @@ class DatasetBuilder:
 
         if not date_ticker_scores:
             panel.attrs["dual_source_join_stats"] = {
+                "artifact_dir": str(dual_source_artifact_dir),
                 "dates_found": 0,
                 "dates_missing": (end - start).days + 1,
                 "rows_total": int(len(panel)),
@@ -1085,6 +1102,7 @@ class DatasetBuilder:
 
         if not ds_records:
             panel.attrs["dual_source_join_stats"] = {
+                "artifact_dir": str(dual_source_artifact_dir),
                 "dates_found": len(date_ticker_scores),
                 "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
                 "rows_total": int(len(panel)),
@@ -1136,6 +1154,7 @@ class DatasetBuilder:
 
         total = join_hit + join_miss
         panel.attrs["dual_source_join_stats"] = {
+            "artifact_dir": str(dual_source_artifact_dir),
             "dates_found": len(date_ticker_scores),
             "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
             "rows_total": int(len(panel)),

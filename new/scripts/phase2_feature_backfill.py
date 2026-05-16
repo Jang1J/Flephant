@@ -22,7 +22,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.data.dataset_builder import DUAL_SOURCE_FEATURES, EXOGENOUS_FEATURES  # noqa: E402
-from src.data.dual_source_runner import load_latest_scores  # noqa: E402
+from src.data.dual_source_runner import (  # noqa: E402
+    DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+    load_latest_scores,
+)
 from src.data.exogenous_feature_store import (  # noqa: E402
     build_neutral_payload as build_neutral_exogenous_payload,
     is_non_neutral,
@@ -40,7 +43,7 @@ from scripts.live_data_readiness import _inspect_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
-_DUAL_SOURCE_DIR = SRC / "artifacts" / "dual_source"
+_DUAL_SOURCE_DIR = DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "phase2_feature_backfill"
 _ALLOWED_DUAL_SOURCE_INPUT_MODES = {"real", "archived_raw_events"}
 

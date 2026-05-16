@@ -8,7 +8,7 @@ Sprint 4 S4-1. Mode B 사이클(18:00~22:00)과 완전 분리된 장전 배치 �
     2. universe_config.yaml 에서 active 20종목 로드
     3. 종목별 뉴스 텍스트 + 커뮤니티 텍스트 수집 (mock 또는 커넥터)
     4. DualSourceScorer.score_universe() 호출
-    5. 결과 JSON 저장 (new/artifacts/dual_source/YYYYMMDD.json)
+    5. 결과 JSON 저장 (artifacts/dual_source/YYYYMMDD.json)
     6. PIT-Safety: snapshot_ts = 오늘 08:30 KST (장전 배치 기준)
 
 ## PIT-Safety
@@ -45,8 +45,11 @@ logger = logging.getLogger(__name__)
 
 _KST = ZoneInfo("Asia/Seoul")
 
-# 결과 저장 경로: new/artifacts/dual_source/
-_ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "dual_source"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# 결과 저장 경로: artifacts/dual_source/
+DEFAULT_DUAL_SOURCE_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "dual_source"
+_ARTIFACT_DIR = DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
 
 def _load_batch_window() -> tuple[int, int, int, int]:
     """risk_config.yaml dual_source.score_build_window 에서 배치 창 로드.
@@ -358,7 +361,7 @@ def run_dual_source_batch(
     scorer = DualSourceScorer()
     results = scorer.score_universe(universe=universe, snapshot_ts=snap_dt)
 
-    # 결과 저장 (new/artifacts/dual_source/YYYYMMDD.json)
+    # 결과 저장 (artifacts/dual_source/YYYYMMDD.json)
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _ARTIFACT_DIR / f"{batch_date.strftime('%Y%m%d')}.json"
 
@@ -381,11 +384,16 @@ def run_dual_source_batch(
     return results
 
 
-def load_latest_scores(date_str: str | None = None) -> list[dict]:
+def load_latest_scores(
+    date_str: str | None = None,
+    *,
+    artifact_dir: Path | None = None,
+) -> list[dict]:
     """저장된 C3A 점수 로드.
 
     Args:
         date_str: 'YYYYMMDD' 형식. None 이면 오늘 날짜.
+        artifact_dir: override root. None이면 root artifacts/dual_source.
 
     Returns:
         list[dict]: C3A 출력 스키마 리스트.
@@ -393,7 +401,8 @@ def load_latest_scores(date_str: str | None = None) -> list[dict]:
     if date_str is None:
         date_str = datetime.now(_KST).strftime("%Y%m%d")
 
-    path = _ARTIFACT_DIR / f"{date_str}.json"
+    root = artifact_dir or _ARTIFACT_DIR
+    path = root / f"{date_str}.json"
     if not path.exists():
         logger.warning("[dual_source] 점수 파일 없음: %s", path)
         return []

@@ -33,6 +33,8 @@ from src.data.dataset_builder import (
     _extract_file_date,
     _parse_yyyymmdd,
 )
+from src.data.dual_source_runner import DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
+from src.data.exogenous_feature_store import DEFAULT_EXOGENOUS_ARTIFACT_DIR
 
 
 # ====================================================================== #
@@ -89,6 +91,14 @@ def _write_jsonl_day(
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return out_path
+
+
+def test_feature_artifact_defaults_use_repo_root() -> None:
+    """Dual-Source/exogenous feature artifacts는 root artifacts/를 SSOT로 쓴다."""
+    repo_root = Path(__file__).resolve().parents[3]
+
+    assert DEFAULT_DUAL_SOURCE_ARTIFACT_DIR == repo_root / "artifacts" / "dual_source"
+    assert DEFAULT_EXOGENOUS_ARTIFACT_DIR == repo_root / "artifacts" / "exogenous"
 
 
 def _write_parquet_day(
@@ -893,6 +903,64 @@ def test_dual_source_join_vectorized_result(tmp_path: Path) -> None:
     # 000660 행: news_score_t = 0.0 (default)
     sel_000660 = result.loc["000660", "news_score_t"].to_numpy()
     assert all(abs(v) < 1e-9 for v in sel_000660), f"000660 news_score_t 불일치: {sel_000660}"
+
+
+def test_dual_source_join_reads_injected_artifact_dir(tmp_path: Path) -> None:
+    """DatasetBuilder는 주입된 root artifact dir에서 Dual-Source JSON을 읽는다."""
+    ds_dir = tmp_path / "dual_source"
+    ds_dir.mkdir()
+    (ds_dir / "20260420.json").write_text(
+        json.dumps(
+            {
+                "batch_date": "2026-04-20",
+                "snapshot_ts": "2026-04-20T08:30:00+09:00",
+                "source_stats": {"input_mode": "archived_raw_events"},
+                "scores": [
+                    {
+                        "ticker": "005930",
+                        "news_score_t": 0.5,
+                        "comm_score_t_1": 0.3,
+                        "comm_score_t_2": 0.1,
+                        "news_comm_divergence": 0.2,
+                        "community_noise_multiplier": 0.9,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    b = DatasetBuilder(
+        artifacts_dir=tmp_path / "data",
+        dual_source_artifact_dir=ds_dir,
+    )
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=2, freq="1min")
+    idx = pd.MultiIndex.from_tuples(
+        [("005930", t) for t in ts] + [("000660", t) for t in ts],
+        names=["ticker", "ts_close"],
+    )
+    panel = pd.DataFrame(
+        {
+            "open": [100.0] * 4,
+            "high": [101.0] * 4,
+            "low": [99.0] * 4,
+            "close": [100.0] * 4,
+            "volume": [1000.0] * 4,
+            "label_5m_ret": [0.01] * 4,
+            "cs_rank": [0.5] * 4,
+            "relevance": [1.0] * 4,
+        },
+        index=idx,
+    )
+
+    result = b._join_dual_source_features(panel, "20260420", "20260420")
+
+    assert result.attrs["dual_source_join_stats"]["artifact_dir"] == str(ds_dir)
+    assert result.attrs["dual_source_join_stats"]["dates_found"] == 1
+    assert result.attrs["dual_source_join_stats"]["rows_non_neutral"] == 2
+    assert result.loc[("005930", ts[0]), "news_score_t"] == pytest.approx(0.5)
+    assert result.loc[("000660", ts[0]), "community_noise_multiplier"] == pytest.approx(1.0)
 
 
 def test_dual_source_join_rejects_future_snapshot(tmp_path: Path) -> None:

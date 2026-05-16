@@ -16,8 +16,8 @@ from zoneinfo import ZoneInfo
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
-_NEW_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_EXOGENOUS_ARTIFACT_DIR = _NEW_ROOT / "artifacts" / "exogenous"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_EXOGENOUS_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "exogenous"
 
 
 def _normalise_date(date_str: str) -> str:

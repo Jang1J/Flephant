@@ -30,7 +30,7 @@ from src.utils.trading_calendar import (  # noqa: E402
 )
 
 _KST = ZoneInfo("Asia/Seoul")
-_ARTIFACT_DIR = SRC / "artifacts" / "dual_source"
+_ARTIFACT_DIR = ROOT / "artifacts" / "dual_source"
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "dual_source_history"
 _FALLBACK_MIN_DUAL_SOURCE_NON_NEUTRAL_DATE_COVERAGE = 0.8
 
