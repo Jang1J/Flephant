@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 import pytest
@@ -189,6 +190,33 @@ def test_budget_tracker_daily_reset_at_midnight(monkeypatch) -> None:
     assert tracker.remaining_total() == 3
 
 
+def test_budget_tracker_record_thread_safe() -> None:
+    """동시 Cold Path 기록에서도 budget counter가 누락되지 않는다."""
+    tracker = _BudgetTracker(daily_limit=5000, allocation={})
+
+    def record_many() -> None:
+        for _ in range(200):
+            tracker.record("news_analysis")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: record_many(), range(8)))
+
+    assert tracker.total_today == 1600
+    assert tracker.remaining_total() == 3400
+
+
+def test_budget_tracker_try_reserve_atomic_under_threads() -> None:
+    """동시 예약에서도 caller quota를 초과하지 않는다."""
+    tracker = _BudgetTracker(daily_limit=10, allocation={"news_analysis": 1})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: tracker.try_reserve("news_analysis"), range(8)))
+
+    assert sum(1 for ok, _ in results if ok) == 1
+    assert tracker.total_today == 1
+    assert tracker.remaining_for("news_analysis") == 0
+
+
 # ====================================================================== #
 # 2. _CircuitBreaker 단위 테스트
 # ====================================================================== #
@@ -255,6 +283,48 @@ def test_circuit_breaker_reopens_on_half_open_failure(monkeypatch) -> None:
     assert cb.state == CircuitState.HALF_OPEN.value
 
     cb.record_failure()
+    assert cb.state == CircuitState.OPEN.value
+
+
+def test_circuit_breaker_allows_only_one_half_open_probe_before_result() -> None:
+    """HALF_OPEN 시험 호출은 결과 기록 전 1회만 허용한다."""
+    cb = _CircuitBreaker(failure_threshold=1, open_duration_sec=0)
+    cb.record_failure()
+
+    assert cb.can_attempt() is True
+    assert cb.state == CircuitState.HALF_OPEN.value
+    assert cb.can_attempt() is False
+
+
+def test_circuit_breaker_releases_half_open_probe_on_success_and_failure() -> None:
+    """HALF_OPEN probe flag는 성공/실패 기록에서 해제된다."""
+    cb = _CircuitBreaker(failure_threshold=1, open_duration_sec=0)
+    cb.record_failure()
+    assert cb.can_attempt() is True
+    assert cb.can_attempt() is False
+
+    cb.record_failure()
+    assert cb.state == CircuitState.OPEN.value
+    assert cb.can_attempt() is True
+    assert cb.can_attempt() is False
+
+    cb.record_success()
+    assert cb.state == CircuitState.CLOSED.value
+    assert cb.can_attempt() is True
+
+
+def test_circuit_breaker_record_failure_thread_safe() -> None:
+    """동시 실패 기록에서도 failure_count와 OPEN 상태가 일관된다."""
+    cb = _CircuitBreaker(failure_threshold=400, open_duration_sec=300)
+
+    def fail_many() -> None:
+        for _ in range(50):
+            cb.record_failure()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda _: fail_many(), range(8)))
+
+    assert cb.failure_count == 400
     assert cb.state == CircuitState.OPEN.value
 
 
@@ -349,6 +419,39 @@ def test_cold_mode_overflow_none_disables_fallback(
     assert result.model_used == LLMModel.KANANA_O.value
     assert result.fallback_used is False
     assert result.error.startswith("FALLBACK_DISABLED: CALLER_QUOTA_EXCEEDED")
+
+
+def test_concurrent_cold_calls_do_not_exceed_caller_quota(
+    minimal_config: dict,
+    monkeypatch,
+) -> None:
+    """공유 router 동시 호출에서도 Kanana caller quota를 넘지 않는다."""
+    monkeypatch.setenv("KANANA_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_API_KEY", "o")
+    minimal_config["llm_budget"]["kanana_daily_limit"] = 8
+    minimal_config["llm_budget"]["overflow_to"] = "none"
+    minimal_config["llm_budget"]["budget_allocation"] = {"news_analysis": 1}
+    router = LLMRouter(config=minimal_config)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: router.call("p", mode="cold", caller="news_analysis"),
+                range(8),
+            )
+        )
+
+    kanana_successes = [
+        result for result in results
+        if result.success and result.model_used == LLMModel.KANANA_O.value
+    ]
+    quota_failures = [
+        result for result in results
+        if not result.success and "CALLER_QUOTA_EXCEEDED" in str(result.error)
+    ]
+    assert len(kanana_successes) == 1
+    assert len(quota_failures) == 7
+    assert router.budget_remaining("news_analysis") == 0
 
 
 def test_unknown_caller_rejected_without_buffer(minimal_config: dict, monkeypatch) -> None:

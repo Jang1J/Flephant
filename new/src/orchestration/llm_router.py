@@ -16,8 +16,9 @@ SSOT: api_contracts.md v3.4 C5 (llm_budget.source: risk_config.yaml llm_budget)
 """
 from __future__ import annotations
 
-import os
 import json
+import os
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -104,22 +105,22 @@ class _BudgetTracker:
     """
 
     def __init__(self, daily_limit: int, allocation: dict[str, int]) -> None:
-        # TODO(Sprint4-async): threading.Lock 추가. 현재 단일 스레드 전제.
-        #   async 도입 시 _counts (BudgetTracker) 동시 접근 보호 필요.
         self._daily_limit = daily_limit
         self._allocation: dict[str, int] = dict(allocation)
         self._counts: dict[str, int] = defaultdict(int)   # caller → 누적 횟수
         self._total: int = 0
         self._reset_day: str | None = None  # 'YYYY-MM-DD' 형식
+        self._lock = threading.RLock()
 
     def _maybe_reset(self) -> None:
         """KST 자정 경과 시 카운터 리셋."""
-        today = now_kst().strftime("%Y-%m-%d")
-        if self._reset_day != today:
-            self._counts.clear()
-            self._total = 0
-            self._reset_day = today
-            logger.info(f"일일 예산 리셋: {today}")
+        with self._lock:
+            today = now_kst().strftime("%Y-%m-%d")
+            if self._reset_day != today:
+                self._counts.clear()
+                self._total = 0
+                self._reset_day = today
+                logger.info(f"일일 예산 리셋: {today}")
 
     def _quota_key_for(self, caller: str) -> str | None:
         """예산 차감 key. 명시 caller가 없으면 buffer에만 태운다."""
@@ -131,6 +132,25 @@ class _BudgetTracker:
             return "buffer"
         return None
 
+    def _can_call_locked(self, caller: str) -> tuple[bool, str, str | None]:
+        """Lock 보유 상태에서 quota 확인."""
+        if self._total >= self._daily_limit:
+            return False, f"DAILY_LIMIT_REACHED: {self._total}/{self._daily_limit}", None
+
+        quota_key = self._quota_key_for(caller)
+        if quota_key is None:
+            return False, f"CALLER_NOT_CONFIGURED: {caller}", None
+
+        alloc = self._allocation.get(quota_key)
+        if alloc is not None and self._counts[quota_key] >= alloc:
+            return (
+                False,
+                f"CALLER_QUOTA_EXCEEDED: {quota_key} {self._counts[quota_key]}/{alloc}",
+                quota_key,
+            )
+
+        return True, "OK", quota_key
+
     def can_call(self, caller: str) -> tuple[bool, str]:
         """호출 허용 여부 + 사유 반환.
 
@@ -140,49 +160,64 @@ class _BudgetTracker:
             (False, 'CALLER_QUOTA_EXCEEDED: caller N/M') caller 할당 초과.
             (False, 'CALLER_NOT_CONFIGURED: caller') caller 정책 누락.
         """
-        self._maybe_reset()
+        with self._lock:
+            self._maybe_reset()
+            ok, reason, _ = self._can_call_locked(caller)
+            return ok, reason
 
-        if self._total >= self._daily_limit:
-            return False, f"DAILY_LIMIT_REACHED: {self._total}/{self._daily_limit}"
-
-        quota_key = self._quota_key_for(caller)
-        if quota_key is None:
-            return False, f"CALLER_NOT_CONFIGURED: {caller}"
-
-        alloc = self._allocation.get(quota_key)
-        if alloc is not None and self._counts[quota_key] >= alloc:
-            return False, f"CALLER_QUOTA_EXCEEDED: {quota_key} {self._counts[quota_key]}/{alloc}"
-
-        return True, "OK"
+    def try_reserve(self, caller: str) -> tuple[bool, str]:
+        """호출 허용 확인과 예산 차감을 원자적으로 수행."""
+        with self._lock:
+            self._maybe_reset()
+            ok, reason, quota_key = self._can_call_locked(caller)
+            if not ok:
+                return False, reason
+            self._counts[quota_key or caller] += 1
+            self._total += 1
+            return True, "OK"
 
     def record(self, caller: str) -> None:
         """호출 1회 기록. can_call() 통과 후 반드시 호출."""
-        self._maybe_reset()
-        quota_key = self._quota_key_for(caller) or caller
-        self._counts[quota_key] += 1
-        self._total += 1
+        with self._lock:
+            self._maybe_reset()
+            quota_key = self._quota_key_for(caller) or caller
+            self._counts[quota_key] += 1
+            self._total += 1
+
+    def release(self, caller: str) -> None:
+        """예약했지만 실제 Kanana 호출 전 차단된 경우 예산 차감을 되돌린다."""
+        with self._lock:
+            self._maybe_reset()
+            quota_key = self._quota_key_for(caller) or caller
+            if self._counts[quota_key] > 0:
+                self._counts[quota_key] -= 1
+            if self._total > 0:
+                self._total -= 1
 
     def remaining_total(self) -> int:
         """일일 총 잔여 호출 횟수."""
-        self._maybe_reset()
-        return max(0, self._daily_limit - self._total)
+        with self._lock:
+            self._maybe_reset()
+            return max(0, self._daily_limit - self._total)
 
     def remaining_for(self, caller: str) -> int:
         """특정 caller의 잔여 호출 횟수. allocation 없으면 총 잔여 반환."""
-        self._maybe_reset()
-        quota_key = self._quota_key_for(caller)
-        if quota_key is None:
-            return 0
-        alloc = self._allocation.get(quota_key)
-        if alloc is None:
-            return self.remaining_total()
-        return max(0, alloc - self._counts[quota_key])
+        with self._lock:
+            self._maybe_reset()
+            quota_key = self._quota_key_for(caller)
+            if quota_key is None:
+                return 0
+            alloc = self._allocation.get(quota_key)
+            if alloc is None:
+                return self.remaining_total()
+            return max(0, alloc - self._counts[quota_key])
 
     @property
     def total_today(self) -> int:
         """오늘 총 호출 횟수 (테스트/모니터링용)."""
-        self._maybe_reset()
-        return self._total
+        with self._lock:
+            self._maybe_reset()
+            return self._total
 
 
 class _CircuitBreaker:
@@ -201,67 +236,79 @@ class _CircuitBreaker:
         open_duration_sec: int,
     ) -> None:
         """CB 설정은 LLMRouter 가 risk_config.yaml 에서 로드 후 주입. default 금지."""
-        # TODO(Sprint4-async): threading.Lock 추가. 현재 단일 스레드 전제.
-        #   async 도입 시 _failures/_state 동시 접근 보호 필요.
         self._threshold = failure_threshold
         self._open_duration_sec = open_duration_sec
         self._state = CircuitState.CLOSED
         self._failures = 0
         self._opened_at: float | None = None
+        self._half_open_probe_in_flight = False
+        self._lock = threading.RLock()
 
     def can_attempt(self) -> bool:
         """호출 시도 가능 여부."""
-        if self._state == CircuitState.CLOSED:
-            return True
-
-        if self._state == CircuitState.OPEN:
-            if (
-                self._opened_at is not None
-                and time.time() - self._opened_at >= self._open_duration_sec
-            ):
-                self._state = CircuitState.HALF_OPEN
-                logger.info("circuit HALF_OPEN (시험 호출 허용, %ss 경과)", self._open_duration_sec)
+        with self._lock:
+            if self._state == CircuitState.CLOSED:
                 return True
-            return False
 
-        # HALF_OPEN: 1회 시험 허용
-        return True
+            if self._state == CircuitState.OPEN:
+                if (
+                    self._opened_at is not None
+                    and time.time() - self._opened_at >= self._open_duration_sec
+                ):
+                    self._state = CircuitState.HALF_OPEN
+                    self._half_open_probe_in_flight = True
+                    logger.info("circuit HALF_OPEN (시험 호출 허용, %ss 경과)", self._open_duration_sec)
+                    return True
+                return False
+
+            # HALF_OPEN: 1회 시험 허용
+            if self._half_open_probe_in_flight:
+                return False
+            self._half_open_probe_in_flight = True
+            return True
 
     def record_success(self) -> None:
         """성공 기록. 모든 상태에서 CLOSED 복귀."""
-        self._failures = 0
-        if self._state != CircuitState.CLOSED:
-            logger.info("circuit CLOSED (복귀)")
-        self._state = CircuitState.CLOSED
-        self._opened_at = None
+        with self._lock:
+            self._failures = 0
+            if self._state != CircuitState.CLOSED:
+                logger.info("circuit CLOSED (복귀)")
+            self._state = CircuitState.CLOSED
+            self._opened_at = None
+            self._half_open_probe_in_flight = False
 
     def record_failure(self) -> None:
         """실패 기록. threshold 도달 시 OPEN 전이."""
-        self._failures += 1
+        with self._lock:
+            self._failures += 1
 
-        if self._state == CircuitState.HALF_OPEN:
-            # HALF_OPEN 실패: 즉시 OPEN 복귀, 타이머 리셋
-            self._state = CircuitState.OPEN
-            self._opened_at = time.time()
-            logger.warning(f"circuit OPEN (HALF_OPEN 실패, {self._open_duration_sec}s 재차단)")
-            return
+            if self._state == CircuitState.HALF_OPEN:
+                # HALF_OPEN 실패: 즉시 OPEN 복귀, 타이머 리셋
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
+                self._half_open_probe_in_flight = False
+                logger.warning(f"circuit OPEN (HALF_OPEN 실패, {self._open_duration_sec}s 재차단)")
+                return
 
-        if self._failures >= self._threshold:
-            self._state = CircuitState.OPEN
-            self._opened_at = time.time()
-            logger.warning(
-                f"circuit OPEN (연속 {self._failures}회 실패, {self._open_duration_sec}s 차단)"
-            )
+            if self._failures >= self._threshold:
+                self._state = CircuitState.OPEN
+                self._opened_at = time.time()
+                self._half_open_probe_in_flight = False
+                logger.warning(
+                    f"circuit OPEN (연속 {self._failures}회 실패, {self._open_duration_sec}s 차단)"
+                )
 
     @property
     def state(self) -> str:
         """현재 circuit 상태 문자열."""
-        return self._state.value
+        with self._lock:
+            return self._state.value
 
     @property
     def failure_count(self) -> int:
         """현재 누적 실패 횟수 (테스트/모니터링용)."""
-        return self._failures
+        with self._lock:
+            return self._failures
 
 
 class LLMRouter:
@@ -393,8 +440,8 @@ class LLMRouter:
             logger.info(f"force_model=gpt-4o: GPT-4o 직접 호출, caller={caller}")
             return self._call_gpt4o(prompt, caller, structured_schema, is_fallback=False)
 
-        # 1) 예산 체크
-        ok, reason = self._budget.can_call(caller)
+        # 1) 예산 예약 (확인 + 차감 원자 처리)
+        ok, reason = self._budget.try_reserve(caller)
         if not ok:
             if reason.startswith("CALLER_NOT_CONFIGURED"):
                 logger.warning("[llm_router] caller 예산 정책 누락: %s", reason)
@@ -412,6 +459,7 @@ class LLMRouter:
 
         # 2) Kanana-o circuit breaker 체크
         if not self._kanana_cb.can_attempt():
+            self._budget.release(caller)
             reason = f"KANANA_CIRCUIT_{self._kanana_cb.state.upper()}"
             logger.info("Kanana-o circuit %s: caller=%s", self._kanana_cb.state, caller)
             return self._fallback_or_failure(prompt, caller, structured_schema, reason)
@@ -422,6 +470,9 @@ class LLMRouter:
         if result.success:
             self._kanana_cb.record_success()
             return result
+
+        if result.error in {"KANANA_API_KEY_MISSING", "KANANA_API_URL_MISSING"}:
+            self._budget.release(caller)
 
         # 실패: circuit breaker 업데이트 + GPT-4o fallback
         self._kanana_cb.record_failure()
@@ -499,7 +550,7 @@ class LLMRouter:
     ) -> LLMCallResult:
         """Kanana-o 호출.
 
-        성공 시 budget.record() 호출.
+        예산은 LLMRouter.call()에서 선예약한다.
         API 키 누락 시 graceful failure (RuntimeError 미발생).
         """
         if self._allow_mock_provider:
@@ -509,7 +560,7 @@ class LLMRouter:
                 caller=caller,
                 cost_usd=self._kanana_cost_placeholder,
                 is_fallback=False,
-                record_budget=True,
+                record_budget=False,
             )
         if self._kanana_key is None:
             logger.warning("KANANA_API_KEY 미설정: Kanana-o 호출 불가")
@@ -558,7 +609,6 @@ class LLMRouter:
                 or json.dumps(payload, ensure_ascii=False)
             )
             latency_ms = (time.time() - start) * 1000.0
-            self._budget.record(caller)
             return LLMCallResult(
                 success=True,
                 model_used=LLMModel.KANANA_O.value,
