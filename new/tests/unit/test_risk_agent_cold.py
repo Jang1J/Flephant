@@ -8,6 +8,7 @@ import pytest
 
 from src.agents.cold.risk_fast import RiskAgentFast
 from src.agents.cold.risk_slow import RiskAgentSlow
+from src.utils.pit_guard import PITViolationError
 
 
 # ------------------------------------------------------------------ #
@@ -179,6 +180,19 @@ def test_slow_analyze_success() -> None:
     assert result["channel"] in {"risk_warning", "regime_change", "veto_recommendation"}
     assert result["report_type"] in {"risk_warning", "regime_change", "veto_recommendation"}
     assert "payload" in result
+
+
+def test_slow_analyze_rejects_future_event_before_llm() -> None:
+    """직접 호출 경로도 occurred_at > asof 미래 이벤트를 LLM 전에 차단한다."""
+    slow = _make_slow()
+    event = _make_event()
+    event["occurred_at"] = "2026-04-18T10:01:00+09:00"
+    event["asof"] = "2026-04-18T10:00:00+09:00"
+
+    with pytest.raises(PITViolationError):
+        slow.analyze(event)
+
+    slow._llm_router.call.assert_not_called()
 
 
 def test_slow_analyze_with_fast_eval() -> None:

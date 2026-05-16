@@ -20,6 +20,7 @@ from src.cache.persistent_cache import PersistentCache
 from src.data.filter_loader import load_news_filter
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.pit_guard import assert_pit_safe
 from src.utils.safe_cast import safe_bool
 
 logger = get_logger("news_agent")
@@ -159,6 +160,8 @@ class NewsAgent(AgentBase):
                 f"[news_agent] 알 수 없는 event_type: {event_type!r}. "
                 f"허용: {sorted(self._EVENT_TYPE_TO_CHANNEL)}"
             )
+        if event.get("occurred_at") and event.get("asof"):
+            assert_pit_safe(event["occurred_at"], snapshot_ts=event["asof"])
 
         publish_channel = self._EVENT_TYPE_TO_CHANNEL[event_type]
 

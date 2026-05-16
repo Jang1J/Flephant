@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.agents.cold.news import NewsAgent
+from src.utils.pit_guard import PITViolationError
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +330,22 @@ class TestAnalyze:
                 "summary": "test",
                 "event_id": "X-1",
             })
+
+    def test_analyze_rejects_future_event_before_llm(self):
+        """직접 호출 경로도 occurred_at > asof 미래 이벤트를 LLM 전에 차단한다."""
+        llm = _make_llm()
+        agent = NewsAgent(llm_router=llm)
+        with pytest.raises(PITViolationError):
+            agent.analyze({
+                "event_type": "news",
+                "ticker": "005930",
+                "title": "미래 뉴스",
+                "summary": "아직 발생하지 않은 뉴스",
+                "event_id": "E-future",
+                "occurred_at": "2026-04-20T10:01:00+09:00",
+                "asof": "2026-04-20T10:00:00+09:00",
+            })
+        llm.call.assert_not_called()
 
     def test_analyze_llm_failure_stance_neutral_fallback(self):
         """LLMCallResult(success=False) → stance=neutral, llm_fallback=True."""

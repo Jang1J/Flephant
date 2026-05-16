@@ -21,6 +21,7 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.pit_guard import assert_pit_safe
 
 logger = get_logger("risk_slow")
 
@@ -135,6 +136,8 @@ class RiskAgentSlow(AgentBase):
         ticker = event.get("ticker") or event.get("payload", {}).get("ticker", "")
         payload_raw = event.get("payload", {})
         occurred_at = event.get("occurred_at", "")
+        if occurred_at and event.get("asof"):
+            assert_pit_safe(occurred_at, snapshot_ts=event["asof"])
 
         prompt = self._build_prompt(
             event_type=event_type,
