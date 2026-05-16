@@ -137,6 +137,9 @@ def run_pipeline(
     price: float | None,
     confirm_phrase: str | None,
     order_type: str,
+    target_col_override: str | None = None,
+    registry_dir: str | None = None,
+    allow_production_candidate_write: bool = False,
 ) -> dict[str, Any]:
     end_dt = datetime.strptime(end_date, "%Y%m%d").date()
     start_date = _business_start_date(end_dt, business_days).strftime("%Y%m%d")
@@ -150,6 +153,8 @@ def run_pipeline(
         "end_date": end_date,
         "business_days": business_days,
         "bundle_id": resolved_bundle_id,
+        "target_col_override": target_col_override,
+        "registry_dir": registry_dir,
         "runtime": {
             "elephant_mode": os.environ.get("ELEPHANT_MODE"),
             "kis_mode": os.environ.get("KIS_MODE"),
@@ -194,11 +199,15 @@ def run_pipeline(
         return report
 
     try:
-        lgbm_result = NightlyLGBMRetrainer().retrain(
+        lgbm_result = NightlyLGBMRetrainer(
+            registry_dir=registry_dir,
+            allow_production_candidate_write=allow_production_candidate_write,
+        ).retrain(
             bundle_id=resolved_bundle_id,
             tickers=training_tickers,
             start_date=start_date,
             end_date=end_date,
+            target_col_override=target_col_override,
         )
         stages["02_lgbm_bundle"] = _stage(
             "PASS" if lgbm_result.get("candidate_bundle_staged") else "BLOCKED",
@@ -379,6 +388,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--price", type=float, default=None)
     parser.add_argument("--order-type", default="00")
     parser.add_argument("--confirm-phrase", default="")
+    parser.add_argument("--target-col-override", default="")
+    parser.add_argument("--registry-dir", default="")
+    parser.add_argument("--allow-production-candidate-write", action="store_true")
     parser.add_argument("--no-write-report", action="store_true")
     return parser.parse_args(argv)
 
@@ -399,6 +411,9 @@ def main(argv: list[str] | None = None) -> int:
         price=args.price,
         confirm_phrase=str(args.confirm_phrase).strip() or None,
         order_type=str(args.order_type or "00"),
+        target_col_override=str(args.target_col_override).strip() or None,
+        registry_dir=str(args.registry_dir).strip() or None,
+        allow_production_candidate_write=bool(args.allow_production_candidate_write),
     )
     if not bool(args.no_write_report):
         _write_report(report)

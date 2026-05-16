@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,8 @@ import pytest
 
 def _make_retrainer(**kwargs):
     """NightlyLGBMRetrainer 인스턴스 생성 with patched config."""
+    registry_dir = kwargs.pop("registry_dir", None)
+    allow_production_candidate_write = kwargs.pop("allow_production_candidate_write", False)
     cfg_defaults = {
         "lookback_days": 30,
         "max_alpha_factors": 5,
@@ -44,7 +47,10 @@ def _make_retrainer(**kwargs):
         return_value=cfg_defaults,
     ):
         from src.mode_b.nightly_lgbm_retrainer import NightlyLGBMRetrainer
-        return NightlyLGBMRetrainer()
+        return NightlyLGBMRetrainer(
+            registry_dir=registry_dir,
+            allow_production_candidate_write=allow_production_candidate_write,
+        )
 
 
 def _mock_registry(versions: list[str]) -> MagicMock:
@@ -320,9 +326,9 @@ def test_retrain_normalizes_dates_for_lgbm_trainer():
     assert kwargs["end_date"] == "20260427"
 
 
-def test_retrain_passes_target_col_override_to_lgbm_trainer():
+def test_retrain_passes_target_col_override_to_lgbm_trainer(tmp_path: Path):
     """cost-aware label 실험은 Nightly retrainer를 거쳐 trainer까지 전달된다."""
-    retrainer = _make_retrainer()
+    retrainer = _make_retrainer(registry_dir=tmp_path / "lgbm_research")
 
     mock_trainer = MagicMock()
     mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
@@ -348,6 +354,19 @@ def test_retrain_passes_target_col_override_to_lgbm_trainer():
     kwargs = mock_trainer.train.call_args.kwargs
     assert kwargs["target_col_override"] == "label_session_close_net_ret"
     assert result["target_col"] == "label_session_close_net_ret"
+
+
+def test_retrain_blocks_target_col_override_on_production_registry():
+    """cost-aware 실험 label은 명시 research registry 없이 production에 저장하지 않는다."""
+    retrainer = _make_retrainer()
+
+    with patch.object(retrainer, "_make_registry", side_effect=AssertionError("registry touched")):
+        with pytest.raises(RuntimeError, match="production registry"):
+            retrainer.retrain(
+                tickers=["005930"],
+                end_date="2026-04-27",
+                target_col_override="label_session_close_net_ret",
+            )
 
 
 # ================================================================== #

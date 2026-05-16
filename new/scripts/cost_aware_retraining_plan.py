@@ -153,6 +153,38 @@ def _label_scan_command(
     return " ".join(parts)
 
 
+def _research_registry_dir(bundle_id: str) -> str:
+    safe_bundle = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in bundle_id)
+    safe_bundle = safe_bundle or "cost_aware"
+    return f"artifacts/lgbm_research/{safe_bundle}"
+
+
+def _retrain_command(
+    *,
+    bundle_id: str,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+    target_col_override: str | None,
+) -> str:
+    registry_dir = _research_registry_dir(bundle_id)
+    version = "cost_aware_" + "".join(
+        ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in bundle_id
+    )
+    parts = [
+        "PYTHONPATH=new python -m src.models.lgbm_trainer",
+        f"--tickers {','.join(tickers)}" if tickers else "",
+        f"--start {start_date}" if start_date else "",
+        f"--end {end_date}" if end_date else "",
+        f"--version {version}",
+        f"--bundle-id {bundle_id}",
+        f"--registry-dir {registry_dir}",
+    ]
+    if target_col_override:
+        parts.append(f"--target-col-override {target_col_override}")
+    return " ".join(part for part in parts if part)
+
+
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
     if not isinstance(label_scan, dict):
         return {}
@@ -225,6 +257,10 @@ def build_retraining_plan(
             "source": "final_dataset_gate",
             "ticker_count": len(final_tickers),
             "tickers": final_tickers,
+        },
+        "research_registry": {
+            "registry_dir": _research_registry_dir(bundle_id),
+            "production_registry_mutated": False,
         },
         "active_label": {
             "horizon_bars": active_horizon,
@@ -300,6 +336,13 @@ def build_retraining_plan(
                 start_date=final_window["start_date"],
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
+            ),
+            _retrain_command(
+                bundle_id=bundle_id,
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+                target_col_override=target_col_override,
             ),
             f"PYTHONPATH=new python new/scripts/service_policy_replay.py --bundle-id {bundle_id}",
         ],

@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from src.data.dataset_builder import DatasetBuilder
+from src.models import lgbm_trainer as trainer_module
 from src.models.lgbm_trainer import LGBMTrainer
 from src.models.registry import ModelRegistry, VersionNotFoundError
 from src.models.splitter import WalkForwardSplitter
@@ -263,6 +264,26 @@ def test_train_accepts_cost_aware_target_override(
     assert metadata["label_horizon_bars"] == trainer_small.builder.horizon_bars
     assert metadata["target_horizon_bars"] == 0
     assert metadata["target_horizon_kind"] == "session_close"
+
+
+def test_cli_blocks_target_override_on_production_registry() -> None:
+    """cost-aware 실험 label은 명시 research registry 없이 CLI에서 production에 저장하지 않는다."""
+    result = trainer_module.main(
+        [
+            "--tickers",
+            "005930",
+            "--start",
+            "20260101",
+            "--end",
+            "20260107",
+            "--version",
+            "cost-aware",
+            "--target-col-override",
+            "label_session_close_net_ret",
+        ]
+    )
+
+    assert result == 1
 
 
 def test_train_blocks_missing_feature_manifest(trainer_small: LGBMTrainer) -> None:

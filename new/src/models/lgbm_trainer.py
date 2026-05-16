@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -37,6 +38,8 @@ from src.utils.logger import get_logger
 from src.utils.safe_cast import safe_bool
 
 logger = get_logger("lgbm_trainer")
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_PRODUCTION_LGBM_DIR = _REPO_ROOT / "artifacts" / "lgbm"
 
 
 def _load_feature_cols() -> list[str]:
@@ -577,13 +580,52 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="실험용 label 컬럼 override (예: label_session_close_net_ret)",
     )
+    p.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="ModelRegistry 저장 디렉터리. cost-aware 실험은 artifacts/lgbm_research 권장",
+    )
+    p.add_argument(
+        "--allow-production-candidate-write",
+        action="store_true",
+        help="target_col_override를 production artifacts/lgbm에 쓰는 것을 명시 허용",
+    )
     return p.parse_args(argv)
+
+
+def _resolve_registry_dir(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else _REPO_ROOT / path
+
+
+def _uses_production_registry(registry_dir: Path | None) -> bool:
+    if registry_dir is None:
+        return True
+    try:
+        return registry_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
+    except OSError:
+        return registry_dir == _PRODUCTION_LGBM_DIR
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
-    trainer = LGBMTrainer()
+    registry_dir = _resolve_registry_dir(args.registry_dir)
+    if (
+        args.target_col_override
+        and _uses_production_registry(registry_dir)
+        and not bool(args.allow_production_candidate_write)
+    ):
+        logger.error(
+            "[lgbm_trainer] target_col_override 실험은 production registry에 직접 저장하지 않음. "
+            "--registry-dir artifacts/lgbm_research/... 또는 --allow-production-candidate-write 필요"
+        )
+        return 1
+    registry = ModelRegistry(artifacts_dir=registry_dir) if registry_dir is not None else None
+    trainer = LGBMTrainer(registry=registry)
     try:
         result = trainer.train(
             tickers=tickers,

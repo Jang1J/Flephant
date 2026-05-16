@@ -37,6 +37,7 @@ from src.utils.safe_cast import safe_bool
 logger = get_logger("nightly_lgbm_retrainer")
 _KST = ZoneInfo("Asia/Seoul")
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
+_PRODUCTION_LGBM_DIR = _ARTIFACTS_ROOT / "lgbm"
 
 
 class NightlyLGBMRetrainer:
@@ -49,11 +50,18 @@ class NightlyLGBMRetrainer:
     파라미터 출처: risk_config.yaml nightly_retrainer 섹션 (불변 원칙 5).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        registry_dir: str | Path | None = None,
+        allow_production_candidate_write: bool = False,
+    ) -> None:
         cfg = config_load("risk_config.yaml", "nightly_retrainer") or {}
         self._tickers: list[str] = list(cfg.get("tickers", []))
         self._lookback_days: int = int(cfg.get("lookback_days", 30))
         self._max_alpha_factors: int = int(cfg.get("max_alpha_factors", 5))
+        self._registry_dir = self._resolve_registry_dir(registry_dir)
+        self._allow_production_candidate_write = bool(allow_production_candidate_write)
         self._synthetic_fallback_enabled: bool = safe_bool(
             cfg.get("synthetic_fallback_enabled", False),
             default=False,
@@ -103,6 +111,16 @@ class NightlyLGBMRetrainer:
         Raises:
             RuntimeError: LGBMTrainer.train() 내부 오류. 호출자(scheduler)가 catch.
         """
+        if (
+            target_col_override
+            and self._uses_production_registry()
+            and not self._allow_production_candidate_write
+        ):
+            raise RuntimeError(
+                "cost-aware target_col_override는 production registry에 직접 쓸 수 없습니다. "
+                "registry_dir=artifacts/lgbm_research/... 또는 allow_production_candidate_write=True 필요"
+            )
+
         # 1. 다음 버전 결정
         registry = self._make_registry()
         next_version = self._next_version(registry)
@@ -120,7 +138,7 @@ class NightlyLGBMRetrainer:
         start_dt = self._normalize_yyyymmdd(start_raw)
 
         # 4. LGBMTrainer 구성 + alpha feature 추가
-        trainer = self._make_trainer()
+        trainer = self._make_trainer(registry=registry)
         if alpha_feature_cols:
             if hasattr(trainer.builder, "add_neutral_feature_columns"):
                 trainer.builder.add_neutral_feature_columns(alpha_feature_cols)
@@ -192,9 +210,9 @@ class NightlyLGBMRetrainer:
         """Create ModelRegistry. Split out so tests do not patch sys.modules."""
         from src.models.registry import ModelRegistry
 
-        return ModelRegistry()
+        return ModelRegistry(artifacts_dir=self._registry_dir)
 
-    def _make_trainer(self) -> Any:
+    def _make_trainer(self, registry: Any | None = None) -> Any:
         """Create LGBMTrainer with the configured DatasetBuilder."""
         from src.data.dataset_builder import DatasetBuilder
         from src.models.lgbm_trainer import LGBMTrainer
@@ -203,8 +221,24 @@ class NightlyLGBMRetrainer:
             dataset_builder=DatasetBuilder(
                 allow_synthetic_fallback=self._synthetic_fallback_enabled,
                 synthetic_seed=self._synthetic_seed,
-            )
+            ),
+            registry=registry,
         )
+
+    @staticmethod
+    def _resolve_registry_dir(registry_dir: str | Path | None) -> Path | None:
+        if registry_dir is None:
+            return None
+        path = Path(registry_dir)
+        return path if path.is_absolute() else _ARTIFACTS_ROOT.parent / path
+
+    def _uses_production_registry(self) -> bool:
+        if self._registry_dir is None:
+            return True
+        try:
+            return self._registry_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
+        except OSError:
+            return self._registry_dir == _PRODUCTION_LGBM_DIR
 
     def _next_version(self, registry) -> str:
         """현재 최신 버전 다음 버전 결정. baseline → v2 → v3 ...

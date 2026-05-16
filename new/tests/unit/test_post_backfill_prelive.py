@@ -114,6 +114,8 @@ def test_pipeline_stops_before_training_when_80d_gate_blocked(monkeypatch):
         price=None,
         confirm_phrase=None,
         order_type="00",
+        target_col_override=None,
+        registry_dir=None,
     )
 
     assert report["status"] == "BLOCKED"
@@ -125,6 +127,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     mod = _load_script_module()
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
     gate_calls = []
+    retrainer_init_kwargs = {}
     retrain_kwargs = {}
 
     def fake_build_report(**kwargs):
@@ -154,7 +157,11 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         def submit_probe_order(self, **kwargs):
             return {"status": "PASS", "stages": {"execution": {"status": "PASS"}}}
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    def fake_retrainer_factory(**kwargs):
+        retrainer_init_kwargs.update(kwargs)
+        return FakeLGBM()
+
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", fake_retrainer_factory)
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(
         mod,
@@ -182,6 +189,8 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         price=1.0,
         confirm_phrase="PAPER_ORDER_OK",
         order_type="00",
+        target_col_override="label_session_close_net_ret",
+        registry_dir="artifacts/lgbm_research/BUNDLE-TEST",
     )
 
     assert report["status"] == "PASS"
@@ -193,7 +202,11 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     assert gate_calls[0].get("bundle_id") is None
     assert gate_calls[-1]["bundle_id"] == "BUNDLE-TEST"
     assert report["training_tickers"] == ["005930", "105560"]
+    assert retrainer_init_kwargs["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
+    assert retrainer_init_kwargs["allow_production_candidate_write"] is False
     assert retrain_kwargs["tickers"] == ["005930", "105560"]
+    assert retrain_kwargs["target_col_override"] == "label_session_close_net_ret"
+    assert report["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
 
 
 def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
@@ -241,7 +254,7 @@ def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",
@@ -285,7 +298,7 @@ def test_pipeline_stops_when_service_policy_replay_blocks(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
     monkeypatch.setattr(
         mod,
         "run_service_policy_replay",
@@ -329,7 +342,7 @@ def test_pipeline_blocks_backtest_pass_with_regression_flag(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",

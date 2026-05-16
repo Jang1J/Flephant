@@ -125,6 +125,15 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
     )
     assert plan["recommended_experiment"]["active_horizon_mean_net_bps"] == -14.0
     assert "20260508" not in plan["next_commands"][0]
+    assert plan["research_registry"] == {
+        "registry_dir": "artifacts/lgbm_research/BUNDLE-TEST",
+        "production_registry_mutated": False,
+    }
+    retrain_command = plan["next_commands"][1]
+    assert "python -m src.models.lgbm_trainer" in retrain_command
+    assert "--bundle-id BUNDLE-TEST" in retrain_command
+    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in retrain_command
+    assert "--target-col-override label_session_close_net_ret" in retrain_command
 
 
 def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch, tmp_path):
@@ -178,6 +187,7 @@ def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch
 
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
     command = plan["next_commands"][0]
+    retrain_command = plan["next_commands"][1]
 
     assert plan["training_window"] == {
         "source": "final_dataset_gate",
@@ -189,6 +199,11 @@ def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch
     assert "--end-date 20260515" in command
     assert "--tickers 005930,105560" in command
     assert "20260508" not in command
+    assert "--start 20250509" in retrain_command
+    assert "--end 20260515" in retrain_command
+    assert "--tickers 005930,105560" in retrain_command
+    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in retrain_command
+    assert "20260508" not in retrain_command
 
 
 def test_cost_aware_objective_string_false(monkeypatch, tmp_path):
