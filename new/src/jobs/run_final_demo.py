@@ -13,10 +13,10 @@ GPT Pro 권고: "demo.sh / run_final_demo.py W1 안에 반드시 작성. 발표 
                           -> ModeBDeployer -> deploy_status (blocked / deployed)
 
 사용법:
-    python -m src.jobs.run_final_demo                   # 3 demo 전체
+    python -m src.jobs.run_final_demo --bundle-id ID    # 3 demo 전체
     python -m src.jobs.run_final_demo --demo hot        # Demo A 단독
     python -m src.jobs.run_final_demo --demo cold       # Demo B 단독
-    python -m src.jobs.run_final_demo --demo mode_b     # Demo C 단독
+    python -m src.jobs.run_final_demo --demo mode_b --bundle-id ID  # Demo C 단독
     python -m src.jobs.run_final_demo --scenario X.yaml # 시나리오 파일 지정
 
 또는 루트의 demo.sh:
@@ -51,7 +51,6 @@ from src.utils.safe_cast import safe_bool, safe_int
 logger = get_logger("run_final_demo")
 _KST = ZoneInfo("Asia/Seoul")
 _DEMO_OUTPUT_ROOT = _NEW_ROOT.parent / "artifacts" / "audit"
-_DEFAULT_BUNDLE_ID = "BUNDLE-20260512-0AEEE37A"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -78,10 +77,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--bundle-id",
-        default=_DEFAULT_BUNDLE_ID,
-        help=f"Mode B read-only evidence demo에 사용할 bundle id. 기본: {_DEFAULT_BUNDLE_ID}",
+        default=None,
+        help="Mode B read-only evidence demo에 사용할 bundle id. --demo all/mode_b에서는 필수.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.demo in {"all", "mode_b"} and not args.bundle_id:
+        parser.error("--bundle-id is required when --demo is all or mode_b")
+    return args
 
 
 def _print_banner(title: str) -> None:
@@ -225,7 +227,7 @@ def run_demo_cold(scenario: str, short_mode: bool) -> dict[str, Any]:
     return summary
 
 
-def run_demo_mode_b(scenario: str, bundle_id: str = _DEFAULT_BUNDLE_ID) -> dict[str, Any]:
+def run_demo_mode_b(scenario: str, bundle_id: str) -> dict[str, Any]:
     """Demo C: read-only Mode B evidence without violating 18:00 KST PIT gate."""
     _print_banner("Demo C: Mode B Evidence (C12 -> C14 dry-run -> Service Readiness)")
 

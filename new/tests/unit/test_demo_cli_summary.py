@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 from src.jobs.run_e2e_scenario import _summary_failures as e2e_summary_failures
 from src.jobs.run_final_demo import (
+    _parse_args,
     _summary_failures as demo_summary_failures,
     run_demo_mode_b,
 )
@@ -76,6 +81,46 @@ def test_mode_b_demo_uses_read_only_evidence(monkeypatch, tmp_path) -> None:
     assert summary["mode_b_verdicts"] == ["pass"]
     assert summary["production_active_version"] is None
     assert summary["paper_active_version"] == "paper_model"
+
+
+def test_final_demo_requires_bundle_id_for_mode_b(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_final_demo.py", "--demo", "mode_b"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        _parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_final_demo_requires_bundle_id_for_all(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_final_demo.py", "--demo", "all"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        _parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_final_demo_allows_hot_without_bundle_id(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["run_final_demo.py", "--demo", "hot"])
+
+    args = _parse_args()
+
+    assert args.demo == "hot"
+    assert args.bundle_id is None
+
+
+def test_final_demo_accepts_explicit_bundle_id(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_final_demo.py", "--demo", "mode_b", "--bundle-id", "BUNDLE-TEST"],
+    )
+
+    args = _parse_args()
+
+    assert args.demo == "mode_b"
+    assert args.bundle_id == "BUNDLE-TEST"
 
 
 def test_mode_b_stage_blocking_treats_string_true_critical_alert_as_blocking() -> None:
