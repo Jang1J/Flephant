@@ -116,7 +116,7 @@ class BarBuffer:
     ) -> list[dict]:
         """ticker의 asof 이하 최근 n개 bar 반환."""
         if asof in (None, ""):
-            return self.get_latest(ticker, n)
+            return []
 
         ticker = pad_ticker(str(ticker))
         buf = self._buffers.get(ticker)

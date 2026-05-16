@@ -287,7 +287,19 @@ class QuantAgent(AgentBase):
         """
         t0 = time.perf_counter()
         padded_all = [pad_ticker(str(t)) for t in tickers]
-        asof_str = str(asof)
+        asof_str = str(asof or "").strip()
+        if not asof_str:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._latency_records.append(elapsed_ms)
+            return {
+                "tickers": [],
+                "scores": {},
+                "ts": "",
+                "mode": "blocked",
+                "blocker": "asof_required",
+                "latency_ms": elapsed_ms,
+                "n_tickers": 0,
+            }
 
         if not self.has_model:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -407,6 +419,8 @@ class QuantAgent(AgentBase):
 
         Returns: list of {ticker, anomaly_type, z_score, ts}
         """
+        if not str(asof or "").strip():
+            return []
         padded_all = [pad_ticker(str(t)) for t in tickers]
         max_window = int(self._multi_scale_windows[-1])
         out: list[dict[str, Any]] = []

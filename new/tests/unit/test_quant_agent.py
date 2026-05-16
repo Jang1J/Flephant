@@ -366,6 +366,31 @@ def test_score_cross_section_excludes_future_buffered_bars(
     assert agent_active._booster.last_X[0, 0] < agent_active._outlier_cap_z
 
 
+def test_score_cross_section_empty_asof_does_not_use_latest_buffer(
+    agent_active: QuantAgent,
+) -> None:
+    """asof가 비어 있으면 buffer의 최신 bar를 암묵적으로 쓰지 않는다."""
+    for bar in _make_bars("005930", n=65):
+        agent_active.on_bar(bar)
+
+    result = agent_active.score_cross_section(["005930"], asof="")
+
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "asof_required"
+    assert result["scores"] == {}
+    assert agent_active._booster.predict_calls == 0
+
+
+def test_detect_anomalies_empty_asof_does_not_use_latest_buffer(
+    agent_active: QuantAgent,
+) -> None:
+    """anomaly sidecar도 empty asof에서 최신 buffer fallback을 쓰지 않는다."""
+    for bar in _make_bars("005930", n=65):
+        agent_active.on_bar(bar)
+
+    assert agent_active.detect_anomalies(["005930"], asof="") == []
+
+
 def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> None:
     """Hot Path SLA: 단일 20종목 추론 p95 < 100ms 목표.
 

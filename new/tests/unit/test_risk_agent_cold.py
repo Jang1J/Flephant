@@ -192,6 +192,35 @@ def test_fast_uncertainty_signal_payload_has_score_and_trace() -> None:
     assert payload["asof"] == "2026-04-18T10:01:00+09:00"
 
 
+def test_fast_rejects_future_event_before_uncertainty_publish() -> None:
+    """RiskFast도 occurred_at > asof 미래 이벤트를 publish 전에 차단한다."""
+    pubsub = MagicMock()
+    fast = RiskAgentFast(pubsub=pubsub)
+    event = _make_event()
+    event["occurred_at"] = "2026-04-18T10:02:00+09:00"
+    event["asof"] = "2026-04-18T10:01:00+09:00"
+
+    with pytest.raises(PITViolationError):
+        fast.evaluate(event, context={"news_comm_divergence": 0.8})
+
+    pubsub.publish.assert_not_called()
+
+
+def test_fast_uncertainty_signal_normalizes_short_ticker_and_scope() -> None:
+    """uncertainty_signal ticker/scope는 raw ticker가 아니라 6자리 코드로 발행된다."""
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-UNC-2"
+    fast = RiskAgentFast(pubsub=pubsub)
+    event = _make_event(ticker="5930")
+    event["asof"] = "2026-04-18T10:01:00+09:00"
+
+    fast.evaluate(event, context={"news_comm_divergence": 0.8})
+
+    payload = pubsub.publish.call_args.args[1]["payload"]
+    assert payload["ticker"] == "005930"
+    assert payload["scope"] == "ticker:005930"
+
+
 # ------------------------------------------------------------------ #
 # RiskAgentSlow 테스트
 # ------------------------------------------------------------------ #
@@ -331,6 +360,40 @@ def test_slow_direct_call_publishes_to_pubsub() -> None:
     assert pubsub.publish.call_args.args[0] == result["channel"]
     assert result["message_id"] == "MSG-RISK-1"
     assert result["published_by_agent"] is True
+    payload = result["payload"]
+    assert payload["event_id"] == "EVT-TEST-001"
+    assert payload["occurred_at"] == "2026-04-18T10:00:00+09:00"
+    assert payload["ticker"] == "005930"
+    assert payload["scope"] == "ticker:005930"
+
+
+def test_slow_fallback_publishes_event_trace_to_pubsub() -> None:
+    """LLM 실패 fallback도 MessagePool trace를 잃지 않는다."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=False,
+        model_used=None,
+        content="",
+        latency_ms=0.0,
+        error="timeout",
+    )
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-RISK-FALLBACK"
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=pubsub)
+    event = _make_event(ticker="5930")
+    event["asof"] = "2026-04-18T10:01:00+09:00"
+
+    result = slow.analyze(event, fast_eval={"stance": "risk_reduce", "risk_level": "medium"})
+
+    assert result is not None
+    pubsub.publish.assert_called_once()
+    payload = result["payload"]
+    assert payload["event_id"] == "EVT-TEST-001"
+    assert payload["occurred_at"] == "2026-04-18T10:00:00+09:00"
+    assert payload["asof"] == "2026-04-18T10:01:00+09:00"
+    assert payload["ticker"] == "005930"
+    assert payload["scope"] == "ticker:005930"
+    assert payload["affected_tickers"] == ["005930"]
 
 
 def test_fast_intraday_drop_anomaly_trigger() -> None:

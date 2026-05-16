@@ -22,6 +22,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
 from src.utils.pit_guard import assert_pit_safe
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_slow")
 
@@ -76,6 +77,29 @@ class RiskAgentSlow(AgentBase):
         except Exception as e:
             logger.warning("[risk_slow] 설정 로드 실패: %s. 기본값 사용", e)
             return 300
+
+    @staticmethod
+    def _event_trace(event: dict[str, Any]) -> dict[str, Any]:
+        """RiskSlow direct/fallback publish trace를 6자리 ticker 기준으로 정규화한다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        ticker = normalize_ticker(event.get("ticker") or payload.get("ticker"))
+        raw_scope = str(event.get("scope") or "").strip()
+        if raw_scope.startswith("ticker:"):
+            scoped_ticker = normalize_ticker(raw_scope.split(":", 1)[1])
+            scope = f"ticker:{scoped_ticker}" if scoped_ticker else "market"
+        elif raw_scope:
+            scope = raw_scope
+        elif ticker:
+            scope = f"ticker:{ticker}"
+        else:
+            scope = "market"
+        return {
+            "event_id": event.get("event_id"),
+            "occurred_at": event.get("occurred_at"),
+            "asof": event.get("asof"),
+            "ticker": ticker or None,
+            "scope": scope,
+        }
 
     # ------------------------------------------------------------------
     # C5 report 생성
@@ -138,6 +162,7 @@ class RiskAgentSlow(AgentBase):
         occurred_at = event.get("occurred_at", "")
         if occurred_at and event.get("asof"):
             assert_pit_safe(occurred_at, snapshot_ts=event["asof"])
+        trace = self._event_trace(event)
 
         prompt = self._build_prompt(
             event_type=event_type,
@@ -172,10 +197,14 @@ class RiskAgentSlow(AgentBase):
                 "micro_note_ref": None,
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
                 "narrative": parsed.get("narrative", "")[:self._narrative_max_chars],
-                "affected_tickers": parsed.get("affected_tickers", [ticker] if ticker else []),
+                "affected_tickers": parsed.get(
+                    "affected_tickers",
+                    [trace["ticker"]] if trace["ticker"] else [],
+                ),
                 "regime_signal": parsed.get("regime_signal"),
                 "llm_model": llm_result.model_used,
                 "llm_latency_ms": llm_result.latency_ms,
+                **trace,
             },
             channel=publish_channel,
         )
@@ -312,6 +341,7 @@ class RiskAgentSlow(AgentBase):
         if fast_eval:
             stance = fast_eval.get("stance", "neutral")
             risk_level = fast_eval.get("risk_level", "low")
+        trace = self._event_trace(event)
 
         rpt = self.report(
             "risk_warning",
@@ -322,7 +352,8 @@ class RiskAgentSlow(AgentBase):
                 "micro_note_ref": None,
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
                 "narrative": "[LLM 호출 실패. Fast Rule 결과 기반 fallback]",
-                "affected_tickers": [],
+                "affected_tickers": [trace["ticker"]] if trace["ticker"] else [],
+                **trace,
             },
         )
         self._publish_if_available(str(rpt.get("channel", "risk_warning")), rpt)

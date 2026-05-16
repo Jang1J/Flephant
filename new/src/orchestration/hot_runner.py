@@ -223,14 +223,14 @@ class HotRunner:
                 asof_dt = _parse_hot_ts(asof)
             except (TypeError, ValueError):
                 asof_dt = None
-        if bars_batch and asof_dt is None:
+        if asof_dt is None:
             return {
                 "pipeline_state": self._sm.state.value,
                 "skipped": True,
-                "reason": "asof_required_for_bar_batch",
+                "reason": "asof_required",
                 "asof": asof,
                 "n_bars_consumed": 0,
-                "bar_errors": ["asof_required_for_bar_batch"],
+                "bar_errors": ["asof_required"],
             }
 
         # 1. on_bar 호출 (BarBuffer 저장, 경량)
@@ -292,6 +292,27 @@ class HotRunner:
                 "severity": "high",
                 "reason_code": "PPO_ALLOCATION_PLAN_INVALID",
                 "message": "allocation_plan.target_weights missing",
+            })
+            target_weights = {}
+        allocation_meta = allocation.get("metadata") if isinstance(allocation, dict) else {}
+        if not isinstance(allocation_meta, dict):
+            allocation_meta = {}
+        allocation_reason = str(
+            allocation_meta.get("reason") or allocation.get("reason", "")
+        )
+        allocation_status = str(allocation.get("status", "")).upper() if isinstance(allocation, dict) else ""
+        if (
+            allocation_reason == "ppo_policy_universe_mismatch"
+            or allocation_status == "BLOCKED"
+        ):
+            ppo_guard_warnings.append({
+                "agent": "PPOAllocator",
+                "severity": "high",
+                "reason_code": "PPO_POLICY_UNIVERSE_MISMATCH"
+                if allocation_reason == "ppo_policy_universe_mismatch"
+                else "PPO_ALLOCATION_BLOCKED",
+                "message": allocation_reason or "allocation blocked",
+                "details": allocation_meta,
             })
             target_weights = {}
         ppo_ms = self._profiler.end_stage("ppo", t_ppo)

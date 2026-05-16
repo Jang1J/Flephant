@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.pit_guard import assert_pit_safe
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_fast_cold")
 
@@ -118,6 +120,23 @@ class RiskAgentFast(AgentBase):
             result[key] = float(cold_cfg[key])
         return result
 
+    @staticmethod
+    def _event_trace(event: dict[str, Any]) -> dict[str, str]:
+        """Cold event trace를 PIT-safe publish payload용으로 정규화한다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        ticker = normalize_ticker(event.get("ticker") or payload.get("ticker"))
+        raw_scope = str(event.get("scope") or "").strip()
+        if raw_scope.startswith("ticker:"):
+            scoped_ticker = normalize_ticker(raw_scope.split(":", 1)[1])
+            scope = f"ticker:{scoped_ticker}" if scoped_ticker else "market"
+        elif raw_scope:
+            scope = raw_scope
+        elif ticker:
+            scope = f"ticker:{ticker}"
+        else:
+            scope = "market"
+        return {"ticker": ticker, "scope": scope}
+
     def evaluate(
         self,
         event: dict,
@@ -146,6 +165,11 @@ class RiskAgentFast(AgentBase):
         uncertainty_score: float | None = None
 
         event_type = event.get("event_type", "")
+        occurred_at = event.get("occurred_at")
+        asof = event.get("asof")
+        if occurred_at and asof:
+            assert_pit_safe(occurred_at, snapshot_ts=asof)
+        trace = self._event_trace(event)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # admit_candidate action rule 은 AdmissionEngine 담당. risk_fast 는 skip.
@@ -223,13 +247,11 @@ class RiskAgentFast(AgentBase):
                     "trigger": "news_comm_divergence_strong",
                     "uncertainty_score": uncertainty_score,
                     "confidence": uncertainty_score,
-                    "scope": event.get("scope") or (
-                        f"ticker:{event.get('ticker')}" if event.get("ticker") else "market"
-                    ),
+                    "scope": trace["scope"],
                     "event_id": event.get("event_id"),
-                    "ticker": event.get("ticker"),
-                    "occurred_at": event.get("occurred_at"),
-                    "asof": event.get("asof"),
+                    "ticker": trace["ticker"] or None,
+                    "occurred_at": occurred_at,
+                    "asof": asof,
                     "ts": datetime.now(_KST).isoformat(),
                     "reasoning": "뉴스-커뮤니티 방향 불일치로 불확실성 신호 발행",
                 },

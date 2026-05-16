@@ -276,9 +276,21 @@ def test_run_once_requires_asof_for_bar_batch(runner: HotRunner) -> None:
     result = runner.run_once(tickers=["005930"], bars_batch=[bar])
 
     assert result["skipped"] is True
-    assert result["reason"] == "asof_required_for_bar_batch"
+    assert result["reason"] == "asof_required"
     assert result["n_bars_consumed"] == 0
     assert runner._quant._bar_buffer.get_latest("005930") == []
+
+
+def test_run_once_requires_asof_even_without_bar_batch(runner: HotRunner) -> None:
+    """HOT_RUNNING 루프는 기존 buffer를 읽더라도 asof 없이는 열리지 않는다."""
+    runner.start()
+    _prime_buffer(runner, ["005930"], n=65)
+
+    result = runner.run_once(tickers=["005930"], bars_batch=[])
+
+    assert result["skipped"] is True
+    assert result["reason"] == "asof_required"
+    assert result["n_bars_consumed"] == 0
 
 
 def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
@@ -298,6 +310,34 @@ def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
 
     assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_ALLOCATION_PLAN_INVALID"
     assert result["final_decision"]["approved"] is False
+
+
+def test_run_once_vetoes_ppo_policy_universe_mismatch(runner: HotRunner) -> None:
+    """PPO 정책 universe mismatch는 빈 allocation을 정상 approve로 통과시키지 않는다."""
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers, n=65)
+    runner._ppo.allocate = lambda **_: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {}},
+        "status": "BLOCKED",
+        "metadata": {
+            "reason": "ppo_policy_universe_mismatch",
+            "policy_tickers": ["000660"],
+            "request_tickers": ["005930"],
+        },
+    }
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_POLICY_UNIVERSE_MISMATCH"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
 
 def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
@@ -437,6 +477,7 @@ def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
         bars_batch=[],
         latest_prices={"005930": 50000.0},
         risk_warnings=[{"ticker": "005930", "severity": "high", "reason": "fake"}],
+        asof="2026-04-20T10:05:00+09:00",
     )
     assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
     assert result["final_decision"]["approved"] is False
@@ -451,6 +492,7 @@ def test_latency_stats(runner: HotRunner) -> None:
             tickers=tickers,
             bars_batch=[],
             latest_prices={t: 50000.0 for t in tickers},
+            asof="2026-04-20T10:05:00+09:00",
         )
     stats = runner.latency_stats()
     assert stats["count"] == 3
