@@ -272,7 +272,7 @@ def test_slow_analyze_success() -> None:
     result = slow.analyze(_make_event())
     assert result is not None
     assert result["channel"] in {"risk_warning", "regime_change", "veto_recommendation"}
-    assert result["report_type"] in {"risk_warning", "regime_change", "veto_recommendation"}
+    assert result["report_type"] == "risk_warning"
     assert "payload" in result
 
 
@@ -358,6 +358,93 @@ def test_slow_analyze_llm_failure_fallback() -> None:
     result = slow.analyze(_make_event(), fast_eval=fast_eval)
     assert result is not None
     assert result["payload"]["stance"] == "risk_reduce"
+
+
+def test_slow_llm_failure_without_fast_eval_fails_closed() -> None:
+    """LLM 실패 + fast_eval 없음 → neutral/low로 열지 않고 risk_reduce로 닫는다."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=False,
+        model_used=None,
+        content="",
+        latency_ms=0.0,
+        error="timeout",
+    )
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=None)
+
+    result = slow.analyze(_make_event())
+
+    assert result is not None
+    assert result["channel"] == "risk_warning"
+    payload = result["payload"]
+    assert payload["stance"] == "risk_reduce"
+    assert payload["risk_level"] == "medium"
+    assert "Fast Rule 없음" in payload["narrative"]
+
+
+def test_slow_llm_failure_without_fast_eval_dart_vetoes() -> None:
+    """DART 이벤트는 fast_eval 없이 LLM이 실패하면 high/veto로 fail-closed."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=False,
+        model_used=None,
+        content="",
+        latency_ms=0.0,
+        error="timeout",
+    )
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-RISK-DART-FALLBACK"
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=pubsub)
+
+    result = slow.analyze(_make_event(event_type="dart"))
+
+    assert result is not None
+    assert result["channel"] == "veto_recommendation"
+    pubsub.publish.assert_called_once()
+    assert pubsub.publish.call_args.args[0] == "veto_recommendation"
+    payload = result["payload"]
+    assert payload["stance"] == "veto_recommendation"
+    assert payload["risk_level"] == "high"
+    assert payload["affected_tickers"] == ["005930"]
+
+
+@pytest.mark.parametrize(
+    "event_update,payload_update",
+    [
+        ({"priority": "urgent"}, {}),
+        ({"priority": "critical"}, {}),
+        ({"severity": "high"}, {}),
+        ({"critical": True}, {}),
+        ({}, {"priority": "urgent"}),
+        ({}, {"severity": "critical"}),
+        ({}, {"critical": "true"}),
+    ],
+)
+def test_slow_llm_failure_without_fast_eval_high_risk_markers_veto(
+    event_update: dict,
+    payload_update: dict,
+) -> None:
+    """fast_eval 없이 LLM이 실패하면 urgent/critical marker를 high/veto로 닫는다."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=False,
+        model_used=None,
+        content="",
+        latency_ms=0.0,
+        error="timeout",
+    )
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=None)
+    event = _make_event()
+    event.update(event_update)
+    event["payload"].update(payload_update)
+
+    result = slow.analyze(event)
+
+    assert result is not None
+    assert result["channel"] == "veto_recommendation"
+    payload = result["payload"]
+    assert payload["stance"] == "veto_recommendation"
+    assert payload["risk_level"] == "high"
 
 
 def test_slow_parse_string_bool_and_string_ticker() -> None:

@@ -340,13 +340,15 @@ class RiskAgentSlow(AgentBase):
         fast_eval: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """LLM 실패 시 fast_eval 기반 fallback 응답."""
-        stance = "neutral"
-        risk_level = "low"
-        regime_signal = False
         if fast_eval:
             stance = fast_eval.get("stance", "neutral")
             risk_level = fast_eval.get("risk_level", "low")
             regime_signal = self._safe_bool(fast_eval.get("regime_signal", False))
+            narrative = "[LLM 호출 실패. Fast Rule 결과 기반 fallback]"
+        else:
+            stance, risk_level, regime_signal, narrative = (
+                self._fallback_without_fast_eval(event)
+            )
         trace = self._event_trace(event)
         publish_channel = self._choose_publish_channel(
             {"stance": stance, "regime_signal": regime_signal}
@@ -360,7 +362,7 @@ class RiskAgentSlow(AgentBase):
                 "macro_note_ref": None,
                 "micro_note_ref": None,
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
-                "narrative": "[LLM 호출 실패. Fast Rule 결과 기반 fallback]",
+                "narrative": narrative,
                 "affected_tickers": [trace["ticker"]] if trace["ticker"] else [],
                 "regime_signal": regime_signal,
                 **trace,
@@ -369,6 +371,36 @@ class RiskAgentSlow(AgentBase):
         )
         self._publish_if_available(publish_channel, rpt)
         return rpt
+
+    def _fallback_without_fast_eval(
+        self,
+        event: dict[str, Any],
+    ) -> tuple[str, str, bool, str]:
+        """LLM과 Fast Rule이 모두 없으면 neutral/low로 열지 않는다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_type = str(event.get("event_type") or "").strip().lower()
+        priority = str(event.get("priority") or payload.get("priority") or "").strip().lower()
+        severity = str(event.get("severity") or payload.get("severity") or "").strip().lower()
+        is_critical = self._safe_bool(event.get("critical") or payload.get("critical"), default=False)
+        high_risk = (
+            event_type == "dart"
+            or priority in {"critical", "urgent"}
+            or severity in {"critical", "urgent", "high"}
+            or is_critical
+        )
+        if high_risk:
+            return (
+                "veto_recommendation",
+                "high",
+                False,
+                "[LLM 호출 실패 + Fast Rule 없음. 중요 이벤트는 fail-closed veto 처리]",
+            )
+        return (
+            "risk_reduce",
+            "medium",
+            False,
+            "[LLM 호출 실패 + Fast Rule 없음. 보수적 risk_reduce fallback]",
+        )
 
     def _publish_if_available(self, channel: str, message: dict[str, Any]) -> None:
         """Direct RiskSlow calls should also reach MessagePool when pubsub is injected."""

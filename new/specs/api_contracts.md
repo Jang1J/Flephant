@@ -465,6 +465,7 @@ sla:
           sla: "<50ms (비LLM 규칙 기반)"
         allowed_publish_channels:
           - risk_warning
+          - uncertainty_signal
         report_type: "risk_warning"
         thresholds_source: "risk_config.yaml risk_fast.cold_path (SSOT)"
         sign_convention: "foreign_net_sell_krw 음수 컨벤션 (순매도 = 음수)"
