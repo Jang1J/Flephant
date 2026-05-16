@@ -393,6 +393,39 @@ def test_slow_fallback_publishes_event_trace_to_pubsub() -> None:
     assert payload["asof"] == "2026-04-18T10:01:00+09:00"
     assert payload["ticker"] == "005930"
     assert payload["scope"] == "ticker:005930"
+
+
+def test_slow_fallback_preserves_fast_veto_channel() -> None:
+    """LLM 실패 fallback도 fast veto 성격을 channel에 반영한다."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=False,
+        model_used=None,
+        content="",
+        latency_ms=0.0,
+        error="timeout",
+    )
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-RISK-VETO"
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=pubsub)
+
+    result = slow.analyze(
+        _make_event(),
+        fast_eval={
+            "stance": "veto_recommendation",
+            "risk_level": "high",
+            "fast_rule_match": [{"rule_id": "foreign_net_sell_critical"}],
+            "triggered_rules": ["foreign_net_sell_critical"],
+        },
+    )
+
+    assert result is not None
+    assert result["channel"] == "veto_recommendation"
+    pubsub.publish.assert_called_once()
+    assert pubsub.publish.call_args.args[0] == "veto_recommendation"
+    payload = result["payload"]
+    assert payload["stance"] == "veto_recommendation"
+    assert payload["risk_level"] == "high"
     assert payload["affected_tickers"] == ["005930"]
 
 

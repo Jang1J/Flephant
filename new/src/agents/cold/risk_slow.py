@@ -338,10 +338,15 @@ class RiskAgentSlow(AgentBase):
         """LLM 실패 시 fast_eval 기반 fallback 응답."""
         stance = "neutral"
         risk_level = "low"
+        regime_signal = False
         if fast_eval:
             stance = fast_eval.get("stance", "neutral")
             risk_level = fast_eval.get("risk_level", "low")
+            regime_signal = self._safe_bool(fast_eval.get("regime_signal", False))
         trace = self._event_trace(event)
+        publish_channel = self._choose_publish_channel(
+            {"stance": stance, "regime_signal": regime_signal}
+        )
 
         rpt = self.report(
             "risk_warning",
@@ -353,10 +358,12 @@ class RiskAgentSlow(AgentBase):
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
                 "narrative": "[LLM 호출 실패. Fast Rule 결과 기반 fallback]",
                 "affected_tickers": [trace["ticker"]] if trace["ticker"] else [],
+                "regime_signal": regime_signal,
                 **trace,
             },
+            channel=publish_channel,
         )
-        self._publish_if_available(str(rpt.get("channel", "risk_warning")), rpt)
+        self._publish_if_available(publish_channel, rpt)
         return rpt
 
     def _publish_if_available(self, channel: str, message: dict[str, Any]) -> None:
