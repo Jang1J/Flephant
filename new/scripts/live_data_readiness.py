@@ -250,6 +250,12 @@ def _saved_file_summary(
         ticker_mismatch_counts: dict[str, int | None] = {}
         duplicate_ts_counts: dict[str, int | None] = {}
         out_of_hours_counts: dict[str, int | None] = {}
+        first_ts_by_date: dict[str, str | None] = {}
+        last_ts_by_date: dict[str, str | None] = {}
+        session_span_minutes_by_date: dict[str, float | None] = {}
+        session_span_ok_by_date: dict[str, bool | None] = {}
+        max_gap_minutes_by_date: dict[str, float | None] = {}
+        max_gap_ok_by_date: dict[str, bool | None] = {}
         duplicate_date_artifacts: dict[str, list[str]] = {}
         file_mtime_ns: dict[str, int] = {}
         if ticker_dir.exists():
@@ -269,7 +275,12 @@ def _saved_file_summary(
                 file_path = _preferred_bar_artifact(paths)
                 files.append(str(file_path))
                 relative_files.append(_repo_relative(file_path))
-                inspection = _inspect_bar_file(file_path, date_part, pad_ticker(ticker))
+                inspection = _inspect_bar_file(
+                    file_path,
+                    date_part,
+                    pad_ticker(ticker),
+                    min_rows_per_day=int(min_rows),
+                )
                 rows = inspection.get("rows")
                 row_counts[date_part] = rows
                 timestamp_dates_match[date_part] = inspection.get("timestamp_dates_match")
@@ -278,6 +289,12 @@ def _saved_file_summary(
                 ticker_mismatch_counts[date_part] = inspection.get("ticker_mismatch_count")
                 duplicate_ts_counts[date_part] = inspection.get("duplicate_ts_count")
                 out_of_hours_counts[date_part] = inspection.get("out_of_hours_count")
+                first_ts_by_date[date_part] = inspection.get("first_ts")
+                last_ts_by_date[date_part] = inspection.get("last_ts")
+                session_span_minutes_by_date[date_part] = inspection.get("session_span_minutes")
+                session_span_ok_by_date[date_part] = inspection.get("session_span_ok")
+                max_gap_minutes_by_date[date_part] = inspection.get("max_gap_minutes")
+                max_gap_ok_by_date[date_part] = inspection.get("max_gap_ok")
                 file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
                 valid_dates[date_part] = (
                     rows is not None and int(rows) >= int(min_rows)
@@ -285,6 +302,8 @@ def _saved_file_summary(
                     and inspection.get("ticker_matches") is True
                     and int(inspection.get("duplicate_ts_count") or 0) == 0
                     and int(inspection.get("out_of_hours_count") or 0) == 0
+                    and inspection.get("session_span_ok") is True
+                    and inspection.get("max_gap_ok") is True
                     and date_part not in duplicate_date_artifacts
                 )
         summary[pad_ticker(ticker)] = {
@@ -299,6 +318,12 @@ def _saved_file_summary(
             "ticker_mismatch_counts": ticker_mismatch_counts,
             "duplicate_ts_counts": duplicate_ts_counts,
             "out_of_hours_counts": out_of_hours_counts,
+            "first_ts": first_ts_by_date,
+            "last_ts": last_ts_by_date,
+            "session_span_minutes": session_span_minutes_by_date,
+            "session_span_ok": session_span_ok_by_date,
+            "max_gap_minutes": max_gap_minutes_by_date,
+            "max_gap_ok": max_gap_ok_by_date,
             "duplicate_date_artifacts": duplicate_date_artifacts,
             "file_mtime_ns": file_mtime_ns,
         }
@@ -331,6 +356,12 @@ def _artifact_date_quality(
             ticker_mismatch_counts = info.get("ticker_mismatch_counts", {})
             duplicate_ts_counts = info.get("duplicate_ts_counts", {})
             out_of_hours_counts = info.get("out_of_hours_counts", {})
+            first_ts = info.get("first_ts", {})
+            last_ts = info.get("last_ts", {})
+            session_span_minutes = info.get("session_span_minutes", {})
+            session_span_ok = info.get("session_span_ok", {})
+            max_gap_minutes = info.get("max_gap_minutes", {})
+            max_gap_ok = info.get("max_gap_ok", {})
             duplicate_date_artifacts = info.get("duplicate_date_artifacts", {})
             rows = row_counts.get(day)
             if valid_dates.get(day) is True:
@@ -345,6 +376,12 @@ def _artifact_date_quality(
                     "ticker_mismatch_count": ticker_mismatch_counts.get(day),
                     "duplicate_ts_count": duplicate_ts_counts.get(day),
                     "out_of_hours_count": out_of_hours_counts.get(day),
+                    "first_ts": first_ts.get(day),
+                    "last_ts": last_ts.get(day),
+                    "session_span_minutes": session_span_minutes.get(day),
+                    "session_span_ok": session_span_ok.get(day),
+                    "max_gap_minutes": max_gap_minutes.get(day),
+                    "max_gap_ok": max_gap_ok.get(day),
                     "duplicate_date_artifacts": duplicate_date_artifacts.get(day, []),
                     "valid_date": valid_dates.get(day, False),
                 })
@@ -409,7 +446,12 @@ def _parse_bar_timestamp(row: dict[str, Any]) -> datetime | None:
     return None
 
 
-def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, Any]:
+def _inspect_bar_file(
+    file_path: Path,
+    yyyymmdd: str,
+    ticker: str,
+    min_rows_per_day: int | None = None,
+) -> dict[str, Any]:
     """Inspect one saved bar artifact for date/ticker/timestamp integrity."""
     expected_date = date(
         int(yyyymmdd[:4]),
@@ -427,6 +469,12 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
             "ticker_mismatch_count": None,
             "duplicate_ts_count": None,
             "out_of_hours_count": None,
+            "first_ts": None,
+            "last_ts": None,
+            "session_span_minutes": None,
+            "session_span_ok": None,
+            "max_gap_minutes": None,
+            "max_gap_ok": None,
         }
     if rows is None:
         return {
@@ -437,6 +485,12 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
             "ticker_mismatch_count": None,
             "duplicate_ts_count": None,
             "out_of_hours_count": None,
+            "first_ts": None,
+            "last_ts": None,
+            "session_span_minutes": None,
+            "session_span_ok": None,
+            "max_gap_minutes": None,
+            "max_gap_ok": None,
         }
 
     timestamps = [_parse_bar_timestamp(row) for row in rows]
@@ -468,6 +522,37 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
         for ts in present_timestamps
         if ts.time() < market_open or ts.time() > market_close
     )
+    sorted_timestamps = sorted(present_timestamps)
+    first_ts = sorted_timestamps[0] if sorted_timestamps else None
+    last_ts = sorted_timestamps[-1] if sorted_timestamps else None
+    session_span_minutes = (
+        (last_ts - first_ts).total_seconds() / 60.0
+        if first_ts is not None and last_ts is not None
+        else None
+    )
+    gap_minutes = [
+        (right - left).total_seconds() / 60.0
+        for left, right in zip(sorted_timestamps, sorted_timestamps[1:])
+    ]
+    max_gap_minutes = max(gap_minutes) if gap_minutes else (0.0 if sorted_timestamps else None)
+    readiness_cfg = _readiness_cfg()
+    min_session_span = float(
+        readiness_cfg.get(
+            "min_session_span_minutes",
+            min_rows_per_day or _readiness_min_rows("min_rows_per_day"),
+        )
+    )
+    max_allowed_gap = float(readiness_cfg.get("max_bar_gap_minutes", 5))
+    session_span_ok = (
+        timestamp_dates_match is True
+        and session_span_minutes is not None
+        and session_span_minutes >= min_session_span
+    )
+    max_gap_ok = (
+        timestamp_dates_match is True
+        and max_gap_minutes is not None
+        and max_gap_minutes <= max_allowed_gap
+    )
     return {
         "rows": len(rows),
         "timestamp_dates_match": timestamp_dates_match,
@@ -476,6 +561,12 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
         "ticker_mismatch_count": ticker_mismatch_count,
         "duplicate_ts_count": duplicate_ts_count,
         "out_of_hours_count": out_of_hours_count,
+        "first_ts": first_ts.isoformat() if first_ts else None,
+        "last_ts": last_ts.isoformat() if last_ts else None,
+        "session_span_minutes": session_span_minutes,
+        "session_span_ok": session_span_ok,
+        "max_gap_minutes": max_gap_minutes,
+        "max_gap_ok": max_gap_ok,
     }
 
 

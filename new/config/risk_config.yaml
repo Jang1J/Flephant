@@ -803,6 +803,8 @@ walk_forward:
 live_data_readiness:
   min_rows_per_day: 300             # KIS virtual 과거 분봉은 일부 종목 381 rows도 정상으로 허용
   train_min_rows_per_day: 300       # LightGBM real artifact 날짜 인정 최소 row 수
+  min_session_span_minutes: 300      # 오전장 일부만 있는 300-row artifact를 학습 가능 날짜에서 제외
+  max_bar_gap_minutes: 5             # 중간 구간 누락/큰 timestamp jump artifact 차단
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
   max_consecutive_backfill_failed_dates: 3

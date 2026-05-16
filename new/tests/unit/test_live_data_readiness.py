@@ -102,6 +102,41 @@ def _write_jsonl_constant_ts(
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _write_jsonl_day_with_gap(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    rows: int,
+    gap_after: int,
+    gap_minutes: int,
+) -> None:
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    with out.open("w", encoding="utf-8") as fh:
+        for i in range(rows):
+            extra_gap = gap_minutes if i > gap_after else 0
+            ts = start + timedelta(minutes=i + extra_gap)
+            rec = {
+                "ticker": ticker,
+                "ts_close": ts.isoformat(),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
 def _write_parquet_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> None:
     import pandas as pd
 
@@ -298,6 +333,59 @@ def test_artifact_date_quality_rejects_partial_missing_ticker(monkeypatch, tmp_p
     assert first["ticker"] == "005930"
     assert first["ticker_matches"] is False
     assert first["ticker_mismatch_count"] == 1
+
+
+def test_artifact_date_quality_rejects_morning_only_session_span(monkeypatch, tmp_path):
+    """row 수만 맞춘 오전장 일부 artifact는 session span 부족으로 FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 300)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["session_span_ok"] is False
+    assert first["session_span_minutes"] == 299.0
+    assert first["max_gap_ok"] is True
+
+
+def test_artifact_date_quality_rejects_large_intraday_gap(monkeypatch, tmp_path):
+    """row/date/ticker가 맞아도 중간 timestamp gap이 크면 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=301,
+        gap_after=150,
+        gap_minutes=20,
+    )
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["session_span_ok"] is True
+    assert first["max_gap_ok"] is False
+    assert first["max_gap_minutes"] == 21.0
 
 
 def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
