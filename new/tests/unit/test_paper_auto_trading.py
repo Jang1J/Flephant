@@ -420,6 +420,29 @@ def test_paper_auto_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
     assert client.orders == []
 
 
+def test_paper_auto_rejects_fractional_qty_without_truncation(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty="1.9"),  # type: ignore[arg-type]
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_guard"]["status"] == "FAIL"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
+    assert client.orders == []
+
+
 def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:
     trader = PaperAutoTrader(
         kis_client=FakeRealKIS(),

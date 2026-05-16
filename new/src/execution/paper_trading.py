@@ -23,7 +23,7 @@ from src.ops.safety_guards import SafetyGuards
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_int, safe_lossless_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_trading")
@@ -267,7 +267,7 @@ class PaperTradingRunner:
             }
         if side_norm not in {"buy", "sell"}:
             return {"status": "FAIL", "reason": "side_must_be_buy_or_sell"}
-        qty_int = safe_int(qty, default=0)
+        qty_int = safe_lossless_int(qty, default=0)
         if qty_int <= 0 or qty_int > self._max_probe_order_qty:
             return {
                 "status": "FAIL",
@@ -305,7 +305,7 @@ class PaperTradingRunner:
             "order_deltas": [{
                 "ticker": pad_ticker(str(ticker)),
                 "side": str(side).lower(),
-                "qty": safe_int(qty, default=0),
+                "qty": safe_lossless_int(qty, default=0),
                 "price": safe_float(price, default=0.0),
                 "order_type": str(order_type or "00"),
                 "reason": "paper_trading_probe",

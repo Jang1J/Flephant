@@ -494,6 +494,79 @@ def test_broker_evidence_treats_string_false_external_flag_as_false(
     assert evidence["external_kis_api"] is False
 
 
+def test_service_status_blocks_paper_trading_only_even_if_history_pass(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    monkeypatch.setattr(
+        service_readiness_status,
+        "_service_policy_gate_pass",
+        lambda backtest, bundle_id, **kwargs: True,
+    )
+    _write_json(
+        tmp_path / "artifacts/lgbm/registry.json",
+        {"active_version": None, "versions": []},
+    )
+    _write_json(
+        tmp_path / "artifacts/lgbm_paper/registry.json",
+        {"active_version": "paper-v1", "versions": [{"version": "paper-v1"}]},
+    )
+    _write_json(
+        tmp_path / f"artifacts/reports/backtest/backtest_{bundle_id}_20260514.json",
+        {
+            "bundle_id": bundle_id,
+            "verdict": "pass",
+            "regression_risk": {"flagged": False, "severity": "low"},
+            "minute_bar_leakage_check": {"verdict": "pass"},
+            "feature_quality": {
+                "dual_source_rows": 10,
+                "dual_source_non_neutral_rows": 10,
+                "exogenous_rows": 10,
+                "exogenous_non_neutral_rows": 10,
+            },
+            "service_policy_replay": {"status": "PASS"},
+            "candidate_model_metadata": _final_dataset_metadata(),
+        },
+    )
+    _write_json(
+        tmp_path
+        / "artifacts/reports/paper_trading/paper_trading_balance_reconciliation_20260514.json",
+        {
+            "status": "PASS",
+            "runtime": {"kis_mode": "virtual"},
+            "stages": {"balance": {"status": "PASS", "_mode": "virtual"}},
+        },
+    )
+    _write_json(
+        tmp_path
+        / "artifacts/reports/paper_trading/paper_trading_submit_probe_order_20260514.json",
+        {
+            "status": "PASS",
+            "runtime": {"kis_mode": "virtual"},
+            "stages": {
+                "execution": {"status": "PASS"},
+                "order_history": {
+                    "status": "PASS",
+                    "matched_order_count": 1,
+                    "_mode": "virtual",
+                },
+            },
+        },
+    )
+
+    payload = service_readiness_status.build_service_status(
+        bundle_id=bundle_id,
+        root=tmp_path,
+    )
+
+    assert payload["status"] == "PARTIAL"
+    assert payload["deploy_quality"] == "PASS"
+    assert payload["broker_evidence"] == "BLOCKED"
+    assert payload["kis_broker_evidence"]["blocker"] == "paper_auto_bundle_evidence_missing"
+    assert payload["kis_broker_evidence"]["paper_trading_evidence"]["order_history"]["status"] == "PASS"
+
+
 def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
     tmp_path: Path,
 ) -> None:

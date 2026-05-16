@@ -563,7 +563,14 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_*.json",
     )
     if not reports:
-        return paper_trading
+        state = dict(paper_trading)
+        if state.get("status") == "PASS":
+            state["status"] = "BLOCKED"
+        state["blocker"] = "paper_auto_bundle_evidence_missing"
+        state["bundle_match"] = False
+        state["bundle_ids"] = []
+        state["paper_auto_cycle_history_matched"] = False
+        return state
 
     latest_external_state: dict[str, Any] | None = None
     for path, data in reports:
@@ -603,11 +610,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     if latest_external_state is not None:
         return latest_external_state
 
-    # Internal fake rehearsals are useful smoke artifacts, but they must not mask
-    # older external KIS paper evidence or downgrade broker readiness by recency.
-    if paper_trading.get("status") == "PASS":
-        return paper_trading
-
+    # Internal fake rehearsals and manual paper probes are useful smoke artifacts,
+    # but final broker readiness requires external paper-auto evidence for this
+    # bundle plus matched order-history proof.
     path, data = reports[0]
     external = safe_bool(data.get("external_kis_api"), default=False)
     stage_statuses = _broker_stage_statuses(data)

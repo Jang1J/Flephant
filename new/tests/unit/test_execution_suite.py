@@ -446,7 +446,18 @@ def _live_approval_proof(**overrides) -> dict:
     proof = {
         "prelive_gate": "PASS",
         "deploy_quality": "PASS",
-        "broker_evidence": "PASS",
+        "broker_evidence": {
+            "status": "PASS",
+            "external_kis_api": True,
+            "bundle_match": True,
+            "paper_auto_cycle_history_matched": True,
+            "stage_statuses": {
+                "paper_auto_cycle": "PASS",
+                "balance_reconciliation": "PASS",
+                "probe_order": "PASS",
+                "order_history_requery": "PASS",
+            },
+        },
         "production_registry": {"active_version": "MODEL-LIVE-1"},
         "live_trading_allowed": True,
     }
@@ -568,6 +579,124 @@ def test_execute_live_with_complete_approval_proof_submits(
     assert report["execution_mode"] == "live"
     assert report["fills"][0]["broker_order_id"] == "OD-LIVE"
     assert client.calls == [("005930", "buy", 1, 70000.0)]
+
+
+def test_execute_live_rejects_bare_string_broker_evidence_pass(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("bare string broker_evidence must not submit")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(broker_evidence="PASS"),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "broker_evidence" in result["execution_report"]["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_rejects_unmatched_broker_evidence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("unmatched broker_evidence must not submit")
+
+    proof = _live_approval_proof()
+    proof["broker_evidence"] = {
+        **proof["broker_evidence"],
+        "bundle_match": False,
+    }
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=proof,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "broker_evidence" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_rejects_fractional_qty_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PaperKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("fractional qty must not be truncated and submitted")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PaperKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": "1.9", "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_deltas" in result["execution_report"]["rejection_reason"]
+
+
+def test_rejected_execution_does_not_emit_success_audit(tmp_path: Path) -> None:
+    audit = AuditLogger(log_path=tmp_path / "exec.jsonl")
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=audit,
+    )
+    fd = _final_decision(
+        approved=False,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    gw.execute(fd)
+
+    records = audit.read_recent(n=10)
+    assert [record["event_type"] for record in records] == ["execution_rejected"]
 
 
 def test_execute_broker_partial_fill_reports_rejections(monkeypatch, tmp_path: Path) -> None:

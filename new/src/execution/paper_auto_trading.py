@@ -18,7 +18,7 @@ from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_int, safe_lossless_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_auto_trading")
@@ -363,7 +363,7 @@ class PaperAutoTrader:
                 continue
             ticker = pad_ticker(str(od.get("ticker", "")))
             side = str(od.get("side", "")).lower()
-            qty = safe_int(od.get("qty", 0), default=0)
+            qty = safe_lossless_int(od.get("qty", 0), default=0)
             order_type = str(od.get("order_type", "00") or "00")
             price = safe_float(od.get("price", 0.0), default=0.0)
             if ticker == "000000" or not is_valid_ticker(ticker):

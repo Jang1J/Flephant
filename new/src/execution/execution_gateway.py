@@ -24,7 +24,7 @@ from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_order_plan_id
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_lossless_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("execution_gateway")
@@ -202,8 +202,10 @@ class ExecutionGateway:
                 f"invalid execution_mode={self._mode}"
             )
 
-        # 4. Audit log
-        self._audit("execution_success", report)
+        # 4. Audit log. Rejected reports already emit execution_rejected in _rejected().
+        status = (report.get("execution_report") or {}).get("status")
+        if status != "rejected":
+            self._audit("execution_success", report)
 
         return report
 
@@ -233,7 +235,7 @@ class ExecutionGateway:
 
         for od in order_deltas:
             fill_price = safe_float(od.get("price", 0.0), default=0.0)
-            qty = safe_int(od.get("qty", 0), default=0)
+            qty = safe_lossless_int(od.get("qty", 0), default=0)
 
             # snapshot_vwap: yaml slippage_bps 기반 noise
             vwap_noise = random.uniform(-slippage_noise, slippage_noise)
@@ -259,7 +261,7 @@ class ExecutionGateway:
 
         # portfolio-level realized_slippage: 비용 가중 평균
         total_cost = sum(
-            safe_int(od.get("qty", 0), default=0)
+            safe_lossless_int(od.get("qty", 0), default=0)
             * safe_float(od.get("price", 0.0), default=0.0)
             for od in order_deltas
         )
@@ -339,13 +341,40 @@ class ExecutionGateway:
             )
         return str(value or "").strip().upper() == "PASS"
 
+    @staticmethod
+    def _broker_evidence_is_live_approved(value: Any) -> bool:
+        """실계좌 proof는 문자열 PASS가 아니라 외부 KIS order-history 증거여야 한다."""
+        if not isinstance(value, dict):
+            return False
+        stage_statuses = value.get("stage_statuses")
+        if not isinstance(stage_statuses, dict):
+            stage_statuses = {}
+        required_stages = (
+            "paper_auto_cycle",
+            "balance_reconciliation",
+            "probe_order",
+            "order_history_requery",
+        )
+        return (
+            ExecutionGateway._proof_status_is_pass(value)
+            and safe_bool(value.get("external_kis_api"), default=False)
+            and safe_bool(value.get("bundle_match"), default=False)
+            and safe_bool(value.get("paper_auto_cycle_history_matched"), default=False)
+            and all(str(stage_statuses.get(stage, "")).upper() == "PASS" for stage in required_stages)
+        )
+
     def _live_approval_rejection(self) -> str | None:
         """실계좌 주문은 C10 경계에서도 명시 proof 없으면 fail-closed."""
         proof = self._live_approval_proof
         missing: list[str] = []
-        for field in ("prelive_gate", "deploy_quality", "broker_evidence"):
+        for field in ("prelive_gate", "deploy_quality"):
             if not self._proof_status_is_pass(proof.get(field)):
                 missing.append(field)
+        broker_evidence = proof.get("broker_evidence")
+        if not isinstance(broker_evidence, dict):
+            broker_evidence = proof.get("kis_broker_evidence")
+        if not self._broker_evidence_is_live_approved(broker_evidence):
+            missing.append("broker_evidence")
 
         registry = proof.get("production_registry")
         active_version = ""
@@ -400,7 +429,7 @@ class ExecutionGateway:
         for od in order_deltas:
             ticker = str(od.get("ticker", ""))
             side = str(od.get("side", "")).lower()
-            qty = safe_int(od.get("qty", 0), default=0)
+            qty = safe_lossless_int(od.get("qty", 0), default=0)
             price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
 
@@ -525,7 +554,7 @@ class ExecutionGateway:
                 continue
             ticker = pad_ticker(str(od.get("ticker", "")))
             side = str(od.get("side", "")).lower()
-            qty = safe_int(od.get("qty", 0), default=0)
+            qty = safe_lossless_int(od.get("qty", 0), default=0)
             price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
             if not ExecutionGateway._valid_order_delta(ticker, side, qty, price, order_type):

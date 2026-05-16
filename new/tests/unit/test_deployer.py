@@ -751,3 +751,46 @@ def test_service_policy_gate_uses_relative_fallback_when_absolute_path_stale(tmp
     evidence["report_path_relative"] = relative_path
 
     deployer._check_service_policy_gate(evidence, bundle_id=_BUNDLE_ID)
+
+
+def test_deploy_blocks_existing_lgbm_version_with_different_model(tmp_path):
+    """Candidate version collision must fail before active/latest can point at old pkl."""
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
+
+    _prepare_candidate_bundle(tmp_path)
+    candidate_meta_path = (
+        tmp_path / "bundles" / _BUNDLE_ID / "lgbm" / "latest_model_metadata.json"
+    )
+    candidate_meta = json.loads(candidate_meta_path.read_text(encoding="utf-8"))
+    candidate_meta["version"] = "v2"
+    candidate_meta_path.write_text(
+        json.dumps(candidate_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _prepare_live_artifacts(tmp_path)
+    (tmp_path / "lgbm" / "v2.pkl").write_bytes(b"OLD_PRODUCTION_MODEL")
+    (tmp_path / "lgbm" / "v2_metadata.json").write_text(
+        json.dumps(
+            {
+                **_candidate_lgbm_metadata(bundle_id="OLD-BUNDLE"),
+                "version": "v2",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    deployer = _make_deployer(tmp_path)
+    with _mode_b_env():
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id=_BUNDLE_ID,
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=False),
+            )
+
+    assert exc_info.value.reason == "lgbm_version_collision"
+    assert (tmp_path / "lgbm" / "v2.pkl").read_bytes() == b"OLD_PRODUCTION_MODEL"
+    assert not (tmp_path / "lgbm" / "registry.json").exists()

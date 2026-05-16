@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +244,7 @@ class ModeBDeployer:
 
         # ── 4. Atomic swap ────────────────────────────────────────────
         self._validate_candidate_bundle(bundle_id)
+        self._check_lgbm_version_collision(bundle_id)
         previous_active_version = self._current_lgbm_active_version()
         backup_dir = self._root / "backup" / deploy_id
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -537,6 +539,71 @@ class ModeBDeployer:
         except Exception as e:
             logger.warning("[ModeBDeployer] registry active_version 읽기 실패: %s", e)
             return None
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _check_lgbm_version_collision(self, bundle_id: str) -> None:
+        """기존 production version이 다른 bundle/model이면 fail-closed."""
+        bundle_root = self._bundle_root(bundle_id)
+        metadata_path = bundle_root / "lgbm" / "latest_model_metadata.json"
+        with metadata_path.open("r", encoding="utf-8") as fh:
+            metadata = json.load(fh)
+        version = str(metadata.get("version", "")).strip()
+        if not version:
+            return
+
+        live_lgbm_dir = self._root / "lgbm"
+        version_pkl = live_lgbm_dir / f"{version}.pkl"
+        version_meta = live_lgbm_dir / f"{version}_metadata.json"
+        if not version_pkl.exists():
+            return
+
+        candidate_pkl = bundle_root / "lgbm" / "latest_model.pkl"
+        if not candidate_pkl.is_file():
+            return
+
+        if self._sha256_file(version_pkl) != self._sha256_file(candidate_pkl):
+            raise DeployBlocked(
+                "lgbm_version_collision",
+                (
+                    f"bundle_id={bundle_id} version={version} already exists "
+                    "with different model bytes"
+                ),
+            )
+
+        if not version_meta.is_file():
+            raise DeployBlocked(
+                "lgbm_version_collision",
+                (
+                    f"bundle_id={bundle_id} version={version} already exists "
+                    "without metadata"
+                ),
+            )
+
+        try:
+            with version_meta.open("r", encoding="utf-8") as fh:
+                live_metadata = json.load(fh)
+        except json.JSONDecodeError as e:
+            raise DeployBlocked(
+                "lgbm_version_collision",
+                f"bundle_id={bundle_id} version={version} metadata invalid_json:{e}",
+            ) from e
+
+        live_bundle_id = live_metadata.get("bundle_id")
+        if live_bundle_id and live_bundle_id != bundle_id:
+            raise DeployBlocked(
+                "lgbm_version_collision",
+                (
+                    f"bundle_id={bundle_id} version={version} already belongs "
+                    f"to bundle_id={live_bundle_id!r}"
+                ),
+            )
 
     def _activate_lgbm_registry(self, bundle_id: str) -> str:
         metadata_path = self._bundle_root(bundle_id) / "lgbm" / "latest_model_metadata.json"
