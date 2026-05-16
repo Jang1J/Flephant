@@ -15,6 +15,11 @@ import json
 import re
 
 
+def _reject_nonfinite_json_constant(value: str) -> None:
+    """Reject JSON NaN/Infinity tokens from permissive Python json parser."""
+    raise ValueError(f"LLM_JSON_NONFINITE_CONSTANT:{value}")
+
+
 def parse_llm_json(content: str) -> dict:
     """LLM 응답에서 markdown fence를 제거하고 JSON을 파싱한다.
 
@@ -32,7 +37,7 @@ def parse_llm_json(content: str) -> dict:
         ValueError: JSON은 유효하지만 object가 아닐 때.
     """
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
-    parsed = json.loads(cleaned)
+    parsed = json.loads(cleaned, parse_constant=_reject_nonfinite_json_constant)
     if not isinstance(parsed, dict):
         raise ValueError("LLM_JSON_NOT_OBJECT")
     return parsed

@@ -698,7 +698,9 @@ class FDAAgent(AgentBase):
             parsed = parse_llm_json(content)
             if not isinstance(parsed, dict):
                 raise TypeError(f"LLM JSON root must be object. got={type(parsed)}")
-            approved = self._safe_bool(parsed.get("approved"), default=False)
+            approved = self._safe_bool(parsed.get("approved"), default=None)
+            if approved is None:
+                raise ValueError("LLM approved must be bool-like finite true/false")
             rc = str(parsed.get("reason_code", "")).strip()
             if rc not in self._valid_reason_codes:
                 logger.warning(
@@ -711,6 +713,12 @@ class FDAAgent(AgentBase):
                     "veto_reason": "Cold Path LLM reason_code 오류. FDA fail-closed.",
                     "confidence": parsed.get("confidence"),
                 }
+            if approved is True and rc != "NORMAL_APPROVE":
+                raise ValueError(
+                    f"LLM approved=true inconsistent with reason_code={rc}"
+                )
+            if approved is False and rc == "NORMAL_APPROVE":
+                raise ValueError("LLM veto inconsistent with NORMAL_APPROVE")
             return {
                 "approved": approved,
                 "reason_code": rc,
@@ -726,14 +734,19 @@ class FDAAgent(AgentBase):
             }
 
     @staticmethod
-    def _safe_bool(value: Any, default: bool = True) -> bool:
+    def _safe_bool(value: Any, default: bool | None = True) -> bool | None:
         """LLM bool-like 값을 문자열까지 안전하게 해석한다."""
         if isinstance(value, bool):
             return value
         if value is None:
             return default
         if isinstance(value, (int, float)):
-            return bool(value)
+            as_float = float(value)
+            if not math.isfinite(as_float):
+                return default
+            if as_float in (0.0, 1.0):
+                return bool(int(as_float))
+            return default
         if isinstance(value, str):
             normalized = value.strip().lower()
             if normalized in {"true", "yes", "y", "1", "approve", "approved", "승인"}:

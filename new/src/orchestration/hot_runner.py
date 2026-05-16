@@ -36,6 +36,7 @@ from src.ops.profiler import HotPathProfiler
 from src.ops.state_machine import PipelineState, StateMachine
 from src.portfolio.portfolio_manager import PortfolioManager
 from src.utils.config_loader import load as config_load
+from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
 
 logger = get_logger("hot_runner")
@@ -571,13 +572,24 @@ class HotRunner:
         self._latency_records.append(elapsed_ms)
         reason = f"{stage}_exception: {type(error).__name__}: {error}"
         final_decision = {
-            "decision_id": "",
+            "decision_id": generate_decision_id(),
             "approved": False,
             "target_weights": {},
             "order_deltas": [],
             "veto_reason": reason,
             "reason_code": "TIMEOUT",
+            "risk_overrides": [
+                {
+                    "rule": f"{stage}_stage",
+                    "original": "complete",
+                    "override": "fail_closed",
+                    "justification": reason,
+                }
+            ],
             "confidence": 0.0,
+            "expiry": datetime.now(tz=timezone.utc).isoformat(),
+            "portfolio_patch_ref": "",
+            "active_reports": [],
         }
         logger.exception("[hot_runner] %s stage fail-closed: %s", stage, error)
         return {

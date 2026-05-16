@@ -499,6 +499,32 @@ def test_fda_cold_llm_string_false_vetoes() -> None:
     assert fd["reason_code"] == "NEWS_DIVERGENCE"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"approved": NaN, "reason_code": "NORMAL_APPROVE", "confidence": 0.6}',
+        '{"approved": 2, "reason_code": "NORMAL_APPROVE", "confidence": 0.6}',
+        '{"approved": false, "reason_code": "NORMAL_APPROVE", "confidence": 0.6}',
+        '{"approved": true, "reason_code": "RISK_FAST_TRIGGER", "confidence": 0.6}',
+    ],
+)
+def test_fda_cold_llm_malformed_bool_or_reason_fails_closed(content: str) -> None:
+    """LLM bool/reason_code 불일치는 approve로 승격하지 않고 fail-closed."""
+    fda = FDAAgent(llm_router=_make_router(content))
+    result = fda.decide(
+        portfolio_patch_ref="PP-20260426-BADBOOL",
+        target_weights={"005930": 0.05},
+        mode="cold",
+        risk_warnings=[],
+        agent_signals=[],
+        debate_result={"conflict_detected": False},
+    )
+
+    fd = _fd(result)
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+
+
 def test_fda_cold_llm_json_array_fails_closed_without_crash() -> None:
     """JSON array 응답은 crash 없이 NEWS_DIVERGENCE veto로 닫힌다."""
     fda = FDAAgent(llm_router=_make_router("[]"))

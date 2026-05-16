@@ -325,8 +325,23 @@ def test_run_once_malformed_numeric_bar_fails_closed(runner: HotRunner) -> None:
 
     assert result["status"] == "FAIL"
     assert result["failure_stage"] == "quant"
-    assert result["final_decision"]["approved"] is False
-    assert result["final_decision"]["reason_code"] == "TIMEOUT"
+    fd = result["final_decision"]
+    assert set(fd) == {
+        "decision_id",
+        "approved",
+        "target_weights",
+        "order_deltas",
+        "veto_reason",
+        "reason_code",
+        "risk_overrides",
+        "confidence",
+        "expiry",
+        "portfolio_patch_ref",
+        "active_reports",
+    }
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert fd["risk_overrides"][0]["override"] == "fail_closed"
 
 
 def test_run_once_requires_asof_for_bar_batch(runner: HotRunner) -> None:
