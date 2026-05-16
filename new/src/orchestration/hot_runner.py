@@ -19,6 +19,7 @@ S4-8 부트스트랩 메모리 복원:
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -139,6 +140,39 @@ class HotRunner:
             "[hot_runner] 초기화. 상태=%s, quant_model=%s, sla_ms=%.1f",
             self._sm.state.value, self._quant.has_model, self._sla_ms,
         )
+
+    def _risk_fast_sla_ms(self) -> float:
+        """RiskFast sidecar deadline. 비정상 설정은 fail-closed 기본 50ms."""
+        try:
+            sla_ms = float(getattr(self._risk_fast, "_sla_ms", 50.0))
+        except (TypeError, ValueError):
+            return 50.0
+        return max(1.0, sla_ms)
+
+    def _evaluate_risk_fast_with_deadline(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        ts: datetime,
+    ) -> dict[str, Any]:
+        """RiskFast sidecar를 bounded 실행한다.
+
+        ThreadPoolExecutor를 호출마다 닫되 wait=False로 반환해 Hot Path 루프가
+        sidecar 지연에 묶이지 않게 한다. timeout은 FDA fail-closed 입력으로 전환된다.
+        """
+        sla_ms = self._risk_fast_sla_ms()
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="risk_fast_sidecar",
+        )
+        future = executor.submit(self._risk_fast.evaluate, snapshot=snapshot, ts=ts)
+        try:
+            return future.result(timeout=sla_ms / 1000.0)
+        except FuturesTimeoutError as e:
+            future.cancel()
+            raise TimeoutError(f"risk_fast_sidecar_timeout>{sla_ms:.0f}ms") from e
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # ================================================================== #
     # Lifecycle
@@ -412,7 +446,7 @@ class HotRunner:
 
         t_rf = self._profiler.start_stage("risk_fast")
         try:
-            risk_eval = self._risk_fast.evaluate(
+            risk_eval = self._evaluate_risk_fast_with_deadline(
                 snapshot={
                     "ranking": quant_output.get("scores", {}),
                     "portfolio_patch": portfolio_patch,

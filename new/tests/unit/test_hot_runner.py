@@ -5,6 +5,8 @@ Integration test: QuantAgent + PPOAllocator + PortfolioManager + FDAAgent 전체
 from __future__ import annotations
 
 
+import time
+
 import numpy as np
 import pytest
 
@@ -350,6 +352,54 @@ def test_run_once_risk_fast_exception_degrades_nonblocking(
     assert result["risk_eval"]["status"] == "DISABLED"
     assert result["risk_eval"]["risk_level"] == "high"
     assert result["risk_eval"]["recommended_action"] == "halt"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_run_once_risk_fast_timeout_degrades_nonblocking(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar timeout도 Hot Path 루프를 오래 붙잡지 않고 fail-closed."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+    runner._risk_fast._sla_ms = 5.0
+
+    def slow_evaluate(snapshot, ts):
+        time.sleep(0.2)
+        return {
+            "risk_level": "low",
+            "severity": "low",
+            "fast_rule_match": None,
+            "triggered_rules": [],
+            "affected_tickers": [],
+            "recommended_action": "pass",
+            "stance": "neutral",
+            "rationale": "too late",
+            "latency_ms": 200.0,
+        }
+
+    runner._risk_fast.evaluate = slow_evaluate  # type: ignore[method-assign]
+
+    start = time.perf_counter()
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
+    )
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    assert elapsed_ms < 120.0
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result.get("failure_stage") != "risk_fast"
+    assert result["risk_eval"]["enabled"] is False
+    assert result["risk_eval"]["status"] == "DISABLED"
+    assert result["risk_eval"]["error_type"] == "TimeoutError"
+    assert "risk_fast_sidecar_timeout" in result["risk_eval"]["rationale"]
     assert result["final_decision"]["approved"] is False
     assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
