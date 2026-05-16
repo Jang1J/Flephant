@@ -407,6 +407,35 @@ def test_artifact_date_quality_rejects_large_intraday_gap(monkeypatch, tmp_path)
     assert first["max_gap_minutes"] == 21.0
 
 
+def test_artifact_date_quality_allows_closing_auction_gap(monkeypatch, tmp_path):
+    """KIS 1분봉의 15:19→15:30 closing auction gap은 정상 artifact로 인정한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=381,
+        gap_after=379,
+        gap_minutes=10,
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is True
+    summary = readiness._saved_file_summary(["005930"], "20260508", "20260508", 300)
+    assert summary["005930"]["valid_dates"]["20260508"] is True
+    assert summary["005930"]["max_gap_minutes"]["20260508"] == 11.0
+    assert summary["005930"]["unexpected_max_gap_minutes"]["20260508"] == 0.0
+    assert summary["005930"]["allowed_closing_auction_gap_counts"]["20260508"] == 1
+
+
 def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
     """row 수만 맞춘 중복 timestamp artifact는 학습 가능 날짜가 아니다."""
     readiness = _load_script_module()

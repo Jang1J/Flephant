@@ -16,7 +16,7 @@ import json
 import math
 import os
 import sys
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -257,6 +257,8 @@ def _saved_file_summary(
         session_span_ok_by_date: dict[str, bool | None] = {}
         max_gap_minutes_by_date: dict[str, float | None] = {}
         max_gap_ok_by_date: dict[str, bool | None] = {}
+        unexpected_max_gap_minutes_by_date: dict[str, float | None] = {}
+        allowed_closing_auction_gap_counts: dict[str, int | None] = {}
         missing_ohlcv_counts: dict[str, int | None] = {}
         non_finite_ohlcv_counts: dict[str, int | None] = {}
         invalid_ohlcv_counts: dict[str, int | None] = {}
@@ -299,6 +301,12 @@ def _saved_file_summary(
                 session_span_ok_by_date[date_part] = inspection.get("session_span_ok")
                 max_gap_minutes_by_date[date_part] = inspection.get("max_gap_minutes")
                 max_gap_ok_by_date[date_part] = inspection.get("max_gap_ok")
+                unexpected_max_gap_minutes_by_date[date_part] = inspection.get(
+                    "unexpected_max_gap_minutes"
+                )
+                allowed_closing_auction_gap_counts[date_part] = inspection.get(
+                    "allowed_closing_auction_gap_count"
+                )
                 missing_ohlcv_counts[date_part] = inspection.get("missing_ohlcv_count")
                 non_finite_ohlcv_counts[date_part] = inspection.get("non_finite_ohlcv_count")
                 invalid_ohlcv_counts[date_part] = inspection.get("invalid_ohlcv_count")
@@ -334,6 +342,8 @@ def _saved_file_summary(
             "session_span_ok": session_span_ok_by_date,
             "max_gap_minutes": max_gap_minutes_by_date,
             "max_gap_ok": max_gap_ok_by_date,
+            "unexpected_max_gap_minutes": unexpected_max_gap_minutes_by_date,
+            "allowed_closing_auction_gap_counts": allowed_closing_auction_gap_counts,
             "missing_ohlcv_counts": missing_ohlcv_counts,
             "non_finite_ohlcv_counts": non_finite_ohlcv_counts,
             "invalid_ohlcv_counts": invalid_ohlcv_counts,
@@ -375,6 +385,11 @@ def _artifact_date_quality(
             session_span_ok = info.get("session_span_ok", {})
             max_gap_minutes = info.get("max_gap_minutes", {})
             max_gap_ok = info.get("max_gap_ok", {})
+            unexpected_max_gap_minutes = info.get("unexpected_max_gap_minutes", {})
+            allowed_closing_auction_gap_counts = info.get(
+                "allowed_closing_auction_gap_counts",
+                {},
+            )
             missing_ohlcv_counts = info.get("missing_ohlcv_counts", {})
             non_finite_ohlcv_counts = info.get("non_finite_ohlcv_counts", {})
             invalid_ohlcv_counts = info.get("invalid_ohlcv_counts", {})
@@ -398,6 +413,10 @@ def _artifact_date_quality(
                     "session_span_ok": session_span_ok.get(day),
                     "max_gap_minutes": max_gap_minutes.get(day),
                     "max_gap_ok": max_gap_ok.get(day),
+                    "unexpected_max_gap_minutes": unexpected_max_gap_minutes.get(day),
+                    "allowed_closing_auction_gap_count": (
+                        allowed_closing_auction_gap_counts.get(day)
+                    ),
                     "missing_ohlcv_count": missing_ohlcv_counts.get(day),
                     "non_finite_ohlcv_count": non_finite_ohlcv_counts.get(day),
                     "invalid_ohlcv_count": invalid_ohlcv_counts.get(day),
@@ -486,6 +505,8 @@ def _inspect_bar_file(
         "session_span_ok": None,
         "max_gap_minutes": None,
         "max_gap_ok": None,
+        "unexpected_max_gap_minutes": None,
+        "allowed_closing_auction_gap_count": None,
         "missing_ohlcv_count": None,
         "non_finite_ohlcv_count": None,
         "invalid_ohlcv_count": None,
@@ -539,12 +560,42 @@ def _inspect_bar_file(
         if first_ts is not None and last_ts is not None
         else None
     )
-    gap_minutes = [
-        (right - left).total_seconds() / 60.0
-        for left, right in zip(sorted_timestamps, sorted_timestamps[1:])
-    ]
-    max_gap_minutes = max(gap_minutes) if gap_minutes else (0.0 if sorted_timestamps else None)
     readiness_cfg = _readiness_cfg()
+    allow_closing_auction_gap = safe_bool(
+        readiness_cfg.get("allow_closing_auction_gap", True),
+        default=True,
+    )
+    closing_auction_start = time(15, 20)
+    closing_auction_left_floor = (
+        datetime.combine(expected_date, closing_auction_start, tzinfo=_KST)
+        - timedelta(minutes=5)
+    ).time()
+    max_closing_auction_gap = float(
+        readiness_cfg.get("max_closing_auction_gap_minutes", 15)
+    )
+    gap_minutes = []
+    unexpected_gap_minutes = []
+    allowed_closing_auction_gap_count = 0
+    for left, right in zip(sorted_timestamps, sorted_timestamps[1:]):
+        gap = (right - left).total_seconds() / 60.0
+        gap_minutes.append(gap)
+        is_closing_auction_gap = (
+            allow_closing_auction_gap
+            and left.date() == right.date()
+            and closing_auction_left_floor <= left.time() < closing_auction_start
+            and right.time() == market_close
+            and gap <= max_closing_auction_gap
+        )
+        if is_closing_auction_gap:
+            allowed_closing_auction_gap_count += 1
+        elif gap > 1.0:
+            unexpected_gap_minutes.append(gap)
+    max_gap_minutes = max(gap_minutes) if gap_minutes else (0.0 if sorted_timestamps else None)
+    unexpected_max_gap_minutes = (
+        max(unexpected_gap_minutes)
+        if unexpected_gap_minutes
+        else (0.0 if sorted_timestamps else None)
+    )
     min_session_span = float(
         readiness_cfg.get(
             "min_session_span_minutes",
@@ -559,8 +610,8 @@ def _inspect_bar_file(
     )
     max_gap_ok = (
         timestamp_dates_match is True
-        and max_gap_minutes is not None
-        and max_gap_minutes <= max_allowed_gap
+        and unexpected_max_gap_minutes is not None
+        and unexpected_max_gap_minutes <= max_allowed_gap
     )
     required_ohlcv = ("open", "high", "low", "close", "volume")
     missing_ohlcv_count = 0
@@ -608,6 +659,8 @@ def _inspect_bar_file(
         "session_span_ok": session_span_ok,
         "max_gap_minutes": max_gap_minutes,
         "max_gap_ok": max_gap_ok,
+        "unexpected_max_gap_minutes": unexpected_max_gap_minutes,
+        "allowed_closing_auction_gap_count": allowed_closing_auction_gap_count,
         "missing_ohlcv_count": missing_ohlcv_count,
         "non_finite_ohlcv_count": non_finite_ohlcv_count,
         "invalid_ohlcv_count": invalid_ohlcv_count,
