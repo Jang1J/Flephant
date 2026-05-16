@@ -33,6 +33,7 @@ def _make_metadata(version: str = "baseline", **overrides) -> dict:
         "train_end": "2026-04-19",
         "feature_cols": ["feat_a", "feat_b", "feat_c"],
         "label_horizon_bars": 5,
+        "target_col": "label_5m_ret",
         "label_generation_version": "session_local_v2",
         "label_session_scope": "ticker_trading_day",
         "metrics": {
@@ -319,6 +320,7 @@ def test_model_metadata_to_dict() -> None:
         train_end="2026-04-19",
         feature_cols=["a", "b"],
         label_horizon_bars=5,
+        target_col="label_5m_ret",
         label_generation_version="session_local_v2",
         label_session_scope="ticker_trading_day",
         metrics={"ic": 0.01},

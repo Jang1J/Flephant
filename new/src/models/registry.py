@@ -75,6 +75,7 @@ class ModelMetadata:
     train_end: str
     feature_cols: list[str]
     label_horizon_bars: int
+    target_col: str
     label_generation_version: str
     label_session_scope: str
     metrics: dict[str, float]
