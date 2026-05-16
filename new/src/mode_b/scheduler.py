@@ -55,6 +55,67 @@ def _check_permission(permission: str) -> None:
         raise PermissionViolationError(permission)
 
 
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    cfg = config_load("risk_config.yaml", "backtest_agent") or {}
+    gate_cfg = (
+        cfg.get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
+def _final_dataset_tickers(gate_cfg: dict[str, Any]) -> list[str]:
+    universe_cfg = config_load("universe_config.yaml") or {}
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    allowed_stock_statuses = {"active"}
+    if include_pending:
+        allowed_stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+    allowed_sector_statuses = {"confirmed"}
+    if include_pending:
+        allowed_sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (universe_cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict):
+            continue
+        if str(sector.get("status")) not in allowed_sector_statuses:
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict):
+                continue
+            if str(stock.get("status")) in allowed_stock_statuses:
+                ticker = str(stock.get("ticker", "")).zfill(6)
+                if ticker != "000000":
+                    tickers.append(ticker)
+    return sorted(dict.fromkeys(tickers))
+
+
+def _final_dataset_lgbm_retrain_kwargs() -> dict[str, Any]:
+    gate_cfg = _final_dataset_gate_cfg()
+    if not safe_bool(gate_cfg.get("required", True), default=True):
+        return {}
+    kwargs: dict[str, Any] = {}
+    tickers = _final_dataset_tickers(gate_cfg)
+    if tickers:
+        kwargs["tickers"] = tickers
+    if gate_cfg.get("expected_start_date"):
+        kwargs["start_date"] = str(gate_cfg["expected_start_date"])
+    if gate_cfg.get("expected_end_date"):
+        kwargs["end_date"] = str(gate_cfg["expected_end_date"])
+    return kwargs
+
+
 class StageTimeoutError(RuntimeError):
     """Stage SLA 초과."""
 
@@ -613,7 +674,11 @@ class ModeBScheduler:
         try:
             from src.mode_b.nightly_lgbm_retrainer import NightlyLGBMRetrainer
 
-            lgbm_result = NightlyLGBMRetrainer().retrain(bundle_id=self._bundle_id)
+            lgbm_kwargs = {
+                "bundle_id": self._bundle_id,
+                **_final_dataset_lgbm_retrain_kwargs(),
+            }
+            lgbm_result = NightlyLGBMRetrainer().retrain(**lgbm_kwargs)
             lgbm_version = lgbm_result.get("version", "unknown")
             lgbm_path = lgbm_result.get("model_path", "")
             lgbm_metrics = lgbm_result.get("metrics", {})

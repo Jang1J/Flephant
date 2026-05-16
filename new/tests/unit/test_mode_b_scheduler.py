@@ -211,6 +211,77 @@ def test_scheduler_init_loads_timeouts(scheduler):
     assert expected_keys == set(timeouts.keys())
 
 
+def test_stage_4_passes_final_dataset_gate_to_lgbm(scheduler, monkeypatch):
+    """stage_4는 LGBM retrain에 final dataset 종목/기간을 명시한다."""
+    from src.mode_b import scheduler as scheduler_mod
+
+    captured: dict = {}
+
+    class FakeLGBM:
+        def retrain(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "version": "v2",
+                "model_path": "artifacts/lgbm/v2.pkl",
+                "metrics": {"ic": 0.05},
+                "alpha_factors_used": 0,
+            }
+
+    class FakePPO:
+        def retrain(self, **kwargs):
+            return {"version": "ppo_v1", "model_path": "artifacts/ppo/v1.zip"}
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if file == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "semis": {
+                        "status": "confirmed",
+                        "stocks": [{"ticker": "005930", "status": "active"}],
+                    },
+                    "banks": {
+                        "status": "confirmed_pending_data",
+                        "stocks": [{"ticker": "105560", "status": "pending_data"}],
+                    },
+                }
+            }
+        if key == "backtest_agent":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "required": True,
+                        "include_pending_data_tickers": True,
+                        "allowed_stock_statuses": ["active", "pending_data"],
+                        "allowed_sector_statuses": [
+                            "confirmed",
+                            "confirmed_pending_data",
+                        ],
+                        "expected_start_date": "20250509",
+                        "expected_end_date": "20260515",
+                    }
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(scheduler_mod, "config_load", fake_config_load)
+    with patch.dict("sys.modules", {
+        "src.mode_b.nightly_lgbm_retrainer": MagicMock(
+            NightlyLGBMRetrainer=MagicMock(return_value=FakeLGBM())
+        ),
+        "src.mode_b.nightly_ppo_retrainer": MagicMock(
+            NightlyPPORetrainer=MagicMock(return_value=FakePPO())
+        ),
+    }):
+        scheduler._bundle_id = "BUNDLE-TEST"
+        result = scheduler.stage_4_model_evolution()
+
+    assert result["status"] == "done"
+    assert captured["bundle_id"] == "BUNDLE-TEST"
+    assert captured["tickers"] == ["005930", "105560"]
+    assert captured["start_date"] == "20250509"
+    assert captured["end_date"] == "20260515"
+
+
 # --------------------------------------------------------------------------- #
 # 3. stage_3 실행 후 bundle_id 생성
 # --------------------------------------------------------------------------- #
