@@ -91,9 +91,9 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
     _write_json(
         label_scan,
         {
-            "status": "WARN",
+            "status": "PASS",
             "best_horizon": "session_close",
-            "deployable_label_recommendation": False,
+            "deployable_label_recommendation": True,
             "data": {
                 "start_date": "20250509",
                 "end_date": "20260515",
@@ -303,9 +303,11 @@ def test_cost_aware_plan_ready_to_train_without_existing_service_policy(
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
 
     assert plan["status"] == "BLOCKED"
-    assert plan["blockers"] == ["cost_aware_target_no_rank_change"]
+    assert "cost_aware_target_no_rank_change" in plan["blockers"]
     assert "service_policy_replay_not_pass" in plan["predeploy_blockers"]
     assert "cost_aware_target_no_rank_change" in plan["pretraining_blockers"]
+    assert "label_horizon_scan_not_pass" in plan["pretraining_blockers"]
+    assert "label_horizon_scan_not_deployable" in plan["pretraining_blockers"]
     assert plan["recommended_experiment"]["target_col_candidate"] == "label_5m_net_ret"
     assert plan["recommended_experiment"]["target_col_override"] is None
     assert plan["recommended_experiment"]["rank_changing_target"] is False
@@ -458,6 +460,84 @@ def test_cost_aware_plan_blocks_label_scan_missing_tickers(
     assert plan["status"] == "BLOCKED"
     assert "label_horizon_scan_missing_tickers" in plan["blockers"]
     assert "label_horizon_scan_ticker_mismatch" not in plan["blockers"]
+
+
+def test_cost_aware_plan_blocks_warn_label_scan_even_if_window_matches(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("cost_aware_retraining_plan")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "phase2_feature_backfill"
+        / "phase2_feature_backfill.json",
+        {"status": "PASS", "coverage": {}},
+    )
+    _write_json(
+        tmp_path
+        / "artifacts"
+        / "reports"
+        / "label_horizon_scan"
+        / "cost_aware_label_horizon_scan.json",
+        {
+            "status": "WARN",
+            "best_horizon": "session_close",
+            "deployable_label_recommendation": False,
+            "data": {
+                "start_date": "20250509",
+                "end_date": "20260515",
+                "ticker_count": 2,
+                "missing_tickers": [],
+            },
+            "horizons": [
+                {"horizon": "5", "mean_net_bps": -1.0, "positive_net_rate": 0.45},
+                {
+                    "horizon": "session_close",
+                    "mean_net_bps": 1.0,
+                    "positive_net_rate": 0.55,
+                },
+            ],
+        },
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if file == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "semis": {
+                        "status": "confirmed",
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                            {"ticker": "105560", "status": "active"},
+                        ],
+                    },
+                },
+            }
+        if key == "backtest_agent":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "expected_start_date": "20250509",
+                        "expected_end_date": "20260515",
+                        "min_tickers": 2,
+                    },
+                },
+            }
+        if key == "label":
+            return {"horizon_bars": 5, "target_col": "label_5m_ret"}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
+
+    assert plan["status"] == "BLOCKED"
+    assert "label_horizon_scan_not_pass" in plan["blockers"]
+    assert "label_horizon_scan_not_deployable" in plan["blockers"]
 
 
 def test_cost_aware_objective_string_false(monkeypatch, tmp_path):

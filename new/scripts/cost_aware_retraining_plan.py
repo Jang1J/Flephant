@@ -246,6 +246,10 @@ def _label_scan_pretraining_blockers(
 
     data = label_scan.get("data") if isinstance(label_scan.get("data"), dict) else {}
     blockers: list[str] = []
+    if label_scan.get("status") != "PASS":
+        blockers.append("label_horizon_scan_not_pass")
+    if safe_bool(label_scan.get("deployable_label_recommendation"), default=False) is not True:
+        blockers.append("label_horizon_scan_not_deployable")
     expected_start = final_window.get("start_date")
     expected_end = final_window.get("end_date")
     if expected_start and data.get("start_date") != expected_start:
