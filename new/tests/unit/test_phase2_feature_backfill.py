@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib.util
 import re
 from datetime import datetime, timedelta
@@ -323,3 +324,90 @@ def test_phase2_blocks_sparse_feature_rows_for_final_universe(
     assert report["coverage"]["exogenous_ticker_coverage"] == 1.0
     assert report["coverage"]["dual_source_non_neutral_row_coverage"] == 0.5
     assert report["coverage"]["exogenous_non_neutral_row_coverage"] == 0.5
+
+
+def test_phase2_blocks_mock_dual_source_artifact_even_with_full_coverage(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    ds_dir = tmp_path / "dual_source"
+    tickers = ["005930", "105560"]
+
+    for ticker in tickers:
+        _write_jsonl(artifacts / ticker / "bars_1m_20260515.jsonl", 301)
+
+    ds_scores = [
+        {
+            "ticker": ticker,
+            "news_score_t": 0.2,
+            "comm_score_t_1": -0.1,
+            "comm_score_t_2": 0.0,
+            "news_comm_divergence": 0.3,
+            "community_noise_multiplier": 1.0,
+        }
+        for ticker in tickers
+    ]
+    ds_dir.mkdir(parents=True)
+    (ds_dir / "20260515.json").write_text(
+        json.dumps(
+            {
+                "batch_date": "2026-05-15",
+                "snapshot_ts": "2026-05-15T08:30:00+09:00",
+                "generated_at": "2026-05-15T08:31:00+09:00",
+                "source_stats": {"input_mode": "mock"},
+                "scores": ds_scores,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(mod, "_DUAL_SOURCE_DIR", ds_dir)
+    monkeypatch.setattr(mod, "_active_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        mod,
+        "_expected_artifact_dates",
+        lambda *, end_date, business_days: ["20260515"],
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "phase2_feature_backfill":
+            return {
+                "min_rows_per_day": 300,
+                "min_dual_source_non_neutral_date_coverage": 0.0,
+                "min_exogenous_non_neutral_date_coverage": 0.0,
+            }
+        if key == "live_data_readiness":
+            return {"train_min_rows_per_day": 300}
+        if key == "exogenous_features":
+            return {"neutral_defaults": {}}
+        return {}
+
+    exog_feature = mod.EXOGENOUS_FEATURES[0]
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "load_latest_scores", lambda date_key: ds_scores)
+    monkeypatch.setattr(
+        mod,
+        "load_exogenous_scores",
+        lambda date_key, feature_cols, defaults: (
+            {ticker: {exog_feature: 1.0} for ticker in tickers},
+            {"status": "found", "record_count": len(tickers)},
+        ),
+    )
+
+    report = mod.run_phase2_feature_backfill(
+        end_date="20260515",
+        business_days=1,
+        write_neutral_placeholders=False,
+        artifacts_dir=artifacts,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "dual_source_non_real_input_mode" in report["blockers"]
+    assert report["coverage"]["dual_source_ticker_coverage"] == 1.0
+    assert report["per_date"][0]["dual_source_artifact_blockers"] == [
+        "dual_source_non_real_input_mode"
+    ]

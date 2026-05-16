@@ -272,6 +272,35 @@ def _neutral_dual_source_payload(date_key: str, tickers: list[str]) -> dict[str,
     }
 
 
+def _load_dual_source_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"source_stats": {"payload_read_error": True}}
+    return data if isinstance(data, dict) else {}
+
+
+def _dual_source_artifact_blockers(payload: dict[str, Any]) -> list[str]:
+    if not payload:
+        return []
+    source_stats = payload.get("source_stats")
+    if not isinstance(source_stats, dict):
+        return ["dual_source_provenance_missing"]
+
+    blockers: list[str] = []
+    input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+    if input_mode and input_mode != "real":
+        blockers.append("dual_source_non_real_input_mode")
+    if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+        blockers.append("dual_source_neutral_rehearsal_artifact")
+    if safe_bool(source_stats.get("payload_read_error"), default=False):
+        blockers.append("dual_source_payload_read_error")
+    return blockers
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
@@ -334,6 +363,8 @@ def run_phase2_feature_backfill(
 
     for date_key in selected_dates:
         ds_path = _DUAL_SOURCE_DIR / f"{date_key}.json"
+        ds_payload = _load_dual_source_payload(ds_path)
+        ds_artifact_blockers = _dual_source_artifact_blockers(ds_payload)
         ds_scores = load_latest_scores(date_key)
         ds_found = bool(ds_scores)
         ds_non_neutral = _dual_source_non_neutral(ds_scores)
@@ -344,11 +375,16 @@ def run_phase2_feature_backfill(
         if not ds_found and write_neutral_placeholders:
             payload = _neutral_dual_source_payload(date_key, tickers)
             _write_json(ds_path, payload)
+            ds_payload = payload
+            ds_artifact_blockers = _dual_source_artifact_blockers(ds_payload)
             files_written.append(str(ds_path.relative_to(ROOT)))
             ds_scores = payload["scores"]
             ds_found = True
             ds_non_neutral = False
             ds_tickers = _dual_source_tickers(ds_scores) & expected_ticker_set
+            ds_non_neutral_tickers = set()
+        if ds_artifact_blockers:
+            ds_non_neutral = False
             ds_non_neutral_tickers = set()
         dual_source_found += int(ds_found)
         dual_source_non_neutral += int(ds_non_neutral)
@@ -395,6 +431,7 @@ def run_phase2_feature_backfill(
             "date": date_key,
             "dual_source_found": ds_found,
             "dual_source_non_neutral": ds_non_neutral,
+            "dual_source_artifact_blockers": ds_artifact_blockers,
             "dual_source_score_count": len(ds_scores),
             "dual_source_ticker_count": len(ds_tickers),
             "dual_source_missing_tickers_sample": sorted(
@@ -436,6 +473,12 @@ def run_phase2_feature_backfill(
         1,
     )
     blockers: list[str] = []
+    dual_source_artifact_blockers = sorted({
+        blocker
+        for item in per_date
+        for blocker in item.get("dual_source_artifact_blockers", [])
+    })
+    blockers.extend(dual_source_artifact_blockers)
     if missing_artifact_dates:
         blockers.append("kis_1m_artifact_date_coverage_below_threshold")
     if dual_source_ticker_coverage < 1.0:
