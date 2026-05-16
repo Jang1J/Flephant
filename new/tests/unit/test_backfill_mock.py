@@ -30,6 +30,28 @@ def _sample_bars() -> list[dict]:
     ]
 
 
+def _sample_bars_many(n: int, yyyymmdd: str = "20260417") -> list[dict]:
+    day = datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    bars: list[dict] = []
+    for i in range(n):
+        hour = 9 + (i // 60)
+        minute = i % 60
+        ts = datetime.combine(day, datetime.min.time(), tzinfo=_KST).replace(
+            hour=hour,
+            minute=minute,
+        )
+        bars.append({
+            "ticker": "005930",
+            "ts_close": ts.isoformat(),
+            "open": 70000 + i,
+            "high": 70100 + i,
+            "low": 69900 + i,
+            "close": 70050 + i,
+            "volume": 5000 + i,
+        })
+    return bars
+
+
 # ------------------------------------------------------------------ #
 # test_fetch_1m_bars_mock_mode
 # ------------------------------------------------------------------ #
@@ -121,6 +143,47 @@ def test_save_jsonl_fallback_removes_stale_parquet(monkeypatch, tmp_path):
     assert out_path.suffix == ".jsonl"
     assert out_path.exists()
     assert not stale_parquet.exists()
+
+
+def test_save_jsonl_preserves_existing_complete_artifact_on_short_refetch(
+    monkeypatch,
+    tmp_path,
+):
+    """partial refetch가 기존 완성 JSONL artifact를 덮어쓰지 않는다."""
+    _set_mock_env(monkeypatch)
+    from src.data import backfill as backfill_module
+    from src.data.backfill import Backfill
+
+    monkeypatch.setattr(backfill_module, "_has_pyarrow", lambda: False)
+    bf = Backfill(output_dir=tmp_path)
+    original = bf.save_parquet("005930", _sample_bars_many(381), "20260417")
+
+    out_path = bf.save_parquet("005930", _sample_bars_many(100), "20260417")
+
+    assert out_path == original
+    assert original.exists()
+    with original.open("r", encoding="utf-8") as fh:
+        assert sum(1 for line in fh if line.strip()) == 381
+
+
+def test_save_parquet_preserves_existing_complete_artifact_on_short_refetch(
+    monkeypatch,
+    tmp_path,
+):
+    """partial refetch가 기존 완성 parquet artifact를 덮어쓰지 않는다."""
+    pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    _set_mock_env(monkeypatch)
+    import pandas as pd
+    from src.data.backfill import Backfill
+
+    bf = Backfill(output_dir=tmp_path)
+    original = bf.save_parquet("005930", _sample_bars_many(381), "20260417")
+
+    out_path = bf.save_parquet("005930", _sample_bars_many(100), "20260417")
+
+    assert out_path == original
+    assert len(pd.read_parquet(original)) == 381
 
 
 def test_parquet_atomic_replace_failure_preserves_existing(monkeypatch, tmp_path):

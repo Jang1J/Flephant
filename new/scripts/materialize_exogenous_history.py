@@ -30,6 +30,7 @@ from src.data.exogenous_feature_store import (  # noqa: E402
     write_exogenous_payload,
 )
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -58,10 +59,37 @@ def _business_dates(end_date: str, business_days: int) -> list[str]:
 
 def _active_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
         for item in sector.get("stocks", []) or []:
-            if str(item.get("status", "")).lower() == "active":
+            if str(item.get("status", "")) in stock_statuses:
                 tickers.append(pad_ticker(str(item.get("ticker", ""))))
     fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
     tickers.extend(pad_ticker(str(t)) for t in fallback)

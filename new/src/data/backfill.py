@@ -29,6 +29,7 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # artifacts 루트 (new/ 기준)
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts" / "data"
+_MIN_COMPLETE_INTRADAY_ROWS = 300
 
 
 def _has_pyarrow() -> bool:
@@ -70,6 +71,57 @@ def _cleanup_alternate_bar_artifact(target_path: Path) -> None:
             alternate_path,
             e,
         )
+
+
+def _artifact_row_count(path: Path) -> int | None:
+    """Persisted bar artifact row count. Corrupt/unreadable files return None."""
+    try:
+        if path.suffix == ".parquet":
+            import pandas as pd  # type: ignore[import]
+
+            return int(len(pd.read_parquet(path)))
+        if path.suffix == ".jsonl":
+            with path.open("r", encoding="utf-8") as fh:
+                return sum(1 for line in fh if line.strip())
+    except Exception as e:
+        logger.warning("[backfill] 기존 artifact row count 확인 실패: %s (%s)", path, e)
+        return None
+    return None
+
+
+def _existing_artifact_to_preserve(
+    target_path: Path,
+    new_rows: int,
+) -> Path | None:
+    """Return existing artifact path if writing `new_rows` would downgrade it."""
+    candidates = [target_path]
+    alternate = _alternate_bar_artifact_path(target_path)
+    if alternate is not None:
+        candidates.append(alternate)
+
+    best_path: Path | None = None
+    best_rows = -1
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        row_count = _artifact_row_count(candidate)
+        if row_count is None:
+            continue
+        if row_count > best_rows:
+            best_path = candidate
+            best_rows = row_count
+
+    if best_path is None:
+        return None
+    if best_rows >= _MIN_COMPLETE_INTRADAY_ROWS and new_rows < best_rows:
+        logger.warning(
+            "[backfill] 기존 artifact 보존: %s rows=%d > new_rows=%d",
+            best_path,
+            best_rows,
+            new_rows,
+        )
+        return best_path
+    return None
 
 
 def _load_market_hours() -> tuple[time, time]:
@@ -281,6 +333,9 @@ class Backfill:
                 if not _has_pyarrow():
                     raise ImportError
                 out_path = save_dir / f"bars_1m_{date}.parquet"
+                preserved = _existing_artifact_to_preserve(out_path, len(bars))
+                if preserved is not None:
+                    return preserved
                 temp_path = _temp_artifact_path(out_path)
                 df = pd.DataFrame(bars)
                 try:
@@ -304,6 +359,9 @@ class Backfill:
     ) -> Path:
         """JSON Lines fallback 저장."""
         out_path = save_dir / f"bars_1m_{date}.jsonl"
+        preserved = _existing_artifact_to_preserve(out_path, len(bars))
+        if preserved is not None:
+            return preserved
         temp_path = _temp_artifact_path(out_path)
         try:
             with temp_path.open("w", encoding="utf-8") as fh:

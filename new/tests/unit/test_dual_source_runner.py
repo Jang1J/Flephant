@@ -107,6 +107,41 @@ def test_load_active_tickers_from_sectors_shape() -> None:
         assert _load_active_tickers() == ["005930"]
 
 
+def test_load_active_tickers_includes_pending_for_final_dataset() -> None:
+    """final_dataset_gate가 켜져 있으면 Dual-Source universe도 30종목 기준을 따른다."""
+    universe_cfg = {
+        "sectors": {
+            "반도체": {
+                "status": "confirmed",
+                "stocks": [{"ticker": "5930", "status": "active"}],
+            },
+            "금융": {
+                "status": "confirmed_pending_data",
+                "stocks": [{"ticker": "105560", "status": "pending_data"}],
+            },
+        }
+    }
+    risk_cfg = {
+        "deploy_decision_gate": {
+            "final_dataset_gate": {
+                "include_pending_data_tickers": True,
+                "allowed_stock_statuses": ["active", "pending_data"],
+                "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+            }
+        }
+    }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "universe_config.yaml":
+            return universe_cfg
+        if file_name == "risk_config.yaml" and section == "backtest_agent":
+            return risk_cfg
+        return {}
+
+    with patch("src.data.dual_source_runner.config_load", side_effect=fake_config_load):
+        assert _load_active_tickers() == ["005930", "105560"]
+
+
 def test_run_dual_source_batch_real_path_filters_future_data(tmp_path) -> None:
     """use_mock=False 경로가 실 connector 입력을 만들고 snapshot 이후 데이터는 제외한다."""
     snapshot = datetime(2026, 5, 8, 8, 30, tzinfo=_KST)

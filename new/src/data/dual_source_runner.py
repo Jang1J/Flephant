@@ -39,6 +39,7 @@ from src.connectors.naver_rest import NaverNewsClient, NaverNewsItem
 from src.data.dual_source_scorer import DualSourceScorer
 from src.utils.config_loader import load as config_load
 from src.utils.pit_guard import assert_pit_safe
+from src.utils.safe_cast import safe_bool
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +74,37 @@ def _is_in_batch_window(now: datetime) -> bool:
 
 
 def _load_active_universe() -> list[dict[str, Any]]:
-    """universe_config.yaml 에서 active 종목 메타데이터 로드.
+    """universe_config.yaml 에서 최종 학습 universe 메타데이터 로드.
 
-    과거 구조(cfg["active"])와 현행 sectors 구조를 모두 지원한다.
+    과거 구조(cfg["active"])와 현행 sectors 구조를 모두 지원한다. final_dataset_gate가
+    pending_data를 포함하면 Dual-Source feature도 30종목 기준으로 materialize한다.
     """
     cfg = config_load("universe_config.yaml")
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     universe: list[dict[str, Any]] = []
 
     for item in cfg.get("active", []) or []:
@@ -94,10 +121,10 @@ def _load_active_universe() -> list[dict[str, Any]]:
 
     sectors = cfg.get("sectors", {}) or {}
     for sector in sectors.values():
-        if not isinstance(sector, dict) or sector.get("status") != "confirmed":
+        if not isinstance(sector, dict) or str(sector.get("status")) not in sector_statuses:
             continue
         for stock in sector.get("stocks", []) or []:
-            if not isinstance(stock, dict) or stock.get("status") != "active":
+            if not isinstance(stock, dict) or str(stock.get("status")) not in stock_statuses:
                 continue
             ticker = str(stock.get("ticker", "")).zfill(6)
             if ticker and ticker != "000000":

@@ -186,6 +186,44 @@ def test_exogenous_history_blocks_without_required_real_providers(monkeypatch, t
     assert report["provider_availability"]["kis_investor_real"] is False
 
 
+def test_exogenous_active_tickers_include_pending_for_final_dataset(monkeypatch):
+    """exogenous history도 final_dataset_gate 30종목 universe를 사용한다."""
+    mod = _load_script("materialize_exogenous_history")
+    universe_cfg = {
+        "sectors": {
+            "반도체": {
+                "status": "confirmed",
+                "stocks": [{"ticker": "5930", "status": "active"}],
+            },
+            "금융": {
+                "status": "confirmed_pending_data",
+                "stocks": [{"ticker": "105560", "status": "pending_data"}],
+            },
+        },
+        "backtest_universe_mode": {"fallback_tickers": []},
+    }
+    risk_cfg = {
+        "deploy_decision_gate": {
+            "final_dataset_gate": {
+                "include_pending_data_tickers": True,
+                "allowed_stock_statuses": ["active", "pending_data"],
+                "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+            }
+        }
+    }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "universe_config.yaml":
+            return universe_cfg
+        if file_name == "risk_config.yaml" and section == "backtest_agent":
+            return risk_cfg
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    assert mod._active_tickers() == ["005930", "105560"]
+
+
 def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_path):
     mod = _load_script("materialize_exogenous_history")
 
