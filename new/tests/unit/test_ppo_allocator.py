@@ -229,6 +229,27 @@ def test_max_single_name_cap_enforced(allocator: PPOAllocator) -> None:
         assert w <= allocator._max_single_name + 1e-9
 
 
+def test_max_sector_cap_enforced(allocator: PPOAllocator) -> None:
+    scores = {
+        "005930": 10.0,
+        "000660": 10.0,
+        "042700": 10.0,
+        "403870": 10.0,
+        "058470": 10.0,
+    }
+
+    result = allocator.allocate(_quant_output(scores))
+    weights = result["allocation_plan"]["target_weights"]
+    semiconductor_weight = sum(weights.values())
+
+    assert set(weights) == set(scores)
+    assert semiconductor_weight == pytest.approx(allocator._max_sector, abs=1e-9)
+    assert result["allocation_plan"]["cash_weight"] == pytest.approx(
+        1.0 - allocator._max_sector,
+        abs=1e-9,
+    )
+
+
 def test_min_cash_ratio(allocator: PPOAllocator) -> None:
     scores = {
         "005930": 10.0,

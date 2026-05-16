@@ -65,6 +65,7 @@ class PPOAllocator:
         regime_cfg = config_load("risk_config.yaml", "regime_gate")
         cost_cfg = config_load("risk_config.yaml", "cost_aware_retraining") or {}
         trade_gate_cfg = cost_cfg.get("trade_probability_gate") or {}
+        sector_cfg = config_load("sector_config.yaml", "ticker_to_sector") or {}
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
@@ -81,6 +82,10 @@ class PPOAllocator:
             min_value=0.0,
             max_value=1.0,
         )
+        self._ticker_to_sector: dict[str, str] = {
+            pad_ticker(str(ticker)): str(sector)
+            for ticker, sector in sector_cfg.items()
+        }
 
         self._daily_turnover_max: float = float(turnover_cfg["daily_max"])
         self._regime_actions: dict[str, Any] = dict(regime_cfg["actions"])
@@ -167,13 +172,16 @@ class PPOAllocator:
         # 6. max_single_name cap
         capped_weights = self._apply_max_single_cap(raw_weights)
 
-        # 7. regime_gate multiplier
+        # 7. max_sector cap
+        sector_capped_weights = self._apply_max_sector_cap(capped_weights)
+
+        # 8. regime_gate multiplier
         regime_multiplier = self._resolve_regime_multiplier(market_state)
         scaled_weights = {
-            t: float(w * regime_multiplier) for t, w in capped_weights.items()
+            t: float(w * regime_multiplier) for t, w in sector_capped_weights.items()
         }
 
-        # 8. cash_weight
+        # 9. cash_weight
         total_weight = float(sum(scaled_weights.values()))
         cash_weight = max(float(self._min_cash), 1.0 - total_weight)
         # target_weights 합 + cash_weight > 1 이면 비례 축소
@@ -410,6 +418,35 @@ class PPOAllocator:
                     capped[t] = new_w
         return capped
 
+    def _apply_max_sector_cap(self, weights: dict[str, float]) -> dict[str, float]:
+        """Scale each mapped sector down to max_sector, leaving overflow as cash."""
+        if not weights:
+            return weights
+
+        sector_totals: dict[str, float] = {}
+        for ticker, weight in weights.items():
+            sector = self._sector_for_ticker(ticker)
+            sector_totals[sector] = sector_totals.get(sector, 0.0) + weight
+
+        capped = dict(weights)
+        for sector, sector_weight in sector_totals.items():
+            if sector_weight <= self._max_sector + 1e-9:
+                continue
+            scale = self._max_sector / sector_weight
+            for ticker in capped:
+                if self._sector_for_ticker(ticker) == sector:
+                    capped[ticker] = capped[ticker] * scale
+            logger.warning(
+                "[ppo_allocator] max_sector(%.2f) 초과 sector=%s weight=%.4f scale=%.4f",
+                self._max_sector, sector, sector_weight, scale,
+            )
+        return capped
+
+    def _sector_for_ticker(self, ticker: str) -> str:
+        """Return configured sector. Unmapped tickers are capped independently."""
+        padded = pad_ticker(str(ticker))
+        return self._ticker_to_sector.get(padded, f"__unmapped__:{padded}")
+
     def _resolve_regime_multiplier(
         self,
         market_state: dict[str, Any] | None,
@@ -610,6 +647,7 @@ class PPOAllocator:
 
         # constraints (기존 heuristic 경로와 동일)
         capped_weights = self._apply_max_single_cap(target_weights)
+        capped_weights = self._apply_max_sector_cap(capped_weights)
         regime_multiplier = self._resolve_regime_multiplier(market_state)
         scaled_weights = {t: float(w * regime_multiplier) for t, w in capped_weights.items()}
 
