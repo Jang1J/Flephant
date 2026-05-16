@@ -485,6 +485,36 @@ def test_stage_7_blocks_when_c12_deploy_evidence_missing(scheduler, monkeypatch)
     assert result["missing_evidence"] == ["feature_quality", "service_policy_replay"]
 
 
+def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypatch):
+    """deployer 주입 후 NotImplementedError는 not_configured와 구분한다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    class _MockDeployer:
+        def deploy(self, **kwargs):
+            _ = kwargs
+            raise NotImplementedError("deploy pending")
+
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._current_verdict = "pass"
+    scheduler._current_sanity_check_result = "ok"
+    scheduler._current_regression_risk = {"flagged": False, "severity": "low", "evidence": []}
+    scheduler._current_feature_quality = {
+        "dual_source_rows": 100,
+        "dual_source_non_neutral_rows": 90,
+        "exogenous_rows": 100,
+        "exogenous_non_neutral_rows": 90,
+    }
+    scheduler._current_service_policy_evidence = {"status": "PASS"}
+    scheduler._deployer = _MockDeployer()
+
+    result = scheduler.stage_7_deploy()
+
+    assert result["deploy_status"] == "blocked"
+    assert result["deploy_result"] == "deployer_not_implemented"
+    assert result["error"] == "deployer_not_implemented"
+    assert result["error_detail"] == "deploy pending"
+
+
 # --------------------------------------------------------------------------- #
 # 10. candidate 없으면 Backtest 건너뜀 (stages=5개)
 # --------------------------------------------------------------------------- #

@@ -805,8 +805,17 @@ class ModeBScheduler:
                     feature_quality=self._current_feature_quality,
                     service_policy_evidence=self._current_service_policy_evidence,
                 )
-            except NotImplementedError:
-                pass
+            except NotImplementedError as e:
+                return {
+                    "status": "blocked",
+                    "deploy_status": "blocked",
+                    "deploy_result": "deployer_not_implemented",
+                    "bundle_id": self._bundle_id,
+                    "sanity_check_result": self._current_sanity_check_result,
+                    "regression_risk": self._current_regression_risk or {},
+                    "error": "deployer_not_implemented",
+                    "error_detail": str(e),
+                }
         return {
             "status": "blocked",
             "deploy_status": "not_configured",
