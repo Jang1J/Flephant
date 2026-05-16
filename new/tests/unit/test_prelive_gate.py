@@ -283,6 +283,60 @@ def test_80_day_artifact_gate_rejects_large_intraday_gap(monkeypatch, tmp_path):
     assert first["max_gap_minutes"] == 21.0
 
 
+def test_80_day_artifact_gate_rejects_invalid_ohlcv(monkeypatch, tmp_path):
+    import pandas as pd
+
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508")
+    path = tmp_path / "005930" / "bars_1m_20260508.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[0, "close"] = 0.0
+    frame.to_parquet(path, index=False)
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["valid_artifact"] is False
+    assert first["invalid_ohlcv_count"] == 1
+
+
+def test_80_day_artifact_gate_rejects_duplicate_same_date_files(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508")
+    duplicate = tmp_path / "005930" / "bars_1m_20260508_shadow.jsonl"
+    duplicate.write_text(
+        (
+            '{"ticker": "005930", '
+            '"ts_close": "2026-05-08T09:00:00+09:00", '
+            '"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["reason"] == "duplicate_date_artifacts"
+    assert len(first["duplicate_date_artifacts"]) == 2
+
+
 def test_latest_matching_report_skips_non_matching_and_bad_json(tmp_path):
     gate = _load_script_module()
     (tmp_path / "prelive_gate_bad.json").write_text("{", encoding="utf-8")

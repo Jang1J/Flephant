@@ -336,6 +336,33 @@ def _count_rows(path: Path) -> int | None:
         return None
 
 
+def _bar_artifact_paths_for_date(ticker: str, day: str) -> list[Path]:
+    ticker_dir = _DATA_ROOT / ticker
+    if not ticker_dir.exists():
+        return []
+    prefix = f"bars_1m_{day}"
+    return sorted(
+        path
+        for path in ticker_dir.iterdir()
+        if path.name.startswith(prefix) and path.suffix in {".parquet", ".jsonl"}
+    )
+
+
+def _duplicate_bar_artifact(
+    paths: list[Path],
+    ticker: str,
+    day: str,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "rows": None,
+        "valid_artifact": False,
+        "reason": "duplicate_date_artifacts",
+        "date": day,
+        "duplicate_date_artifacts": [_repo_relative(path) for path in paths],
+    }
+
+
 def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
     """Inspect saved 1m parquet before counting it as train-ready evidence."""
     if not path.exists():
@@ -355,6 +382,9 @@ def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
         and int(inspection.get("out_of_hours_count") or 0) == 0
         and inspection.get("session_span_ok") is True
         and inspection.get("max_gap_ok") is True
+        and int(inspection.get("missing_ohlcv_count") or 0) == 0
+        and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+        and int(inspection.get("invalid_ohlcv_count") or 0) == 0
     )
     reason = None if valid_artifact else "artifact_integrity_failed"
     return {
@@ -372,6 +402,9 @@ def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
         "session_span_ok": inspection.get("session_span_ok"),
         "max_gap_minutes": inspection.get("max_gap_minutes"),
         "max_gap_ok": inspection.get("max_gap_ok"),
+        "missing_ohlcv_count": inspection.get("missing_ohlcv_count"),
+        "non_finite_ohlcv_count": inspection.get("non_finite_ohlcv_count"),
+        "invalid_ohlcv_count": inspection.get("invalid_ohlcv_count"),
         "path": _repo_relative(path),
     }
 
@@ -501,7 +534,11 @@ def _check_80_day_artifacts(
     for day in required_dates:
         missing_or_short: list[dict[str, Any]] = []
         for ticker in tickers:
-            path = _DATA_ROOT / ticker / f"bars_1m_{day}.parquet"
+            paths = _bar_artifact_paths_for_date(ticker, day)
+            if len(paths) > 1:
+                missing_or_short.append(_duplicate_bar_artifact(paths, ticker, day))
+                continue
+            path = paths[0] if paths else _DATA_ROOT / ticker / f"bars_1m_{day}.parquet"
             inspection = _inspect_bar_artifact(path, ticker, day)
             rows = inspection.get("rows")
             if (
