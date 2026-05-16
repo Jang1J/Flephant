@@ -970,6 +970,107 @@ def _latest_paper_report(action: str) -> tuple[Path | None, dict[str, Any] | Non
     )
 
 
+def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for key in ("bundle_id", "model_bundle_id"):
+        value = data.get(key)
+        if value:
+            out.add(str(value))
+    active_model = (
+        ((data.get("stages") or {}).get("paper_auto_cycle") or {})
+        .get("stages", {})
+        .get("active_model_guard")
+    )
+    if isinstance(active_model, dict) and active_model.get("bundle_id"):
+        out.add(str(active_model["bundle_id"]))
+    return out
+
+
+def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
+    cycle_stage = ((data.get("stages") or {}).get("paper_auto_cycle") or {})
+    cycle_stages = cycle_stage.get("stages") if isinstance(cycle_stage, dict) else None
+    cycles = cycle_stages.get("cycles") if isinstance(cycle_stages, dict) else None
+    items = cycles.get("items", []) if isinstance(cycles, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        history = item.get("order_history_verification")
+        if not isinstance(history, dict) or history.get("status") != "PASS":
+            continue
+        for query in history.get("queries", []) or []:
+            if isinstance(query, dict) and safe_int(
+                query.get("matched_order_count", 0),
+                default=0,
+                min_value=0,
+            ) > 0:
+                return True
+    return False
+
+
+def _latest_paper_auto_bundle_report(
+    bundle_id: str | None,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if not requested_bundle_id:
+        return None, None
+    return _latest_matching_report(
+        _REPORT_ROOT / "paper_auto_trading",
+        "paper_auto_service_rehearsal_",
+        lambda data: (
+            safe_bool(data.get("external_kis_api"), default=False)
+            and requested_bundle_id in _paper_auto_bundle_ids(data)
+        ),
+    )
+
+
+def _paper_auto_bundle_stage(
+    bundle_id: str,
+    stage_name: str,
+    *,
+    require_order_history_match: bool = False,
+) -> dict[str, Any]:
+    path, data = _latest_paper_auto_bundle_report(bundle_id)
+    if not path or not data:
+        return _stage(
+            "BLOCKED",
+            "No external paper-auto bundle evidence report was found.",
+            {
+                "blocker": "paper_auto_bundle_evidence_missing",
+                "bundle_id": bundle_id,
+            },
+        )
+    stage_statuses = data.get("stage_statuses", {})
+    if not isinstance(stage_statuses, dict):
+        stage_statuses = {}
+    history_matched = _paper_auto_cycle_history_matched(data)
+    passed = (
+        data.get("status") == "PASS"
+        and stage_statuses.get(stage_name) == "PASS"
+        and (
+            not require_order_history_match
+            or (
+                stage_statuses.get("order_history_requery") == "PASS"
+                and history_matched
+            )
+        )
+    )
+    return _stage(
+        "PASS" if passed else "BLOCKED",
+        "Latest external paper-auto bundle evidence inspected.",
+        {
+            "report_path": _repo_relative(path),
+            "bundle_id": bundle_id,
+            "bundle_ids": sorted(_paper_auto_bundle_ids(data)),
+            "external_kis_api": safe_bool(data.get("external_kis_api"), default=False),
+            "evidence_level": data.get("evidence_level"),
+            "report_status": data.get("status"),
+            "stage_name": stage_name,
+            "stage_statuses": stage_statuses,
+            "paper_auto_cycle_history_matched": history_matched,
+        },
+    )
+
+
 def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
     if not isinstance(report_or_stage, dict):
         return 0
@@ -982,7 +1083,13 @@ def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
     return 0
 
 
-def _check_paper_balance() -> dict[str, Any]:
+def _check_paper_balance(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "balance_reconciliation",
+        )
     path, data = _latest_paper_report("balance_reconciliation")
     if not path or not data:
         return _stage("BLOCKED", "No paper balance report was found.")
@@ -999,7 +1106,13 @@ def _check_paper_balance() -> dict[str, Any]:
     )
 
 
-def _check_paper_reconciliation() -> dict[str, Any]:
+def _check_paper_reconciliation(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "balance_reconciliation",
+        )
     path, data = _latest_paper_report("balance_reconciliation")
     if not path or not data:
         return _stage("BLOCKED", "No paper reconciliation report was found.")
@@ -1015,7 +1128,14 @@ def _check_paper_reconciliation() -> dict[str, Any]:
     )
 
 
-def _check_probe_order() -> dict[str, Any]:
+def _check_probe_order(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "probe_order",
+            require_order_history_match=True,
+        )
     path, data = _latest_paper_report("submit_probe_order")
     if not path or not data:
         return _stage("BLOCKED", "No paper probe order report was found.")
@@ -1150,9 +1270,15 @@ def build_report(
     stages["05_backtest_real_candidate"] = _check_backtest_gate(
         stages["04_lgbm_real_train"]
     )
-    stages["06_paper_balance"] = _check_paper_balance()
-    stages["07_paper_reconciliation"] = _check_paper_reconciliation()
-    stages["08_paper_probe_order"] = _check_probe_order()
+    stages["06_paper_balance"] = _check_paper_balance(
+        requested_bundle_id or None
+    )
+    stages["07_paper_reconciliation"] = _check_paper_reconciliation(
+        requested_bundle_id or None
+    )
+    stages["08_paper_probe_order"] = _check_probe_order(
+        requested_bundle_id or None
+    )
     stages["09_ops_risk"] = _check_ops_risk()
 
     blockers = [

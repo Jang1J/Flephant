@@ -576,6 +576,82 @@ def test_probe_order_passes_with_order_history_match(monkeypatch, tmp_path):
     assert result["matched_order_count"] == 1
 
 
+def test_bundle_paper_auto_evidence_satisfies_paper_stages(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    balance = gate._check_paper_balance(bundle_id)
+    reconciliation = gate._check_paper_reconciliation(bundle_id)
+    probe = gate._check_probe_order(bundle_id)
+
+    assert balance["status"] == "PASS"
+    assert reconciliation["status"] == "PASS"
+    assert probe["status"] == "PASS"
+    assert probe["paper_auto_cycle_history_matched"] is True
+
+
+def test_bundle_paper_auto_evidence_blocks_wrong_bundle(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-OTHER",
+                "external_kis_api": True,
+                "stage_statuses": {"probe_order": "PASS"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order("BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "paper_auto_bundle_evidence_missing"
+
+
 def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
@@ -1484,9 +1560,13 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
 
     monkeypatch.setattr(gate, "_check_lgbm_real_train", fake_lgbm)
     monkeypatch.setattr(gate, "_check_backtest_gate", fake_backtest)
-    monkeypatch.setattr(gate, "_check_paper_balance", lambda: {"status": "PASS"})
-    monkeypatch.setattr(gate, "_check_paper_reconciliation", lambda: {"status": "PASS"})
-    monkeypatch.setattr(gate, "_check_probe_order", lambda: {"status": "PASS"})
+    monkeypatch.setattr(gate, "_check_paper_balance", lambda bundle_id=None: {"status": "PASS"})
+    monkeypatch.setattr(
+        gate,
+        "_check_paper_reconciliation",
+        lambda bundle_id=None: {"status": "PASS"},
+    )
+    monkeypatch.setattr(gate, "_check_probe_order", lambda bundle_id=None: {"status": "PASS"})
     monkeypatch.setattr(gate, "_check_ops_risk", lambda: {"status": "PASS"})
 
     report = gate.build_report(
