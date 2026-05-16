@@ -96,6 +96,18 @@ class KISRestClient(BaseConnector):
         self._timeout_sec = self.timeout_sec
         self._max_retries = self.max_retries
         self._backoff_base = self.backoff_base
+        circuit_cfg = (config_load("risk_config.yaml", "kis_rest") or {}).get(
+            "circuit_breaker",
+            {},
+        )
+        self._circuit_enabled = safe_bool(circuit_cfg.get("enabled", True), default=True)
+        self._circuit_failure_threshold = max(
+            1,
+            int(circuit_cfg.get("failure_threshold", 5)),
+        )
+        self._circuit_open_duration_sec = float(circuit_cfg.get("open_duration_sec", 60))
+        self._circuit_consecutive_failures = 0
+        self._circuit_opened_at: float | None = None
 
         self.auth = auth or AuthManager()
         self.rate_limiter = rate_limiter or RateLimiter("kis_rest")
@@ -570,6 +582,7 @@ class KISRestClient(BaseConnector):
             key: ("***" if key in {"CANO", "ACNT_PRDT_CD"} else value)
             for key, value in params.items()
         }
+        self._check_circuit()
 
         last_err: Exception | None = None
         for attempt in range(self._max_retries):
@@ -592,6 +605,7 @@ class KISRestClient(BaseConnector):
                         f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}",
                         retry_after_sec=self._float_or_none(body.get("_retry_after_sec")),
                     )
+                self._record_call_success()
                 return body
             except Exception as e:
                 self._error_count += 1
@@ -611,6 +625,7 @@ class KISRestClient(BaseConnector):
                     )
                     time.sleep(wait_sec)
 
+        self._record_call_failure(last_err)
         raise ConnectionError(
             f"[kis_rest] KIS API {path} {self._max_retries}회 재시도 실패. "
             f"last_err={self._sanitize_error_text(str(last_err))}"
@@ -629,6 +644,7 @@ class KISRestClient(BaseConnector):
             key: ("***" if key in {"CANO", "ACNT_PRDT_CD"} else value)
             for key, value in payload.items()
         }
+        self._check_circuit()
 
         last_err: Exception | None = None
         for attempt in range(self._max_retries):
@@ -651,6 +667,7 @@ class KISRestClient(BaseConnector):
                         f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}",
                         retry_after_sec=self._float_or_none(body.get("_retry_after_sec")),
                     )
+                self._record_call_success()
                 return body
             except Exception as e:
                 self._error_count += 1
@@ -670,6 +687,7 @@ class KISRestClient(BaseConnector):
                     )
                     time.sleep(wait_sec)
 
+        self._record_call_failure(last_err)
         raise ConnectionError(
             f"[kis_rest] KIS API POST {path} {self._max_retries}회 재시도 실패. "
             f"last_err={self._sanitize_error_text(str(last_err))}"
@@ -840,6 +858,40 @@ class KISRestClient(BaseConnector):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _check_circuit(self) -> None:
+        if not self._circuit_enabled or self._circuit_opened_at is None:
+            return
+        elapsed = time.monotonic() - self._circuit_opened_at
+        remaining = self._circuit_open_duration_sec - elapsed
+        if remaining > 0:
+            raise KISAPIError(
+                "[kis_rest] circuit breaker OPEN",
+                retry_after_sec=remaining,
+            )
+        self._circuit_opened_at = None
+        self._circuit_consecutive_failures = max(
+            0,
+            self._circuit_failure_threshold - 1,
+        )
+
+    def _record_call_success(self) -> None:
+        self._circuit_consecutive_failures = 0
+        self._circuit_opened_at = None
+
+    def _record_call_failure(self, error: Exception | None) -> None:
+        if not self._circuit_enabled:
+            return
+        if error is not None and self._is_non_retryable_kis_error(error):
+            return
+        self._circuit_consecutive_failures += 1
+        if self._circuit_consecutive_failures >= self._circuit_failure_threshold:
+            self._circuit_opened_at = time.monotonic()
+            logger.warning(
+                "[kis_rest] circuit breaker OPEN. consecutive_failures=%d threshold=%d",
+                self._circuit_consecutive_failures,
+                self._circuit_failure_threshold,
+            )
 
     @staticmethod
     def _is_non_retryable_kis_error(error: Exception) -> bool:

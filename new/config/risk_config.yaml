@@ -612,6 +612,12 @@ connector_defaults:
   max_retries: 3        # 네트워크 실패 재시도 횟수
   backoff_base: 2       # 지수 백오프 base (2 ** attempt)
 
+kis_rest:
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5       # retry 소진 call 연속 N회 실패 시 OPEN
+    open_duration_sec: 60      # OPEN 유지 후 half-open 1회 허용
+
 # PIT-Safety snapshot policy (불변 원칙 1 enforcement)
 # pit_guard.py가 참조. 18:00 KST = snapshot cutoff
 pit_safety:
