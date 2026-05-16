@@ -370,6 +370,7 @@ def test_real_readiness_treats_allow_mock_string_false_as_real(monkeypatch, tmp_
                 "stages": {
                     "smoke": {"naver": {"status": "PASS"}},
                     "backfill": {"status": "PASS", "counts": {"005930": 30400}},
+                    "train": {"status": "PASS", "data_source": "artifact_bars"},
                 },
             },
             ensure_ascii=False,
@@ -382,6 +383,35 @@ def test_real_readiness_treats_allow_mock_string_false_as_real(monkeypatch, tmp_
 
     assert result["status"] == "PASS"
     assert result["backfill_min_rows"] == 30400
+    assert result["train_status"] == "PASS"
+
+
+def test_real_readiness_requires_train_pass(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "data_readiness"
+    report_dir.mkdir(parents=True)
+    report = report_dir / "data_readiness_20260516_000000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "end_date": "20260515",
+                "allow_mock": False,
+                "stages": {
+                    "smoke": {"naver": {"status": "PASS"}},
+                    "backfill": {"status": "PASS", "counts": {"005930": 30400}},
+                    "train": {"status": "SKIP"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_real_readiness("20260515")
+
+    assert result["status"] == "BLOCKED"
 
 
 def test_deployable_backtest_treats_regression_string_false_as_false(monkeypatch):

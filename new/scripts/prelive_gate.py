@@ -474,11 +474,13 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
         stages = data.get("stages", {})
         smoke = stages.get("smoke", {})
         backfill = stages.get("backfill", {})
+        train = stages.get("train", {})
         return (
             data.get("status") == "PASS"
             and data.get("end_date") == end_yyyymmdd
             and bool(smoke)
             and backfill.get("status") == "PASS"
+            and train.get("status") == "PASS"
             and not safe_bool(data.get("allow_mock", False), default=True)
         )
 
@@ -497,6 +499,7 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
     secret_presence = data.get("runtime", {}).get("secret_presence", {})
     smoke = data.get("stages", {}).get("smoke", {})
     backfill = data.get("stages", {}).get("backfill", {})
+    train = data.get("stages", {}).get("train", {})
     return _stage(
         "PASS",
         "Latest real readiness report passed.",
@@ -515,6 +518,8 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
                 if backfill.get("counts")
                 else None
             ),
+            "train_status": train.get("status"),
+            "train_data_source": train.get("data_source"),
         },
     )
 
