@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -21,6 +21,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.safe_cast import safe_bool, safe_float, safe_int, safe_lossless_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
+from src.utils.trading_calendar import is_kospi_trading_day
 
 logger = get_logger("paper_auto_trading")
 _KST = ZoneInfo("Asia/Seoul")
@@ -40,6 +41,7 @@ class PaperAutoTrader:
         hot_runner: HotRunner | None = None,
         report_dir: Path | str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        now_fn: Callable[[], datetime] | None = None,
         required_bundle_id: str | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
@@ -55,9 +57,22 @@ class PaperAutoTrader:
             log_path=self._report_dir / "paper_auto_execution_audit.jsonl"
         )
         self._sleep = sleep_fn or time.sleep
+        self._now = now_fn or (lambda: datetime.now(_KST))
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
+        self._enforce_market_session = safe_bool(
+            self._cfg.get("enforce_market_session", True),
+            default=True,
+        )
+        self._market_open_time = self._parse_hhmm(
+            self._cfg.get("market_open_time", "09:00"),
+            default=dt_time(9, 0),
+        )
+        self._market_close_time = self._parse_hhmm(
+            self._cfg.get("market_close_time", "15:30"),
+            default=dt_time(15, 30),
+        )
         self._require_virtual_mode = safe_bool(
             self._cfg.get("require_virtual_mode", True),
             default=True,
@@ -102,6 +117,14 @@ class PaperAutoTrader:
         report["stages"]["start_guard"] = start_guard
         if start_guard["status"] != "PASS":
             report["status"] = "SKIP" if start_guard.get("safe_skip") else "FAIL"
+            return self._finish_report(report, write_report)
+
+        market_session_guard = self._market_session_check()
+        report["stages"]["market_session_guard"] = market_session_guard
+        if market_session_guard["status"] != "PASS":
+            report["status"] = (
+                "SKIP" if market_session_guard.get("safe_skip") else "FAIL"
+            )
             return self._finish_report(report, write_report)
 
         mode_guard = self._paper_mode_check()
@@ -314,6 +337,39 @@ class PaperAutoTrader:
                 "required_phrase": self._confirm_start_phrase,
             }
         return {"status": "PASS"}
+
+    def _market_session_check(self) -> dict[str, Any]:
+        if not self._enforce_market_session:
+            return {"status": "PASS", "enforced": False}
+        now = self._now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_KST)
+        else:
+            now = now.astimezone(_KST)
+        if not is_kospi_trading_day(now.date()):
+            return {
+                "status": "SKIP",
+                "safe_skip": True,
+                "reason": "not_kospi_trading_day",
+                "now": now.isoformat(),
+            }
+        now_time = now.time().replace(tzinfo=None)
+        if now_time < self._market_open_time or now_time > self._market_close_time:
+            return {
+                "status": "SKIP",
+                "safe_skip": True,
+                "reason": "outside_market_session",
+                "now": now.isoformat(),
+                "market_open_time": self._market_open_time.strftime("%H:%M"),
+                "market_close_time": self._market_close_time.strftime("%H:%M"),
+            }
+        return {
+            "status": "PASS",
+            "enforced": True,
+            "now": now.isoformat(),
+            "market_open_time": self._market_open_time.strftime("%H:%M"),
+            "market_close_time": self._market_close_time.strftime("%H:%M"),
+        }
 
     def _paper_mode_check(self) -> dict[str, Any]:
         mode = str(getattr(self._kis_client, "mode", "unknown")).lower()
@@ -577,6 +633,15 @@ class PaperAutoTrader:
             "stages": {},
             "failures": [],
         }
+
+    @staticmethod
+    def _parse_hhmm(value: Any, *, default: dt_time) -> dt_time:
+        try:
+            hour, minute = str(value).strip().split(":", 1)
+            return dt_time(int(hour), int(minute))
+        except Exception as e:
+            logger.warning("[paper_auto_trading] 장중 시간 설정 파싱 실패: %s", e)
+            return default
 
     def _finish_report(self, report: dict[str, Any], write_report: bool) -> dict[str, Any]:
         report["failures"] = self._collect_failures(report)

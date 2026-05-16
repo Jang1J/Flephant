@@ -188,7 +188,14 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             if use_real_hot_runner
             else (_FakeHotRunner() if args.internal_fake_kis else None)
         )
-        trader = PaperAutoTrader(kis_client=kis_client, hot_runner=hot_runner)
+        trader_kwargs: dict[str, Any] = {}
+        if args.internal_fake_kis:
+            trader_kwargs["now_fn"] = lambda: datetime(2026, 5, 12, 10, 0, 0, tzinfo=_KST)
+        trader = PaperAutoTrader(
+            kis_client=kis_client,
+            hot_runner=hot_runner,
+            **trader_kwargs,
+        )
         stages["paper_auto_cycle"] = trader.run(
             tickers=[pad_ticker(t.strip()) for t in str(args.tickers).split(",") if t.strip()],
             cycles=int(args.cycles),

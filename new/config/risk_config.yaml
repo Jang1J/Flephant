@@ -125,6 +125,9 @@ paper_trading:
 paper_auto_trading:
   report_dir: "artifacts/reports/paper_auto_trading"
   confirm_start_phrase: "PAPER_AUTO_OK"
+  enforce_market_session: true
+  market_open_time: "09:00"
+  market_close_time: "15:30"
   require_virtual_mode: true
   require_prelive_pass: true
   require_active_model: true

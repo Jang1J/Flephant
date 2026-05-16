@@ -3,12 +3,16 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.execution import paper_auto_trading as paper_auto_module
 from src.execution.paper_auto_trading import PaperAutoTrader
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _load_paper_auto_trade_script():
@@ -21,6 +25,18 @@ def _load_paper_auto_trade_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _paper_session_now() -> datetime:
+    return datetime(2026, 5, 12, 10, 0, tzinfo=_KST)
+
+
+def _paper_preopen_now() -> datetime:
+    return datetime(2026, 5, 12, 8, 30, tzinfo=_KST)
+
+
+def _paper_weekend_now() -> datetime:
+    return datetime(2026, 5, 16, 10, 0, tzinfo=_KST)
 
 
 class FakePaperKIS:
@@ -262,6 +278,7 @@ def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
         kis_client=client,
         hot_runner=FakeHotRunner(),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -283,6 +300,7 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
         kis_client=client,
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -307,12 +325,61 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
 
 
+def test_paper_auto_skips_before_market_open(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_preopen_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "SKIP"
+    assert report["stages"]["market_session_guard"]["reason"] == "outside_market_session"
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
+
+
+def test_paper_auto_skips_non_trading_day(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_weekend_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "SKIP"
+    assert report["stages"]["market_session_guard"]["reason"] == "not_kospi_trading_day"
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
+
+
 def test_paper_auto_run_once_requires_start_guard(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
         kis_client=client,
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     result = trader.run_once(tickers=["005930"], cycle_index=0)
@@ -328,6 +395,7 @@ def test_paper_auto_active_model_guard_requires_has_model_flag(tmp_path: Path) -
         kis_client=client,
         hot_runner=FakeNoModelFlagHotRunner(),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -350,6 +418,7 @@ def test_paper_auto_active_model_guard_requires_bundle_id(tmp_path: Path) -> Non
         kis_client=client,
         hot_runner=FakeNoBundleHotRunner(),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -373,6 +442,7 @@ def test_paper_auto_active_model_guard_requires_requested_bundle(tmp_path: Path)
         hot_runner=FakeOtherBundleHotRunner(),
         report_dir=tmp_path,
         required_bundle_id="BUNDLE-TEST",
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -397,6 +467,7 @@ def test_paper_auto_active_model_guard_treats_string_false_as_false(tmp_path: Pa
         kis_client=client,
         hot_runner=FakeStringFalseModelHotRunner(),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -420,6 +491,7 @@ def test_paper_auto_rejects_zero_cycles_before_starting_hot_runner(tmp_path: Pat
         kis_client=client,
         hot_runner=hot_runner,
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -442,6 +514,7 @@ def test_paper_auto_broker_rejection_fails_cycle(tmp_path: Path) -> None:
         kis_client=FakePaperKISRejects(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -464,6 +537,7 @@ def test_paper_auto_fails_when_broker_order_id_not_in_history(tmp_path: Path) ->
         kis_client=FakePaperKISNoHistoryMatch(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -487,6 +561,7 @@ def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
         kis_client=FakePaperKISNoBrokerOrderId(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -510,6 +585,7 @@ def test_paper_auto_fails_when_order_history_method_missing(tmp_path: Path) -> N
         kis_client=FakePaperKISNoHistoryMethod(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -533,6 +609,7 @@ def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: P
         kis_client=client,
         hot_runner=FakeHotRunner(qty=2),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -581,6 +658,7 @@ def test_paper_auto_treats_string_false_market_order_as_disabled(
         kis_client=client,
         hot_runner=FakeMarketHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -604,6 +682,7 @@ def test_paper_auto_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
         kis_client=client,
         hot_runner=FakeHotRunner(qty="abc"),  # type: ignore[arg-type]
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -627,6 +706,7 @@ def test_paper_auto_rejects_fractional_qty_without_truncation(tmp_path: Path) ->
         kis_client=client,
         hot_runner=FakeHotRunner(qty="1.9"),  # type: ignore[arg-type]
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -659,6 +739,7 @@ def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:
         kis_client=FakeRealKIS(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
