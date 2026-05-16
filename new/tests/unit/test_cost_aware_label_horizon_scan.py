@@ -158,6 +158,39 @@ def test_session_close_return_series_uses_active_horizon_drop_policy():
     assert series.iloc[5:].isna().all()
 
 
+def test_best_horizon_selection_uses_label_topk_before_mean_net():
+    mod = _load_script("cost_aware_label_horizon_scan")
+
+    best = mod._select_best_horizon_report(
+        [
+            {
+                "horizon": "5",
+                "status": "PASS",
+                "valid_rows": 100,
+                "mean_net_bps": 12.0,
+                "positive_net_rate": 0.62,
+                "label_topk": {
+                    "mean_net_bps": 13.0,
+                    "positive_net_rate": 0.70,
+                },
+            },
+            {
+                "horizon": "30",
+                "status": "PASS",
+                "valid_rows": 100,
+                "mean_net_bps": 8.0,
+                "positive_net_rate": 0.59,
+                "label_topk": {
+                    "mean_net_bps": 25.0,
+                    "positive_net_rate": 0.82,
+                },
+            },
+        ]
+    )
+
+    assert best["horizon"] == "30"
+
+
 def test_horizon_summary_reports_selection_impact_for_active_noop():
     mod = _load_script("cost_aware_label_horizon_scan")
     panel = pd.DataFrame(
@@ -190,6 +223,8 @@ def test_horizon_summary_reports_selection_impact_for_active_noop():
         "groups_compared": 0,
         "rank_equivalent_to_active_horizon": True,
     }
+    assert summary["label_topk"]["method"] == "candidate_label_topk_net_bps"
+    assert summary["label_topk"]["rows"] == 1
 
 
 def test_horizon_summary_reports_selection_changes():

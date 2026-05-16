@@ -319,6 +319,87 @@ def _horizon_returns(
     return values[np.isfinite(values)]
 
 
+def _label_topk_stats(
+    *,
+    panel,
+    horizon: str,
+    total_cost_bps: float,
+    top_k_fraction: float,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+) -> dict[str, Any]:
+    """Diagnostic top-K of the candidate label itself, not model performance."""
+    returns = _horizon_return_series(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
+    joined = panel[["ticker", "ts_close"]].copy()
+    joined["_return"] = returns
+    joined = joined.replace([np.inf, -np.inf], np.nan).dropna(subset=["_return"])
+    if joined.empty:
+        return {
+            "method": "candidate_label_topk_net_bps",
+            "top_k_fraction": top_k_fraction,
+            "groups": 0,
+            "rows": 0,
+            "mean_net_bps": None,
+            "positive_net_rate": None,
+        }
+
+    selected: list[float] = []
+    groups = 0
+    for _, group in joined.groupby("ts_close", sort=False):
+        if group.empty:
+            continue
+        k = max(1, int(np.ceil(len(group) * top_k_fraction)))
+        top = group.nlargest(k, "_return")
+        net_bps = top["_return"].to_numpy(dtype=float) * 10000.0 - total_cost_bps
+        finite_net = net_bps[np.isfinite(net_bps)]
+        if finite_net.size == 0:
+            continue
+        selected.extend(float(value) for value in finite_net)
+        groups += 1
+
+    if not selected:
+        return {
+            "method": "candidate_label_topk_net_bps",
+            "top_k_fraction": top_k_fraction,
+            "groups": 0,
+            "rows": 0,
+            "mean_net_bps": None,
+            "positive_net_rate": None,
+        }
+    values = np.asarray(selected, dtype=float)
+    return {
+        "method": "candidate_label_topk_net_bps",
+        "top_k_fraction": top_k_fraction,
+        "groups": int(groups),
+        "rows": int(values.size),
+        "mean_net_bps": float(values.mean()),
+        "positive_net_rate": float((values > 0.0).mean()),
+    }
+
+
+def _horizon_selection_score(report: dict[str, Any]) -> tuple[float, float, float, float, int]:
+    topk = report.get("label_topk")
+    if not isinstance(topk, dict):
+        topk = {}
+    status_rank = 1.0 if report.get("status") == "PASS" else 0.0
+    return (
+        status_rank,
+        safe_float(topk.get("mean_net_bps"), default=-1e18),
+        safe_float(topk.get("positive_net_rate"), default=-1.0),
+        safe_float(report.get("mean_net_bps"), default=-1e18),
+        safe_int(report.get("valid_rows"), default=0, min_value=0),
+    )
+
+
+def _select_best_horizon_report(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return max(reports, key=_horizon_selection_score, default=None)
+
+
 def _selection_impact(
     *,
     panel,
@@ -464,6 +545,14 @@ def _summarize_horizon(
         "net_bps_quantiles": _quantiles(net_bps),
         "pass_mean_net_threshold": bool(pass_mean),
         "pass_positive_net_rate_threshold": bool(pass_hit),
+        "label_topk": _label_topk_stats(
+            panel=panel,
+            horizon=horizon,
+            total_cost_bps=total_cost_bps,
+            top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
+            active_horizon=active_horizon,
+        ),
         "selection_impact": _selection_impact(
             panel=panel,
             horizon=horizon,
@@ -529,7 +618,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         for horizon in horizons
     ]
     valid_reports = [r for r in horizon_reports if r.get("valid_rows", 0)]
-    best = max(valid_reports, key=lambda r: float(r.get("mean_net_bps", -1e18)), default=None)
+    best = _select_best_horizon_report(valid_reports)
     deployable = bool(best and best.get("status") == "PASS")
     return {
         "status": "PASS" if deployable else "WARN",
@@ -562,6 +651,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             },
         },
         "best_horizon": best.get("horizon") if best else None,
+        "best_horizon_selection": {
+            "method": "status_then_candidate_label_topk_net_bps",
+            "score": list(_horizon_selection_score(best)) if best else None,
+            "note": "label_topk is label separability diagnostic, not model OOS PnL",
+        },
         "deployable_label_recommendation": deployable,
         "warnings": warnings,
         "horizons": horizon_reports,
