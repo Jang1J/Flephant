@@ -699,6 +699,8 @@ output:
     risk_overrides: [{rule: string, original: string, override: string, justification: string}]
     confidence: float
     expiry: ISO8601
+    portfolio_patch_ref: string             # trace-only. C8 patch 참조. FDA가 order_deltas를 생성/수정하는 권한 아님.
+    active_reports: [message_id]            # trace-only. 판단 당시 참조한 active report id 목록.
 rules:
   can_change_weight: false
   must_include_reasoning: true
