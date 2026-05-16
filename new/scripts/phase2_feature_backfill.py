@@ -30,6 +30,7 @@ from src.data.exogenous_feature_store import (  # noqa: E402
     write_exogenous_payload,
 )
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -40,10 +41,37 @@ _REPORT_DIR = ROOT / "artifacts" / "reports" / "phase2_feature_backfill"
 
 def _active_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
         for item in sector.get("stocks", []) or []:
-            if str(item.get("status", "")).lower() == "active":
+            if str(item.get("status", "")) in stock_statuses:
                 tickers.append(pad_ticker(str(item.get("ticker", ""))))
     fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
     tickers.extend(pad_ticker(str(t)) for t in fallback)
@@ -61,7 +89,35 @@ def _extract_date(path: Path) -> str | None:
     return match.group(1)
 
 
-def _common_artifact_dates(artifacts_dir: Path, tickers: list[str]) -> list[str]:
+def _artifact_row_count(path: Path) -> int | None:
+    try:
+        if path.suffix == ".parquet":
+            import pandas as pd  # type: ignore[import]
+
+            return int(len(pd.read_parquet(path)))
+        if path.suffix == ".jsonl":
+            with path.open("r", encoding="utf-8") as fh:
+                return sum(1 for line in fh if line.strip())
+    except Exception:
+        return None
+    return None
+
+
+def _valid_bar_artifact(path: Path, min_rows: int) -> bool:
+    if not path.name.startswith("bars_1m_"):
+        return False
+    if path.suffix not in {".parquet", ".jsonl"}:
+        return False
+    row_count = _artifact_row_count(path)
+    return row_count is not None and row_count >= min_rows
+
+
+def _common_artifact_dates(
+    artifacts_dir: Path,
+    tickers: list[str],
+    *,
+    min_rows: int,
+) -> list[str]:
     counts: dict[str, int] = {}
     for ticker in tickers:
         ticker_dir = artifacts_dir / ticker
@@ -70,7 +126,7 @@ def _common_artifact_dates(artifacts_dir: Path, tickers: list[str]) -> list[str]
         seen: set[str] = set()
         for path in ticker_dir.iterdir():
             date_key = _extract_date(path)
-            if date_key:
+            if date_key and _valid_bar_artifact(path, min_rows):
                 seen.add(date_key)
         for date_key in seen:
             counts[date_key] = counts.get(date_key, 0) + 1
@@ -84,8 +140,13 @@ def _select_dates(
     *,
     end_date: str,
     business_days: int,
+    min_rows: int,
 ) -> list[str]:
-    dates = [date_key for date_key in _common_artifact_dates(artifacts_dir, tickers) if date_key <= end_date]
+    dates = [
+        date_key
+        for date_key in _common_artifact_dates(artifacts_dir, tickers, min_rows=min_rows)
+        if date_key <= end_date
+    ]
     return dates[-business_days:]
 
 
@@ -144,12 +205,21 @@ def run_phase2_feature_backfill(
     artifacts_dir: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
+    gate_cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
+    readiness_cfg = config_load("risk_config.yaml", "live_data_readiness") or {}
+    min_artifact_rows = int(
+        gate_cfg.get(
+            "min_rows_per_day",
+            readiness_cfg.get("train_min_rows_per_day", 300),
+        )
+    )
     tickers = _active_tickers()
     selected_dates = _select_dates(
         artifacts_dir,
         tickers,
         end_date=end_date,
         business_days=business_days,
+        min_rows=min_artifact_rows,
     )
     if not selected_dates:
         raise RuntimeError("no common 1m artifact dates found for active tickers")
@@ -159,7 +229,6 @@ def run_phase2_feature_backfill(
         col: float((exog_cfg.get("neutral_defaults") or {}).get(col, 0.0))
         for col in EXOGENOUS_FEATURES
     }
-    gate_cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
     min_ds_cov = float(gate_cfg.get("min_dual_source_non_neutral_date_coverage", 0.8))
     min_exog_cov = float(gate_cfg.get("min_exogenous_non_neutral_date_coverage", 0.8))
 
@@ -238,6 +307,7 @@ def run_phase2_feature_backfill(
         "date_count": date_count,
         "date_range": {"start": selected_dates[0], "end": selected_dates[-1]},
         "ticker_count": len(tickers),
+        "min_artifact_rows_per_day": min_artifact_rows,
         "thresholds": {
             "min_dual_source_non_neutral_date_coverage": min_ds_cov,
             "min_exogenous_non_neutral_date_coverage": min_exog_cov,
