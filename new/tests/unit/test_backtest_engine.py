@@ -70,13 +70,14 @@ _MINIMAL_CFG_EVAL = {
 }
 
 
-def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None):
+def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None, cost_aware=None):
     """config_load 패치용 side_effect."""
     _vt = vt or _MINIMAL_CFG_VT
     _wf = wf or _MINIMAL_CFG_WF
     _cost = cost or _MINIMAL_CFG_COST
     _eval = eval_ or _MINIMAL_CFG_EVAL
     _service = service or {}
+    _cost_aware = cost_aware or {}
 
     def _loader(file: str = "risk_config.yaml", key: str | None = None):
         if key == "validation_tools.backtest_engine":
@@ -89,6 +90,8 @@ def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None):
             return _eval
         if key == "service_policy_replay":
             return _service
+        if key == "cost_aware_retraining":
+            return _cost_aware
         # pit_safety 등 기타 키 → 빈 dict
         return {}
 
@@ -138,13 +141,18 @@ def test_service_policy_bool_strings_are_not_truthy() -> None:
         service={
             "allow_position_pyramiding": "false",
             "turnover_budget_hard_stop": "false",
-        }
+        },
+        cost_aware={
+            "trade_probability_gate": {"enabled": "false", "min_probability": "0.7"}
+        },
     )
 
     policy = engine._service_policy_config()
 
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is False
+    assert policy.trade_probability_gate_enabled is False
+    assert policy.min_trade_probability == 0.7
 
 
 class _mode_b_env:

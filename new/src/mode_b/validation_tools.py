@@ -14,7 +14,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_backtest_id, generate_pa_id, generate_replay_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float
 from src.utils.ticker_utils import pad_ticker
 from src.utils.trading_calendar import kospi_trading_dates_between
 
@@ -151,6 +151,7 @@ class BacktestEngine:
         self._cfg_turnover = config_load("risk_config.yaml", "turnover_cap") or {}
         self._cfg_label = config_load("risk_config.yaml", "label") or {}
         self._cfg_service_policy = config_load("risk_config.yaml", "service_policy_replay") or {}
+        self._cfg_cost_aware = config_load("risk_config.yaml", "cost_aware_retraining") or {}
         # S3 Critical 8: 하드코딩 제거. mock_data 파라미터를 yaml에서 로드.
         _mock_cfg: dict[str, Any] = (self._cfg_vt or {}).get("mock_data", {})
         self._mock_base_price: float = float(_mock_cfg.get("base_price", 50000.0))
@@ -665,6 +666,7 @@ class BacktestEngine:
         from src.mode_b.service_policy_replay import ServicePolicyConfig
 
         cost_components = (self._cfg_cost or {}).get("components", {}) or {}
+        trade_gate_cfg = (self._cfg_cost_aware.get("trade_probability_gate", {}) or {})
 
         return ServicePolicyConfig(
             initial_capital=float(self._initial_capital),
@@ -714,6 +716,16 @@ class BacktestEngine:
             ),
             min_service_policy_sharpe=float(
                 self._cfg_service_policy.get("min_service_policy_sharpe", 0.0)
+            ),
+            trade_probability_gate_enabled=safe_bool(
+                trade_gate_cfg.get("enabled"),
+                default=False,
+            ),
+            min_trade_probability=safe_float(
+                trade_gate_cfg.get("min_probability"),
+                default=0.5,
+                min_value=0.0,
+                max_value=1.0,
             ),
         )
 
