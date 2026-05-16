@@ -72,6 +72,63 @@ def test_final_dataset_gate_blocks_wrong_ticker_set() -> None:
     assert result["expected_universe_hash"]
 
 
+def test_final_dataset_gate_blocks_missing_expected_universe(monkeypatch) -> None:
+    monkeypatch.setattr(service_readiness_status, "_final_dataset_tickers", lambda: [])
+    metadata = _final_dataset_metadata()
+    arbitrary_tickers = [f"{i:06d}" for i in range(100000, 100030)]
+    metadata["requested_tickers"] = arbitrary_tickers
+    metadata["loaded_tickers"] = arbitrary_tickers
+    metadata["n_tickers"] = len(arbitrary_tickers)
+
+    result = service_readiness_status._final_dataset_gate_state({
+        "candidate_model_metadata": metadata,
+    })
+
+    assert result["status"] == "BLOCKED"
+    assert "final_dataset_expected_universe_missing" in result["blockers"]
+    assert result["expected_ticker_count"] == 0
+    assert result["expected_universe_hash"] is None
+
+
+def test_final_dataset_tickers_selects_config_order_before_normalizing(monkeypatch) -> None:
+    gate_cfg = {
+        "min_tickers": 30,
+        "include_pending_data_tickers": True,
+        "allowed_stock_statuses": ["active", "pending_data"],
+        "allowed_sector_statuses": ["confirmed"],
+    }
+    stocks = [
+        {"ticker": f"{i:06d}", "status": "active"}
+        for i in range(100000, 100029)
+    ] + [
+        {"ticker": "999999", "status": "active"},
+        {"ticker": "000030", "status": "active"},
+    ]
+    universe_cfg = {
+        "sectors": {
+            "synthetic": {
+                "status": "confirmed",
+                "stocks": stocks,
+            }
+        }
+    }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml":
+            return gate_cfg
+        if file_name == "universe_config.yaml":
+            return universe_cfg
+        return {}
+
+    monkeypatch.setattr(service_readiness_status, "config_load", fake_config_load)
+
+    tickers = service_readiness_status._final_dataset_tickers()
+
+    assert len(tickers) == 30
+    assert "999999" in tickers
+    assert "000030" not in tickers
+
+
 def test_feature_quality_gate_blocks_missing_config(monkeypatch) -> None:
     monkeypatch.setattr(
         service_readiness_status,

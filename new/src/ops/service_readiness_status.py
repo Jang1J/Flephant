@@ -233,8 +233,8 @@ def _final_dataset_tickers() -> list[str]:
     if not tickers:
         tickers.extend((universe_cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", []))
     min_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
-    normalized = normalize_service_policy_universe(tickers)
-    return normalized[:min_tickers] if min_tickers else normalized
+    selected = tickers[:min_tickers] if min_tickers else tickers
+    return normalize_service_policy_universe(selected)
 
 
 def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
@@ -293,6 +293,11 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
     if ticker_count < min_tickers:
         blockers.append("ticker_count_below_final_dataset_min")
     expected_tickers = _final_dataset_tickers()
+    if min_tickers > 0:
+        if not expected_tickers:
+            blockers.append("final_dataset_expected_universe_missing")
+        elif len(expected_tickers) != min_tickers:
+            blockers.append("final_dataset_expected_universe_incomplete")
     expected_universe_hash = (
         service_policy_universe_hash(expected_tickers) if expected_tickers else None
     )

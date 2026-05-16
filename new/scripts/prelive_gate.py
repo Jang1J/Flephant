@@ -240,6 +240,11 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
         if min_tickers > 0
         else []
     )
+    if min_tickers > 0:
+        if not expected_tickers:
+            blockers.append("final_dataset_expected_universe_missing")
+        elif len(expected_tickers) != min_tickers:
+            blockers.append("final_dataset_expected_universe_incomplete")
     expected_universe_hash = (
         service_policy_universe_hash(expected_tickers) if expected_tickers else None
     )

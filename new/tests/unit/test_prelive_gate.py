@@ -745,6 +745,24 @@ def test_final_dataset_gate_blocks_wrong_ticker_set():
     assert result["expected_universe_hash"]
 
 
+def test_final_dataset_gate_blocks_missing_expected_universe(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_active_tickers", lambda max_tickers: [])
+
+    metadata = _final_dataset_metadata()
+    arbitrary_tickers = [f"{i:06d}" for i in range(100000, 100030)]
+    metadata["requested_tickers"] = arbitrary_tickers
+    metadata["loaded_tickers"] = arbitrary_tickers
+    metadata["n_tickers"] = len(arbitrary_tickers)
+
+    result = gate._final_dataset_gate_result({"model_metadata": metadata})
+
+    assert result["status"] == "BLOCKED"
+    assert "final_dataset_expected_universe_missing" in result["blockers"]
+    assert result["expected_ticker_count"] == 0
+    assert result["expected_universe_hash"] is None
+
+
 def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
