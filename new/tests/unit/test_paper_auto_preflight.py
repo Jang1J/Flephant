@@ -53,6 +53,19 @@ def test_paper_auto_preflight_passes_when_all_narrow_gates_pass(monkeypatch) -> 
     assert report["stage_statuses"]["active_registry"] == "WARN"
 
 
+def test_ops_risk_treats_string_false_live_enabled_as_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        paper_auto_preflight,
+        "config_load",
+        lambda file_name, section: {"live_enabled": "false"} if section == "execution" else {},
+    )
+
+    report = paper_auto_preflight._ops_risk()
+
+    assert report["status"] == "PASS"
+    assert report["risk_config_live_enabled"] is False
+
+
 def test_paper_auto_preflight_blocks_without_paper_evidence(monkeypatch) -> None:
     monkeypatch.setattr(
         paper_auto_preflight.print_env_readiness,
@@ -190,6 +203,56 @@ def test_paper_evidence_reports_market_closed_probe_blocker(monkeypatch) -> None
                                     "error": (
                                         "[kis_rest] KIS API 오류 "
                                         "msg_cd=40580000 msg=모의투자 장종료 입니다."
+                                    )
+                                }],
+                            },
+                        },
+                    },
+                    "order_history": {
+                        "status": "PASS",
+                        "matched_order_count": 0,
+                    },
+                },
+            }
+        if "order_history" in pattern:
+            return None
+        return None
+
+    monkeypatch.setattr(paper_auto_preflight, "_latest_json", _fake_latest)
+
+    evidence = paper_auto_preflight._paper_evidence()
+
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["probe_order"]["blocker"]["error_code"] == "BROKER_MARKET_CLOSED"
+
+
+def test_paper_evidence_reports_non_business_day_probe_blocker(monkeypatch) -> None:
+    def _fake_latest(pattern: str):
+        if "balance_reconciliation" in pattern:
+            return {
+                "status": "PASS",
+                "_path": "balance.json",
+                "generated_at": _now_iso(),
+                "evidence": _evidence(),
+                "stages": {
+                    "balance": {"status": "PASS"},
+                    "reconciliation": {"status": "PASS"},
+                },
+            }
+        if "submit_probe_order" in pattern:
+            return {
+                "status": "FAIL",
+                "_path": "probe.json",
+                "generated_at": _now_iso(),
+                "evidence": _evidence(),
+                "stages": {
+                    "execution": {
+                        "result": {
+                            "execution_report": {
+                                "rejections": [{
+                                    "error": (
+                                        "[kis_rest] KIS API 오류 "
+                                        "msg_cd=40100000 msg=모의투자 영업일이 아닙니다."
                                     )
                                 }],
                             },

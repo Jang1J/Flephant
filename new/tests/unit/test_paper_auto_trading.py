@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from src.execution import paper_auto_trading as paper_auto_module
 from src.execution.paper_auto_trading import PaperAutoTrader
 
 
@@ -174,6 +175,14 @@ class FakeHotRunner:
         }
 
 
+class FakeMarketHotRunner(FakeHotRunner):
+    def run_once(self, **_: Any) -> dict[str, Any]:
+        result = super().run_once(**_)
+        result["final_decision"]["order_deltas"][0]["order_type"] = "01"
+        result["final_decision"]["order_deltas"][0]["price"] = 0.0
+        return result
+
+
 def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
@@ -316,6 +325,74 @@ def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:
     assert clipping["original_qty"] == 2
     assert clipping["clipped_qty"] == 1
     assert clipping["direction"] == "decrease_only"
+
+
+def test_paper_auto_treats_string_false_market_order_as_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        paper_auto_module,
+        "config_load",
+        lambda file_name, section: (
+            {
+                "report_dir": str(tmp_path),
+                "confirm_start_phrase": "PAPER_AUTO_OK",
+                "require_virtual_mode": "true",
+                "require_active_model": "true",
+                "max_orders_per_cycle": 3,
+                "max_order_qty_per_order": 1,
+                "allow_market_order": "false",
+                "use_latest_ppo_policy_if_available": "false",
+            }
+            if section == "paper_auto_trading"
+            else {"warmup_bars": 60} if section == "quant_agent"
+            else {}
+        ),
+    )
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeMarketHotRunner(qty=1),
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_guard"]["status"] == "FAIL"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "market_order_not_allowed"
+    assert client.orders == []
+
+
+def test_paper_auto_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty="abc"),  # type: ignore[arg-type]
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_guard"]["status"] == "FAIL"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
+    assert client.orders == []
 
 
 def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.utils.safe_cast import safe_bool, safe_int
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -89,9 +91,11 @@ def verify_service_policy_evidence(
         "order_caps_respected",
         "cash_guard_respected",
     ):
-        if checks.get(key) is not True:
+        if not safe_bool(checks.get(key), default=False):
             blockers.append(f"service_policy_check_failed:{key}")
-    if int(stats.get("naked_short_attempts", 0) or 0) != 0:
+    naked_raw = stats.get("naked_short_attempts", 0)
+    naked_default = 0 if naked_raw is None else -1
+    if safe_int(naked_raw, default=naked_default) != 0:
         blockers.append("service_policy_naked_short_attempts")
 
     blockers = sorted(set(blockers))

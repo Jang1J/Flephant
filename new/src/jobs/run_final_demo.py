@@ -43,12 +43,15 @@ _NEW_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(_NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(_NEW_ROOT))
 
+from src.ops.service_readiness_status import build_service_status
 from src.runner.e2e_scenario_runner import E2EScenarioRunner
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_int
 
 logger = get_logger("run_final_demo")
 _KST = ZoneInfo("Asia/Seoul")
 _DEMO_OUTPUT_ROOT = _NEW_ROOT.parent / "artifacts" / "audit"
+_DEFAULT_BUNDLE_ID = "BUNDLE-20260512-0AEEE37A"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -72,6 +75,11 @@ def _parse_args() -> argparse.Namespace:
         "--full-ticks",
         action="store_true",
         help="Hot Path 전체 390 tick 실행. 기본은 short (5 tick)",
+    )
+    parser.add_argument(
+        "--bundle-id",
+        default=_DEFAULT_BUNDLE_ID,
+        help=f"Mode B read-only evidence demo에 사용할 bundle id. 기본: {_DEFAULT_BUNDLE_ID}",
     )
     return parser.parse_args()
 
@@ -118,13 +126,13 @@ def _summary_failures(
     require_mode_b_pass: bool = False,
 ) -> list[str]:
     failures: list[str] = []
-    if int(summary.get("pit_violations", 0)) > 0:
+    if _positive_count(summary.get("pit_violations")):
         failures.append("pit_violations")
-    if int(summary.get("fda_missing_reason_code", 0)) > 0:
+    if _positive_count(summary.get("fda_missing_reason_code")):
         failures.append("fda_missing_reason_code")
-    if int(summary.get("total_errors", 0)) > 0:
+    if _positive_count(summary.get("total_errors")):
         failures.append("total_errors")
-    if require_sla and not bool(summary.get("hot_path_sla", {}).get("sla_ok", False)):
+    if require_sla and not safe_bool(summary.get("hot_path_sla", {}).get("sla_ok", False), default=False):
         failures.append("hot_path_sla")
     if require_mode_b_pass:
         bad_mode_b = [
@@ -136,6 +144,12 @@ def _summary_failures(
     summary["status"] = "FAIL" if failures else "PASS"
     summary["failures"] = failures
     return failures
+
+
+def _positive_count(value: object) -> bool:
+    """Treat malformed counters as positive so demo summaries fail closed."""
+    default = 0 if value in (None, "") else 1
+    return safe_int(value, default=default, min_value=0) > 0
 
 
 def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
@@ -204,42 +218,74 @@ def run_demo_cold(scenario: str, short_mode: bool) -> dict[str, Any]:
     print(f"  PIT 위반           : {summary.get('pit_violations', 0)}")
     print(f"  FDA reason_code 누락 : {summary.get('fda_missing_reason_code', 0)}")
     print(f"  에러 합계          : {summary.get('total_errors', 0)}")
-    print(f"  (Cold Path event_injector 4종 inject 결과는 audit_log JSONL 에서 확인)")
+    print("  (Cold Path event_injector 4종 inject 결과는 audit_log JSONL 에서 확인)")
 
     out = _save_summary("b_cold", summary)
     print(f"  → 산출: {out}")
     return summary
 
 
-def run_demo_mode_b(scenario: str) -> dict[str, Any]:
-    """Demo C: Mode B blocked. ModeBScheduler 7-stage -> BacktestAgent -> deploy_status."""
-    _print_banner("Demo C: Mode B (Scheduler -> BacktestAgent -> Deployer)")
+def run_demo_mode_b(scenario: str, bundle_id: str = _DEFAULT_BUNDLE_ID) -> dict[str, Any]:
+    """Demo C: read-only Mode B evidence without violating 18:00 KST PIT gate."""
+    _print_banner("Demo C: Mode B Evidence (C12 -> C14 dry-run -> Service Readiness)")
 
-    runner = E2EScenarioRunner(
-        scenario_file=scenario,
-        short_mode=True,
-        skip_mode_b=False,
+    readiness = build_service_status(bundle_id=bundle_id)
+    c12 = readiness.get("c12_backtest") if isinstance(readiness, dict) else {}
+    production = readiness.get("production_registry") if isinstance(readiness, dict) else {}
+    paper = readiness.get("paper_registry") if isinstance(readiness, dict) else {}
+    mode_b_pass = (
+        readiness.get("status") == "PASS"
+        and readiness.get("deploy_quality") == "PASS"
+        and readiness.get("broker_evidence") == "PASS"
+        and c12.get("verdict") == "pass"
+        and safe_bool(c12.get("deployable"), default=False)
     )
-    result = runner.run()
-    summary = result.summary()
+    summary = {
+        "scenario_name": scenario,
+        "bundle_id": bundle_id,
+        "mode_b_demo_mode": "read_only_evidence",
+        "mode_b_verdicts": ["pass" if mode_b_pass else "blocked"],
+        "service_readiness_status": readiness.get("status"),
+        "deploy_quality": readiness.get("deploy_quality"),
+        "broker_evidence": readiness.get("broker_evidence"),
+        "registry_mutated": readiness.get("registry_mutated"),
+        "live_trading_allowed": readiness.get("live_trading_allowed"),
+        "c12_report_path": c12.get("report_path"),
+        "c12_selection": c12.get("selection"),
+        "ignored_newer_non_deployable_reports": c12.get("ignored_newer_non_deployable_reports", 0),
+        "c12_metrics": c12.get("metrics", {}),
+        "production_active_version": production.get("active_version"),
+        "paper_active_version": paper.get("active_version"),
+        "pit_violations": 0,
+        "fda_missing_reason_code": 0,
+        "total_errors": 0 if mode_b_pass else 1,
+        "total_days": 0,
+    }
     _mark_demo_context(
         summary,
         demo_id="mode_b",
         caveats=[
-            "Mode B demo runs short scenario mode and may include stub_short_mode candidates.",
-            "Production readiness requires non-stub C12 real backtest PASS and C14 deploy.",
+            "Mode B Scheduler/DQR is not executed outside the 18:00 KST Mode B window.",
+            "This demo reads persisted C12/C14/service-readiness evidence instead of bypassing PIT gates.",
+            "Production registry remains inactive; paper registry and broker evidence are read-only.",
         ],
     )
     _summary_failures(summary, require_mode_b_pass=True)
 
     verdicts = summary.get("mode_b_verdicts", [])
-    print(f"  시나리오           : {summary.get('scenario_name', 'N/A')}")
-    print(f"  Mode B 실행일수    : {summary.get('total_days', 0)}")
-    print(f"  backtest_verdict   : {verdicts}")
-    print(f"  fail/blocked 일수  : {sum(1 for v in verdicts if v in ('fail', 'blocked'))}")
-    print(f"  pass 일수          : {sum(1 for v in verdicts if v == 'pass')}")
-    print(f"  PIT 위반           : {summary.get('pit_violations', 0)}")
-    print(f"  에러 합계          : {summary.get('total_errors', 0)}")
+    print(f"  bundle_id          : {summary.get('bundle_id')}")
+    print(f"  evidence mode      : {summary.get('mode_b_demo_mode')}")
+    print(f"  service_readiness  : {summary.get('service_readiness_status')}")
+    print(f"  deploy_quality     : {summary.get('deploy_quality')}")
+    print(f"  broker_evidence    : {summary.get('broker_evidence')}")
+    print(f"  c12_verdict        : {c12.get('verdict')}")
+    print(f"  c12_deployable     : {c12.get('deployable')}")
+    print(f"  c12_selection      : {summary.get('c12_selection')}")
+    print(f"  mode_b_verdict     : {verdicts}")
+    print(f"  production active  : {summary.get('production_active_version')}")
+    print(f"  paper active       : {summary.get('paper_active_version')}")
+    print(f"  registry_mutated   : {summary.get('registry_mutated')}")
+    print(f"  live_trading_allowed: {summary.get('live_trading_allowed')}")
 
     out = _save_summary("c_mode_b", summary)
     print(f"  → 산출: {out}")
@@ -252,7 +298,7 @@ def main() -> int:
 
     print()
     print("=" * 72)
-    print(f"  학기말 발표 데모 runner (P0-6)")
+    print("  학기말 발표 데모 runner (P0-6)")
     print(f"  scenario={args.scenario} demo={args.demo} short={short_mode}")
     print("=" * 72)
 
@@ -281,7 +327,7 @@ def main() -> int:
 
     if args.demo in ("all", "mode_b"):
         try:
-            results["mode_b"] = run_demo_mode_b(args.scenario)
+            results["mode_b"] = run_demo_mode_b(args.scenario, bundle_id=str(args.bundle_id))
             if results["mode_b"].get("status") == "FAIL":
                 failed.append("mode_b")
         except Exception as e:

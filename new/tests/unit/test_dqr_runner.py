@@ -13,7 +13,6 @@ PIT-Safety: skip_pit_guard=True 사용 (시간 의존 제거).
 from __future__ import annotations
 
 import json
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo

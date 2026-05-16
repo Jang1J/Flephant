@@ -14,6 +14,7 @@ from typing import Callable
 from src.data.event_admission import EventAdmission
 from src.data.event_normalizer import EventNormalizer
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("event_gateway")
 
@@ -168,8 +169,8 @@ class EventGateway:
             and isinstance(result, dict)
             and isinstance(publish_message, dict)
             and publish_message.get("content")
-            and not result.get("llm_fallback", False)
-            and not result.get("published_by_agent", False)
+            and not safe_bool(result.get("llm_fallback", False), default=False)
+            and not safe_bool(result.get("published_by_agent", False), default=False)
             and "message_id" not in result
         ):
             try:

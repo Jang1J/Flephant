@@ -10,7 +10,6 @@ parquet 미지원 시 JSON Lines fallback (pyarrow 미설치 환경 대응).
 from __future__ import annotations
 
 import json
-import logging
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -235,7 +234,9 @@ class Backfill:
         try:
             import pandas as pd  # type: ignore[import]
             try:
-                import pyarrow  # type: ignore[import] # noqa: F401
+                from importlib.util import find_spec
+                if find_spec("pyarrow") is None:
+                    raise ImportError
                 out_path = save_dir / f"bars_1m_{date}.parquet"
                 df = pd.DataFrame(bars)
                 df.to_parquet(out_path, index=False)

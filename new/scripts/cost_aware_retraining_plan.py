@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "cost_aware_retraining"
@@ -133,8 +134,14 @@ def build_retraining_plan(
         },
         "candidate_horizons": cfg.get("horizon_candidates", []),
         "objective": {
-            "net_of_cost_target": bool(objective_cfg.get("net_of_cost_target", True)),
-            "trade_no_trade_classifier": bool(objective_cfg.get("trade_no_trade_classifier", True)),
+            "net_of_cost_target": safe_bool(
+                objective_cfg.get("net_of_cost_target", True),
+                default=True,
+            ),
+            "trade_no_trade_classifier": safe_bool(
+                objective_cfg.get("trade_no_trade_classifier", True),
+                default=True,
+            ),
             "turnover_penalty": float(ppo_cfg.get("turnover_penalty", 0.0)),
             "min_expected_net_alpha_bps": float(
                 service_policy_cfg.get("min_expected_net_alpha_bps", 0.0)

@@ -13,8 +13,6 @@
 """
 from __future__ import annotations
 
-import json
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -251,6 +249,26 @@ def test_restore_all_disabled(tmp_kb: KnowledgeBase) -> None:
     assert counts == {}
 
 
+def test_restore_all_disabled_string_false(tmp_kb: KnowledgeBase) -> None:
+    """외부 yaml/env 스타일 문자열 false도 disabled로 해석한다."""
+    cfg = {
+        "enabled": "false",
+        "storage_types": ["macro_notes"],
+        "restore_window_days": 7,
+        "restore_max_entries_per_agent": 100,
+        "ttl_days": {},
+    }
+    restorer = AgentMemoryRestorer(tmp_kb, config=cfg)
+
+    tmp_kb.write(_make_entry("메모", "risk_slow"), "macro_notes")
+
+    class FakeAgent:
+        pass
+
+    counts = restorer.restore_all({"risk_slow": FakeAgent()})
+    assert counts == {}
+
+
 # ====================================================================== #
 # Test 7: Hot Runner bootstrap 통합 (BOOTSTRAP 상태에서 작동)
 # ====================================================================== #
@@ -258,7 +276,7 @@ def test_restore_all_disabled(tmp_kb: KnowledgeBase) -> None:
 
 def test_hot_runner_bootstrap_restores_memory(tmp_path: Path) -> None:
     """HotRunner.bootstrap() 호출 시 BOOTSTRAP 상태에서 메모리 복원 수행."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 
     kb = KnowledgeBase(storage_root=tmp_path / "kb")
     kb.write(

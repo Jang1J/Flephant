@@ -20,7 +20,7 @@ C5 risk_warning payload:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from src.agents._base import AgentBase

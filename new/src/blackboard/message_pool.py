@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_message_id
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_confidence, safe_int
 from src.utils.time_utils import now_kst
 
 logger = get_logger("message_pool")
@@ -153,7 +154,9 @@ class MessagePool:
         if missing:
             raise ValueError(f"MESSAGE_SCHEMA_INVALID: missing fields {sorted(missing)}")
 
-        # 1c. enum 검증
+        # 1c. enum + scalar 검증
+        message["confidence"] = safe_confidence(message.get("confidence", 0.5))
+
         priority = message.get("priority")
         if priority not in _VALID_PRIORITIES:
             raise ValueError(f"MESSAGE_SCHEMA_INVALID: priority='{priority}' not in {sorted(_VALID_PRIORITIES)}")
@@ -172,7 +175,7 @@ class MessagePool:
 
         # 3. expires_at + timestamp 자동 계산
         if "expires_at" not in message:
-            ttl = int(message.get("ttl", self._default_ttl_sec))
+            ttl = safe_int(message.get("ttl", self._default_ttl_sec), default=self._default_ttl_sec, min_value=1)
             now = now_kst()
             message["expires_at"] = (now + timedelta(seconds=ttl)).isoformat()
             if "timestamp" not in message:

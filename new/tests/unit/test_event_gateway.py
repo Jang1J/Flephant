@@ -466,6 +466,43 @@ def test_dispatch_next_auto_publish_skipped_when_result_not_dict(tmp_path: Path)
     assert pool.pool_size() == 0
 
 
+def test_auto_publish_treats_string_false_flags_as_false(tmp_path: Path) -> None:
+    """문자열 false 플래그는 auto_publish 차단 조건으로 해석하지 않는다."""
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+
+    def dart_handler(event: dict) -> dict:
+        return {
+            "content": "공시 분석",
+            "cause_by": "DartAgent",
+            "sent_from": "dart_agent",
+            "priority": "normal",
+            "confidence": 0.9,
+            "reasoning": "중요 공시 발생",
+            "scope": "ticker:005930",
+            "action_type": "alert",
+            "timestamp": _recent_ts(),
+            "llm_fallback": "false",
+            "published_by_agent": "false",
+        }
+
+    gw.register_handler("dart", dart_handler, publish_channel="dart_alert")
+    gw.ingest(_dart_raw(), source="dart")
+    result = gw.dispatch_next()
+
+    assert result is not None
+    assert "message_id" in result
+    assert pool.pool_size() == 1
+
+
 # ------------------------------------------------------------------
 # 12. dispatch_next: handler가 TimeoutError 발생 시 handler_error 반환
 # ------------------------------------------------------------------

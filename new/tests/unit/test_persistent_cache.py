@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -212,6 +212,28 @@ def test_disabled_cache_noop(tmp_path: Path) -> None:
         assert result is None
     finally:
         c._enabled = True  # cleanup
+        c.close()
+
+
+def test_string_false_cache_config_is_disabled(monkeypatch, tmp_path: Path) -> None:
+    """cache.enabled='false' 문자열이 캐시를 켜지 않도록 방어."""
+    monkeypatch.setattr(
+        "src.cache.persistent_cache._load_cache_config",
+        lambda: {
+            "enabled": "false",
+            "storage_path": str(tmp_path / "ignored.db"),
+            "news_ttl_seconds": 3600,
+            "agent_report_ttl_seconds": 1800,
+            "cleanup_interval_seconds": 600,
+            "max_entries": 100,
+        },
+    )
+    c = PersistentCache(db_path=tmp_path / "string_false.db")
+    try:
+        assert c.stats()["enabled"] is False
+        c.set("news:005930:EVT-DIS", {"value": 1}, ttl_seconds=3600)
+        assert c.get("news:005930:EVT-DIS") is None
+    finally:
         c.close()
 
 

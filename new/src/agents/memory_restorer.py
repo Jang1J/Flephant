@@ -31,6 +31,7 @@ from typing import Any
 from src.knowledge.kb import KnowledgeBase
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("memory_restorer")
 
@@ -69,7 +70,7 @@ class AgentMemoryRestorer:
         self._kb = kb
         if config is None:
             config = config_load("risk_config.yaml", "agent_memory") or {}
-        self._enabled: bool = bool(config.get("enabled", True))
+        self._enabled: bool = safe_bool(config.get("enabled", True), default=True)
         self._storage_types: list[str] = list(
             config.get("storage_types", list(_STORAGE_TO_AGENT.keys()))
         )
@@ -211,7 +212,6 @@ class AgentMemoryRestorer:
             window 내 항목 list.
         """
         import json
-        from pathlib import Path
 
         storage_dir = self._kb.storage_root / storage_type
         if not storage_dir.exists():

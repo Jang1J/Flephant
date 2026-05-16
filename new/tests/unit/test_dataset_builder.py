@@ -147,6 +147,38 @@ def test_init_loads_config(builder: DatasetBuilder) -> None:
     assert builder._outlier_cap_z > 0
 
 
+def test_init_treats_string_false_feature_flags_as_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """label/feature 설정의 문자열 false가 학습 feature gate를 켜지 않도록 방어."""
+    original_config_load = dataset_builder_module.config_load
+
+    def _fake_config_load(file_name: str, section: str):
+        cfg = original_config_load(file_name, section)
+        if isinstance(cfg, dict):
+            cfg = dict(cfg)
+        if section == "label":
+            cfg["leakage_guard"] = "false"
+        elif section == "dual_source":
+            cfg["enabled_for_lgbm"] = "false"
+        elif section == "exogenous_features":
+            cfg["enabled_for_lgbm"] = "false"
+        return cfg
+
+    monkeypatch.setattr(dataset_builder_module, "config_load", _fake_config_load)
+
+    b = DatasetBuilder(
+        artifacts_dir=tmp_path,
+        allow_synthetic_fallback="false",  # type: ignore[arg-type]
+    )
+
+    assert b._allow_synthetic_fallback is False
+    assert b._leakage_guard is False
+    assert b._ds_enabled_for_lgbm is False
+    assert b._exog_enabled_for_lgbm is False
+
+
 def test_join_exogenous_features_reads_daily_artifact(
     builder: DatasetBuilder,
     tmp_path: Path,
@@ -684,8 +716,6 @@ def test_dual_source_join_vectorized_result(tmp_path: Path) -> None:
     - join 후 005930 행은 news_score_t = 0.5, 000660 행은 0.0 (default)
     """
     from unittest.mock import patch
-
-    from src.data.dataset_builder import DUAL_SOURCE_FEATURES
 
     b = DatasetBuilder(artifacts_dir=tmp_path)
     # 강제로 enabled_for_lgbm 활성화

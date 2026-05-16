@@ -17,9 +17,8 @@ from pathlib import Path
 import subprocess
 import sys
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -189,6 +188,25 @@ def test_load_feature_cols_without_dual_source() -> None:
     assert len(cols) == 4, f"4피처 기대, 실제: {len(cols)} — {cols}"
     for feat in DUAL_SOURCE_FEATURES:
         assert feat not in cols, f"Dual-Source 피처가 있어선 안 됨: {feat}"
+
+
+def test_load_feature_cols_string_false_dual_source_disabled() -> None:
+    """enabled_for_lgbm='false' 문자열도 Dual-Source 피처를 켜지 않는다."""
+    def _loader(key: str, section: str | None = None) -> Any:
+        if section == "preprocessor":
+            return _base_preprocessor_cfg()
+        if section == "dual_source":
+            return {"enabled_for_lgbm": "false"}
+        if section == "exogenous_features":
+            return {"enabled_for_lgbm": "false"}
+        return {}
+
+    with patch("src.models.lgbm_trainer.config_load", side_effect=_loader):
+        cols = _load_feature_cols()
+
+    assert len(cols) == 4
+    for feat in DUAL_SOURCE_FEATURES:
+        assert feat not in cols
 
 
 # ====================================================================== #

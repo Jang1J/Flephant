@@ -13,8 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-import pytest
-
 from src.connectors.community import CommunityPost
 from src.data import dual_source_runner
 from src.data.dual_source_runner import (

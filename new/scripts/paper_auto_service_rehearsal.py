@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
 import paper_auto_preflight  # noqa: E402
 from src.execution.paper_auto_trading import PaperAutoTrader  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_float  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -109,7 +110,7 @@ class _FakeHotRunner:
     def run_once(self, **kwargs: Any) -> dict[str, Any]:
         latest_prices = kwargs.get("latest_prices", {})
         ticker = pad_ticker(str((kwargs.get("tickers") or ["005930"])[0]))
-        price = float(latest_prices.get(ticker, 70000.0) or 70000.0)
+        price = safe_float(latest_prices.get(ticker), default=70000.0, min_value=1.0)
         return {
             "final_decision": {
                 "decision_id": "FDA-PAPER-AUTO-REHEARSAL",

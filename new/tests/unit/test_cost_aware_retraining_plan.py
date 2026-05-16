@@ -124,3 +124,33 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
         == "label_session_close_net_ret"
     )
     assert plan["recommended_experiment"]["active_horizon_mean_net_bps"] == -14.0
+
+
+def test_cost_aware_objective_string_false(monkeypatch, tmp_path):
+    """objective 설정 문자열 false를 Python truthiness로 True 처리하지 않는다."""
+    mod = _load_script("cost_aware_retraining_plan")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "cost_aware_retraining":
+            return {
+                "objective": {
+                    "net_of_cost_target": "false",
+                    "trade_no_trade_classifier": "false",
+                },
+                "horizon_candidates": ["5"],
+            }
+        if key == "label":
+            return {"horizon_bars": 5, "target_col": "label_5m_ret"}
+        if key == "ppo_allocator":
+            return {}
+        if key == "service_policy_replay":
+            return {}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
+
+    assert plan["objective"]["net_of_cost_target"] is False
+    assert plan["objective"]["trade_no_trade_classifier"] is False

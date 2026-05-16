@@ -9,7 +9,6 @@ ticker: 6자리 zero-padded (pad_ticker 경유).
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger

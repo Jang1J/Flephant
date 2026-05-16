@@ -280,7 +280,7 @@ def main() -> int:
     print(f"  Accuracy       : {overall['accuracy']:.3f} (threshold {overall['threshold']:.2f})")
     print(f"  PASS           : {overall['pass']}")
     print()
-    print(f"  reason_code 별 accuracy:")
+    print("  reason_code 별 accuracy:")
     for rc in REASON_CODE_CATALOG:
         if rc in result["by_reason_code"]:
             s = result["by_reason_code"][rc]

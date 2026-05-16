@@ -309,7 +309,7 @@ def test_smoke_passes_us_overnight_with_real_source(monkeypatch):
         _is_mock = False
 
         def get_macro_pack(self, as_of_date):
-            return {"interest_rate": 2.5, "usd_krw": 1450.8}
+            return {"interest_rate": 0.0, "usd_krw": 1450.8}
 
     class FakeUSMarketClient:
         _is_mock = False

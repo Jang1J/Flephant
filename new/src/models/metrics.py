@@ -343,7 +343,6 @@ class MetricsBundle:
             - min-max 정규화는 호출자 레벨에서 normalize_performance_vector() 사용.
         """
         if ic_history is not None and len(ic_history) > 0:
-            ic_ranks = rank_transform(np.asarray(ic_history, dtype=float))
             # bundle.ic의 rank: ic_history 내에서의 위치 (마지막 값 기준)
             # 배열에 bundle.ic 포함 여부 모름 → 배열 맨 끝에 bundle.ic 추가 후 rank
             ic_with_self = np.append(ic_history, self.ic)

@@ -14,7 +14,6 @@ C15 DynamicUniverseContract candidate_pool 편입 엔진 검증.
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -123,7 +122,7 @@ def _make_engine(
     min_trigger_count: int = 1,
     cooldown_sec: int = 300,
     candidate_pool_max: int = 10,
-) -> "AdmissionEngine":
+) -> object:
     """테스트용 AdmissionEngine 생성 헬퍼."""
     from src.dynamic_universe.admission_engine import AdmissionEngine
 
@@ -154,7 +153,7 @@ def _make_engine(
     with patch(
         "src.utils.trigger_loader.config_load",
         return_value={"rules": _make_admission_rules()},
-    ) as mock_cfg, patch(
+    ), patch(
         "src.dynamic_universe.admission_engine.load_trigger_rules",
         return_value=_make_admission_rules(),
     ):

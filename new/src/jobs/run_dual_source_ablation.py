@@ -191,7 +191,6 @@ def _run_config(
         pre_cfg = config_load("risk_config.yaml", "preprocessor")
         feature_cols = list(pre_cfg["feature_cols"])
 
-    from src.models.splitter import WalkForwardSplitter
     from src.models.registry import ModelRegistry
 
     trainer = LGBMTrainer(

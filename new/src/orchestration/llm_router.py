@@ -20,14 +20,14 @@ import os
 import json
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.time_utils import now_kst
 
 logger = get_logger("llm_router")
@@ -184,7 +184,7 @@ class _CircuitBreaker:
                 and time.time() - self._opened_at >= self._open_duration_sec
             ):
                 self._state = CircuitState.HALF_OPEN
-                logger.info(f"circuit HALF_OPEN (시험 호출 허용, {self._open_duration_sec}s 경과)")
+                logger.info("circuit HALF_OPEN (시험 호출 허용, %ss 경과)", self._open_duration_sec)
                 return True
             return False
 
@@ -195,7 +195,7 @@ class _CircuitBreaker:
         """성공 기록. 모든 상태에서 CLOSED 복귀."""
         self._failures = 0
         if self._state != CircuitState.CLOSED:
-            logger.info(f"circuit CLOSED (복귀)")
+            logger.info("circuit CLOSED (복귀)")
         self._state = CircuitState.CLOSED
         self._opened_at = None
 
@@ -297,10 +297,10 @@ class LLMRouter:
         self._kanana_key: str | None = os.environ.get("KANANA_API_KEY")
         self._openai_key: str | None = os.environ.get("OPENAI_API_KEY")
         self._kanana_api_url: str | None = os.environ.get("KANANA_API_URL")
-        self._allow_mock_provider: bool = bool(
-            cfg.get("allow_mock_provider", False)
+        self._allow_mock_provider: bool = (
+            safe_bool(cfg.get("allow_mock_provider", False), default=False)
             or os.environ.get("ELEPHANT_ALLOW_LLM_MOCK") == "1"
-            or os.environ.get("PYTEST_CURRENT_TEST")
+            or bool(os.environ.get("PYTEST_CURRENT_TEST"))
         )
 
         logger.info(
@@ -499,7 +499,7 @@ class LLMRouter:
                 content=str(content),
                 latency_ms=latency_ms,
                 tokens_in=max(1, len(prompt) // 4),
-                tokens_out=int(payload.get("tokens_out", 0) or 0) or None,
+                tokens_out=safe_int(payload.get("tokens_out"), default=0, min_value=0) or None,
                 cost_usd=self._kanana_cost_placeholder,
                 circuit_state=self._kanana_cb.state,
             )

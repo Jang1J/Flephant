@@ -19,6 +19,7 @@ from typing import Any
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_portfolio_patch_id
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("portfolio_manager")
@@ -59,7 +60,10 @@ class PortfolioManager:
         # "PPO 가 비중, PM 이 order_deltas" boundary spirit 위반. backward compat 위해 default false 유지.
         # 운영 strict mode 권장: yaml 에 portfolio_manager.respect_ppo_weights: true 명시.
         pm_cfg = config_load("risk_config.yaml", "portfolio_manager") or {}
-        self._respect_ppo_weights: bool = bool(pm_cfg.get("respect_ppo_weights", False))
+        self._respect_ppo_weights: bool = safe_bool(
+            pm_cfg.get("respect_ppo_weights", False),
+            default=False,
+        )
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
@@ -102,15 +106,21 @@ class PortfolioManager:
         Returns: C8 output + metadata (turnover, turnover_exceeded, errors)
         """
         target_weights_norm = {
-            pad_ticker(str(t)): float(w)
+            pad_ticker(str(t)): safe_float(w, default=0.0)
             for t, w in (target_weights or {}).items()
         }
         current_positions = current_positions or []
         latest_prices = latest_prices or {}
         latest_prices_norm = {
-            pad_ticker(str(t)): float(p) for t, p in latest_prices.items()
+            pad_ticker(str(t)): safe_float(p, default=0.0)
+            for t, p in latest_prices.items()
         }
         cold_path_exits_set = {pad_ticker(str(t)) for t in (cold_path_exits or [])}
+        cold_path_exit_overrides: list[str] = []
+        for ticker in sorted(cold_path_exits_set):
+            if target_weights_norm.get(ticker, 0.0) != 0.0:
+                cold_path_exit_overrides.append(ticker)
+            target_weights_norm[ticker] = 0.0
 
         # Codex 권고 8 (2026-05-09): PM boundary 정책. respect_ppo_weights=True 면 PPO weights
         # 변경 안 함 + violation 만 errors 에 보고. False (default backward-compat) 면 clip/drop/renorm.
@@ -173,7 +183,16 @@ class PortfolioManager:
                     }
 
         current_weights = {
-            pad_ticker(str(p["ticker"])): float(p.get("weight", 0.0))
+            pad_ticker(str(p["ticker"])): safe_float(p.get("weight", 0.0), default=0.0)
+            for p in current_positions
+            if "ticker" in p
+        }
+        current_qty = {
+            pad_ticker(str(p["ticker"])): safe_int(
+                p.get("qty", 0),
+                default=0,
+                min_value=0,
+            )
             for p in current_positions
             if "ticker" in p
         }
@@ -198,6 +217,7 @@ class PortfolioManager:
         )
         order_deltas: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        sell_caps_applied: list[dict[str, Any]] = []
 
         for ticker in all_tickers:
             target_w = target_weights_norm.get(ticker, 0.0)
@@ -230,6 +250,23 @@ class PortfolioManager:
                 continue
 
             side = "buy" if delta_w > 0 else "sell"
+            if side == "sell":
+                held_qty = current_qty.get(ticker)
+                if held_qty is not None and qty > held_qty:
+                    sell_caps_applied.append({
+                        "ticker": ticker,
+                        "requested_qty": qty,
+                        "capped_qty": held_qty,
+                    })
+                    qty = held_qty
+                if qty <= 0:
+                    errors.append({
+                        "ticker": ticker,
+                        "error": "SELL_QTY_UNAVAILABLE",
+                        "delta_weight": delta_w,
+                        "held_qty": held_qty,
+                    })
+                    continue
 
             if ticker in cold_path_exits_set:
                 reason = "risk_reduce"
@@ -270,6 +307,8 @@ class PortfolioManager:
             "n_errors": len(errors),
             # Codex 권고 8 (2026-05-09): PPO boundary violations (respect_ppo_weights=True 시 변경 없이 보고).
             "ppo_violations": ppo_violations,
+            "cold_path_exit_overrides": cold_path_exit_overrides,
+            "sell_caps_applied": sell_caps_applied,
             "respect_ppo_weights": self._respect_ppo_weights,
             "constraints_applied": {
                 "max_names": self._max_names,

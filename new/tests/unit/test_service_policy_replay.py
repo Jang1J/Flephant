@@ -10,6 +10,7 @@ from src.mode_b.backtest_diagnostics import (
     attach_service_policy_evidence,
     load_service_policy_evidence,
 )
+from src.mode_b.service_policy_verifier import verify_service_policy_evidence
 from src.mode_b.service_policy_replay import (
     ServicePolicyConfig,
     ServicePolicyReplayEngine,
@@ -122,6 +123,45 @@ def test_policy_config_maps_risk_config_values() -> None:
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is True
     assert policy.min_service_policy_sharpe == 0.0
+
+
+def test_policy_config_treats_string_false_flags_as_false(monkeypatch) -> None:
+    """service policy 운영 플래그가 문자열 false여도 Python truthy로 과장되지 않는다."""
+    config_by_section = {
+        "backtest": {"initial_capital": 1_000_000.0},
+        "evaluation": {
+            "top_k_fraction": 0.5,
+            "annualization_factor": 252,
+            "min_daily_pnl_std": 1e-8,
+        },
+        "paper_auto_trading": {
+            "max_orders_per_cycle": 1,
+            "max_order_qty_per_order": 1,
+        },
+        "position_limits": {
+            "max_names": 10,
+            "max_single_name": 1.0,
+            "min_cash": 0.0,
+        },
+        "turnover_cap": {"daily_max": 10.0},
+        "execution_cost_model": {
+            "components": {"commission_bps": 5.0, "slippage_bps": 10.0}
+        },
+        "label": {"horizon_bars": 5},
+        "service_policy_replay": {
+            "allow_position_pyramiding": "false",
+            "turnover_budget_hard_stop": "false",
+        },
+    }
+    monkeypatch.setattr(
+        "src.mode_b.service_policy_replay.config_load",
+        lambda _file, section: config_by_section.get(section, {}),
+    )
+
+    policy = ServicePolicyConfig.from_config()
+
+    assert policy.allow_position_pyramiding is False
+    assert policy.turnover_budget_hard_stop is False
 
 
 def test_no_trade_score_spread_filters_low_conviction_cycle() -> None:
@@ -261,6 +301,21 @@ def test_service_policy_sharpe_threshold_comes_from_policy() -> None:
     assert "service_policy_sharpe_below_threshold" in blockers
 
 
+def test_service_policy_gate_blockers_treat_string_false_as_false() -> None:
+    blockers = ServicePolicyReplayEngine._gate_blockers(
+        metrics={"total_return_bps": 100.0, "sr": 1.0},
+        policy=_policy(),
+        max_daily_turnover=0.0,
+        policy_checks={
+            "no_naked_short_exposure": "false",
+            "order_caps_respected": "true",
+            "cash_guard_respected": "true",
+        },
+    )
+
+    assert blockers == ["naked_short_exposure"]
+
+
 def test_service_policy_evidence_loader_and_attach(tmp_path: Path) -> None:
     report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260512_120000.json"
     report_path.write_text(
@@ -297,3 +352,85 @@ def test_service_policy_evidence_loader_and_attach(tmp_path: Path) -> None:
         "daily_turnover_cap_violation",
     ]
     assert "service_policy_replay=BLOCKED" in merged["diagnostic_notes"]
+
+
+def test_service_policy_verifier_handles_string_bools_and_malformed_stats(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260512_120000.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-TEST",
+                "date_range": {"start": "20260501", "end": "20260508"},
+                "gate": {"status": "PASS", "blockers": []},
+                "policy_checks": {
+                    "deploy_candidate_by_service_policy": "true",
+                    "no_naked_short_exposure": "true",
+                    "order_caps_respected": "true",
+                    "cash_guard_respected": "true",
+                },
+                "order_stats": {"naked_short_attempts": "0"},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    verification = verify_service_policy_evidence(
+        evidence,
+        bundle_id="BUNDLE-TEST",
+        repo_root=tmp_path,
+        expected_date_range={"start": "20260501", "end": "20260508"},
+    )
+
+    assert verification.status == "PASS"
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    payload["order_stats"]["naked_short_attempts"] = "many"
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    verification = verify_service_policy_evidence(
+        evidence,
+        bundle_id="BUNDLE-TEST",
+        repo_root=tmp_path,
+        expected_date_range={"start": "20260501", "end": "20260508"},
+    )
+
+    assert verification.status == "BLOCKED"
+    assert "service_policy_naked_short_attempts" in verification.blockers
+
+
+def test_backtest_diagnostics_treats_string_false_flags_as_false(tmp_path: Path) -> None:
+    report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260516_120000.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-TEST",
+                "gate": {"status": "PASS", "blockers": []},
+                "policy_checks": {
+                    "deploy_candidate_by_service_policy": True,
+                    "no_naked_short_exposure": True,
+                    "order_caps_respected": True,
+                    "cash_guard_respected": True,
+                },
+                "order_stats": {"naked_short_attempts": 0},
+                "external_kis_api": "false",
+                "registry_mutated": "false",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    assert evidence["verification"]["status"] == "PASS"
+    assert evidence["external_kis_api"] is False
+    assert evidence["registry_mutated"] is False

@@ -22,8 +22,9 @@ NEW_ROOT = REPO_ROOT / "new"
 if str(NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(NEW_ROOT))
 
-from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.mode_b.service_policy_verifier import service_policy_gate_pass  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
+from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
     kospi_trading_start_date,
@@ -65,14 +66,197 @@ def _business_dates_between(start: date, end: date) -> list[str]:
     return kospi_trading_dates_between(start, end)
 
 
-def _active_tickers(max_tickers: int | None = 20) -> list[str]:
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
+    gate_cfg = (
+        cfg.get("backtest_agent", {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
+def _active_tickers(
+    max_tickers: int | None = 30,
+    *,
+    include_pending_data: bool | None = None,
+) -> list[str]:
     cfg = _load_yaml(NEW_ROOT / "config" / "universe_config.yaml")
+    gate_cfg = _final_dataset_gate_cfg()
+    include_pending = (
+        safe_bool(
+            gate_cfg.get("include_pending_data_tickers"),
+            default=False,
+        )
+        if include_pending_data is None
+        else bool(include_pending_data)
+    )
+    allowed_statuses = {"active"}
+    if include_pending:
+        configured = gate_cfg.get("allowed_stock_statuses") or [
+            "active",
+            "pending_data",
+        ]
+        allowed_statuses = {str(status) for status in configured}
+    allowed_sector_statuses = {"confirmed"}
+    if include_pending:
+        configured_sectors = gate_cfg.get("allowed_sector_statuses") or [
+            "confirmed",
+            "confirmed_pending_data",
+        ]
+        allowed_sector_statuses = {str(status) for status in configured_sectors}
+
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in allowed_sector_statuses:
+            continue
         for stock in sector.get("stocks", []) or []:
-            if stock.get("status") == "active":
+            if str(stock.get("status")) in allowed_statuses:
                 tickers.append(pad_ticker(str(stock["ticker"])))
     return tickers[:max_tickers] if max_tickers is not None else tickers
+
+
+def _parse_dataset_date(value: Any) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _extract_model_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("model_metadata", "candidate_model_metadata", "candidate_metadata"):
+        raw = payload.get(key)
+        if isinstance(raw, dict):
+            return raw
+    artifact = payload.get("candidate_artifact")
+    if isinstance(artifact, dict):
+        raw_meta = artifact.get("metadata")
+        if isinstance(raw_meta, dict):
+            return raw_meta
+        if any(
+            key in artifact
+            for key in ("train_start", "train_end", "requested_tickers", "n_tickers")
+        ):
+            return artifact
+    return {}
+
+
+def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = sorted({
+                pad_ticker(str(ticker))
+                for ticker in raw
+                if str(ticker).strip()
+            })
+            if tickers:
+                return len(tickers), tickers
+    return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
+
+
+def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
+    gate_cfg = _final_dataset_gate_cfg()
+    if not gate_cfg:
+        return {
+            "status": "BLOCKED",
+            "blockers": ["final_dataset_gate_config_missing"],
+        }
+    if not safe_bool(gate_cfg.get("required", True), default=True):
+        return {"status": "PASS", "required": False, "blockers": []}
+
+    metadata = _extract_model_metadata(payload)
+    blockers: list[str] = []
+    if not metadata:
+        blockers.append("model_metadata_missing")
+
+    expected_start = _parse_dataset_date(gate_cfg.get("expected_start_date"))
+    expected_end = _parse_dataset_date(gate_cfg.get("expected_end_date"))
+    train_start = _parse_dataset_date(metadata.get("train_start"))
+    train_end = _parse_dataset_date(metadata.get("train_end"))
+    min_days = safe_int(gate_cfg.get("min_business_days"), default=0, min_value=1)
+    min_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=1)
+    data_source_required = str(gate_cfg.get("allowed_model_data_source") or "").strip()
+    data_source = str(metadata.get("data_source") or "").strip()
+
+    if expected_start is None or expected_end is None or min_days <= 0:
+        blockers.append("final_dataset_gate_config_invalid_date_window")
+    if min_tickers <= 0:
+        blockers.append("final_dataset_gate_config_invalid_min_tickers")
+    if train_start is None:
+        blockers.append("train_start_missing_or_invalid")
+    if train_end is None:
+        blockers.append("train_end_missing_or_invalid")
+
+    business_day_count = 0
+    if train_start is not None and train_end is not None:
+        if train_start > train_end:
+            blockers.append("train_date_range_inverted")
+        else:
+            business_day_count = len(kospi_trading_dates_between(train_start, train_end))
+            if expected_start is not None and train_start > expected_start:
+                blockers.append("train_start_after_required_dataset_start")
+            if expected_end is not None and train_end < expected_end:
+                blockers.append("train_end_before_required_dataset_end")
+            if business_day_count < min_days:
+                blockers.append("business_day_count_below_final_dataset_min")
+
+    ticker_count, tickers = _metadata_ticker_count(metadata)
+    if ticker_count < min_tickers:
+        blockers.append("ticker_count_below_final_dataset_min")
+    if data_source_required and data_source != data_source_required:
+        blockers.append("model_data_source_not_allowed_for_final_dataset")
+    if safe_bool(metadata.get("synthetic_fallback"), default=False):
+        blockers.append("synthetic_fallback_not_allowed_for_final_dataset")
+    missing_tickers = metadata.get("missing_tickers")
+    if isinstance(missing_tickers, list) and missing_tickers:
+        blockers.append("missing_tickers_present")
+
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "required": True,
+        "blockers": blockers,
+        "expected_start_date": expected_start.strftime("%Y%m%d") if expected_start else None,
+        "expected_end_date": expected_end.strftime("%Y%m%d") if expected_end else None,
+        "train_start": train_start.strftime("%Y%m%d") if train_start else None,
+        "train_end": train_end.strftime("%Y%m%d") if train_end else None,
+        "business_day_count": business_day_count,
+        "min_business_days": min_days,
+        "ticker_count": ticker_count,
+        "min_tickers": min_tickers,
+        "sample_tickers": tickers[:5],
+        "data_source": data_source or None,
+        "required_data_source": data_source_required or None,
+    }
+
+
+def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
+    return _final_dataset_gate_result(payload).get("status") == "PASS"
+
+
+def _final_gate_min_business_days(default: int = 80) -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(
+        gate_cfg.get("min_business_days", default),
+        default=default,
+        min_value=1,
+    )
+
+
+def _final_gate_min_tickers(default: int = 30) -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(gate_cfg.get("min_tickers", default), default=default, min_value=1)
 
 
 def _stage(
@@ -139,12 +323,13 @@ def _check_code_ssot() -> dict[str, Any]:
 
     if missing:
         return _stage("FAIL", "Required SSOT files are missing.", {"missing": missing})
-    active_count = len(_active_tickers(20))
+    trade_universe_count = len(_active_tickers(_final_gate_min_tickers()))
     return _stage(
         "PASS",
-        "SSOT files parse and active universe is available.",
+        "SSOT files parse and final trade universe is available.",
         {
-            "active_tickers_checked": active_count,
+            "trade_universe_tickers_checked": trade_universe_count,
+            "final_dataset_gate": _final_dataset_gate_cfg(),
             "execution_mode": risk_cfg.get("execution", {}).get("mode"),
             "live_enabled": risk_cfg.get("execution", {}).get("live_enabled"),
             "universe_sections": sorted((universe_cfg.get("sectors") or {}).keys()),
@@ -162,7 +347,7 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
             and data.get("end_date") == end_yyyymmdd
             and bool(smoke)
             and backfill.get("status") == "PASS"
-            and not data.get("allow_mock", False)
+            and not safe_bool(data.get("allow_mock", False), default=True)
         )
 
     path, data = _latest_matching_report(
@@ -326,7 +511,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         )
     model_path = meta.get("model_path")
     model_exists = bool(model_path and (REPO_ROOT / str(model_path)).exists())
-    synthetic = bool(meta.get("synthetic_fallback"))
+    synthetic = safe_bool(meta.get("synthetic_fallback"), default=False)
     data_source = meta.get("data_source")
     real_data_source = data_source == "artifact_bars"
     bundle_id = meta.get("bundle_id")
@@ -334,6 +519,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     actual_label_scope = meta.get("label_session_scope")
     label_version_ok = actual_label_version == required_label_version
     label_scope_ok = actual_label_scope == required_label_scope
+    final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
     status = (
         "PASS"
         if model_exists
@@ -372,6 +558,13 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "label_session_scope": actual_label_scope,
             "required_label_session_scope": required_label_scope,
             "n_train_rows": meta.get("n_train_rows"),
+            "train_start": meta.get("train_start"),
+            "train_end": meta.get("train_end"),
+            "requested_tickers": meta.get("requested_tickers"),
+            "loaded_tickers": meta.get("loaded_tickers"),
+            "missing_tickers": meta.get("missing_tickers"),
+            "n_tickers": meta.get("n_tickers"),
+            "final_dataset_gate": final_dataset_gate,
             "metrics": meta.get("metrics", {}),
             "metric_scope": meta.get(
                 "metric_scope",
@@ -391,10 +584,11 @@ def _is_deployable_backtest_report(payload: dict[str, Any], bundle_id: str) -> b
     return (
         payload.get("bundle_id") == bundle_id
         and payload.get("verdict") == "pass"
-        and regression.get("flagged") is False
+        and not safe_bool(regression.get("flagged", False), default=True)
         and leakage.get("verdict") == "pass"
         and _feature_quality_gate_pass(payload)
         and _service_policy_gate_pass(payload, bundle_id)
+        and _final_dataset_gate_pass(payload)
     )
 
 
@@ -487,6 +681,7 @@ def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
                 "metrics": data.get("metrics", {}),
                 "regression_risk": data.get("regression_risk"),
                 "minute_bar_leakage_check": data.get("minute_bar_leakage_check"),
+                "final_dataset_gate": _final_dataset_gate_result(data),
                 "cli_available": cli_path.exists(),
                 "cli_path": _repo_relative(cli_path),
             },
@@ -510,6 +705,7 @@ def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
             "latest_leakage_verdict": leakage.get("verdict"),
             "latest_feature_quality_gate_pass": _feature_quality_gate_pass(latest_data),
             "latest_feature_quality": latest_data.get("feature_quality") or {},
+            "latest_final_dataset_gate": _final_dataset_gate_result(latest_data),
             "latest_service_policy_gate_pass": _service_policy_gate_pass(
                 latest_data,
                 bundle_id,
@@ -560,16 +756,10 @@ def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
         return 0
     direct = report_or_stage.get("matched_order_count")
     if direct is not None:
-        try:
-            return int(direct)
-        except (TypeError, ValueError):
-            return 0
+        return safe_int(direct, default=0, min_value=0)
     stage = report_or_stage.get("stages", {}).get("order_history")
     if isinstance(stage, dict):
-        try:
-            return int(stage.get("matched_order_count", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return safe_int(stage.get("matched_order_count", 0), default=0, min_value=0)
     return 0
 
 
@@ -644,18 +834,18 @@ def _check_ops_risk() -> dict[str, Any]:
     paper = risk_cfg.get("paper_trading", {})
     paper_auto = risk_cfg.get("paper_auto_trading", {})
     checks = {
-        "execution_live_disabled": execution.get("live_enabled") is False,
+        "execution_live_disabled": not safe_bool(execution.get("live_enabled"), default=True),
         "execution_not_live": execution.get("mode") != "live",
-        "paper_requires_virtual": paper.get("require_virtual_mode") is True,
+        "paper_requires_virtual": safe_bool(paper.get("require_virtual_mode"), default=False),
         "probe_qty_limited_to_one": int(paper.get("max_probe_order_qty", 0)) <= 1,
-        "market_order_disabled": paper.get("allow_market_order") is False,
+        "market_order_disabled": not safe_bool(paper.get("allow_market_order"), default=True),
         "confirm_phrase_configured": bool(paper.get("confirm_order_phrase")),
-        "paper_auto_requires_virtual": paper_auto.get("require_virtual_mode") is True,
-        "paper_auto_requires_prelive_pass": paper_auto.get("require_prelive_pass") is True,
-        "paper_auto_requires_active_model": paper_auto.get("require_active_model") is True,
+        "paper_auto_requires_virtual": safe_bool(paper_auto.get("require_virtual_mode"), default=False),
+        "paper_auto_requires_prelive_pass": safe_bool(paper_auto.get("require_prelive_pass"), default=False),
+        "paper_auto_requires_active_model": safe_bool(paper_auto.get("require_active_model"), default=False),
         "paper_auto_confirm_phrase_configured": bool(paper_auto.get("confirm_start_phrase")),
         "paper_auto_order_qty_limited": int(paper_auto.get("max_order_qty_per_order", 0)) <= 1,
-        "paper_auto_market_order_disabled": paper_auto.get("allow_market_order") is False,
+        "paper_auto_market_order_disabled": not safe_bool(paper_auto.get("allow_market_order"), default=True),
     }
     status = "PASS" if all(checks.values()) else "FAIL"
     return _stage(
@@ -721,7 +911,11 @@ def build_report(
             "stages": stages,
             "blockers": blockers,
             "bundle_id": str(bundle_id or "").strip() or None,
-            "next_commands": _next_commands(end_date=end_date, business_days=business_days),
+            "next_commands": _next_commands(
+                end_date=end_date,
+                business_days=business_days,
+                max_tickers=max_tickers,
+            ),
         }
     stages["02_real_data_readiness"] = _check_real_readiness(end_date)
     stages["03_80_business_day_data"] = _check_80_day_artifacts(
@@ -756,19 +950,28 @@ def build_report(
         "tickers": tickers,
         "stages": stages,
         "blockers": blockers,
-        "next_commands": _next_commands(end_date=end_date, business_days=business_days),
+        "next_commands": _next_commands(
+            end_date=end_date,
+            business_days=business_days,
+            max_tickers=max_tickers,
+        ),
     }
     return report
 
 
-def _next_commands(end_date: str, business_days: int) -> dict[str, str]:
+def _next_commands(end_date: str, business_days: int, max_tickers: int) -> dict[str, str]:
     root = str(REPO_ROOT)
     py_prefix = f"PYTHONPATH={root}/new python"
     return {
-        "real_readiness_80d_user_terminal": (
+        "real_readiness_final_dataset_user_terminal": (
             f"COMMUNITY_SCRAPE_ENABLED=1 {py_prefix} "
             f"new/scripts/live_data_readiness.py --all --end-date {end_date} "
-            f"--business-days {business_days} --max-tickers 20 --require-train"
+            f"--business-days {business_days} --max-tickers {max_tickers} --require-train"
+        ),
+        "real_readiness_80d_rehearsal_user_terminal": (
+            f"COMMUNITY_SCRAPE_ENABLED=1 {py_prefix} "
+            f"new/scripts/live_data_readiness.py --all --end-date {end_date} "
+            f"--business-days 80 --max-tickers {max_tickers} --require-train"
         ),
         "paper_balance_user_terminal": (
             f"{py_prefix} new/scripts/paper_trading_smoke.py --action balance"
@@ -808,8 +1011,8 @@ def _parse_args() -> argparse.Namespace:
     default_end = _previous_business_day().strftime("%Y%m%d")
     parser = argparse.ArgumentParser(description="Elephant Lab pre-live 1~9 gate")
     parser.add_argument("--end-date", default=default_end, help="YYYYMMDD")
-    parser.add_argument("--business-days", type=int, default=80)
-    parser.add_argument("--max-tickers", type=int, default=20)
+    parser.add_argument("--business-days", type=int, default=_final_gate_min_business_days())
+    parser.add_argument("--max-tickers", type=int, default=_final_gate_min_tickers())
     parser.add_argument(
         "--bundle-id",
         default="",

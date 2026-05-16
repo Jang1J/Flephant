@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 import prelive_gate  # noqa: E402
 from src.execution.paper_auto_trading import PaperAutoTrader  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 
@@ -78,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tickers = _parse_tickers(str(args.tickers), int(args.max_tickers))
     prelive = None
-    if bool(cfg.get("require_prelive_pass", True)):
+    if safe_bool(cfg.get("require_prelive_pass", True), default=True):
         prelive = prelive_gate.build_report(
             end_date=str(args.end_date),
             business_days=int(args.business_days),

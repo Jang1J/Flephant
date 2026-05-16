@@ -17,15 +17,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from src.data.dataset_builder import DatasetBuilder
-from src.models.metrics import MetricsBundle, annualized_return, max_drawdown
+from src.models.metrics import MetricsBundle
 from src.models.ranking_loss import (
     get_lightgbm,
     build_lgbm_params,
@@ -36,6 +34,7 @@ from src.models.registry import ModelRegistry
 from src.models.splitter import WalkForwardSplitter
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("lgbm_trainer")
 
@@ -52,7 +51,7 @@ def _load_feature_cols() -> list[str]:
 
     # S4-2: Dual-Source 5피처 병합 (enabled_for_lgbm 플래그)
     ds_cfg = config_load("risk_config.yaml", "dual_source") or {}
-    if ds_cfg.get("enabled_for_lgbm", False):
+    if safe_bool(ds_cfg.get("enabled_for_lgbm", False), default=False):
         ds_cols: list[str] = list(cfg.get("dual_source_feature_cols", []))
         # 중복 방지: base에 없는 피처만 추가
         for col in ds_cols:
@@ -60,7 +59,7 @@ def _load_feature_cols() -> list[str]:
                 base_cols.append(col)
 
     exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
-    if exog_cfg.get("enabled_for_lgbm", False):
+    if safe_bool(exog_cfg.get("enabled_for_lgbm", False), default=False):
         exog_cols: list[str] = list(cfg.get("exogenous_feature_cols", []))
         for col in exog_cols:
             if col not in base_cols:
@@ -237,7 +236,7 @@ class LGBMTrainer:
             "metrics": avg_metrics,
             "data_version": self._compute_data_version(tickers, start_date_norm, end_date_norm),
             "data_source": data_source.get("data_source", "artifact_bars"),
-            "synthetic_fallback": bool(data_source.get("synthetic_fallback", False)),
+            "synthetic_fallback": safe_bool(data_source.get("synthetic_fallback", False), default=False),
             "requested_tickers": list(data_source.get("requested_tickers", tickers)),
             "loaded_tickers": list(data_source.get("loaded_tickers", [])),
             "missing_tickers": list(data_source.get("missing_tickers", [])),
@@ -272,7 +271,7 @@ class LGBMTrainer:
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
             "is_latest": effective_is_latest,
             "data_source": data_source.get("data_source", "artifact_bars"),
-            "synthetic_fallback": bool(data_source.get("synthetic_fallback", False)),
+            "synthetic_fallback": safe_bool(data_source.get("synthetic_fallback", False), default=False),
             "missing_tickers": list(data_source.get("missing_tickers", [])),
             "label_generation_version": self.builder.label_generation_version,
             "label_session_scope": self.builder.label_session_scope,

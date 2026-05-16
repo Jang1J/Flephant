@@ -25,7 +25,7 @@ SSOT: api_contracts.md C18 audit_log_schema (2026-05-09 backfill 메타 2필드 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

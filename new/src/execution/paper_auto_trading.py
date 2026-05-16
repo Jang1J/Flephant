@@ -18,7 +18,7 @@ from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_auto_trading")
@@ -52,11 +52,28 @@ class PaperAutoTrader:
         self._sleep = sleep_fn or time.sleep
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
-        self._require_virtual_mode = bool(self._cfg["require_virtual_mode"])
-        self._require_active_model = bool(self._cfg["require_active_model"])
-        self._max_orders_per_cycle = int(self._cfg["max_orders_per_cycle"])
-        self._max_order_qty_per_order = int(self._cfg["max_order_qty_per_order"])
-        self._allow_market_order = bool(self._cfg["allow_market_order"])
+        self._require_virtual_mode = safe_bool(
+            self._cfg.get("require_virtual_mode", True),
+            default=True,
+        )
+        self._require_active_model = safe_bool(
+            self._cfg.get("require_active_model", True),
+            default=True,
+        )
+        self._max_orders_per_cycle = safe_int(
+            self._cfg["max_orders_per_cycle"],
+            default=1,
+            min_value=1,
+        )
+        self._max_order_qty_per_order = safe_int(
+            self._cfg["max_order_qty_per_order"],
+            default=1,
+            min_value=1,
+        )
+        self._allow_market_order = safe_bool(
+            self._cfg.get("allow_market_order", False),
+            default=False,
+        )
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -99,13 +116,14 @@ class PaperAutoTrader:
             self._hot_runner.start()
 
         cycle_reports: list[dict[str, Any]] = []
-        for idx in range(max(0, int(cycles))):
+        cycles_int = safe_int(cycles, default=0, min_value=0)
+        for idx in range(cycles_int):
             cycle = self.run_once(tickers=tickers, cycle_index=idx)
             cycle_reports.append(cycle)
             if cycle.get("status") == "FAIL":
                 break
-            if idx < int(cycles) - 1:
-                self._sleep(float(interval_sec))
+            if idx < cycles_int - 1:
+                self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
@@ -197,7 +215,10 @@ class PaperAutoTrader:
         }
 
     def _make_ppo_allocator(self) -> PPOAllocator:
-        if not bool(self._cfg.get("use_latest_ppo_policy_if_available", True)):
+        if not safe_bool(
+            self._cfg.get("use_latest_ppo_policy_if_available", True),
+            default=True,
+        ):
             return PPOAllocator()
         ppo_cfg = config_load("risk_config.yaml", "nightly_ppo_retrainer") or {}
         artifacts_path = Path(str(ppo_cfg.get("artifacts_path", "artifacts/ppo")))
@@ -225,14 +246,14 @@ class PaperAutoTrader:
         prices: dict[str, float] = {}
         for ticker, bars in bars_by_ticker.items():
             if bars:
-                prices[ticker] = float(bars[-1].get("close", 0.0))
+                prices[ticker] = safe_float(bars[-1].get("close", 0.0), default=0.0)
         return prices
 
     @staticmethod
     def _portfolio_value(balance: dict[str, Any]) -> float:
         bal = balance.get("balance") if isinstance(balance.get("balance"), dict) else {}
         for key in ("net_asset", "total_eval", "cash"):
-            value = float(bal.get(key, 0.0) or 0.0)
+            value = safe_float(bal.get(key, 0.0), default=0.0)
             if value > 0:
                 return value
         return 0.0
@@ -248,8 +269,11 @@ class PaperAutoTrader:
             ticker = pad_ticker(str(pos.get("ticker", "")))
             if ticker == "000000":
                 continue
-            qty = int(pos.get("qty", 0) or 0)
-            price = latest_prices.get(ticker, float(pos.get("current_price", 0.0) or 0.0))
+            qty = safe_int(pos.get("qty", 0), default=0, min_value=0)
+            price = latest_prices.get(
+                ticker,
+                safe_float(pos.get("current_price", 0.0), default=0.0),
+            )
             weight = (qty * price / portfolio_value) if portfolio_value > 0 and price > 0 else 0.0
             out.append({"ticker": ticker, "qty": qty, "weight": float(weight)})
         return out
@@ -331,9 +355,9 @@ class PaperAutoTrader:
                 continue
             ticker = pad_ticker(str(od.get("ticker", "")))
             side = str(od.get("side", "")).lower()
-            qty = int(od.get("qty", 0) or 0)
+            qty = safe_int(od.get("qty", 0), default=0)
             order_type = str(od.get("order_type", "00") or "00")
-            price = float(od.get("price", 0.0) or 0.0)
+            price = safe_float(od.get("price", 0.0), default=0.0)
             if ticker == "000000" or not is_valid_ticker(ticker):
                 violations.append({
                     "ticker": ticker,
@@ -373,7 +397,7 @@ class PaperAutoTrader:
         for od in final_decision.get("order_deltas", []):
             if not isinstance(od, dict):
                 continue
-            original_qty = int(od.get("qty", 0) or 0)
+            original_qty = safe_int(od.get("qty", 0), default=0)
             if original_qty > self._max_order_qty_per_order:
                 od["qty"] = self._max_order_qty_per_order
                 clipped.append({

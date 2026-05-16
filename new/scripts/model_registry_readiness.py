@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +22,7 @@ if str(SRC) not in sys.path:
 
 from src.models.registry import ModelRegistry, VersionNotFoundError  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _RECOMMENDED_PYTHON = Path("/opt/anaconda3/envs/elephant/bin/python")
@@ -56,7 +56,7 @@ def _feature_manifest_status(metadata: dict[str, Any]) -> dict[str, Any]:
         "feature_count": len(feature_cols),
         "manifest_feature_count": required_count,
         "requires_exogenous": (
-            bool(manifest.get("requires_exogenous"))
+            safe_bool(manifest.get("requires_exogenous"), default=False)
             if isinstance(manifest, dict)
             else None
         ),
@@ -166,7 +166,7 @@ def build_report(
             blockers.append("feature_manifest_missing")
 
         metrics = metadata.get("metrics", {}) if isinstance(metadata.get("metrics"), dict) else {}
-        deploy_quality = bool(metrics.get("deploy_quality", False))
+        deploy_quality = safe_bool(metrics.get("deploy_quality", False), default=False)
         checks["deploy_quality"] = {
             "status": "PASS" if deploy_quality else "WARN",
             "value": deploy_quality,

@@ -50,6 +50,7 @@ from src.ops.state_machine import PipelineState, StateMachine
 from src.orchestration.event_gateway import EventGateway
 from src.orchestration.hot_runner import HotRunner
 from src.portfolio.portfolio_manager import PortfolioManager
+from src.utils.safe_cast import safe_bool
 from src.runner.event_injector import EventInjector
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_bundle_id
@@ -328,7 +329,7 @@ class E2EScenarioRunner:
         gateway = EventGateway()
         injector = EventInjector(
             gateway=gateway,
-            audit_log_path=_AUDIT_DIR / f"injected_events.jsonl",
+            audit_log_path=_AUDIT_DIR / "injected_events.jsonl",
         )
 
         # 2. BOOTSTRAP → HOT_RUNNING
@@ -740,7 +741,7 @@ class E2EScenarioRunner:
         status = str(result.get("status", "")).lower()
         if status in {"error", "fail", "failed", "blocked"}:
             return True
-        return bool(result.get("critical_alert") is True)
+        return safe_bool(result.get("critical_alert"), default=False)
 
     # ------------------------------------------------------------------ #
     # IO helpers

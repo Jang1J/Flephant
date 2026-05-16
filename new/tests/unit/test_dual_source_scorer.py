@@ -38,7 +38,6 @@ coverage (5 sub-task + 통합 + PIT-Safety):
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest

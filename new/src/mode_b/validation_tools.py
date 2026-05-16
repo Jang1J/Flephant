@@ -13,6 +13,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_backtest_id, generate_pa_id, generate_replay_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("BacktestEngine")
@@ -633,11 +634,13 @@ class BacktestEngine:
                 0.0,
                 float(self._cfg_service_policy.get("no_trade_score_spread", 0.0)),
             ),
-            allow_position_pyramiding=bool(
-                self._cfg_service_policy.get("allow_position_pyramiding", False)
+            allow_position_pyramiding=safe_bool(
+                self._cfg_service_policy.get("allow_position_pyramiding", False),
+                default=False,
             ),
-            turnover_budget_hard_stop=bool(
-                self._cfg_service_policy.get("turnover_budget_hard_stop", True)
+            turnover_budget_hard_stop=safe_bool(
+                self._cfg_service_policy.get("turnover_budget_hard_stop", True),
+                default=True,
             ),
             min_expected_net_alpha_bps=float(
                 self._cfg_service_policy.get("min_expected_net_alpha_bps", 0.0)
@@ -1021,7 +1024,26 @@ class BacktestEngine:
         if not feature_cols:
             raise BundleLoadFailed(f"candidate metadata feature_cols 없음: {metadata_path}")
         feature_width = len(feature_cols) if feature_cols else 4
-        metadata_synthetic_fallback = bool(metadata.get("synthetic_fallback", False))
+        metadata_synthetic_fallback = safe_bool(
+            metadata.get("synthetic_fallback", False),
+            default=False,
+        )
+        metadata_summary_keys = [
+            "version",
+            "bundle_id",
+            "train_start",
+            "train_end",
+            "data_version",
+            "data_source",
+            "synthetic_fallback",
+            "requested_tickers",
+            "loaded_tickers",
+            "missing_tickers",
+            "n_tickers",
+            "n_train_rows",
+            "label_generation_version",
+            "label_session_scope",
+        ]
 
         return model_callable, feature_width, {
             "loaded": True,
@@ -1030,6 +1052,11 @@ class BacktestEngine:
             "data_source": str(metadata.get("data_source", "artifact_bars")),
             "model_path": str(model_path),
             "metadata_path": str(metadata_path),
+            "metadata": {
+                key: metadata.get(key)
+                for key in metadata_summary_keys
+                if key in metadata
+            },
             "feature_cols": [str(col) for col in feature_cols],
             "feature_width": feature_width,
         }

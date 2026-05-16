@@ -20,6 +20,7 @@ from src.cache.persistent_cache import PersistentCache
 from src.data.filter_loader import load_news_filter
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("news_agent")
 
@@ -193,7 +194,10 @@ class NewsAgent(AgentBase):
                 )
                 if self._pubsub is not None and isinstance(cached, dict):
                     cached_message = cached.get("message")
-                    if isinstance(cached_message, dict) and not cached.get("llm_fallback", False):
+                    if (
+                        isinstance(cached_message, dict)
+                        and not safe_bool(cached.get("llm_fallback", False), default=False)
+                    ):
                         try:
                             msg_id = self._pubsub.publish(
                                 str(cached_message.get("channel") or publish_channel),

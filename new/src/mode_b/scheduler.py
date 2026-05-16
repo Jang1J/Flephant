@@ -20,6 +20,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_bundle_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool
 from src.utils.trading_calendar import load_kospi_holidays
 
 logger = get_logger("mode_b_scheduler")
@@ -725,7 +726,7 @@ class ModeBScheduler:
         severity_order = {"none": 0, "low": 1, "medium": 2, "high": 3}
         sev_level = severity_order.get(regression_severity, 3)
         block_level = severity_order.get(severity_block, 2)
-        risk_flagged = bool(regression_risk.get("flagged"))
+        risk_flagged = safe_bool(regression_risk.get("flagged"), default=False)
         critical_alert = (
             verdict == "fail"
             or sanity_check_result != "ok"
@@ -797,7 +798,7 @@ class ModeBScheduler:
                     backtest_verdict=self._current_verdict or "fail",
                     sanity_check_result=self._current_sanity_check_result,
                     regression_risk=RegressionRisk(
-                        flagged=bool(risk.get("flagged", False)),
+                        flagged=safe_bool(risk.get("flagged", False), default=False),
                         severity=str(risk.get("severity", "low")),
                         evidence=[str(e) for e in risk.get("evidence", [])],
                     ),
@@ -860,8 +861,8 @@ class ModeBScheduler:
         status = str(stage.get("status", "")).lower()
         return (
             status in {"timeout", "error", "blocked"}
-            or bool(stage.get("critical_alert"))
-            or bool(stage.get("error"))
+            or safe_bool(stage.get("critical_alert"), default=False)
+            or safe_bool(stage.get("error"), default=False)
         )
 
     def _finish_blocked_pipeline(

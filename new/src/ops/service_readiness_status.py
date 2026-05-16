@@ -8,13 +8,16 @@ never mutates registry artifacts. Backend services can import
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.mode_b.service_policy_verifier import service_policy_gate_pass
 from src.utils.config_loader import load as config_load
+from src.utils.safe_cast import safe_bool, safe_int
+from src.utils.ticker_utils import pad_ticker
+from src.utils.trading_calendar import kospi_trading_dates_between
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -45,6 +48,19 @@ def _latest_json(root: Path, pattern: str) -> tuple[Path | None, dict[str, Any] 
             _ = e
             continue
     return None, None
+
+
+def _json_candidates(root: Path, pattern: str) -> list[tuple[Path, dict[str, Any]]]:
+    candidates = [path for path in root.glob(pattern) if path.is_file()]
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    out: list[tuple[Path, dict[str, Any]]] = []
+    for path in candidates:
+        try:
+            out.append((path, _load_json(path)))
+        except Exception as e:
+            _ = e
+            continue
+    return out
 
 
 def _registry_state(root: Path, relative_path: str) -> dict[str, Any]:
@@ -84,12 +100,16 @@ def _feature_quality_gate_pass(backtest: dict[str, Any]) -> bool:
     )
 
 
-def _service_policy_gate_pass(backtest: dict[str, Any], bundle_id: str) -> bool:
+def _service_policy_gate_pass(
+    backtest: dict[str, Any],
+    bundle_id: str,
+    repo_root: Path | None = None,
+) -> bool:
     evidence = backtest.get("service_policy_replay")
     return service_policy_gate_pass(
         evidence if isinstance(evidence, dict) else None,
         bundle_id=bundle_id,
-        repo_root=_REPO_ROOT,
+        repo_root=repo_root or _REPO_ROOT,
         expected_date_range=(
             backtest.get("service_policy_expected_date_range")
             or backtest.get("date_range")
@@ -97,29 +117,157 @@ def _service_policy_gate_pass(backtest: dict[str, Any], bundle_id: str) -> bool:
     )
 
 
-def _backtest_state(root: Path, bundle_id: str) -> dict[str, Any]:
-    path, data = _latest_json(
-        root,
-        f"artifacts/reports/backtest/backtest_{bundle_id}_*.json",
+def _parse_dataset_date(value: Any) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+            return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _extract_model_metadata(backtest: dict[str, Any]) -> dict[str, Any]:
+    for key in ("model_metadata", "candidate_model_metadata", "candidate_metadata"):
+        raw = backtest.get(key)
+        if isinstance(raw, dict):
+            return raw
+    artifact = backtest.get("candidate_artifact")
+    if isinstance(artifact, dict):
+        raw_meta = artifact.get("metadata")
+        if isinstance(raw_meta, dict):
+            return raw_meta
+        if any(
+            key in artifact
+            for key in ("train_start", "train_end", "requested_tickers", "n_tickers")
+        ):
+            return artifact
+    return {}
+
+
+def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = sorted({
+                pad_ticker(str(ticker))
+                for ticker in raw
+                if str(ticker).strip()
+            })
+            if tickers:
+                return len(tickers), tickers
+    return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
+
+
+def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
+    gate_cfg = (
+        config_load(
+            "risk_config.yaml",
+            "backtest_agent.deploy_decision_gate.final_dataset_gate",
+        )
+        or {}
     )
-    if path is None or data is None:
+    if not isinstance(gate_cfg, dict) or not gate_cfg:
         return {
-            "status": "MISSING",
-            "report_path": None,
-            "deployable": False,
-            "schema_current": False,
+            "status": "BLOCKED",
+            "blockers": ["final_dataset_gate_config_missing"],
         }
+    if not safe_bool(gate_cfg.get("required", True), default=True):
+        return {"status": "PASS", "required": False, "blockers": []}
+
+    metadata = _extract_model_metadata(backtest)
+    blockers: list[str] = []
+    if not metadata:
+        blockers.append("model_metadata_missing")
+
+    expected_start = _parse_dataset_date(gate_cfg.get("expected_start_date"))
+    expected_end = _parse_dataset_date(gate_cfg.get("expected_end_date"))
+    train_start = _parse_dataset_date(metadata.get("train_start"))
+    train_end = _parse_dataset_date(metadata.get("train_end"))
+    min_days = safe_int(gate_cfg.get("min_business_days"), default=0, min_value=1)
+    min_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=1)
+    required_data_source = str(gate_cfg.get("allowed_model_data_source") or "").strip()
+    data_source = str(metadata.get("data_source") or "").strip()
+
+    if expected_start is None or expected_end is None or min_days <= 0:
+        blockers.append("final_dataset_gate_config_invalid_date_window")
+    if min_tickers <= 0:
+        blockers.append("final_dataset_gate_config_invalid_min_tickers")
+    if train_start is None:
+        blockers.append("train_start_missing_or_invalid")
+    if train_end is None:
+        blockers.append("train_end_missing_or_invalid")
+
+    business_day_count = 0
+    if train_start is not None and train_end is not None:
+        if train_start > train_end:
+            blockers.append("train_date_range_inverted")
+        else:
+            business_day_count = len(kospi_trading_dates_between(train_start, train_end))
+            if expected_start is not None and train_start > expected_start:
+                blockers.append("train_start_after_required_dataset_start")
+            if expected_end is not None and train_end < expected_end:
+                blockers.append("train_end_before_required_dataset_end")
+            if business_day_count < min_days:
+                blockers.append("business_day_count_below_final_dataset_min")
+
+    ticker_count, tickers = _metadata_ticker_count(metadata)
+    if ticker_count < min_tickers:
+        blockers.append("ticker_count_below_final_dataset_min")
+    if required_data_source and data_source != required_data_source:
+        blockers.append("model_data_source_not_allowed_for_final_dataset")
+    if safe_bool(metadata.get("synthetic_fallback"), default=False):
+        blockers.append("synthetic_fallback_not_allowed_for_final_dataset")
+    missing_tickers = metadata.get("missing_tickers")
+    if isinstance(missing_tickers, list) and missing_tickers:
+        blockers.append("missing_tickers_present")
+
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "required": True,
+        "blockers": blockers,
+        "expected_start_date": expected_start.strftime("%Y%m%d") if expected_start else None,
+        "expected_end_date": expected_end.strftime("%Y%m%d") if expected_end else None,
+        "train_start": train_start.strftime("%Y%m%d") if train_start else None,
+        "train_end": train_end.strftime("%Y%m%d") if train_end else None,
+        "business_day_count": business_day_count,
+        "min_business_days": min_days,
+        "ticker_count": ticker_count,
+        "min_tickers": min_tickers,
+        "sample_tickers": tickers[:5],
+        "data_source": data_source or None,
+        "required_data_source": required_data_source or None,
+    }
+
+
+def _backtest_state_from_report(
+    root: Path,
+    bundle_id: str,
+    path: Path,
+    data: dict[str, Any],
+) -> dict[str, Any]:
     regression = data.get("regression_risk") or {}
     leakage = data.get("minute_bar_leakage_check") or {}
     feature_pass = _feature_quality_gate_pass(data)
-    service_pass = _service_policy_gate_pass(data, bundle_id)
+    service_pass = _service_policy_gate_pass(data, bundle_id, repo_root=root)
+    final_dataset_gate = _final_dataset_gate_state(data)
+    final_dataset_pass = final_dataset_gate.get("status") == "PASS"
     schema_current = "feature_quality" in data and "service_policy_replay" in data
     deployable = (
         data.get("verdict") == "pass"
-        and regression.get("flagged") is False
+        and not safe_bool(regression.get("flagged", False), default=True)
         and leakage.get("verdict") == "pass"
         and feature_pass
         and service_pass
+        and final_dataset_pass
     )
     return {
         "status": "PASS" if deployable else "BLOCKED",
@@ -132,16 +280,59 @@ def _backtest_state(root: Path, bundle_id: str) -> dict[str, Any]:
         "minute_bar_leakage_verdict": leakage.get("verdict"),
         "feature_quality_gate_pass": feature_pass,
         "service_policy_gate_pass": service_pass,
+        "final_dataset_gate_pass": final_dataset_pass,
+        "final_dataset_gate": final_dataset_gate,
         "metrics": data.get("metrics", {}),
     }
 
 
-def _latest_report_state(root: Path, pattern: str) -> dict[str, Any]:
-    path, data = _latest_json(root, pattern)
-    if path is None or data is None:
+def _backtest_state(root: Path, bundle_id: str) -> dict[str, Any]:
+    reports = _json_candidates(
+        root,
+        f"artifacts/reports/backtest/backtest_{bundle_id}_*.json",
+    )
+    if not reports:
+        return {
+            "status": "MISSING",
+            "report_path": None,
+            "deployable": False,
+            "schema_current": False,
+        }
+    states = [
+        _backtest_state_from_report(root, bundle_id, path, data)
+        for path, data in reports
+    ]
+    for idx, state in enumerate(states):
+        if safe_bool(state.get("deployable"), default=False):
+            state["selection"] = "latest_deployable"
+            state["ignored_newer_non_deployable_reports"] = idx
+            return state
+    states[0]["selection"] = "latest_non_deployable"
+    states[0]["ignored_newer_non_deployable_reports"] = 0
+    return states[0]
+
+
+def _report_status(data: dict[str, Any]) -> str:
+    return str(data.get("status") or data.get("gate", {}).get("status") or "UNKNOWN")
+
+
+def _latest_report_state(
+    root: Path,
+    pattern: str,
+    *,
+    prefer_pass: bool = False,
+) -> dict[str, Any]:
+    reports = _json_candidates(root, pattern)
+    if not reports:
         return {"status": "MISSING", "report_path": None}
+    path, data = reports[0]
+    if prefer_pass:
+        for candidate_path, candidate_data in reports:
+            if _report_status(candidate_data) == "PASS":
+                path, data = candidate_path, candidate_data
+                break
     return {
-        "status": data.get("status") or data.get("gate", {}).get("status") or "UNKNOWN",
+        "status": _report_status(data),
         "report_path": _repo_relative(path, root),
         "blockers": data.get("blockers") or data.get("gate", {}).get("blockers") or [],
         "coverage": data.get("coverage", {}),
@@ -214,7 +405,12 @@ def _probe_order_blocker(probe: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(rejection, dict):
             continue
         error = str(rejection.get("error", ""))
-        if "msg_cd=40580000" in error or "장종료" in error:
+        if (
+            "msg_cd=40580000" in error
+            or "msg_cd=40100000" in error
+            or "장종료" in error
+            or "영업일이 아닙니다" in error
+        ):
             return {
                 "error_code": "BROKER_MARKET_CLOSED",
                 "message": "KIS virtual broker rejected probe order because paper market is closed.",
@@ -362,13 +558,58 @@ def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
 
 def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     paper_trading = _paper_trading_evidence_state(root)
-    path, data = _latest_json(
+    reports = _json_candidates(
         root,
         "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_*.json",
     )
-    if path is None or data is None:
+    if not reports:
         return paper_trading
-    external = bool(data.get("external_kis_api"))
+
+    latest_external_state: dict[str, Any] | None = None
+    for path, data in reports:
+        external = safe_bool(data.get("external_kis_api"), default=False)
+        if not external:
+            continue
+
+        stage_statuses = _broker_stage_statuses(data)
+        bundle_ids = _paper_auto_bundle_ids(data)
+        bundle_match = bundle_id in bundle_ids
+        cycle_history_matched = _paper_auto_cycle_history_matched(data)
+        passed = (
+            data.get("status") == "PASS"
+            and stage_statuses.get("paper_auto_cycle") == "PASS"
+            and stage_statuses.get("balance_reconciliation") == "PASS"
+            and stage_statuses.get("probe_order") == "PASS"
+            and stage_statuses.get("order_history_requery") == "PASS"
+            and cycle_history_matched
+            and bundle_match
+        )
+        state = {
+            "status": "PASS" if passed else "BLOCKED",
+            "external_kis_api": True,
+            "evidence_level": data.get("evidence_level"),
+            "report_path": _repo_relative(path, root),
+            "stage_statuses": stage_statuses,
+            "bundle_match": bundle_match,
+            "bundle_ids": sorted(bundle_ids),
+            "paper_auto_cycle_history_matched": cycle_history_matched,
+            "paper_trading_evidence": paper_trading.get("paper_trading_evidence", {}),
+        }
+        if latest_external_state is None:
+            latest_external_state = state
+        if passed:
+            return state
+
+    if latest_external_state is not None:
+        return latest_external_state
+
+    # Internal fake rehearsals are useful smoke artifacts, but they must not mask
+    # older external KIS paper evidence or downgrade broker readiness by recency.
+    if paper_trading.get("status") == "PASS":
+        return paper_trading
+
+    path, data = reports[0]
+    external = safe_bool(data.get("external_kis_api"), default=False)
     stage_statuses = _broker_stage_statuses(data)
     bundle_ids = _paper_auto_bundle_ids(data)
     bundle_match = bundle_id in bundle_ids
@@ -444,6 +685,7 @@ def build_service_status(
         "service_policy_replay": _latest_report_state(
             repo_root,
             f"artifacts/reports/service_policy_replay/service_policy_replay_{bundle_id}_*.json",
+            prefer_pass=True,
         ),
         "kis_broker_evidence": broker,
         "be_contract": {

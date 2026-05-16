@@ -23,6 +23,7 @@ from src.ops.safety_guards import SafetyGuards
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_trading")
@@ -56,9 +57,13 @@ class PaperTradingRunner:
         self._audit_logger = audit_logger
         self._kill_switch = kill_switch or KillSwitch()
         self._confirm_phrase = str(cfg["confirm_order_phrase"])
-        self._require_virtual_mode = bool(cfg["require_virtual_mode"])
-        self._max_probe_order_qty = int(cfg["max_probe_order_qty"])
-        self._allow_market_order = bool(cfg["allow_market_order"])
+        self._require_virtual_mode = safe_bool(cfg.get("require_virtual_mode", True), default=True)
+        self._max_probe_order_qty = safe_int(
+            cfg["max_probe_order_qty"],
+            default=1,
+            min_value=1,
+        )
+        self._allow_market_order = safe_bool(cfg.get("allow_market_order", False), default=False)
 
     @property
     def confirm_phrase(self) -> str:
@@ -147,11 +152,11 @@ class PaperTradingRunner:
         try:
             report["stages"]["balance_before"] = self._read_balance_stage()
             fd = self._probe_final_decision(
-                ticker=ticker,
-                side=side,
-                qty=qty,
-                price=price,
-                order_type=order_type,
+                ticker=guard["ticker"],
+                side=guard["side"],
+                qty=guard["qty"],
+                price=guard["price"],
+                order_type=guard["order_type"],
             )
             gateway = ExecutionGateway(
                 kill_switch=self._kill_switch,
@@ -184,8 +189,8 @@ class PaperTradingRunner:
                     "broker_order_ids": broker_order_ids,
                 }
             report["stages"]["order_history"] = self._read_order_history_stage(
-                ticker=ticker,
-                side=side,
+                ticker=guard["ticker"],
+                side=guard["side"],
                 order_id=broker_order_ids[0] if broker_order_ids else None,
                 execution_filter="all",
             )
@@ -262,7 +267,7 @@ class PaperTradingRunner:
             }
         if side_norm not in {"buy", "sell"}:
             return {"status": "FAIL", "reason": "side_must_be_buy_or_sell"}
-        qty_int = int(qty)
+        qty_int = safe_int(qty, default=0)
         if qty_int <= 0 or qty_int > self._max_probe_order_qty:
             return {
                 "status": "FAIL",
@@ -273,14 +278,15 @@ class PaperTradingRunner:
         order_type_norm = str(order_type or "00")
         if order_type_norm == "01" and not self._allow_market_order:
             return {"status": "FAIL", "reason": "market_order_not_allowed"}
-        if order_type_norm != "01" and (price is None or float(price) <= 0):
+        price_float = safe_float(price, default=0.0)
+        if order_type_norm != "01" and price_float <= 0:
             return {"status": "FAIL", "reason": "positive_price_required"}
         return {
             "status": "PASS",
             "ticker": ticker_norm,
             "side": side_norm,
             "qty": qty_int,
-            "price": float(price or 0.0),
+            "price": price_float,
             "order_type": order_type_norm,
         }
 
@@ -299,8 +305,8 @@ class PaperTradingRunner:
             "order_deltas": [{
                 "ticker": pad_ticker(str(ticker)),
                 "side": str(side).lower(),
-                "qty": int(qty),
-                "price": float(price or 0.0),
+                "qty": safe_int(qty, default=0),
+                "price": safe_float(price, default=0.0),
                 "order_type": str(order_type or "00"),
                 "reason": "paper_trading_probe",
             }],

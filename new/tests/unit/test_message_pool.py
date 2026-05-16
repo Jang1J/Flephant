@@ -122,6 +122,28 @@ def test_publish_expires_at_auto_computed_from_ttl() -> None:
     assert timedelta(seconds=58) < diff < timedelta(seconds=62)
 
 
+def test_publish_normalizes_malformed_confidence_and_ttl() -> None:
+    pool = _pool()
+    msg = _valid_msg(confidence="high", ttl="bad")
+
+    pool.publish("news_signal", msg)
+
+    assert msg["confidence"] == 0.5
+    assert "expires_at" in msg
+
+
+def test_publish_clamps_confidence_range() -> None:
+    pool = _pool()
+    high = _valid_msg(confidence=2.0)
+    low = _valid_msg(confidence=-1.0)
+
+    pool.publish("news_signal", high)
+    pool.publish("risk_warning", low)
+
+    assert high["confidence"] == 1.0
+    assert low["confidence"] == 0.0
+
+
 # ------------------------------------------------------------------
 # 7. subscribe: 게시 시 handler 수신
 # ------------------------------------------------------------------

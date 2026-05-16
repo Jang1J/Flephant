@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -215,6 +215,7 @@ class TestOneDayModeA:
         p95 = float(np.percentile(latencies, 95))
         # 테스트 환경에서는 SLA 비교 정보 제공 (fail 기준은 너무 엄격하지 않게)
         # 실제 운영에서만 100ms 강제
+        assert p95 >= 0.0
         assert len(latencies) == 5
 
     def test_fda_reason_code_always_present(self, hot_runner: HotRunner) -> None:
@@ -246,7 +247,7 @@ class TestOneDayModeA:
     ) -> None:
         """Cold Path 이벤트 주입 + dispatch_next 정상 동작."""
         ts = _today_intraday(9, 30)
-        result = injector.inject_news(
+        injector.inject_news(
             ticker="005930",
             headline="삼성전자 호재 뉴스",
             ts=ts,
@@ -559,7 +560,7 @@ class TestAuditLogIntegrity:
         )
         audit_dir = pathlib.Path(__file__).resolve().parents[3] / "artifacts" / "audit"
         mode_b_log = audit_dir / "mode_b_20260504.jsonl"
-        assert mode_b_log.exists(), f"mode_b_20260504.jsonl 미생성"
+        assert mode_b_log.exists(), "mode_b_20260504.jsonl 미생성"
 
     def test_cold_path_audit_log_created(self) -> None:
         """cold_path_YYYYMMDD.jsonl 파일 생성 확인."""
@@ -577,7 +578,7 @@ class TestAuditLogIntegrity:
         )
         audit_dir = pathlib.Path(__file__).resolve().parents[3] / "artifacts" / "audit"
         cold_log = audit_dir / "cold_path_20260504.jsonl"
-        assert cold_log.exists(), f"cold_path_20260504.jsonl 미생성"
+        assert cold_log.exists(), "cold_path_20260504.jsonl 미생성"
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -310,6 +310,40 @@ def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
         gw.execute(fd)
 
 
+def test_execute_paper_rejects_malformed_numeric_fields(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """paper/live broker 경로도 malformed qty/price에서 crash 대신 rejection을 남긴다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        def submit_order(self, ticker: str, side: str, qty: int) -> dict:
+            raise AssertionError("invalid broker order must not be submitted")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=FakeKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{
+            "ticker": "005930",
+            "side": "buy",
+            "qty": "many",
+            "price": "market-ish",
+        }],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "invalid_order_deltas" in report["rejection_reason"]
+    assert "invalid_order_delta" in report["rejection_reason"]
+
+
 def test_execute_live_requires_live_enabled(monkeypatch, tmp_path: Path) -> None:
     """live_enabled=false이면 KIS client가 있어도 C10 rejected report로 차단한다."""
     _patch_execution_config(monkeypatch, mode="live", live_enabled=False)
@@ -327,6 +361,33 @@ def test_execute_live_requires_live_enabled(monkeypatch, tmp_path: Path) -> None
     report = result["execution_report"]
     assert report["status"] == "rejected"
     assert report["execution_mode"] == "live"
+    assert "live_enabled=false" in report["rejection_reason"]
+
+
+def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_path: Path) -> None:
+    """operator/BE 입력의 문자열 false도 실계좌 enable로 해석하지 않는다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=False)
+
+    class BrokerClient:
+        def submit_order(self, ticker: str, side: str, qty: int) -> dict:
+            raise AssertionError("live broker must not be called")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=BrokerClient(),
+        live_enabled_override="false",  # type: ignore[arg-type]
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    report = result["execution_report"]
+    assert gw.live_enabled is False
+    assert report["status"] == "rejected"
     assert "live_enabled=false" in report["rejection_reason"]
 
 

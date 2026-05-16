@@ -34,6 +34,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_kb_id
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("kb")
 
@@ -80,7 +81,7 @@ class KnowledgeBase:
             self._root = Path(cfg["storage_root"])
         self._valid_types: list[str] = list(cfg["storage_types"])
         self._required_fields: list[str] = list(cfg["required_fields"])
-        self._pit_check: bool = bool(cfg.get("pit_safety_check", True))
+        self._pit_check: bool = safe_bool(cfg.get("pit_safety_check", True), default=True)
         self._top_k_default: int = int(cfg.get("search_default_top_k", 5))
         self._recency_lambda: float = float(cfg.get("search_recency_boost_lambda", 0.1))
 

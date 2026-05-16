@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.mode_b.service_policy_verifier import verify_service_policy_evidence
+from src.utils.safe_cast import safe_bool
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_SERVICE_POLICY_DIR = (
@@ -75,8 +76,8 @@ def load_service_policy_evidence(
         "metrics": report.get("metrics", {}),
         "order_stats": report.get("order_stats", {}),
         "policy_checks": report.get("policy_checks", {}),
-        "external_kis_api": bool(report.get("external_kis_api", False)),
-        "registry_mutated": bool(report.get("registry_mutated", False)),
+        "external_kis_api": safe_bool(report.get("external_kis_api", False), default=False),
+        "registry_mutated": safe_bool(report.get("registry_mutated", False), default=False),
     }
     verification = verify_service_policy_evidence(
         evidence,

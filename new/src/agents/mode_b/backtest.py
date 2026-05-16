@@ -11,6 +11,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_backtest_id, generate_report_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool, safe_int
 
 logger = get_logger("backtest_agent")
 _KST = ZoneInfo("Asia/Seoul")
@@ -176,20 +177,49 @@ class BacktestAgent(AgentBase):
             }
 
             # SHIP-5 (W1 P0-3): universe SSOT = universe_config.yaml.
-            # 이전: risk_config.yaml universe 섹션 참조 (key 미존재 → silent fallback 2종목).
-            # 현재: universe_config.yaml.sectors[X].stocks (status="active" + sector status="confirmed").
+            # 최종 deploy gate는 risk_config.yaml final_dataset_gate의
+            # allowed_*_statuses를 사용해 30종목(active + pending_data)을 검증한다.
             universe_cfg = config_load("universe_config.yaml") or {}
+            final_dataset_gate = (
+                gate_cfg.get("final_dataset_gate", {})
+                if isinstance(gate_cfg.get("final_dataset_gate", {}), dict)
+                else {}
+            )
+            allowed_stock_statuses = {
+                str(status)
+                for status in (
+                    final_dataset_gate.get("allowed_stock_statuses")
+                    or ["active"]
+                )
+            }
+            allowed_sector_statuses = {
+                str(status)
+                for status in (
+                    final_dataset_gate.get("allowed_sector_statuses")
+                    or ["confirmed"]
+                )
+            }
+            min_universe_tickers = safe_int(
+                final_dataset_gate.get("min_tickers", 0),
+                default=0,
+                min_value=0,
+            )
             sectors = universe_cfg.get("sectors", {})
             universe = []
             for sector_data in sectors.values():
-                if sector_data.get("status") != "confirmed":
+                if str(sector_data.get("status")) not in allowed_sector_statuses:
                     continue
                 for stock in sector_data.get("stocks", []):
-                    if stock.get("status") == "active":
+                    if str(stock.get("status")) in allowed_stock_statuses:
                         universe.append(str(stock["ticker"]).zfill(6))
+            if min_universe_tickers and len(set(universe)) < min_universe_tickers:
+                raise BacktestError(
+                    "universe_config.yaml final deploy universe is incomplete: "
+                    f"{len(set(universe))}/{min_universe_tickers} tickers"
+                )
             if not universe:
                 # SHIP-fix W-4 (GPT Pro 2026-05-09): fallback 발동 = backtest 결과 신뢰도 0.
-                # 20종목 active universe 검증 실패가 축소 백테스트로 숨는 위험 차단.
+                # active/pending universe 검증 실패가 축소 백테스트로 숨는 위험 차단.
                 # 1. fallback_tickers 도 비어있으면 즉시 BacktestError raise.
                 # 2. fallback_tickers 가 있어도 verdict 강제 fail + operator alert.
                 fallback_cfg = universe_cfg.get("backtest_universe_mode", {}).get("fallback_tickers", [])
@@ -283,6 +313,12 @@ class BacktestAgent(AgentBase):
         completed_at = datetime.now(_KST).isoformat()
         metrics = engine_result.get("metrics", {})
         candidate_artifact = engine_result.get("candidate_artifact", {})
+        candidate_model_metadata = (
+            candidate_artifact.get("metadata")
+            if isinstance(candidate_artifact, dict)
+            and isinstance(candidate_artifact.get("metadata"), dict)
+            else {}
+        )
         artifact_gate_evidence: list[str] = []
         if isinstance(candidate_artifact, dict) and candidate_artifact.get("synthetic_fallback"):
             artifact_gate_evidence.append(
@@ -370,6 +406,7 @@ class BacktestAgent(AgentBase):
                 {},
             ),
             "candidate_artifact": candidate_artifact,
+            "candidate_model_metadata": candidate_model_metadata,
             "folds": engine_result.get("trade_log", [])[:10],  # 대표 샘플 (KB 통합 전)
         }
 
@@ -453,10 +490,18 @@ class BacktestAgent(AgentBase):
         raw = raw or {}
         verdict_raw = str(raw.get("verdict", default_verdict)).lower()
         verdict = "pass" if verdict_raw == "pass" else "fail"
-        leakage_detected = bool(raw.get("leakage_detected", verdict != "pass"))
+        leakage_detected = safe_bool(raw.get("leakage_detected", verdict != "pass"))
         return {
-            "purge_bars_used": int(raw.get("purge_bars_used", raw.get("purge_bars", cfg.get("purge_bars", 60)))),
-            "embargo_bars_used": int(raw.get("embargo_bars_used", raw.get("embargo_bars", cfg.get("embargo_bars", 78)))),
+            "purge_bars_used": safe_int(
+                raw.get("purge_bars_used", raw.get("purge_bars", cfg.get("purge_bars", 60))),
+                default=safe_int(cfg.get("purge_bars", 60), default=60),
+                min_value=0,
+            ),
+            "embargo_bars_used": safe_int(
+                raw.get("embargo_bars_used", raw.get("embargo_bars", cfg.get("embargo_bars", 78))),
+                default=safe_int(cfg.get("embargo_bars", 78), default=78),
+                min_value=0,
+            ),
             "replay_unit": str(raw.get("replay_unit", cfg.get("replay_unit", "1m"))),
             "leakage_detected": leakage_detected,
             "verdict": verdict,
@@ -477,7 +522,6 @@ class BacktestAgent(AgentBase):
 
         sr = float(metrics.get("sr", -999.0))
         ic = float(metrics.get("ic", -999.0))
-        mdd = float(metrics.get("mdd", -999.0))
 
         # gate_cfg에서 임계값 로드 (yaml SSOT, 없으면 보수적 기본값)
         pass_sr = float(gate_cfg.get("pass_sr_threshold", 0.0))

@@ -257,6 +257,29 @@ class TestAnalyze:
         assert second["message_id"] == "MSG-CACHED"
         assert pubsub.publish.call_count == 2
 
+    def test_analyze_cache_hit_treats_string_false_fallback_as_false(self):
+        """캐시 payload의 llm_fallback 문자열 false도 재게시 가능 상태로 해석한다."""
+        cache = _DictCache()
+        pubsub = MagicMock()
+        pubsub.publish.return_value = "MSG-CACHED"
+        agent = NewsAgent(llm_router=_make_llm(), pubsub=pubsub, cache=cache)
+        event = {
+            "event_type": "news",
+            "ticker": "005930",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-cache-string-false",
+        }
+
+        first = agent.analyze(event)
+        cached = dict(first)
+        cached["llm_fallback"] = "false"
+        cache.set("news:005930:E-cache-string-false", cached)
+        second = agent.analyze(event)
+
+        assert second["republished_from_cache"] is True
+        assert second["message_id"] == "MSG-CACHED"
+
     def test_analyze_dart_event_returns_dart_alert_channel(self):
         """dart event_type → channel=dart_alert."""
         agent = _make_agent()

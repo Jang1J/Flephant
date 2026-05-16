@@ -24,7 +24,7 @@ from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_order_plan_id
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("execution_gateway")
@@ -60,9 +60,9 @@ class ExecutionGateway:
         exec_cfg = config_load("risk_config.yaml", "execution")
         self._mode: str = str(mode_override or exec_cfg["mode"]).lower()
         self._live_enabled: bool = (
-            bool(exec_cfg["live_enabled"])
+            safe_bool(exec_cfg.get("live_enabled", False), default=False)
             if live_enabled_override is None
-            else bool(live_enabled_override)
+            else safe_bool(live_enabled_override, default=False)
         )
         exec_cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
         self._slippage_bps: float = float(exec_cost_cfg.get("slippage_bps", 10))
@@ -197,8 +197,8 @@ class ExecutionGateway:
         slippage_noise = self._slippage_bps / 10000.0
 
         for od in order_deltas:
-            fill_price = float(od.get("price", 0.0))
-            qty = int(od.get("qty", 0))
+            fill_price = safe_float(od.get("price", 0.0), default=0.0)
+            qty = safe_int(od.get("qty", 0), default=0)
 
             # snapshot_vwap: yaml slippage_bps 기반 noise
             vwap_noise = random.uniform(-slippage_noise, slippage_noise)
@@ -224,7 +224,8 @@ class ExecutionGateway:
 
         # portfolio-level realized_slippage: 비용 가중 평균
         total_cost = sum(
-            int(od.get("qty", 0)) * float(od.get("price", 0.0))
+            safe_int(od.get("qty", 0), default=0)
+            * safe_float(od.get("price", 0.0), default=0.0)
             for od in order_deltas
         )
         portfolio_slippage = (
@@ -286,8 +287,8 @@ class ExecutionGateway:
         for od in order_deltas:
             ticker = str(od.get("ticker", ""))
             side = str(od.get("side", "")).lower()
-            qty = int(od.get("qty", 0) or 0)
-            price = float(od.get("price", 0.0) or 0.0)
+            qty = safe_int(od.get("qty", 0), default=0)
+            price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
 
             if not self._valid_order_delta(ticker, side, qty, price, order_type):
@@ -322,11 +323,12 @@ class ExecutionGateway:
                     })
                     continue
 
-                avg_fill_price = float(
+                avg_fill_price = safe_float(
                     broker_response.get(
                         "avg_fill_price",
                         broker_response.get("price", price),
-                    ) or price
+                    ),
+                    default=price,
                 )
                 estimated_cost += qty * avg_fill_price
                 fills.append({
@@ -410,14 +412,8 @@ class ExecutionGateway:
                 continue
             ticker = pad_ticker(str(od.get("ticker", "")))
             side = str(od.get("side", "")).lower()
-            try:
-                qty = int(od.get("qty", 0) or 0)
-            except (TypeError, ValueError):
-                qty = 0
-            try:
-                price = float(od.get("price", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                price = 0.0
+            qty = safe_int(od.get("qty", 0), default=0)
+            price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
             if not ExecutionGateway._valid_order_delta(ticker, side, qty, price, order_type):
                 errors.append({

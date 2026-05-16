@@ -36,6 +36,7 @@ from src.connectors.naver_rest import NaverNewsClient  # noqa: E402
 from src.connectors.us_market import USMarketClient  # noqa: E402
 from src.data.backfill import Backfill  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -508,7 +509,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
         else:
             macro = ecos.get_macro_pack(as_of_date)
             result["ecos_macro"] = _status(
-                bool(macro.get("interest_rate")) and bool(macro.get("usd_krw")),
+                macro.get("interest_rate") is not None and macro.get("usd_krw") is not None,
                 {"macro": macro, "is_mock": getattr(ecos, "_is_mock", None)},
             )
     except Exception as e:
@@ -559,7 +560,7 @@ def run_backfill(
     try:
         cfg = _readiness_cfg()
         min_rows = _readiness_min_rows("min_rows_per_day")
-        require_all = bool(cfg.get("require_all_tickers_for_backfill", True))
+        require_all = safe_bool(cfg.get("require_all_tickers_for_backfill", True), default=True)
         backfill = Backfill()
         counts = {pad_ticker(ticker): 0 for ticker in tickers}
         fetch_counts_by_date: dict[str, dict[str, int]] = {}
@@ -645,7 +646,7 @@ def run_train_if_ready(
     min_dates = int(wf["train_window_days"]) + int(wf["test_window_days"])
     cfg = _readiness_cfg()
     min_rows = _readiness_min_rows("train_min_rows_per_day")
-    require_all = bool(cfg.get("require_all_tickers_for_train", True))
+    require_all = safe_bool(cfg.get("require_all_tickers_for_train", True), default=True)
     quality = _artifact_date_quality(tickers, start_date, end_date, min_rows)
     if require_all:
         dates = sorted(day for day, item in quality.items() if item["is_valid"])
@@ -681,7 +682,7 @@ def run_train_if_ready(
             bundle_id=None,
             is_latest=False,
         )
-        synthetic = bool(train_result.get("synthetic_fallback", False))
+        synthetic = safe_bool(train_result.get("synthetic_fallback", False), default=False)
         missing_tickers = list(train_result.get("missing_tickers", []))
         return _status(
             not synthetic and not missing_tickers,

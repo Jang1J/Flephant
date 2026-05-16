@@ -14,9 +14,7 @@ C15 activation_gate 준수 검증.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import yaml
@@ -59,6 +57,14 @@ class TestGateDisabledByDefault:
         config_path = tmp_path / "risk_config.yaml"
         with config_path.open("w", encoding="utf-8") as fh:
             yaml.dump({"other_section": {}}, fh)
+        gate = DynamicUniverseGate(risk_config_path=config_path)
+        assert gate.is_enabled() is False
+
+    def test_gate_treats_string_false_as_disabled(self, tmp_path: Path) -> None:
+        """enabled='false' 문자열이 dynamic universe를 켜지 않도록 방어."""
+        config_path = tmp_path / "risk_config.yaml"
+        with config_path.open("w", encoding="utf-8") as fh:
+            yaml.dump({"dynamic_universe": {"enabled": "false"}}, fh)
         gate = DynamicUniverseGate(risk_config_path=config_path)
         assert gate.is_enabled() is False
 

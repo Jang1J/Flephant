@@ -34,7 +34,7 @@ import html
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,6 @@ import yaml
 
 from src.connectors.base import BaseConnector
 from src.data.filter_loader import load_spam_rules, load_manipulation_rules, load_sentiment_dict
-from src.utils.config_loader import load as config_load
 from src.utils.auth import AuthManager
 from src.utils.logger import get_logger
 from src.utils.rate_limiter import RateLimiter
