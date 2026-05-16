@@ -361,6 +361,21 @@ class TestAnalyze:
             })
         llm.call.assert_not_called()
 
+    def test_analyze_requires_asof_for_timestamped_event(self):
+        """직접 호출 이벤트에 occurred_at이 있으면 asof 없이는 LLM 호출하지 않는다."""
+        llm = _make_llm()
+        agent = NewsAgent(llm_router=llm)
+        with pytest.raises(PITViolationError, match="asof_required"):
+            agent.analyze({
+                "event_type": "news",
+                "ticker": "005930",
+                "title": "시각 기준 없는 뉴스",
+                "summary": "occurred_at만 있는 직접 호출",
+                "event_id": "E-no-asof",
+                "occurred_at": "2026-04-20T10:00:00+09:00",
+            })
+        llm.call.assert_not_called()
+
     def test_analyze_llm_failure_stance_neutral_fallback(self):
         """LLMCallResult(success=False) → stance=neutral, llm_fallback=True."""
         llm = _make_llm(success=False)

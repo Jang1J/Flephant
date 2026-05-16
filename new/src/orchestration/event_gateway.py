@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from src.data.event_admission import EventAdmission
 from src.data.event_normalizer import EventNormalizer
@@ -18,6 +19,7 @@ from src.utils.logger import get_logger
 from src.utils.safe_cast import safe_bool
 
 logger = get_logger("event_gateway")
+_KST = ZoneInfo("Asia/Seoul")
 
 # PubSubBroker 는 optional dependency. import 실패 시 auto_publish 비활성
 try:
@@ -101,7 +103,8 @@ class EventGateway:
             }
         """
         try:
-            normalized = self._normalizer.normalize(raw_event, source, asof=asof)
+            effective_asof = asof if asof is not None else datetime.now(_KST)
+            normalized = self._normalizer.normalize(raw_event, source, asof=effective_asof)
         except Exception as e:
             logger.warning("[event_gateway] 정규화 실패: source=%s error=%s", source, e)
             return {"event_id": None, "status": "normalize_failed", "reason": str(e)}

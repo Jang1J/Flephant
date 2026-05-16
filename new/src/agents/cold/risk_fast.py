@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.pit_guard import assert_pit_safe
+from src.utils.pit_guard import PITViolationError, assert_pit_safe
 from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_fast_cold")
@@ -167,7 +167,9 @@ class RiskAgentFast(AgentBase):
         event_type = event.get("event_type", "")
         occurred_at = event.get("occurred_at")
         asof = event.get("asof")
-        if occurred_at and asof:
+        if occurred_at and not asof:
+            raise PITViolationError("[risk_fast_cold] asof_required: occurred_at 이벤트는 asof가 필요합니다.")
+        if occurred_at:
             assert_pit_safe(occurred_at, snapshot_ts=asof)
         trace = self._event_trace(event)
         now_iso = datetime.now(timezone.utc).isoformat()

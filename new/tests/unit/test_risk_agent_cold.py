@@ -39,6 +39,7 @@ def _make_event(event_type: str = "news", ticker: str = "005930") -> dict:
         "event_type": event_type,
         "ticker": ticker,
         "occurred_at": "2026-04-18T10:00:00+09:00",
+        "asof": "2026-04-18T10:01:00+09:00",
         "payload": {
             "ticker": ticker,
             "priority": "normal",
@@ -98,6 +99,7 @@ def test_fast_dart_critical_disclosure() -> None:
         "event_type": "dart",
         "ticker": "005930",
         "occurred_at": "2026-04-18T10:00:00+09:00",
+        "asof": "2026-04-18T10:01:00+09:00",
         "priority": "critical",
         "payload": {"ticker": "005930", "title": "주요 공시"},
     }
@@ -206,6 +208,16 @@ def test_fast_rejects_future_event_before_uncertainty_publish() -> None:
     pubsub.publish.assert_not_called()
 
 
+def test_fast_requires_asof_for_timestamped_event() -> None:
+    """직접 호출 이벤트에 occurred_at이 있으면 asof 없이는 평가하지 않는다."""
+    fast = _make_fast()
+    event = _make_event()
+    event.pop("asof")
+
+    with pytest.raises(PITViolationError, match="asof_required"):
+        fast.evaluate(event)
+
+
 def test_fast_uncertainty_signal_normalizes_short_ticker_and_scope() -> None:
     """uncertainty_signal ticker/scope는 raw ticker가 아니라 6자리 코드로 발행된다."""
     pubsub = MagicMock()
@@ -243,6 +255,18 @@ def test_slow_analyze_rejects_future_event_before_llm() -> None:
     event["asof"] = "2026-04-18T10:00:00+09:00"
 
     with pytest.raises(PITViolationError):
+        slow.analyze(event)
+
+    slow._llm_router.call.assert_not_called()
+
+
+def test_slow_requires_asof_for_timestamped_event() -> None:
+    """직접 호출 이벤트에 occurred_at이 있으면 LLM 호출 전 asof 누락을 차단한다."""
+    slow = _make_slow()
+    event = _make_event()
+    event.pop("asof")
+
+    with pytest.raises(PITViolationError, match="asof_required"):
         slow.analyze(event)
 
     slow._llm_router.call.assert_not_called()

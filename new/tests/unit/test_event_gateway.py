@@ -102,6 +102,18 @@ def test_ingest_admitted_event_goes_to_backlog(tmp_path: Path) -> None:
     assert gw.backlog_size() == 1
 
 
+def test_ingest_without_asof_adds_default_asof(tmp_path: Path) -> None:
+    """Cold Path 기본 ingest도 downstream agent가 쓸 기준시각을 보존한다."""
+    gw = _gateway(tmp_path)
+
+    result = gw.ingest(_dart_raw(), source="dart")
+    assert result["status"] == "admitted"
+
+    event = gw._admission.pop_next()
+    assert event is not None
+    assert event.get("asof")
+
+
 def test_ingest_rejects_event_after_asof(tmp_path: Path, monkeypatch) -> None:
     """EventGateway는 장중 asof 이후 이벤트를 backlog에 넣지 않는다."""
     import src.data.event_normalizer as en

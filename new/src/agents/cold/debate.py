@@ -25,7 +25,7 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
-from src.utils.pit_guard import assert_pit_safe
+from src.utils.pit_guard import PITViolationError, assert_pit_safe
 from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("debate")
@@ -312,23 +312,23 @@ class DebateAgent(AgentBase):
             payload = signal.get("payload", {})
             if not isinstance(payload, dict):
                 payload = {}
+            data_ts = (
+                signal.get("occurred_at")
+                or signal.get("timestamp")
+                or payload.get("occurred_at")
+                or payload.get("timestamp")
+            )
             asof = (
                 signal.get("asof")
                 or signal.get("snapshot_ts")
                 or payload.get("asof")
                 or payload.get("snapshot_ts")
             )
-            if not asof:
-                continue
-            data_ts = (
-                signal.get("occurred_at")
-                or signal.get("timestamp")
-                or signal.get("ts")
-                or payload.get("occurred_at")
-                or payload.get("timestamp")
-                or payload.get("ts")
-            )
-            if data_ts:
+            if data_ts and not asof:
+                raise PITViolationError("[debate] asof_required: timestamped signal은 asof가 필요합니다.")
+            if not data_ts:
+                data_ts = signal.get("ts") or payload.get("ts")
+            if data_ts and asof:
                 assert_pit_safe(data_ts, snapshot_ts=asof)
 
     # ------------------------------------------------------------------

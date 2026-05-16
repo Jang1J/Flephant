@@ -103,6 +103,21 @@ def test_debate_direct_call_rejects_future_signal_before_llm() -> None:
     debate._llm_router.call.assert_not_called()
 
 
+def test_debate_requires_asof_for_timestamped_signal() -> None:
+    """직접 호출 signal에 occurred_at/timestamp가 있으면 asof 누락을 차단한다."""
+    debate = _make_debate()
+    signal = {
+        "agent": "news_agent",
+        "channel": "news_signal",
+        "payload": {"stance": "sell"},
+        "occurred_at": "2026-04-26T10:00:00+09:00",
+    }
+
+    with pytest.raises(PITViolationError, match="asof_required"):
+        debate.run_debate([signal], candidates=["005930"])
+    debate._llm_router.call.assert_not_called()
+
+
 def test_debate_conflict_triggers_pairwise() -> None:
     """veto_recommendation vs quant_top10 충돌 → pairwise 실행."""
     debate = _make_debate()
