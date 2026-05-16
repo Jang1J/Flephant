@@ -152,6 +152,33 @@ def test_debate_conflict_triggers_pairwise() -> None:
     assert payload["wins"][0]["ticker"] == "005930"
 
 
+def test_debate_memory_write_failure_does_not_fail_resolution(tmp_path) -> None:
+    """memory_root가 쓰기 불가여도 debate 결과는 반환된다."""
+    blocked_root = tmp_path / "blocked_memory_root"
+    blocked_root.write_text("not a directory", encoding="utf-8")
+    debate = DebateAgent(
+        llm_router=_make_router(),
+        pubsub=None,
+        memory_root=blocked_root,
+    )
+    quant_sig = {
+        "agent": "quant",
+        "channel": "quant_signal",
+        "payload": {
+            "stance": "neutral",
+            "top10_candidates": ["005930", "000660", "035420"],
+        },
+        "ts": "2026-04-26T10:00:00+09:00",
+    }
+    risk_sig = _signal("risk_slow", "risk_warning", "veto_recommendation")
+
+    result = debate.run_debate([quant_sig, risk_sig], candidates=["005930", "000660"])
+
+    assert result["conflict_detected"] is True
+    assert result["ranked_tickers"]
+    assert "memory_write_error" in result
+
+
 def test_debate_suffix_candidates_are_not_dropped() -> None:
     """suffix ticker 후보도 충돌 path에서 drop하지 않고 pairwise 대상에 넣는다."""
     debate = _make_debate()

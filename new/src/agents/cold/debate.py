@@ -288,9 +288,9 @@ class DebateAgent(AgentBase):
                 logger.warning("[debate] debate_resolution publish 실패: %s", e)
 
         # memory 저장
-        self._save_debate_history(debate_id, resolution_payload)
+        memory_error = self._save_debate_history(debate_id, resolution_payload)
 
-        return {
+        result = {
             "conflict_detected": True,
             "debate_id": debate_id,
             "winner_view": winner_view,
@@ -303,6 +303,9 @@ class DebateAgent(AgentBase):
             "pairwise_msgs": pairwise_msgs,
             "skipped_reason": None,
         }
+        if memory_error is not None:
+            result["memory_write_error"] = memory_error
+        return result
 
     def _assert_signals_pit_safe(self, signals: list[dict[str, Any]]) -> None:
         """Direct-call Debate inputs must not contain future observations."""
@@ -602,11 +605,10 @@ class DebateAgent(AgentBase):
 
     def _save_debate_history(
         self, debate_id: str, result: dict[str, Any]
-    ) -> None:
+    ) -> str | None:
         """debate_history JSONL 저장."""
         today = datetime.now(_KST).strftime("%Y%m%d")
         path = self._memory_root / "debate_agent" / f"{today}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "debate_id": debate_id,
@@ -615,5 +617,12 @@ class DebateAgent(AgentBase):
             "comparison_count": result.get("comparison_count", 0),
             "uncertainty_delta": result.get("uncertainty_delta", 0.0),
         }
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            error = str(e)
+            logger.warning("[debate] memory 저장 실패: path=%s error=%s", path, error)
+            return error
+        return None

@@ -294,6 +294,37 @@ def test_run_once_filters_future_recent_bars_before_risk_fast(
     ]
 
 
+def test_run_once_risk_fast_exception_degrades_nonblocking(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar 예외는 Hot Path core를 fail-close하지 않는다."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+
+    def failing_evaluate(snapshot, ts):
+        raise RuntimeError("risk sidecar unavailable")
+
+    runner._risk_fast.evaluate = failing_evaluate  # type: ignore[method-assign]
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result.get("status") != "FAIL"
+    assert result.get("failure_stage") != "risk_fast"
+    assert result["risk_eval"]["enabled"] is False
+    assert result["risk_eval"]["status"] == "DISABLED"
+    assert result["risk_eval"]["risk_level"] == "low"
+    assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
+
+
 def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     """잘못된 bar 하나가 들어와도 전체 루프는 중단되지 않음."""
     runner.start()

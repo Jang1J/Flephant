@@ -422,27 +422,27 @@ class HotRunner:
             )
         except Exception as e:
             risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
-            return self._fail_closed_result(
-                asof=asof,
-                t0=t0,
-                stage="risk_fast",
-                error=e,
-                n_bars_consumed=n_bars_consumed,
-                bar_errors=bar_errors,
-                stage_ms={
-                    "quant": quant_ms,
-                    "ppo": ppo_ms,
-                    "pm": pm_ms,
-                    "risk_fast": risk_fast_ms,
-                },
-                quant_output=quant_output,
-                anomalies=anomalies,
-                allocation=allocation,
-                pm_result=pm_result,
-                ppo_guard_warnings=ppo_guard_warnings,
-                pm_guard_warnings=pm_guard_warnings,
-            )
-        risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
+            logger.warning("[hot_runner] RiskFast sidecar 비활성화: %s", e)
+            risk_eval = {
+                "risk_level": "low",
+                "severity": "low",
+                "fast_rule_match": None,
+                "triggered_rules": [],
+                "affected_tickers": [],
+                "recommended_action": "pass",
+                "stance": "neutral",
+                "rationale": (
+                    "RiskFast sidecar disabled_nonblocking: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                "latency_ms": risk_fast_ms,
+                "status": "DISABLED",
+                "enabled": False,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
+        else:
+            risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
 
         if risk_eval["risk_level"] == "critical":
             logger.warning(

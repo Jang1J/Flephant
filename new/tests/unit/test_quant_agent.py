@@ -760,6 +760,36 @@ def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     assert result["n_tickers"] == 0
 
 
+def test_score_cross_section_default_does_not_load_dual_source_from_disk(
+    populated_dual_source_registry: ModelRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hot Path 기본값은 Dual-Source artifact 파일을 직접 읽지 않는다."""
+    calls: list[str | None] = []
+
+    def fake_load_latest_scores(date_key: str | None = None) -> list[dict[str, Any]]:
+        calls.append(date_key)
+        return [{"ticker": "005930"}]
+
+    monkeypatch.setattr(
+        "src.data.dual_source_runner.load_latest_scores",
+        fake_load_latest_scores,
+    )
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=None,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+    assert calls == []
+
+
 def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
     populated_dual_source_registry: ModelRegistry,
 ) -> None:

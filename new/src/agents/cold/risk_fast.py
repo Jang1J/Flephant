@@ -20,6 +20,7 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.safe_cast import safe_float
 from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_fast_cold")
@@ -137,6 +138,11 @@ class RiskAgentFast(AgentBase):
             scope = "market"
         return {"ticker": ticker, "scope": scope}
 
+    @staticmethod
+    def _ctx_float(ctx: dict[str, Any], key: str) -> float:
+        """외부 context 숫자를 fail-closed finite float로 정규화한다."""
+        return safe_float(ctx.get(key, 0.0), default=0.0)
+
     def evaluate(
         self,
         event: dict,
@@ -180,7 +186,7 @@ class RiskAgentFast(AgentBase):
         # action=admit_candidate 인 rule 은 이 evaluate loop 에 진입하지 않음.
 
         # 규칙 1: 커뮤니티 게시글 급증
-        comm_z = ctx.get("comm_volume_zscore", 0.0)
+        comm_z = self._ctx_float(ctx, "comm_volume_zscore")
         if comm_z > self._thresholds["comm_volume_zscore"]:
             triggered.append({"rule_id": "comm_volume_spike", "matched_at": now_iso})
             logger.info(
@@ -188,7 +194,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 2: 커뮤니티 감성 급변
-        sent_delta = ctx.get("comm_sentiment_delta", 0.0)
+        sent_delta = self._ctx_float(ctx, "comm_sentiment_delta")
         if abs(sent_delta) > self._thresholds["comm_sentiment_delta"]:
             triggered.append({"rule_id": "comm_sentiment_delta", "matched_at": now_iso})
             logger.info(
@@ -196,7 +202,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 3: 분봉 급락 이상치
-        ret_z = ctx.get("intraday_return_zscore", 0.0)
+        ret_z = self._ctx_float(ctx, "intraday_return_zscore")
         if ret_z < self._thresholds["intraday_return_zscore"]:
             triggered.append({"rule_id": "intraday_drop_anomaly", "matched_at": now_iso})
             logger.info(
@@ -204,7 +210,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 4: 외국인 대규모 순매도 (음수 컨벤션: -100B 이하 = 대규모 순매도)
-        frg_sell = ctx.get("foreign_net_sell_krw", 0.0)
+        frg_sell = self._ctx_float(ctx, "foreign_net_sell_krw")
         if frg_sell < self._thresholds["foreign_net_sell_krw"]:
             triggered.append(
                 {"rule_id": "foreign_net_sell_critical", "matched_at": now_iso}
@@ -227,11 +233,7 @@ class RiskAgentFast(AgentBase):
             logger.info("[risk_fast_cold] rule_dart_critical_disclosure 발동")
 
         # 규칙 6: 뉴스-커뮤니티 방향 불일치
-        divergence = ctx.get("news_comm_divergence", 0.0)
-        try:
-            divergence_value = float(divergence)
-        except (TypeError, ValueError):
-            divergence_value = 0.0
+        divergence_value = self._ctx_float(ctx, "news_comm_divergence")
         if abs(divergence_value) > self._thresholds["news_comm_divergence"]:
             uncertainty_score = max(0.0, min(1.0, abs(divergence_value)))
             triggered.append(

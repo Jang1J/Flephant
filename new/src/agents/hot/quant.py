@@ -756,18 +756,17 @@ class QuantAgent(AgentBase):
         if date_key not in self._dual_source_cache:
             loader = self._dual_source_loader
             if loader is None:
-                from src.data.dual_source_runner import load_latest_scores
-
-                loader = load_latest_scores
-            try:
-                records = loader(date_key)
-            except Exception as e:
-                logger.warning(
-                    "[quant_agent] Dual-Source score load 실패 date=%s: %s",
-                    date_key,
-                    e,
-                )
                 records = []
+            else:
+                try:
+                    records = loader(date_key)
+                except Exception as e:
+                    logger.warning(
+                        "[quant_agent] Dual-Source score load 실패 date=%s: %s",
+                        date_key,
+                        e,
+                    )
+                    records = []
             self._dual_source_cache[date_key] = [
                 item for item in records if isinstance(item, dict)
             ]

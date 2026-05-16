@@ -213,7 +213,9 @@ class RiskAgentSlow(AgentBase):
         self._publish_if_available(publish_channel, rpt)
 
         # macro memory 저장
-        self._save_macro_memory(event_type, ticker, parsed)
+        memory_error = self._save_macro_memory(event_type, ticker, parsed)
+        if memory_error is not None:
+            rpt["memory_write_error"] = memory_error
 
         return rpt
 
@@ -388,11 +390,10 @@ class RiskAgentSlow(AgentBase):
         event_type: str,
         ticker: str,
         parsed: dict[str, Any],
-    ) -> None:
+    ) -> str | None:
         """macro_notes JSONL 저장."""
         today = datetime.now(_KST).strftime("%Y%m%d")
         path = self._memory_root / "risk_agent" / "macro" / f"{today}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
@@ -401,5 +402,12 @@ class RiskAgentSlow(AgentBase):
             "risk_level": parsed.get("risk_level"),
             "regime_signal": parsed.get("regime_signal"),
         }
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            error = str(e)
+            logger.warning("[risk_slow] memory 저장 실패: path=%s error=%s", path, error)
+            return error
+        return None

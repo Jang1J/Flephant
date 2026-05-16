@@ -241,6 +241,27 @@ def test_fast_uncertainty_signal_normalizes_short_ticker_and_scope() -> None:
     assert payload["scope"] == "ticker:005930"
 
 
+def test_fast_context_numeric_strings_and_malformed_values_fail_closed() -> None:
+    """외부 context 숫자는 문자열을 허용하되 NaN/오염값은 기본값으로 fail-closed."""
+    fast = _make_fast()
+    result = fast.evaluate(
+        _make_event(),
+        context={
+            "comm_volume_zscore": "3.1",
+            "comm_sentiment_delta": "bad",
+            "intraday_return_zscore": "NaN",
+            "foreign_net_sell_krw": "-150000000000",
+            "news_comm_divergence": "inf",
+        },
+    )
+
+    assert "comm_volume_spike" in result["triggered_rules"]
+    assert "foreign_net_sell_critical" in result["triggered_rules"]
+    assert "comm_sentiment_delta" not in result["triggered_rules"]
+    assert "intraday_drop_anomaly" not in result["triggered_rules"]
+    assert "news_comm_divergence_strong" not in result["triggered_rules"]
+
+
 # ------------------------------------------------------------------ #
 # RiskAgentSlow 테스트
 # ------------------------------------------------------------------ #
@@ -253,6 +274,28 @@ def test_slow_analyze_success() -> None:
     assert result["channel"] in {"risk_warning", "regime_change", "veto_recommendation"}
     assert result["report_type"] in {"risk_warning", "regime_change", "veto_recommendation"}
     assert "payload" in result
+
+
+def test_slow_memory_write_failure_does_not_fail_analysis(tmp_path) -> None:
+    """memory_root가 쓰기 불가여도 RiskSlow 분석 결과는 반환된다."""
+    blocked_root = tmp_path / "blocked_memory_root"
+    blocked_root.write_text("not a directory", encoding="utf-8")
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=True,
+        model_used="kanana-o",
+        content='{"stance":"risk_reduce","risk_level":"medium",'
+        '"regime_signal":false,"affected_tickers":["005930"],"narrative":"위험"}',
+        latency_ms=10.0,
+        error=None,
+    )
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=None, memory_root=blocked_root)
+
+    result = slow.analyze(_make_event())
+
+    assert result is not None
+    assert result["payload"]["stance"] == "risk_reduce"
+    assert "memory_write_error" in result
 
 
 def test_slow_analyze_rejects_future_event_before_llm() -> None:
