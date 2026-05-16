@@ -53,6 +53,25 @@ def _final_dataset_metadata() -> dict:
     }
 
 
+def test_final_dataset_gate_blocks_wrong_ticker_set() -> None:
+    metadata = _final_dataset_metadata()
+    wrong_tickers = list(metadata["requested_tickers"])
+    wrong_tickers[-1] = "999999"
+    metadata["requested_tickers"] = wrong_tickers
+    metadata["loaded_tickers"] = wrong_tickers
+    metadata["n_tickers"] = len(wrong_tickers)
+
+    result = service_readiness_status._final_dataset_gate_state({
+        "candidate_model_metadata": metadata,
+    })
+
+    assert result["status"] == "BLOCKED"
+    assert "requested_tickers_final_universe_mismatch" in result["blockers"]
+    assert "loaded_tickers_final_universe_mismatch" in result["blockers"]
+    assert result["expected_ticker_count"] == 30
+    assert result["expected_universe_hash"]
+
+
 def test_feature_quality_gate_blocks_missing_config(monkeypatch) -> None:
     monkeypatch.setattr(
         service_readiness_status,

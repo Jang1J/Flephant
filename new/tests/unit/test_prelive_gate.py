@@ -727,6 +727,24 @@ def test_lgbm_real_train_enforces_final_dataset_gate(monkeypatch, tmp_path):
     assert "train_start_missing_or_invalid" in result["final_dataset_gate"]["blockers"]
 
 
+def test_final_dataset_gate_blocks_wrong_ticker_set():
+    gate = _load_script_module()
+    metadata = _final_dataset_metadata()
+    wrong_tickers = list(metadata["requested_tickers"])
+    wrong_tickers[-1] = "999999"
+    metadata["requested_tickers"] = wrong_tickers
+    metadata["loaded_tickers"] = wrong_tickers
+    metadata["n_tickers"] = len(wrong_tickers)
+
+    result = gate._final_dataset_gate_result({"model_metadata": metadata})
+
+    assert result["status"] == "BLOCKED"
+    assert "requested_tickers_final_universe_mismatch" in result["blockers"]
+    assert "loaded_tickers_final_universe_mismatch" in result["blockers"]
+    assert result["expected_ticker_count"] == 30
+    assert result["expected_universe_hash"]
+
+
 def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)

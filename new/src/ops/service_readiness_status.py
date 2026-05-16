@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.mode_b.service_policy_verifier import service_policy_gate_pass
+from src.mode_b.service_policy_verifier import (
+    normalize_service_policy_universe,
+    service_policy_gate_pass,
+    service_policy_universe_hash,
+)
 from src.utils.config_loader import load as config_load
 from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.ticker_utils import pad_ticker
@@ -123,6 +127,7 @@ def _service_policy_gate_pass(
             backtest.get("service_policy_expected_date_range")
             or backtest.get("date_range")
         ),
+        expected_universe=_final_dataset_tickers(),
     )
 
 
@@ -174,6 +179,62 @@ def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
             if tickers:
                 return len(tickers), tickers
     return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
+
+
+def _metadata_ticker_sets(metadata: dict[str, Any]) -> dict[str, list[str]]:
+    sets: dict[str, list[str]] = {}
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = normalize_service_policy_universe([
+                str(ticker)
+                for ticker in raw
+                if str(ticker).strip()
+            ])
+            if tickers:
+                sets[key] = tickers
+    return sets
+
+
+def _final_dataset_tickers() -> list[str]:
+    gate_cfg = (
+        config_load(
+            "risk_config.yaml",
+            "backtest_agent.deploy_decision_gate.final_dataset_gate",
+        )
+        or {}
+    )
+    universe_cfg = config_load("universe_config.yaml") or {}
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (universe_cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict) or str(sector.get("status")) not in sector_statuses:
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if str(stock.get("status")) in stock_statuses:
+                tickers.append(str(stock.get("ticker", "")))
+    if not tickers:
+        tickers.extend((universe_cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", []))
+    min_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+    normalized = normalize_service_policy_universe(tickers)
+    return normalized[:min_tickers] if min_tickers else normalized
 
 
 def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
@@ -231,6 +292,23 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
     ticker_count, tickers = _metadata_ticker_count(metadata)
     if ticker_count < min_tickers:
         blockers.append("ticker_count_below_final_dataset_min")
+    expected_tickers = _final_dataset_tickers()
+    expected_universe_hash = (
+        service_policy_universe_hash(expected_tickers) if expected_tickers else None
+    )
+    observed_sets = _metadata_ticker_sets(metadata)
+    observed_hashes = {
+        key: service_policy_universe_hash(value)
+        for key, value in observed_sets.items()
+    }
+    if expected_tickers:
+        if ticker_count != len(expected_tickers):
+            blockers.append("ticker_count_final_universe_mismatch")
+        if not observed_sets:
+            blockers.append("ticker_set_missing_for_final_dataset")
+        for key, observed_tickers in observed_sets.items():
+            if observed_tickers != expected_tickers:
+                blockers.append(f"{key}_final_universe_mismatch")
     if required_data_source and data_source != required_data_source:
         blockers.append("model_data_source_not_allowed_for_final_dataset")
     if safe_bool(metadata.get("synthetic_fallback"), default=False):
@@ -252,6 +330,9 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
         "ticker_count": ticker_count,
         "min_tickers": min_tickers,
         "sample_tickers": tickers[:5],
+        "expected_ticker_count": len(expected_tickers),
+        "expected_universe_hash": expected_universe_hash,
+        "observed_universe_hashes": observed_hashes,
         "data_source": data_source or None,
         "required_data_source": required_data_source or None,
     }

@@ -22,7 +22,11 @@ NEW_ROOT = REPO_ROOT / "new"
 if str(NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(NEW_ROOT))
 
-from src.mode_b.service_policy_verifier import service_policy_gate_pass  # noqa: E402
+from src.mode_b.service_policy_verifier import (  # noqa: E402
+    normalize_service_policy_universe,
+    service_policy_gate_pass,
+    service_policy_universe_hash,
+)
 from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
@@ -167,6 +171,21 @@ def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
     return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
 
 
+def _metadata_ticker_sets(metadata: dict[str, Any]) -> dict[str, list[str]]:
+    sets: dict[str, list[str]] = {}
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = normalize_service_policy_universe([
+                str(ticker)
+                for ticker in raw
+                if str(ticker).strip()
+            ])
+            if tickers:
+                sets[key] = tickers
+    return sets
+
+
 def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
     gate_cfg = _final_dataset_gate_cfg()
     if not gate_cfg:
@@ -216,6 +235,27 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
     ticker_count, tickers = _metadata_ticker_count(metadata)
     if ticker_count < min_tickers:
         blockers.append("ticker_count_below_final_dataset_min")
+    expected_tickers = (
+        normalize_service_policy_universe(_active_tickers(min_tickers))
+        if min_tickers > 0
+        else []
+    )
+    expected_universe_hash = (
+        service_policy_universe_hash(expected_tickers) if expected_tickers else None
+    )
+    observed_sets = _metadata_ticker_sets(metadata)
+    observed_hashes = {
+        key: service_policy_universe_hash(value)
+        for key, value in observed_sets.items()
+    }
+    if expected_tickers:
+        if ticker_count != len(expected_tickers):
+            blockers.append("ticker_count_final_universe_mismatch")
+        if not observed_sets:
+            blockers.append("ticker_set_missing_for_final_dataset")
+        for key, observed_tickers in observed_sets.items():
+            if observed_tickers != expected_tickers:
+                blockers.append(f"{key}_final_universe_mismatch")
     if data_source_required and data_source != data_source_required:
         blockers.append("model_data_source_not_allowed_for_final_dataset")
     if safe_bool(metadata.get("synthetic_fallback"), default=False):
@@ -237,6 +277,9 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
         "ticker_count": ticker_count,
         "min_tickers": min_tickers,
         "sample_tickers": tickers[:5],
+        "expected_ticker_count": len(expected_tickers),
+        "expected_universe_hash": expected_universe_hash,
+        "observed_universe_hashes": observed_hashes,
         "data_source": data_source or None,
         "required_data_source": data_source_required or None,
     }
