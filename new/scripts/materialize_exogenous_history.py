@@ -30,7 +30,7 @@ from src.data.exogenous_feature_store import (  # noqa: E402
     write_exogenous_payload,
 )
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -40,6 +40,7 @@ from src.utils.trading_calendar import (  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "exogenous_history"
+_FALLBACK_MIN_EXOGENOUS_NON_NEUTRAL_DATE_COVERAGE = 0.8
 
 
 def _parse_date(date_key: str) -> datetime:
@@ -49,6 +50,16 @@ def _parse_date(date_key: str) -> datetime:
 def _snapshot_ts(date_key: str) -> datetime:
     day = _parse_date(date_key).date()
     return datetime.combine(day, time(8, 30), tzinfo=_KST)
+
+
+def _min_exogenous_non_neutral_date_coverage() -> float:
+    cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
+    return safe_float(
+        cfg.get("min_exogenous_non_neutral_date_coverage"),
+        default=_FALLBACK_MIN_EXOGENOUS_NON_NEUTRAL_DATE_COVERAGE,
+        min_value=0.0,
+        max_value=1.0,
+    )
 
 
 def _business_dates(end_date: str, business_days: int) -> list[str]:
@@ -380,8 +391,9 @@ def materialize_exogenous_history(
                     "error_type": type(e).__name__,
                 })
 
+    min_coverage = _min_exogenous_non_neutral_date_coverage()
     coverage = non_neutral_dates / max(len(dates), 1)
-    if coverage < 0.8:
+    if coverage < min_coverage:
         blockers.append("exogenous_non_neutral_coverage_below_threshold")
     if not written:
         blockers.append("no_exogenous_artifacts_written")
@@ -396,6 +408,7 @@ def materialize_exogenous_history(
         "provider_availability": availability,
         "coverage": {
             "exogenous_non_neutral_date_coverage": coverage,
+            "min_exogenous_non_neutral_date_coverage": min_coverage,
             "written_date_count": len(written),
         },
         "blockers": sorted(set(blockers)),

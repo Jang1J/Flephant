@@ -21,6 +21,7 @@ from src.connectors.kis_rest import KISRestClient
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError
+from src.utils.safe_cast import safe_int
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("backfill")
@@ -29,7 +30,18 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # artifacts 루트 (new/ 기준)
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts" / "data"
-_MIN_COMPLETE_INTRADAY_ROWS = 300
+_FALLBACK_MIN_COMPLETE_INTRADAY_ROWS = 300
+
+
+def _min_complete_intraday_rows() -> int:
+    """live_data_readiness.yaml 기준의 완성 1분봉 최소 row 수."""
+    cfg = config_load("risk_config.yaml", "live_data_readiness") or {}
+    threshold = cfg.get("train_min_rows_per_day", cfg.get("min_rows_per_day"))
+    return safe_int(
+        threshold,
+        default=_FALLBACK_MIN_COMPLETE_INTRADAY_ROWS,
+        min_value=1,
+    )
 
 
 def _has_pyarrow() -> bool:
@@ -113,12 +125,14 @@ def _existing_artifact_to_preserve(
 
     if best_path is None:
         return None
-    if best_rows >= _MIN_COMPLETE_INTRADAY_ROWS and new_rows < best_rows:
+    min_complete_rows = _min_complete_intraday_rows()
+    if best_rows >= min_complete_rows and new_rows < best_rows:
         logger.warning(
-            "[backfill] 기존 artifact 보존: %s rows=%d > new_rows=%d",
+            "[backfill] 기존 artifact 보존: %s rows=%d > new_rows=%d min_complete_rows=%d",
             best_path,
             best_rows,
             new_rows,
+            min_complete_rows,
         )
         return best_path
     return None

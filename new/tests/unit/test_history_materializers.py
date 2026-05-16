@@ -1,6 +1,7 @@
 """Historical feature materializer fail-closed tests."""
 from __future__ import annotations
 
+import json
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +152,74 @@ def test_dual_source_history_uses_sector_and_market_fallback(monkeypatch, tmp_pa
     assert artifact.exists()
     assert "news_scope=sector_fallback" in artifact.read_text(encoding="utf-8")
     assert "market_backstop" in artifact.read_text(encoding="utf-8")
+
+
+def test_dual_source_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "20260508.json").write_text(
+        json.dumps({
+            "provenance": {"deploy_quality": True},
+            "rows": [{
+                "ticker": "005930",
+                "news_texts": ["실적 호조"],
+                "comm_texts_t1": [],
+                "comm_texts_t2": [],
+                "data_ts": "2026-05-08T08:00:00+09:00",
+            }],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class DummyScorer:
+        def score_universe(self, rows, snapshot_ts=None):
+            return [
+                {
+                    "ticker": row["ticker"],
+                    "asof": "2026-05-08T08:30:00+09:00",
+                    "news_score_t": 0.5,
+                    "comm_score_t_1": 0.0,
+                    "comm_score_t_2": 0.0,
+                    "news_comm_divergence": 0.5,
+                    "community_noise_multiplier": 1.0,
+                    "source_notes": "test",
+                }
+                for row in rows
+            ]
+
+        def score(self, **kwargs):
+            return {
+                "ticker": kwargs["ticker"],
+                "news_score_t": 0.0,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.0,
+                "community_noise_multiplier": 1.0,
+                "source_notes": "test",
+            }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml" and section == "phase2_feature_backfill":
+            return {"min_dual_source_non_neutral_date_coverage": 0.4}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "_load_active_universe", lambda: [{"ticker": "005930"}])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508", "20260511"])
+    monkeypatch.setattr(mod, "DualSourceScorer", lambda: DummyScorer())
+
+    report = mod.materialize_dual_source_history(
+        end_date="20260511",
+        business_days=2,
+        raw_events_dir=raw_dir,
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert report["coverage"]["dual_source_non_neutral_date_coverage"] == 0.5
+    assert report["coverage"]["min_dual_source_non_neutral_date_coverage"] == 0.4
 
 
 def test_exogenous_history_blocks_without_required_real_providers(monkeypatch, tmp_path):
@@ -337,3 +406,66 @@ def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_p
     assert report["per_date"][0]["source_stats"]["investor_ticker_count"] == 2
     assert report["per_date"][0]["source_stats"]["investor_failures"] == {}
     assert (tmp_path / "exogenous" / "20260508.json").exists()
+
+
+def test_exogenous_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_path):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            non_neutral = as_of == "2026-05-08"
+            return SimpleNamespace(
+                us_sp500_change=0.01 if non_neutral else 0.0,
+                us_nasdaq_change=0.0,
+                us_vix=0.0,
+                us_soxx_change=0.0,
+                source="yfinance",
+                as_of_date=as_of,
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 0.0, "usd_krw": 0.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            return [{
+                "payload": {
+                    "ticker": ticker,
+                    "date": bgn_de,
+                    "foreign_net_buy": 0.0,
+                    "institutional_net_buy": 0.0,
+                    "retail_net_buy": 0.0,
+                }
+            }]
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml" and section == "phase2_feature_backfill":
+            return {"min_exogenous_non_neutral_date_coverage": 0.4}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508", "20260511"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260511",
+        business_days=2,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert report["coverage"]["exogenous_non_neutral_date_coverage"] == 0.5
+    assert report["coverage"]["min_exogenous_non_neutral_date_coverage"] == 0.4
+    assert report["coverage"]["written_date_count"] == 1

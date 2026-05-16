@@ -166,6 +166,29 @@ def test_save_jsonl_preserves_existing_complete_artifact_on_short_refetch(
         assert sum(1 for line in fh if line.strip()) == 381
 
 
+def test_save_jsonl_preserve_threshold_uses_risk_config(monkeypatch, tmp_path):
+    """완성 row 기준은 live_data_readiness 설정을 따른다."""
+    _set_mock_env(monkeypatch)
+    from src.data import backfill as backfill_module
+    from src.data.backfill import Backfill
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml" and section == "live_data_readiness":
+            return {"train_min_rows_per_day": 500}
+        return {}
+
+    monkeypatch.setattr(backfill_module, "_has_pyarrow", lambda: False)
+    monkeypatch.setattr(backfill_module, "config_load", fake_config_load)
+    bf = Backfill(output_dir=tmp_path)
+    original = bf.save_parquet("005930", _sample_bars_many(381), "20260417")
+
+    out_path = bf.save_parquet("005930", _sample_bars_many(100), "20260417")
+
+    assert out_path == original
+    with original.open("r", encoding="utf-8") as fh:
+        assert sum(1 for line in fh if line.strip()) == 100
+
+
 def test_save_parquet_preserves_existing_complete_artifact_on_short_refetch(
     monkeypatch,
     tmp_path,
