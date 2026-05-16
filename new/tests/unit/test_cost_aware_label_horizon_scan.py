@@ -104,6 +104,60 @@ def test_default_horizons_include_service_policy_min_holding(monkeypatch):
     assert mod._default_horizons() == ["5", "30", "60", "195", "session_close"]
 
 
+def test_horizon_return_series_uses_dataset_builder_drop_last_n_policy():
+    mod = _load_script("cost_aware_label_horizon_scan")
+    panel = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 10,
+            "ts_close": pd.date_range(
+                "2026-05-01 09:00:00+09:00",
+                periods=10,
+                freq="min",
+            ),
+            "close": [100.0 + i for i in range(10)],
+        }
+    )
+
+    series = mod._horizon_return_series(
+        panel,
+        "2",
+        drop_last_n_bars=5,
+        active_horizon="2",
+    )
+
+    assert int(series.notna().sum()) == 5
+    assert series.iloc[0] == pytest.approx(102.0 / 100.0 - 1.0)
+    assert series.iloc[4] == pytest.approx(106.0 / 104.0 - 1.0)
+    assert series.iloc[5:].isna().all()
+
+
+def test_session_close_return_series_uses_active_horizon_drop_policy():
+    mod = _load_script("cost_aware_label_horizon_scan")
+    panel = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 10,
+            "ts_close": pd.date_range(
+                "2026-05-01 09:00:00+09:00",
+                periods=10,
+                freq="min",
+            ),
+            "close": [100.0 + i for i in range(10)],
+        }
+    )
+
+    series = mod._horizon_return_series(
+        panel,
+        "session_close",
+        drop_last_n_bars=5,
+        active_horizon="2",
+    )
+
+    assert int(series.notna().sum()) == 5
+    assert series.iloc[0] == pytest.approx(109.0 / 100.0 - 1.0)
+    assert series.iloc[4] == pytest.approx(109.0 / 104.0 - 1.0)
+    assert series.iloc[5:].isna().all()
+
+
 def test_horizon_summary_reports_selection_impact_for_active_noop():
     mod = _load_script("cost_aware_label_horizon_scan")
     panel = pd.DataFrame(

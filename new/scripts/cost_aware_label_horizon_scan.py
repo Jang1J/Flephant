@@ -26,7 +26,7 @@ if str(SRC) not in sys.path:
 
 from src.data.dataset_builder import DatasetBuilder  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -158,6 +158,25 @@ def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, Any]:
     }
 
 
+def _label_generation_settings() -> dict[str, int]:
+    """DatasetBuilder label-row policy used by this read-only diagnostic."""
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    active_horizon_bars = safe_int(
+        label_cfg.get("horizon_bars"),
+        default=5,
+        min_value=1,
+    )
+    drop_last_n_bars = safe_int(
+        label_cfg.get("drop_last_n_bars"),
+        default=active_horizon_bars,
+        min_value=0,
+    )
+    return {
+        "active_horizon_bars": active_horizon_bars,
+        "drop_last_n_bars": drop_last_n_bars,
+    }
+
+
 def _infer_date_range(
     artifacts_dir: Path,
     tickers: list[str],
@@ -231,30 +250,72 @@ def _quantiles(values: np.ndarray) -> dict[str, float | None]:
     }
 
 
-def _horizon_return_series(panel, horizon: str):
+def _horizon_return_series(
+    panel,
+    horizon: str,
+    *,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+):
     df = panel.copy()
     df["_session"] = df["ts_close"].dt.date
+    labels = np.full(len(df), np.nan, dtype=float)
+    close_values = df["close"].to_numpy(dtype=float)
+    grouped_positions = df.groupby(["ticker", "_session"], sort=False).indices
     if horizon == "session_close":
-        grouped = df.groupby(["ticker", "_session"], sort=False)
-        future_close = grouped["close"].transform("last")
-        last_ts = grouped["ts_close"].transform("last")
-        mask = df["ts_close"] < last_ts
+        active_bars = safe_int(active_horizon, default=5, min_value=1)
+        drop_count = max(active_bars, drop_last_n_bars)
+        for positions in grouped_positions.values():
+            positions_arr = np.asarray(positions, dtype=np.int64)
+            valid_count = max(0, len(positions_arr) - drop_count)
+            if valid_count <= 0:
+                continue
+            closes = close_values[positions_arr]
+            now = closes[:valid_count]
+            future = float(closes[-1])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                labels[positions_arr[:valid_count]] = np.where(
+                    now > 1e-8,
+                    future / now - 1.0,
+                    np.nan,
+                )
     else:
         bars = int(horizon)
-        grouped = df.groupby(["ticker", "_session"], sort=False)
-        future_close = grouped["close"].shift(-bars)
-        mask = future_close.notna()
-
-    close = df["close"].astype(float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        returns = np.where(close > 1e-8, future_close.astype(float) / close - 1.0, np.nan)
+        drop_count = max(bars, drop_last_n_bars)
+        for positions in grouped_positions.values():
+            positions_arr = np.asarray(positions, dtype=np.int64)
+            valid_count = max(0, len(positions_arr) - drop_count)
+            if valid_count <= 0:
+                continue
+            closes = close_values[positions_arr]
+            now = closes[:valid_count]
+            future = closes[bars:bars + valid_count]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                labels[positions_arr[:valid_count]] = np.where(
+                    now > 1e-8,
+                    future / now - 1.0,
+                    np.nan,
+                )
     pd = __import__("pandas")
-    series = pd.Series(returns, index=panel.index, dtype=float)
-    return series.where(mask)
+    return pd.Series(labels, index=panel.index, dtype=float)
 
 
-def _horizon_returns(panel, horizon: str) -> np.ndarray:
-    values = np.asarray(_horizon_return_series(panel, horizon).dropna(), dtype=float)
+def _horizon_returns(
+    panel,
+    horizon: str,
+    *,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+) -> np.ndarray:
+    values = np.asarray(
+        _horizon_return_series(
+            panel,
+            horizon,
+            drop_last_n_bars=drop_last_n_bars,
+            active_horizon=active_horizon,
+        ).dropna(),
+        dtype=float,
+    )
     return values[np.isfinite(values)]
 
 
@@ -264,6 +325,7 @@ def _selection_impact(
     horizon: str,
     active_horizon: str,
     top_k_fraction: float,
+    drop_last_n_bars: int = 0,
 ) -> dict[str, Any]:
     if horizon == active_horizon:
         return {
@@ -276,8 +338,18 @@ def _selection_impact(
         }
 
     pd = __import__("pandas")
-    active = _horizon_return_series(panel, active_horizon)
-    candidate = _horizon_return_series(panel, horizon)
+    active = _horizon_return_series(
+        panel,
+        active_horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
+    candidate = _horizon_return_series(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
     joined = panel[["ticker", "ts_close"]].copy()
     joined["_active"] = active
     joined["_candidate"] = candidate
@@ -347,8 +419,14 @@ def _summarize_horizon(
     total_cost_bps: float,
     thresholds: dict[str, float],
     top_k_fraction: float,
+    drop_last_n_bars: int = 0,
 ) -> dict[str, Any]:
-    returns = _horizon_returns(panel, horizon)
+    returns = _horizon_returns(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
     gross_bps = returns * 10000.0
     net_bps = gross_bps - total_cost_bps
     valid_rows = int(net_bps.size)
@@ -363,6 +441,7 @@ def _summarize_horizon(
                 horizon=horizon,
                 active_horizon=active_horizon,
                 top_k_fraction=top_k_fraction,
+                drop_last_n_bars=drop_last_n_bars,
             ),
         }
 
@@ -390,6 +469,7 @@ def _summarize_horizon(
             horizon=horizon,
             active_horizon=active_horizon,
             top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
         ),
     }
 
@@ -426,8 +506,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     total_cost_bps = _cost_bps()
     thresholds = _diagnostic_thresholds(total_cost_bps)
-    label_cfg = config_load("risk_config.yaml", "label") or {}
-    active_horizon = str(label_cfg.get("horizon_bars", 5))
+    label_settings = _label_generation_settings()
+    active_horizon = str(label_settings["active_horizon_bars"])
+    drop_last_n_bars = label_settings["drop_last_n_bars"]
     eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
     top_k_fraction = safe_float(
         eval_cfg.get("top_k_fraction"),
@@ -443,6 +524,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             total_cost_bps=total_cost_bps,
             thresholds=thresholds,
             top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
         )
         for horizon in horizons
     ]
@@ -473,6 +555,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "selection_impact_baseline": {
             "active_horizon": active_horizon,
             "top_k_fraction": top_k_fraction,
+            "label_generation_parity": {
+                "source": "DatasetBuilder._generate_labels",
+                "drop_last_n_bars": drop_last_n_bars,
+                "session_close_drop_uses_active_horizon": active_horizon,
+            },
         },
         "best_horizon": best.get("horizon") if best else None,
         "deployable_label_recommendation": deployable,
