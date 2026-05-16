@@ -237,16 +237,37 @@ class ServicePolicyReplayEngine:
         snapshot_hour = int(pit_cfg.get("snapshot_hour", 18))
         today_snapshot = now.replace(hour=snapshot_hour, minute=0, second=0, microsecond=0)
         default_end = today_snapshot if now >= today_snapshot else today_snapshot - timedelta(days=1)
-        default_start = default_end - timedelta(days=90)
         vt_cfg = config_load("risk_config.yaml", "validation_tools.backtest_engine") or {}
+        wf_cfg = config_load("risk_config.yaml", "walk_forward") or {}
         purge_bars = int(vt_cfg.get("purge_bars", 60))
         embargo_bars = int(vt_cfg.get("embargo_bars", 78))
+        from src.utils.trading_calendar import kospi_trading_start_date
+
+        trading_days_needed = (
+            int(wf_cfg.get("train_window_days", 60))
+            + int(math.ceil(purge_bars / 390))
+            + int(math.ceil(embargo_bars / 390))
+            + int(wf_cfg.get("test_window_days", 20))
+            + max(0, int(wf_cfg.get("n_splits", 8)) - 1)
+            * int(wf_cfg.get("step_days", wf_cfg.get("test_window_days", 20)))
+        )
+        default_start_date = kospi_trading_start_date(default_end.date(), trading_days_needed)
+        default_start = default_end.replace(
+            year=default_start_date.year,
+            month=default_start_date.month,
+            day=default_start_date.day,
+        )
         folds = self._engine._build_folds(default_start, default_end, purge_bars, embargo_bars)
         if not folds:
             raise DataUnavailable("default C12 fold window could not be resolved")
         first_fold = folds[0]
-        replay_start = first_fold["test_start"].strftime("%Y%m%d")
-        replay_end = (first_fold["test_end"] - timedelta(days=1)).strftime("%Y%m%d")
+        test_dates = first_fold.get("test_trading_dates") or []
+        if test_dates:
+            replay_start = str(test_dates[0])
+            replay_end = str(test_dates[-1])
+        else:
+            replay_start = first_fold["test_start"].strftime("%Y%m%d")
+            replay_end = (first_fold["test_end"] - timedelta(days=1)).strftime("%Y%m%d")
         return replay_start, replay_end
 
     @staticmethod

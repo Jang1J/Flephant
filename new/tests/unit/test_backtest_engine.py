@@ -331,6 +331,30 @@ def test_purge_embargo_applied():
         )
 
 
+def test_build_folds_uses_kospi_trading_days_not_calendar() -> None:
+    """walk_forward *_days는 calendar day가 아니라 KOSPI 거래일 수로 해석한다."""
+    engine = _make_engine()
+
+    folds = engine._build_folds(
+        start_dt=datetime(2026, 1, 2, tzinfo=_KST),  # Friday
+        end_dt=datetime(2026, 2, 1, tzinfo=_KST),
+        purge_bars=390,
+        embargo_bars=390,
+    )
+
+    first = folds[0]
+    assert first["train_trading_dates"] == [
+        "20260102",
+        "20260105",
+        "20260106",
+        "20260107",
+        "20260108",
+    ]
+    assert first["test_trading_dates"] == ["20260113", "20260114", "20260115"]
+    assert first["test_start"].strftime("%Y%m%d") == "20260113"
+    assert (first["test_end"] - timedelta(days=1)).strftime("%Y%m%d") == "20260115"
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 3. LEAKAGE_DETECTED: 의도적으로 위반 fold를 주입해서 LeakageDetected raise 확인
 # ────────────────────────────────────────────────────────────────────────
@@ -479,8 +503,15 @@ def test_loads_candidate_bundle_model(tmp_path: Path):
         )
     universe = ["005930", "000660", "042700", "403870"]
     for idx, ticker in enumerate(universe):
-        _write_backtest_day(tmp_path, ticker, "20260109", seed=idx)
-        _write_backtest_day(tmp_path, ticker, "20260112", seed=idx + 10)
+        for day_offset, trading_date in enumerate([
+            "20260113",
+            "20260114",
+            "20260115",
+            "20260116",
+            "20260119",
+            "20260120",
+        ]):
+            _write_backtest_day(tmp_path, ticker, trading_date, seed=idx + day_offset * 10)
 
     engine = _make_engine(artifacts_root=tmp_path)
     with _mode_b_env():
@@ -729,7 +760,7 @@ def test_bar_count_match():
 
     expected = 0
     for fold in folds:
-        test_days = max(1, (fold["test_end"] - fold["test_start"]).days)
+        test_days = len(fold.get("test_trading_dates") or [])
         expected += test_days * len(universe) * wf_cfg["trading_minutes_per_day"]
 
     assert result["bar_count"] == expected, (

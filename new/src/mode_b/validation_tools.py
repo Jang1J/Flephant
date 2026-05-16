@@ -15,6 +15,7 @@ from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
 from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import pad_ticker
+from src.utils.trading_calendar import kospi_trading_dates_between
 
 logger = get_logger("BacktestEngine")
 _KST = ZoneInfo("Asia/Seoul")
@@ -385,20 +386,39 @@ class BacktestEngine:
 
         purge_days = math.ceil(purge_bars / 390)   # 390분봉 = 1거래일
         embargo_days = math.ceil(embargo_bars / 390)
+        buffer_days = purge_days + embargo_days
+        tzinfo = start_dt.tzinfo or _KST
+        trading_dates = [
+            datetime.strptime(raw, "%Y%m%d").date()
+            for raw in kospi_trading_dates_between(start_dt.date(), end_dt.date())
+        ]
+
+        def _dt(day) -> datetime:
+            return datetime.combine(day, datetime.min.time(), tzinfo=tzinfo)
 
         folds = []
         for i in range(n_splits):
-            fold_start = start_dt + timedelta(days=i * step_days)
-            train_end = fold_start + timedelta(days=train_days)
-            test_start = train_end + timedelta(days=purge_days + embargo_days)
-            test_end = test_start + timedelta(days=test_days)
+            train_start_idx = i * step_days
+            train_end_idx = train_start_idx + train_days
+            test_start_idx = train_end_idx + buffer_days
+            test_end_idx = test_start_idx + test_days
+            if test_end_idx > len(trading_dates):
+                break
+
+            train_dates = trading_dates[train_start_idx:train_end_idx]
+            test_dates = trading_dates[test_start_idx:test_end_idx]
+            fold_start = _dt(train_dates[0])
+            train_end = _dt(trading_dates[train_end_idx])
+            test_start = _dt(test_dates[0])
+            test_end = _dt(test_dates[-1] + timedelta(days=1))
 
             if test_end > end_dt:
                 break
 
             # Leakage 검증: test_start >= train_end + purge + embargo
-            buffer_end = train_end + timedelta(days=purge_days + embargo_days)
-            if test_start < buffer_end:
+            buffer_end_idx = train_end_idx + buffer_days
+            buffer_end = _dt(trading_dates[buffer_end_idx])
+            if test_start < buffer_end or test_start_idx < buffer_end_idx:
                 raise LeakageDetected(
                     f"fold {i}: test_start={test_start.date()} < "
                     f"buffer_end={buffer_end.date()} "
@@ -411,6 +431,12 @@ class BacktestEngine:
                 "train_end": train_end,
                 "test_start": test_start,
                 "test_end": test_end,
+                "train_trading_dates": [
+                    day.strftime("%Y%m%d") for day in train_dates
+                ],
+                "test_trading_dates": [
+                    day.strftime("%Y%m%d") for day in test_dates
+                ],
                 "purge_bars": purge_bars,
                 "embargo_bars": embargo_bars,
             })
@@ -457,6 +483,9 @@ class BacktestEngine:
         if not folds:
             return {}
         first_fold = folds[0]
+        test_dates = first_fold.get("test_trading_dates") or []
+        if test_dates:
+            return {"start": str(test_dates[0]), "end": str(test_dates[-1])}
         test_start = first_fold.get("test_start")
         test_end = first_fold.get("test_end")
         if not hasattr(test_start, "strftime") or not hasattr(test_end, "strftime"):
@@ -523,7 +552,12 @@ class BacktestEngine:
 
         test_start = fold["test_start"]
         test_end = fold["test_end"]
-        test_days = max(1, (test_end - test_start).days)
+        test_trading_dates = fold.get("test_trading_dates") or []
+        test_days = (
+            len(test_trading_dates)
+            if test_trading_dates
+            else max(1, (test_end - test_start).days)
+        )
         trading_minutes = int(self._cfg_wf["trading_minutes_per_day"])
         n_features = max(1, int(feature_width or 4))
 
@@ -550,7 +584,12 @@ class BacktestEngine:
         }
 
         for day_offset in range(test_days):
-            day = test_start + timedelta(days=day_offset)
+            if test_trading_dates:
+                day = datetime.strptime(
+                    str(test_trading_dates[day_offset]), "%Y%m%d"
+                ).replace(tzinfo=test_start.tzinfo or _KST)
+            else:
+                day = test_start + timedelta(days=day_offset)
             session_open = day.replace(hour=9, minute=0, second=0, microsecond=0)
             for bar_idx in range(trading_minutes):
                 ts_close = session_open + timedelta(minutes=bar_idx)
@@ -822,10 +861,15 @@ class BacktestEngine:
         try:
             from src.data.dataset_builder import DatasetBuilder
 
-            start_date = fold["test_start"].strftime("%Y%m%d")
-            # _build_folds의 test_end는 exclusive 성격이므로 전일까지만 로드.
-            end_dt = fold["test_end"] - timedelta(days=1)
-            end_date = end_dt.strftime("%Y%m%d")
+            test_dates = fold.get("test_trading_dates") or []
+            if test_dates:
+                start_date = str(test_dates[0])
+                end_date = str(test_dates[-1])
+            else:
+                start_date = fold["test_start"].strftime("%Y%m%d")
+                # _build_folds의 test_end는 exclusive 성격이므로 전일까지만 로드.
+                end_dt = fold["test_end"] - timedelta(days=1)
+                end_date = end_dt.strftime("%Y%m%d")
             builder = DatasetBuilder(
                 artifacts_dir=self._artifacts_root / "data",
             )
