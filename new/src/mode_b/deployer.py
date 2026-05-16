@@ -237,7 +237,7 @@ class ModeBDeployer:
         # Unit tests and isolated temp roots may call deploy() directly. The
         # production artifact root must still fail closed unless the caller
         # supplies C12 feature-quality and service-policy evidence.
-        if self._root == _ARTIFACTS_ROOT:
+        if self._uses_production_root():
             self._check_feature_quality_gate(feature_quality or {})
             self._check_service_policy_gate(service_policy_evidence or {}, bundle_id=bundle_id)
 
@@ -392,6 +392,13 @@ class ModeBDeployer:
         if self._root.name == "artifacts":
             return self._root.parent
         return self._root
+
+    def _uses_production_root(self) -> bool:
+        """Return True when this deployer points at the live project artifacts root."""
+        try:
+            return self._root.resolve(strict=False) == _ARTIFACTS_ROOT.resolve(strict=False)
+        except OSError:
+            return self._root == _ARTIFACTS_ROOT
 
     def _check_verdict(self, backtest_verdict: str, deploy_id: str) -> None:
         """verdict 분기. warn/fail 시 DeployBlocked raise."""

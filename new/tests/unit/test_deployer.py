@@ -695,6 +695,27 @@ def test_deploy_medium_regression_blocked(tmp_path):
     assert exc_info.value.reason == "regression_risk_flagged"
 
 
+def test_relative_production_root_still_requires_extended_gates(monkeypatch):
+    """Path('artifacts')처럼 상대 production root여도 C14 확장 gate를 우회하지 않는다."""
+    from src.mode_b import deployer as deployer_mod
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
+
+    repo_root = deployer_mod._ARTIFACTS_ROOT.parent  # noqa: SLF001
+    monkeypatch.chdir(repo_root)
+    deployer = _make_deployer(Path("artifacts"))
+
+    with _mode_b_env():
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id=_BUNDLE_ID,
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=False),
+            )
+
+    assert exc_info.value.reason == "feature_quality_gate_failed"
+
+
 def test_service_policy_gate_requires_report_binding(tmp_path):
     """Production service-policy gate는 embedded report path/hash 없으면 차단."""
     from src.mode_b.deployer import DeployBlocked
