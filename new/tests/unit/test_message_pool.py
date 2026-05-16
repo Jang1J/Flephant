@@ -152,6 +152,29 @@ def test_publish_malformed_trace_asof_raises() -> None:
     assert pool.pool_size() == 0
 
 
+def test_publish_rejects_future_occurred_at_against_asof() -> None:
+    pool = _pool()
+    msg = _valid_msg(
+        occurred_at="2026-04-20T10:01:00+09:00",
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    with pytest.raises(ValueError, match="MESSAGE_PIT_VIOLATION"):
+        pool.publish("news_signal", msg)
+
+    assert pool.pool_size() == 0
+
+
+def test_publish_rejects_duplicate_message_id() -> None:
+    pool = _pool()
+    msg_id = pool.publish("news_signal", _valid_msg(message_id="MSG-DUPLICATE"))
+
+    with pytest.raises(ValueError, match="MESSAGE_ID_CONFLICT"):
+        pool.publish("risk_warning", _valid_msg(message_id=msg_id, action_type="alert"))
+
+    assert pool.pool_size() == 1
+
+
 def test_publish_valid_expires_at_still_publishes() -> None:
     pool = _pool()
     expires_at = (now_kst() + timedelta(minutes=5)).isoformat()
@@ -333,7 +356,7 @@ def test_expire_removes_stale_messages() -> None:
     past = (now_kst() - timedelta(hours=1)).isoformat()
     msg["expires_at"] = past
     msg["ttl"] = 1
-    msg_id = pool.publish("news_signal", msg)
+    pool.publish("news_signal", msg)
 
     removed = pool.expire(now=now_kst())
 
@@ -543,3 +566,25 @@ def test_dependency_activation_separates_event_id_contexts() -> None:
     assert len(activated) == 1
     assert activated[0]["news_signal"]["event_id"] == "EVT-A"
     assert activated[0]["risk_warning"]["event_id"] == "EVT-A"
+
+
+def test_expire_prunes_dependency_contexts() -> None:
+    """만료된 한쪽 메시지는 dependency context에서도 제거한다."""
+    pool = _pool()
+    activated: list[dict] = []
+    pool.register_dependency(
+        "fda_cold_activate",
+        {"news_signal", "risk_warning"},
+        lambda msgs: activated.append(msgs),
+    )
+
+    msg = _valid_msg(event_id="EVT-A", ttl=1)
+    msg_id = pool.publish("news_signal", msg)
+    pool._messages[msg_id].message["expires_at"] = (
+        now_kst() - timedelta(seconds=1)
+    ).isoformat()
+    assert pool.expire(now=now_kst()) == 1
+
+    pool.publish("risk_warning", _valid_msg(action_type="alert", event_id="EVT-A"))
+
+    assert activated == []

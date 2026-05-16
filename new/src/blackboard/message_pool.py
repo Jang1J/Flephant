@@ -100,6 +100,18 @@ def _parse_iso_datetime_field(message: dict, field_name: str) -> datetime:
     return parsed
 
 
+def _validate_pit_trace_fields(message: dict) -> None:
+    if "occurred_at" not in message or "asof" not in message:
+        return
+    occurred_at = _parse_iso_datetime_field(message, "occurred_at")
+    asof = _parse_iso_datetime_field(message, "asof")
+    if occurred_at > asof:
+        raise ValueError(
+            "MESSAGE_PIT_VIOLATION: occurred_at "
+            f"{occurred_at.isoformat()} > asof {asof.isoformat()}"
+        )
+
+
 @dataclass
 class _MessageEntry:
     """내부 저장소 entry. 외부 공개 금지."""
@@ -194,9 +206,12 @@ class MessagePool:
         for trace_ts_field in ("occurred_at", "asof"):
             if trace_ts_field in message:
                 _parse_iso_datetime_field(message, trace_ts_field)
+        _validate_pit_trace_fields(message)
 
         # 2. message_id
         message_id = message.get("message_id") or generate_message_id()
+        if message_id in self._messages:
+            raise ValueError(f"MESSAGE_ID_CONFLICT: message_id='{message_id}' already exists")
         message["message_id"] = message_id
 
         # 3. expires_at + timestamp 자동 계산
@@ -359,10 +374,31 @@ class MessagePool:
             self._by_channel[entry.channel] = [
                 x for x in self._by_channel[entry.channel] if x != mid
             ]
+        if to_remove:
+            self._prune_dependency_contexts(set(to_remove))
 
         if to_remove:
             logger.info("[message_pool] expire: 제거=%d", len(to_remove))
         return len(to_remove)
+
+    def _prune_dependency_contexts(self, removed_ids: set[str]) -> None:
+        for dep in self._dependencies.values():
+            contexts = dep.get("contexts", {})
+            for corr_key, context in list(contexts.items()):
+                latest_ids = context.get("latest_message_ids", {})
+                removed_channels = {
+                    channel
+                    for channel, message_id in latest_ids.items()
+                    if message_id in removed_ids
+                }
+                if not removed_channels:
+                    continue
+                context["seen"].difference_update(removed_channels)
+                for channel in removed_channels:
+                    context["latest_messages"].pop(channel, None)
+                    latest_ids.pop(channel, None)
+                if not context["seen"]:
+                    contexts.pop(corr_key, None)
 
     # ------------------------------------------------------------------
     # dependency_activation (C4 delivery_semantics)
@@ -418,10 +454,11 @@ class MessagePool:
                 corr_key = self._dependency_correlation_key(message)
                 context = dep["contexts"].setdefault(
                     corr_key,
-                    {"seen": set(), "latest_messages": {}},
+                    {"seen": set(), "latest_messages": {}, "latest_message_ids": {}},
                 )
                 context["seen"].add(just_published_channel)
                 context["latest_messages"][just_published_channel] = message
+                context["latest_message_ids"][just_published_channel] = last_id
             else:
                 continue
 
