@@ -231,6 +231,42 @@ def test_join_exogenous_features_reads_daily_artifact(
     assert stats["rows_non_neutral"] == 2
 
 
+def test_join_exogenous_features_rejects_rehearsal_artifact(
+    builder: DatasetBuilder,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deploy-quality feature join은 rehearsal exogenous artifact를 거부한다."""
+    exog_dir = tmp_path / "exogenous"
+    exog_dir.mkdir()
+    payload = {
+        "batch_date": "2026-05-08",
+        "snapshot_ts": "2026-05-08T08:30:00+09:00",
+        "source_stats": {"input_mode": "real", "neutral_rehearsal_file": True},
+        "features": {"us_sp500_change": 0.012},
+    }
+    (exog_dir / "20260508.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dataset_builder_module,
+        "DEFAULT_EXOGENOUS_ARTIFACT_DIR",
+        exog_dir,
+    )
+
+    frame = pd.DataFrame(
+        {
+            "ticker": ["005930"],
+            "ts_close": pd.to_datetime(["2026-05-08T09:00:00+09:00"]),
+            "close": [70000.0],
+        }
+    ).set_index(["ticker", "ts_close"])
+
+    with pytest.raises(DatasetBuildError, match="exogenous_neutral_rehearsal_artifact"):
+        builder._join_exogenous_features(frame)
+
+
 # ====================================================================== #
 # 2. 날짜 파싱 helper
 # ====================================================================== #
@@ -810,6 +846,43 @@ def test_dual_source_join_vectorized_result(tmp_path: Path) -> None:
     # 000660 행: news_score_t = 0.0 (default)
     sel_000660 = result.loc["000660", "news_score_t"].to_numpy()
     assert all(abs(v) < 1e-9 for v in sel_000660), f"000660 news_score_t 불일치: {sel_000660}"
+
+
+def test_dual_source_join_rejects_future_snapshot(tmp_path: Path) -> None:
+    """Dual-Source artifact snapshot이 장중 이후면 학습 join을 중단한다."""
+    from unittest.mock import patch
+
+    b = DatasetBuilder(artifacts_dir=tmp_path)
+    b._ds_enabled_for_lgbm = True
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=2, freq="1min")
+    idx = pd.MultiIndex.from_tuples([("005930", t) for t in ts], names=["ticker", "ts_close"])
+    panel = pd.DataFrame(
+        {
+            "open": [100.0] * 2,
+            "high": [101.0] * 2,
+            "low": [99.0] * 2,
+            "close": [100.0] * 2,
+            "volume": [1000.0] * 2,
+            "label_5m_ret": [0.01] * 2,
+            "cs_rank": [0.5] * 2,
+            "relevance": [1.0] * 2,
+        },
+        index=idx,
+    )
+    mock_scores = [{
+        "ticker": "005930",
+        "snapshot_ts": "2026-04-20T10:00:00+09:00",
+        "source_stats": {"input_mode": "real"},
+        "news_score_t": 0.5,
+        "comm_score_t_1": 0.3,
+        "comm_score_t_2": 0.1,
+        "news_comm_divergence": 0.2,
+        "community_noise_multiplier": 0.9,
+    }]
+
+    with patch("src.data.dataset_builder.load_latest_scores", return_value=mock_scores):
+        with pytest.raises(DatasetBuildError, match="dual_source_snapshot_after_market_open"):
+            b._join_dual_source_features(panel, "20260420", "20260420")
 
 
 def test_dual_source_join_vectorized_no_scores(tmp_path: Path) -> None:

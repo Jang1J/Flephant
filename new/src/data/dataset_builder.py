@@ -388,6 +388,68 @@ class DatasetBuilder:
         )
         return panel
 
+    @staticmethod
+    def _parse_artifact_datetime(value: object) -> datetime | None:
+        if value in (None, ""):
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+
+    @staticmethod
+    def _market_open_ts(date_key: str) -> datetime:
+        clean = str(date_key).replace("-", "")[:8]
+        parsed = datetime.strptime(clean, "%Y%m%d")
+        return parsed.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=_KST)
+
+    def _dual_source_artifact_blockers(
+        self,
+        date_key: str,
+        scores_list: list[dict],
+    ) -> list[str]:
+        blockers: set[str] = set()
+        market_open = self._market_open_ts(date_key)
+        for item in scores_list:
+            source_stats = item.get("source_stats")
+            if isinstance(source_stats, dict):
+                input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+                if input_mode and input_mode != "real":
+                    blockers.add("dual_source_non_real_input_mode")
+                if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+                    blockers.add("dual_source_neutral_rehearsal_artifact")
+            snapshot_dt = self._parse_artifact_datetime(
+                item.get("snapshot_ts") or item.get("asof")
+            )
+            if snapshot_dt is not None and snapshot_dt > market_open:
+                blockers.add("dual_source_snapshot_after_market_open")
+        return sorted(blockers)
+
+    def _exogenous_artifact_blockers(self, date_key: str, stats: dict[str, Any]) -> list[str]:
+        blockers: set[str] = set()
+        source_stats = stats.get("source_stats")
+        if isinstance(source_stats, dict):
+            input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+            if input_mode and input_mode != "real":
+                blockers.add("exogenous_non_real_input_mode")
+            if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+                blockers.add("exogenous_neutral_rehearsal_artifact")
+            provider_availability = source_stats.get("provider_availability")
+            if isinstance(provider_availability, dict) and any(
+                not bool(value) for value in provider_availability.values()
+            ):
+                blockers.add("exogenous_provider_unavailable")
+            us_source = source_stats.get("us_market_source")
+            if us_source and str(us_source) != "yfinance":
+                blockers.add("exogenous_us_market_source_not_yfinance")
+        snapshot_dt = self._parse_artifact_datetime(stats.get("snapshot_ts"))
+        if snapshot_dt is not None and snapshot_dt > self._market_open_ts(date_key):
+            blockers.add("exogenous_snapshot_after_market_open")
+        return sorted(blockers)
+
     def _join_exogenous_features(self, panel):
         """C3 외생 feature_manifest 컬럼을 panel에 추가.
 
@@ -432,6 +494,12 @@ class DatasetBuilder:
                 artifact_dir=DEFAULT_EXOGENOUS_ARTIFACT_DIR,
             )
             if stats["status"] == "found":
+                blockers = self._exogenous_artifact_blockers(date_key, stats)
+                if blockers:
+                    raise DatasetBuildError(
+                        "unsafe exogenous artifact "
+                        f"date={date_key} blockers={','.join(blockers)}"
+                    )
                 dates_found += 1
                 date_score_maps[date_key] = score_map
             else:
@@ -952,6 +1020,12 @@ class DatasetBuilder:
             date_str = current.strftime("%Y%m%d")
             scores_list: list[dict] = load_latest_scores(date_str)
             if scores_list:
+                blockers = self._dual_source_artifact_blockers(date_str, scores_list)
+                if blockers:
+                    raise DatasetBuildError(
+                        "unsafe dual-source artifact "
+                        f"date={date_str} blockers={','.join(blockers)}"
+                    )
                 ticker_map: dict[str, dict[str, float]] = {}
                 for item in scores_list:
                     t = str(item.get("ticker", "")).zfill(6)

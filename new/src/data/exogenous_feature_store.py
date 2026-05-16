@@ -136,6 +136,9 @@ def load_exogenous_scores(
         "path": str(path),
         "record_count": len(scores),
         "non_neutral_record_count": non_neutral_count,
+        "batch_date": payload.get("batch_date"),
+        "snapshot_ts": payload.get("snapshot_ts"),
+        "generated_at": payload.get("generated_at"),
         "source_stats": payload.get("source_stats", {}),
     }
 

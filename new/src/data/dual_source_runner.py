@@ -409,6 +409,7 @@ def load_latest_scores(date_str: str | None = None) -> list[dict]:
         enriched.setdefault("batch_date", payload.get("batch_date"))
         enriched.setdefault("snapshot_ts", payload.get("snapshot_ts"))
         enriched.setdefault("generated_at", payload.get("generated_at"))
+        enriched.setdefault("source_stats", payload.get("source_stats", {}))
         scores.append(enriched)
     return scores
 

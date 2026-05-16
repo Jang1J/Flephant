@@ -312,5 +312,6 @@ def test_load_latest_scores_preserves_batch_metadata(tmp_path) -> None:
             "batch_date": "2026-05-08",
             "snapshot_ts": "2026-05-08T08:30:00+09:00",
             "generated_at": "2026-05-08T08:31:00+09:00",
+            "source_stats": {},
         }
     ]
