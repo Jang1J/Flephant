@@ -23,10 +23,12 @@ Investor Flow side-channel:
 """
 from __future__ import annotations
 
+import pickle
 import time
 from collections import deque
 from datetime import datetime
 import math
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -46,6 +48,7 @@ from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("quant_agent")
 _KST = ZoneInfo("Asia/Seoul")
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class QuantAgent(AgentBase):
@@ -129,6 +132,7 @@ class QuantAgent(AgentBase):
 
         # --- 모델 로드 (실패 시 passive mode) ---
         self._booster: Any = None
+        self._trade_classifier: Any = None
         self._model_metadata: dict[str, Any] | None = None
         self._try_load_model()
 
@@ -387,6 +391,7 @@ class QuantAgent(AgentBase):
                 "error": "model_prediction_invalid",
             }
         scores = {t: float(s) for t, s in zip(valid_tickers, preds)}
+        trade_probs, trade_classifier_error = self._predict_trade_probs(X, valid_tickers)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self._latency_records.append(elapsed_ms)
@@ -398,7 +403,7 @@ class QuantAgent(AgentBase):
                 elapsed_ms, self._latency_p95_target_ms, len(valid_tickers),
             )
 
-        return {
+        out = {
             "tickers": valid_tickers,
             "scores": scores,
             "ts": asof_str,
@@ -406,6 +411,11 @@ class QuantAgent(AgentBase):
             "latency_ms": elapsed_ms,
             "n_tickers": len(valid_tickers),
         }
+        if trade_probs:
+            out["trade_probs"] = trade_probs
+        if trade_classifier_error:
+            out["trade_classifier_error"] = trade_classifier_error
+        return out
 
     def detect_anomalies(
         self,
@@ -488,6 +498,7 @@ class QuantAgent(AgentBase):
                 "[quant_agent] 모델 로드 실패 (%s). passive mode로 전환.", e
             )
             self._booster = None
+            self._trade_classifier = None
             self._model_metadata = None
             self._inference_feature_cols = list(self._feature_cols)
             return False
@@ -511,6 +522,7 @@ class QuantAgent(AgentBase):
             # train 에 있지만 serve 에 없는 feature 존재 시 추론 불가 → passive
             if missing_in_serve:
                 self._booster = None
+                self._trade_classifier = None
                 self._model_metadata = None
                 self._inference_feature_cols = list(self._feature_cols)
                 return False
@@ -521,12 +533,57 @@ class QuantAgent(AgentBase):
         self._inference_feature_cols = (
             list(metadata.get("feature_cols") or self._feature_cols)
         )
+        self._trade_classifier = self._load_trade_classifier(metadata)
         logger.info(
             "[quant_agent] 모델 로드: version=%s, train_end=%s, feature_cols=%d (train↔serve 정합 OK)",
             metadata.get("version"), metadata.get("train_end"),
             len(metadata.get("feature_cols", [])),
         )
         return True
+
+    def _load_trade_classifier(self, metadata: dict[str, Any]) -> Any | None:
+        classifier = metadata.get("trade_no_trade_classifier")
+        if not isinstance(classifier, dict) or classifier.get("status") != "PASS":
+            return None
+        raw_path = str(classifier.get("model_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        try:
+            with path.open("rb") as fh:
+                return pickle.load(fh)
+        except Exception as e:
+            logger.warning("[quant_agent] trade classifier load 실패: %s", e)
+            return None
+
+    def _predict_trade_probs(
+        self,
+        X: np.ndarray,
+        tickers: list[str],
+    ) -> tuple[dict[str, float], str | None]:
+        if self._trade_classifier is None:
+            return {}, None
+        try:
+            raw = np.asarray(self._trade_classifier.predict(X), dtype=float)
+        except Exception as e:
+            logger.warning("[quant_agent] trade classifier predict 실패: %s", e)
+            return {}, "trade_classifier_predict_failed"
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if len(raw) != len(tickers) or not np.all(np.isfinite(raw)):
+            logger.warning(
+                "[quant_agent] trade classifier output invalid: expected=%d actual=%d",
+                len(tickers),
+                len(raw),
+            )
+            return {}, "trade_classifier_prediction_invalid"
+        return {
+            ticker: float(np.clip(prob, 0.0, 1.0))
+            for ticker, prob in zip(tickers, raw)
+        }, None
 
     # ================================================================== #
     # Internal: Feature 계산 (DatasetBuilder rolling feature 동일 규약)

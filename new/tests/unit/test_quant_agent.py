@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,23 @@ class MockBooster:
         if callable(self._scores):
             return self._scores(X)
         return np.asarray(self._scores[:n], dtype=float)
+
+
+class MockTradeClassifier:
+    """Trade/no-trade classifier sidecar 대체."""
+
+    def __init__(self, probs=None):
+        self._probs = probs
+        self.predict_calls = 0
+        self.last_X = None
+
+    def predict(self, X):
+        self.predict_calls += 1
+        self.last_X = np.asarray(X, dtype=float)
+        n = len(X)
+        if self._probs is None:
+            return np.full(n, 0.5, dtype=float)
+        return np.asarray(self._probs[:n], dtype=float)
 
 
 def _make_bars(
@@ -319,6 +337,53 @@ def test_score_cross_section_happy_path(agent_active: QuantAgent) -> None:
     for s in result["scores"].values():
         assert isinstance(s, float)
     assert result["latency_ms"] > 0
+
+
+def test_score_cross_section_adds_trade_probs_from_classifier(tmp_path: Path) -> None:
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_trade")
+    classifier_path = reg.base_dir / "baseline_trade_classifier.pkl"
+    with classifier_path.open("wb") as fh:
+        pickle.dump(MockTradeClassifier(probs=[0.2, 0.8]), fh)
+    reg.save(
+        MockBooster(scores=[0.1, 0.9]),
+        {
+            "version": "baseline",
+            "bundle_id": None,
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-19",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+            "trade_no_trade_classifier": {
+                "status": "PASS",
+                "model_path": str(classifier_path),
+                "tradeable_col": "label_5m_tradeable",
+            },
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    tickers = ["005930", "000660"]
+    for ticker in tickers:
+        for bar in _make_bars(ticker, n=65):
+            agent.on_bar(bar)
+
+    result = agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "active"
+    assert result["trade_probs"] == {
+        "005930": pytest.approx(0.2),
+        "000660": pytest.approx(0.8),
+    }
 
 
 def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
