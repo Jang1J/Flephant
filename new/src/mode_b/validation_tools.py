@@ -1151,6 +1151,7 @@ class BacktestEngine:
             "target_col",
             "target_horizon_bars",
             "target_horizon_kind",
+            "trade_no_trade_classifier",
         ]
 
         return model_callable, feature_width, {

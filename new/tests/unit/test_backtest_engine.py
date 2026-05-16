@@ -688,6 +688,42 @@ def test_candidate_bundle_exposes_target_col_metadata(tmp_path: Path):
     assert engine._candidate_target_col(artifact, "label_5m_ret") == "label_30m_net_ret"
 
 
+def test_candidate_bundle_exposes_trade_classifier_metadata(tmp_path: Path):
+    """service-policy replay가 candidate summary만으로 trade classifier를 로드한다."""
+    from src.mode_b.service_policy_replay import ServicePolicyReplayEngine
+
+    bundle_id = "BUNDLE-20260509-TRADE01"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    classifier_path = lgbm_dir / "trade_classifier.pkl"
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with classifier_path.open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_session_close_net_ret",
+                "trade_no_trade_classifier": {
+                    "status": "PASS",
+                    "model_path": str(classifier_path),
+                },
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    _, _, artifact = engine._resolve_candidate_model(bundle_id)
+    loaded_classifier = ServicePolicyReplayEngine._load_trade_probability_model(artifact)
+
+    assert artifact["metadata"]["trade_no_trade_classifier"]["status"] == "PASS"
+    assert loaded_classifier is not None
+    assert loaded_classifier.predict([[1.0, 2.0, 3.0, 4.0]]) == [0.1]
+
+
 def test_candidate_bundle_requires_metadata(tmp_path: Path):
     """candidate pkl만 있고 feature metadata가 없으면 backtest를 실패시킨다."""
     from src.mode_b.validation_tools import BundleLoadFailed
