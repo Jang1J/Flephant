@@ -18,7 +18,8 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -67,6 +68,10 @@ _KIS_NON_RETRYABLE_MSG_CODES = {
 
 class KISAPIError(Exception):
     """KIS API 오류."""
+
+    def __init__(self, message: str, retry_after_sec: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_sec = retry_after_sec
 
 
 class KISRestClient(BaseConnector):
@@ -584,7 +589,8 @@ class KISRestClient(BaseConnector):
                     msg_cd = str(body.get("msg_cd", "UNKNOWN"))
                     msg = str(body.get("msg1", body.get("msg", "")))
                     raise KISAPIError(
-                        f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}"
+                        f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}",
+                        retry_after_sec=self._float_or_none(body.get("_retry_after_sec")),
                     )
                 return body
             except Exception as e:
@@ -594,9 +600,9 @@ class KISRestClient(BaseConnector):
                 if self._is_non_retryable_kis_error(e):
                     raise KISAPIError(safe_error) from e
                 if attempt < self._max_retries - 1:
-                    wait_sec = self._backoff_base ** attempt
+                    wait_sec = self._retry_wait_seconds(e, attempt)
                     logger.warning(
-                        "[kis_rest] API 재시도 %d/%d. wait=%ds path=%s error=%s",
+                        "[kis_rest] API 재시도 %d/%d. wait=%.2fs path=%s error=%s",
                         attempt + 1,
                         self._max_retries,
                         wait_sec,
@@ -642,7 +648,8 @@ class KISRestClient(BaseConnector):
                     msg_cd = str(body.get("msg_cd", "UNKNOWN"))
                     msg = str(body.get("msg1", body.get("msg", "")))
                     raise KISAPIError(
-                        f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}"
+                        f"[kis_rest] KIS API 오류 path={path} msg_cd={msg_cd} msg={msg}",
+                        retry_after_sec=self._float_or_none(body.get("_retry_after_sec")),
                     )
                 return body
             except Exception as e:
@@ -652,9 +659,9 @@ class KISRestClient(BaseConnector):
                 if self._is_non_retryable_kis_error(e):
                     raise KISAPIError(safe_error) from e
                 if attempt < self._max_retries - 1:
-                    wait_sec = self._backoff_base ** attempt
+                    wait_sec = self._retry_wait_seconds(e, attempt)
                     logger.warning(
-                        "[kis_rest] API POST 재시도 %d/%d. wait=%ds path=%s error=%s",
+                        "[kis_rest] API POST 재시도 %d/%d. wait=%.2fs path=%s error=%s",
                         attempt + 1,
                         self._max_retries,
                         wait_sec,
@@ -684,12 +691,21 @@ class KISRestClient(BaseConnector):
                 timeout=self.timeout_sec,
             )
             if resp.status_code >= 400:
+                response_headers = getattr(resp, "headers", {}) or {}
+                retry_after_sec = self._parse_retry_after(response_headers.get("Retry-After"))
                 try:
                     body = resp.json()
                 except ValueError:
                     body = None
                 if isinstance(body, dict) and body.get("rt_cd") not in ("0", ""):
+                    if retry_after_sec is not None:
+                        body["_retry_after_sec"] = retry_after_sec
                     return body
+                if resp.status_code == 429:
+                    raise KISAPIError(
+                        "[kis_rest] HTTP 429 Too Many Requests",
+                        retry_after_sec=retry_after_sec,
+                    )
             resp.raise_for_status()
             return resp.json()
         except ImportError:
@@ -735,12 +751,21 @@ class KISRestClient(BaseConnector):
                     timeout=self.timeout_sec,
                 )
                 if resp.status_code >= 400:
+                    response_headers = getattr(resp, "headers", {}) or {}
+                    retry_after_sec = self._parse_retry_after(response_headers.get("Retry-After"))
                     try:
                         body = resp.json()
                     except ValueError:
                         body = None
                     if isinstance(body, dict) and body.get("rt_cd") not in ("0", ""):
+                        if retry_after_sec is not None:
+                            body["_retry_after_sec"] = retry_after_sec
                         return body
+                    if resp.status_code == 429:
+                        raise KISAPIError(
+                            "[kis_rest] HTTP 429 Too Many Requests",
+                            retry_after_sec=retry_after_sec,
+                        )
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.Timeout as e:
@@ -780,6 +805,41 @@ class KISRestClient(BaseConnector):
         for key in ("CANO", "ACNT_PRDT_CD"):
             out = re.sub(rf"({key}=)[^&\\s]+", r"\1***", out)
         return out
+
+    def _retry_wait_seconds(self, error: Exception, attempt: int) -> float:
+        base_wait = float(self._backoff_base ** attempt)
+        retry_after = getattr(error, "retry_after_sec", None)
+        if retry_after is None:
+            return base_wait
+        try:
+            return max(base_wait, float(retry_after))
+        except (TypeError, ValueError):
+            return base_wait
+
+    @staticmethod
+    def _parse_retry_after(value: Any) -> float | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(text)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _is_non_retryable_kis_error(error: Exception) -> bool:
