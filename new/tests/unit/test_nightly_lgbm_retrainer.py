@@ -320,6 +320,36 @@ def test_retrain_normalizes_dates_for_lgbm_trainer():
     assert kwargs["end_date"] == "20260427"
 
 
+def test_retrain_passes_target_col_override_to_lgbm_trainer():
+    """cost-aware label 실험은 Nightly retrainer를 거쳐 trainer까지 전달된다."""
+    retrainer = _make_retrainer()
+
+    mock_trainer = MagicMock()
+    mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
+    mock_trainer.train.return_value = {
+        **_mock_trainer_result("v3"),
+        "target_col": "label_session_close_net_ret",
+    }
+
+    mock_registry = MagicMock()
+    mock_registry.list_versions.return_value = []
+
+    with patch.object(retrainer, "_next_version", return_value="v3"):
+        with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
+            with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
+                with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                    with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                        result = retrainer.retrain(
+                            tickers=["005930"],
+                            end_date="2026-04-27",
+                            target_col_override="label_session_close_net_ret",
+                        )
+
+    kwargs = mock_trainer.train.call_args.kwargs
+    assert kwargs["target_col_override"] == "label_session_close_net_ret"
+    assert result["target_col"] == "label_session_close_net_ret"
+
+
 # ================================================================== #
 # 10. alpha factor → feature_cols에 추가 확인
 # ================================================================== #

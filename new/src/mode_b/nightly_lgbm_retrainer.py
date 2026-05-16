@@ -78,6 +78,7 @@ class NightlyLGBMRetrainer:
         tickers: list[str] | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
+        target_col_override: str | None = None,
     ) -> dict[str, Any]:
         """야간 재학습 실행. 새 버전 pkl 등록 후 결과 dict 반환.
 
@@ -86,6 +87,7 @@ class NightlyLGBMRetrainer:
             tickers:     재학습 대상 ticker 목록. None이면 yaml 기본값 사용.
             start_date:  학습 시작일 "YYYY-MM-DD". None이면 end_date - lookback_days.
             end_date:    학습 종료일 "YYYY-MM-DD". None이면 오늘(KST).
+            target_col_override: cost-aware 실험용 label 컬럼. None이면 yaml 기본값.
 
         Returns:
             {
@@ -145,6 +147,7 @@ class NightlyLGBMRetrainer:
             version=next_version,
             bundle_id=bundle_id,
             is_latest=bundle_id is None,
+            target_col_override=target_col_override,
         )
 
         result["alpha_factors_used"] = len(alpha_feature_cols)
