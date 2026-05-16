@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import date, datetime, time
@@ -256,6 +257,9 @@ def _saved_file_summary(
         session_span_ok_by_date: dict[str, bool | None] = {}
         max_gap_minutes_by_date: dict[str, float | None] = {}
         max_gap_ok_by_date: dict[str, bool | None] = {}
+        missing_ohlcv_counts: dict[str, int | None] = {}
+        non_finite_ohlcv_counts: dict[str, int | None] = {}
+        invalid_ohlcv_counts: dict[str, int | None] = {}
         duplicate_date_artifacts: dict[str, list[str]] = {}
         file_mtime_ns: dict[str, int] = {}
         if ticker_dir.exists():
@@ -295,6 +299,9 @@ def _saved_file_summary(
                 session_span_ok_by_date[date_part] = inspection.get("session_span_ok")
                 max_gap_minutes_by_date[date_part] = inspection.get("max_gap_minutes")
                 max_gap_ok_by_date[date_part] = inspection.get("max_gap_ok")
+                missing_ohlcv_counts[date_part] = inspection.get("missing_ohlcv_count")
+                non_finite_ohlcv_counts[date_part] = inspection.get("non_finite_ohlcv_count")
+                invalid_ohlcv_counts[date_part] = inspection.get("invalid_ohlcv_count")
                 file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
                 valid_dates[date_part] = (
                     rows is not None and int(rows) >= int(min_rows)
@@ -304,6 +311,9 @@ def _saved_file_summary(
                     and int(inspection.get("out_of_hours_count") or 0) == 0
                     and inspection.get("session_span_ok") is True
                     and inspection.get("max_gap_ok") is True
+                    and int(inspection.get("missing_ohlcv_count") or 0) == 0
+                    and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+                    and int(inspection.get("invalid_ohlcv_count") or 0) == 0
                     and date_part not in duplicate_date_artifacts
                 )
         summary[pad_ticker(ticker)] = {
@@ -324,6 +334,9 @@ def _saved_file_summary(
             "session_span_ok": session_span_ok_by_date,
             "max_gap_minutes": max_gap_minutes_by_date,
             "max_gap_ok": max_gap_ok_by_date,
+            "missing_ohlcv_counts": missing_ohlcv_counts,
+            "non_finite_ohlcv_counts": non_finite_ohlcv_counts,
+            "invalid_ohlcv_counts": invalid_ohlcv_counts,
             "duplicate_date_artifacts": duplicate_date_artifacts,
             "file_mtime_ns": file_mtime_ns,
         }
@@ -362,6 +375,9 @@ def _artifact_date_quality(
             session_span_ok = info.get("session_span_ok", {})
             max_gap_minutes = info.get("max_gap_minutes", {})
             max_gap_ok = info.get("max_gap_ok", {})
+            missing_ohlcv_counts = info.get("missing_ohlcv_counts", {})
+            non_finite_ohlcv_counts = info.get("non_finite_ohlcv_counts", {})
+            invalid_ohlcv_counts = info.get("invalid_ohlcv_counts", {})
             duplicate_date_artifacts = info.get("duplicate_date_artifacts", {})
             rows = row_counts.get(day)
             if valid_dates.get(day) is True:
@@ -382,6 +398,9 @@ def _artifact_date_quality(
                     "session_span_ok": session_span_ok.get(day),
                     "max_gap_minutes": max_gap_minutes.get(day),
                     "max_gap_ok": max_gap_ok.get(day),
+                    "missing_ohlcv_count": missing_ohlcv_counts.get(day),
+                    "non_finite_ohlcv_count": non_finite_ohlcv_counts.get(day),
+                    "invalid_ohlcv_count": invalid_ohlcv_counts.get(day),
                     "duplicate_date_artifacts": duplicate_date_artifacts.get(day, []),
                     "valid_date": valid_dates.get(day, False),
                 })
@@ -453,6 +472,24 @@ def _inspect_bar_file(
     min_rows_per_day: int | None = None,
 ) -> dict[str, Any]:
     """Inspect one saved bar artifact for date/ticker/timestamp integrity."""
+    empty_inspection = {
+        "rows": None,
+        "timestamp_dates_match": None,
+        "ticker_matches": None,
+        "missing_timestamp_count": None,
+        "ticker_mismatch_count": None,
+        "duplicate_ts_count": None,
+        "out_of_hours_count": None,
+        "first_ts": None,
+        "last_ts": None,
+        "session_span_minutes": None,
+        "session_span_ok": None,
+        "max_gap_minutes": None,
+        "max_gap_ok": None,
+        "missing_ohlcv_count": None,
+        "non_finite_ohlcv_count": None,
+        "invalid_ohlcv_count": None,
+    }
     expected_date = date(
         int(yyyymmdd[:4]),
         int(yyyymmdd[4:6]),
@@ -461,37 +498,9 @@ def _inspect_bar_file(
     try:
         rows = _load_bar_rows(file_path)
     except Exception:
-        return {
-            "rows": None,
-            "timestamp_dates_match": None,
-            "ticker_matches": None,
-            "missing_timestamp_count": None,
-            "ticker_mismatch_count": None,
-            "duplicate_ts_count": None,
-            "out_of_hours_count": None,
-            "first_ts": None,
-            "last_ts": None,
-            "session_span_minutes": None,
-            "session_span_ok": None,
-            "max_gap_minutes": None,
-            "max_gap_ok": None,
-        }
+        return empty_inspection
     if rows is None:
-        return {
-            "rows": None,
-            "timestamp_dates_match": None,
-            "ticker_matches": None,
-            "missing_timestamp_count": None,
-            "ticker_mismatch_count": None,
-            "duplicate_ts_count": None,
-            "out_of_hours_count": None,
-            "first_ts": None,
-            "last_ts": None,
-            "session_span_minutes": None,
-            "session_span_ok": None,
-            "max_gap_minutes": None,
-            "max_gap_ok": None,
-        }
+        return empty_inspection
 
     timestamps = [_parse_bar_timestamp(row) for row in rows]
     present_timestamps = [ts for ts in timestamps if ts is not None]
@@ -553,6 +562,34 @@ def _inspect_bar_file(
         and max_gap_minutes is not None
         and max_gap_minutes <= max_allowed_gap
     )
+    required_ohlcv = ("open", "high", "low", "close", "volume")
+    missing_ohlcv_count = 0
+    non_finite_ohlcv_count = 0
+    invalid_ohlcv_count = 0
+    for row in rows:
+        if any(row.get(field) is None for field in required_ohlcv):
+            missing_ohlcv_count += 1
+            continue
+        try:
+            open_price = float(row["open"])
+            high_price = float(row["high"])
+            low_price = float(row["low"])
+            close_price = float(row["close"])
+            volume = float(row["volume"])
+        except (TypeError, ValueError):
+            non_finite_ohlcv_count += 1
+            continue
+        values = (open_price, high_price, low_price, close_price, volume)
+        if not all(math.isfinite(value) for value in values):
+            non_finite_ohlcv_count += 1
+            continue
+        if (
+            high_price < max(open_price, close_price)
+            or low_price > min(open_price, close_price)
+            or close_price <= 0
+            or volume < 0
+        ):
+            invalid_ohlcv_count += 1
     return {
         "rows": len(rows),
         "timestamp_dates_match": timestamp_dates_match,
@@ -567,6 +604,9 @@ def _inspect_bar_file(
         "session_span_ok": session_span_ok,
         "max_gap_minutes": max_gap_minutes,
         "max_gap_ok": max_gap_ok,
+        "missing_ohlcv_count": missing_ohlcv_count,
+        "non_finite_ohlcv_count": non_finite_ohlcv_count,
+        "invalid_ohlcv_count": invalid_ohlcv_count,
     }
 
 
@@ -962,9 +1002,10 @@ def run_train_if_ready(
     invalid_requested_dates = [
         day for day in requested_dates if day not in set(dates)
     ]
-    if require_train and require_all and invalid_requested_dates:
+    if require_all and invalid_requested_dates:
+        status = "FAIL" if require_train else "SKIP"
         return {
-            "status": "FAIL",
+            "status": status,
             "reason": "invalid_requested_artifact_dates",
             "available_dates": len(dates),
             "required_dates": len(requested_dates),

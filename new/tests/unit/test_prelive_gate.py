@@ -56,6 +56,7 @@ def _write_staged_lgbm_bundle(
         "label_generation_version": _required_label_generation_version(gate),
         "label_session_scope": _required_label_session_scope(gate),
         "target_col": _required_target_col(gate),
+        **_final_dataset_metadata(),
     }
     if metadata:
         payload.update(metadata)
@@ -117,6 +118,9 @@ def _final_dataset_metadata() -> dict:
         "loaded_tickers": tickers,
         "missing_tickers": [],
         "n_tickers": len(tickers),
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
+        "target_col": "label_5m_ret",
     }
 
 
@@ -335,6 +339,32 @@ def test_deployable_backtest_treats_regression_string_false_as_false(monkeypatch
     )
 
 
+def test_deployable_backtest_blocks_target_col_override(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_service_policy_gate_pass", lambda *_args, **_kwargs: True)
+    metadata = {
+        **_final_dataset_metadata(),
+        "target_col": "label_session_close_net_ret",
+    }
+
+    assert not gate._is_deployable_backtest_report(
+        {
+            "bundle_id": "BUNDLE-TEST",
+            "verdict": "pass",
+            "regression_risk": {"flagged": False},
+            "minute_bar_leakage_check": {"verdict": "pass"},
+            "feature_quality": {
+                "dual_source_rows": 10,
+                "dual_source_non_neutral_rows": 10,
+                "exogenous_rows": 10,
+                "exogenous_non_neutral_rows": 10,
+            },
+            "candidate_model_metadata": metadata,
+        },
+        "BUNDLE-TEST",
+    )
+
+
 def test_probe_order_blocked_without_report(monkeypatch, tmp_path):
     gate = _load_script_module()
     monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
@@ -439,6 +469,7 @@ def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
                         "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -484,6 +515,7 @@ def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
                         "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -536,6 +568,7 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
                         "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -657,6 +690,30 @@ def test_lgbm_real_train_blocks_target_col_override_candidate(monkeypatch, tmp_p
     assert result["required_target_col"] == _required_target_col(gate)
 
 
+def test_lgbm_real_train_enforces_final_dataset_gate(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={
+            "train_start": None,
+            "train_end": None,
+            "requested_tickers": [],
+            "loaded_tickers": [],
+            "n_tickers": 0,
+        },
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["final_dataset_gate"]["status"] == "BLOCKED"
+    assert "train_start_missing_or_invalid" in result["final_dataset_gate"]["blockers"]
+
+
 def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
@@ -683,6 +740,7 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
                         "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                     {
                         "version": "utc_time",
@@ -695,6 +753,7 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
                         "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },

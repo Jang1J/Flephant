@@ -137,6 +137,25 @@ def _write_jsonl_day_with_gap(
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def _mutate_first_jsonl_row(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    patch: dict,
+) -> None:
+    file_path = base_dir / ticker / f"bars_1m_{yyyymmdd}.jsonl"
+    rows = [
+        json.loads(line)
+        for line in file_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rows[0].update(patch)
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_parquet_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> None:
     import pandas as pd
 
@@ -409,6 +428,59 @@ def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_pat
     assert first["duplicate_ts_count"] == 300
 
 
+def test_artifact_date_quality_rejects_bad_ohlcv_values(monkeypatch, tmp_path):
+    """timestamp가 맞아도 OHLCV 값이 말이 안 되면 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"close": 0.0, "high": 0.5, "low": 2.0, "volume": -1.0},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["invalid_ohlcv_count"] == 1
+
+
+def test_artifact_date_quality_rejects_non_finite_ohlcv(monkeypatch, tmp_path):
+    """NaN/문자열 OHLCV는 row 수가 충분해도 readiness에서 차단한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"close": "NaN"},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["non_finite_ohlcv_count"] == 1
+
+
 def test_run_backfill_trips_circuit_breaker_after_repeated_empty_fetches(
     monkeypatch,
     tmp_path,
@@ -604,6 +676,57 @@ def test_train_gate_requires_all_requested_dates_when_require_train(monkeypatch,
     assert result["available_dates"] == 1
     assert result["required_dates"] == 2
     assert result["invalid_requested_dates_sample"] == ["20260507"]
+
+
+def test_train_gate_blocks_partial_requested_dates_without_require_train(
+    monkeypatch,
+    tmp_path,
+):
+    """require_train=False도 요청 249일 중 일부 누락이면 학습 호출 없이 SKIP한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260507", 9)
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+        _write_jsonl_day(tmp_path, ticker, "20260511", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {
+                "train_window_days": 1,
+                "test_window_days": 1,
+                "trading_minutes_per_day": 390,
+            }
+        return {}
+
+    class FailIfCalledTrainer:
+        def train(self, **_kwargs):
+            raise AssertionError("partial final dataset must not train")
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "src.models.lgbm_trainer",
+        type("FakeModule", (), {"LGBMTrainer": FailIfCalledTrainer}),
+    )
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260511",
+        require_train=False,
+    )
+
+    assert result["status"] == "SKIP"
+    assert result["reason"] == "invalid_requested_artifact_dates"
+    assert result["available_dates"] == 2
+    assert result["required_dates"] == 3
 
 
 def test_run_backfill_skips_existing_valid_artifacts(monkeypatch, tmp_path):

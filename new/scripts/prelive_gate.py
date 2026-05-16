@@ -246,6 +246,16 @@ def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
     return _final_dataset_gate_result(payload).get("status") == "PASS"
 
 
+def _label_target_gate_pass(payload: dict[str, Any]) -> bool:
+    """Deployable C12 evidence must match the current label target SSOT."""
+    cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
+    required_target_col = str((cfg.get("label") or {}).get("target_col") or "").strip()
+    if not required_target_col:
+        return False
+    metadata = _extract_model_metadata(payload)
+    return str(metadata.get("target_col") or "").strip() == required_target_col
+
+
 def _final_gate_min_business_days(default: int = 80) -> int:
     gate_cfg = _final_dataset_gate_cfg()
     return safe_int(
@@ -618,6 +628,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     label_scope_ok = actual_label_scope == required_label_scope
     target_col_ok = actual_target_col == required_target_col
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
+    final_dataset_gate_ok = final_dataset_gate.get("status") == "PASS"
     status = (
         "PASS"
         if model_exists
@@ -626,6 +637,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         and label_version_ok
         and label_scope_ok
         and target_col_ok
+        and final_dataset_gate_ok
         and (bundle_id_matches_request is not False)
         else "BLOCKED"
     )
@@ -640,6 +652,9 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         message = "Latest LightGBM artifact has stale or missing label session scope metadata."
     elif not target_col_ok:
         message = "Latest LightGBM artifact target_col does not match risk_config.yaml label.target_col."
+    elif not final_dataset_gate_ok:
+        blockers = final_dataset_gate.get("blockers") or ["final_dataset_gate_blocked"]
+        message = f"Latest LightGBM artifact failed final_dataset_gate: {blockers}"
     elif not real_data_source:
         message = "Latest LightGBM artifact is not marked as artifact_bars real data."
     return _stage(
@@ -701,6 +716,7 @@ def _is_deployable_backtest_report(payload: dict[str, Any], bundle_id: str) -> b
         and _feature_quality_gate_pass(payload)
         and _service_policy_gate_pass(payload, bundle_id)
         and _final_dataset_gate_pass(payload)
+        and _label_target_gate_pass(payload)
     )
 
 
