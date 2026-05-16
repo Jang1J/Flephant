@@ -54,6 +54,46 @@ def _parse_hot_ts(value: Any) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _filter_recent_bars_asof(
+    recent_bars: dict[str, list[dict[str, Any]]] | None,
+    asof_dt: datetime,
+    asof: str,
+) -> tuple[dict[str, list[dict[str, Any]]] | None, list[str]]:
+    if recent_bars is None:
+        return None, []
+    filtered: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for ticker, bars in recent_bars.items():
+        if not isinstance(bars, list):
+            errors.append(f"recent_bars_invalid: ticker={ticker} reason=not_list")
+            continue
+        clean: list[dict[str, Any]] = []
+        for bar in bars:
+            if not isinstance(bar, dict):
+                errors.append(f"recent_bar_invalid: ticker={ticker} reason=not_dict")
+                continue
+            if not bar.get("ts_close"):
+                errors.append(f"recent_bar_invalid: ticker={ticker} reason=ts_close_missing")
+                continue
+            try:
+                bar_ts = _parse_hot_ts(bar["ts_close"])
+            except (TypeError, ValueError):
+                errors.append(
+                    f"recent_bar_invalid: ticker={ticker} ts_close={bar.get('ts_close')}"
+                )
+                continue
+            if bar_ts > asof_dt:
+                errors.append(
+                    "future_recent_bar_rejected: "
+                    f"ticker={ticker} ts_close={bar.get('ts_close')} asof={asof}"
+                )
+                continue
+            clean.append(bar)
+        if clean:
+            filtered[ticker] = clean
+    return filtered, errors
+
+
 class HotRunner:
     """Hot Path 1분 루프 오케스트레이터.
 
@@ -362,6 +402,12 @@ class HotRunner:
 
         # 5. RiskFast sidecar (PM 이후, FDA 이전, S4-4 stage timer)
         ts_dt = asof_dt or datetime.now(tz=timezone.utc)
+        recent_bars_for_risk, recent_bar_errors = _filter_recent_bars_asof(
+            recent_bars,
+            ts_dt,
+            asof,
+        )
+        bar_errors.extend(recent_bar_errors)
 
         t_rf = self._profiler.start_stage("risk_fast")
         try:
@@ -369,7 +415,7 @@ class HotRunner:
                 snapshot={
                     "ranking": quant_output.get("scores", {}),
                     "portfolio_patch": portfolio_patch,
-                    "recent_bars": recent_bars,
+                    "recent_bars": recent_bars_for_risk,
                 },
                 ts=ts_dt,
             )

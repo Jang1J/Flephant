@@ -251,6 +251,49 @@ def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
     assert captured["ts"].isoformat() == "2026-05-15T00:00:00+00:00"
 
 
+def test_run_once_filters_future_recent_bars_before_risk_fast(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar도 asof 이후 recent_bars를 보지 않는다."""
+    runner.start()
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(snapshot, ts):
+        captured["recent_bars"] = snapshot["recent_bars"]
+        return {
+            "risk_level": "low",
+            "severity": "low",
+            "fast_rule_match": None,
+            "triggered_rules": [],
+            "affected_tickers": [],
+            "recommended_action": "pass",
+            "stance": "neutral",
+            "rationale": "ok",
+            "latency_ms": 0.0,
+        }
+
+    runner._risk_fast.evaluate = fake_evaluate  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        asof="2026-04-20T10:00:00+09:00",
+        recent_bars={
+            "005930": [
+                _make_bar("005930", 50000.0, 59),
+                _make_bar("005930", 49000.0, 61),
+            ],
+        },
+    )
+
+    assert captured["recent_bars"] == {
+        "005930": [_make_bar("005930", 50000.0, 59)]
+    }
+    assert result["bar_errors"] == [
+        "future_recent_bar_rejected: ticker=005930 "
+        "ts_close=2026-04-20T10:01:00+09:00 asof=2026-04-20T10:00:00+09:00"
+    ]
+
+
 def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     """잘못된 bar 하나가 들어와도 전체 루프는 중단되지 않음."""
     runner.start()
