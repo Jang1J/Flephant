@@ -523,3 +523,23 @@ def test_dependency_activation_same_channel_twice_does_not_trigger() -> None:
     pool.publish("news_signal", _valid_msg())
     pool.publish("news_signal", _valid_msg())   # 두 번째: seen 변화 없음
     assert call_count[0] == 0, "risk_warning 미도달이므로 callback 없어야 함"
+
+
+def test_dependency_activation_separates_event_id_contexts() -> None:
+    """서로 다른 event_id의 news/risk를 섞어 FDA dependency를 활성화하지 않는다."""
+    pool = _pool()
+    activated: list[dict] = []
+    pool.register_dependency(
+        "fda_cold_activate",
+        {"news_signal", "risk_warning"},
+        lambda msgs: activated.append(msgs),
+    )
+
+    pool.publish("news_signal", _valid_msg(event_id="EVT-A"))
+    pool.publish("risk_warning", _valid_msg(action_type="alert", event_id="EVT-B"))
+    assert activated == []
+
+    pool.publish("risk_warning", _valid_msg(action_type="alert", event_id="EVT-A"))
+    assert len(activated) == 1
+    assert activated[0]["news_signal"]["event_id"] == "EVT-A"
+    assert activated[0]["risk_warning"]["event_id"] == "EVT-A"

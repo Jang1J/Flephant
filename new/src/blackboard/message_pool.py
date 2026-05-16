@@ -142,7 +142,7 @@ class MessagePool:
         self._subscribers: dict[str, list[tuple[Callable, Callable | None]]] = defaultdict(list)
 
         # dependency_activation 레지스트리
-        # key → {"required": set, "callback": Callable, "seen": set, "latest_messages": dict}
+        # key → {"required": set, "callback": Callable, "contexts": {correlation_key: state}}
         self._dependencies: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -374,13 +374,20 @@ class MessagePool:
         self._dependencies[activation_key] = {
             "required": set(required_channels),
             "callback": callback,
-            "seen": set(),
-            "latest_messages": {},
+            "contexts": {},
         }
         logger.info(
             "[message_pool] dependency 등록: key=%s requires=%s",
             activation_key, sorted(required_channels),
         )
+
+    @staticmethod
+    def _dependency_correlation_key(message: dict[str, Any]) -> str:
+        for field in ("event_id", "portfolio_patch_id"):
+            value = message.get(field)
+            if value:
+                return f"{field}:{value}"
+        return f"scope:{message.get('scope', '')}"
 
     def _check_dependencies(self, just_published_channel: str) -> None:
         """publish 직후 호출. 모든 required channel 수신 완료 시 callback."""
@@ -388,23 +395,35 @@ class MessagePool:
             if just_published_channel not in dep["required"]:
                 continue
 
-            dep["seen"].add(just_published_channel)
             # 최신 메시지 캐시
             ids = self._by_channel[just_published_channel]
             if ids:
                 last_id = ids[-1]
-                dep["latest_messages"][just_published_channel] = self._messages[last_id].message
+                message = self._messages[last_id].message
+                corr_key = self._dependency_correlation_key(message)
+                context = dep["contexts"].setdefault(
+                    corr_key,
+                    {"seen": set(), "latest_messages": {}},
+                )
+                context["seen"].add(just_published_channel)
+                context["latest_messages"][just_published_channel] = message
+            else:
+                continue
 
-            if dep["seen"] == dep["required"]:
+            if context["seen"] == dep["required"]:
                 try:
-                    dep["callback"](dep["latest_messages"])
-                    logger.info("[message_pool] dependency activated: key=%s", key)
+                    dep["callback"](context["latest_messages"])
+                    logger.info(
+                        "[message_pool] dependency activated: key=%s corr=%s",
+                        key,
+                        corr_key,
+                    )
                 except Exception as e:
                     logger.warning(
                         "[message_pool] dependency callback 예외: key=%s err=%s", key, e
                     )
-                # 한 사이클 완료 후 seen 리셋. 재활성화 지원
-                dep["seen"] = set()
+                # 한 사이클 완료 후 context 제거. correlation별 재활성화 지원
+                dep["contexts"].pop(corr_key, None)
 
     # ------------------------------------------------------------------
     # 조회 helpers

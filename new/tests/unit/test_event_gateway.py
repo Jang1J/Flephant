@@ -172,6 +172,14 @@ def test_register_handler_and_dispatch(tmp_path: Path) -> None:
     assert gw.backlog_size() == 0
 
 
+def test_register_handler_duplicate_event_type_raises(tmp_path: Path) -> None:
+    gw = _gateway(tmp_path)
+    gw.register_handler("dart", lambda event: event)
+
+    with pytest.raises(ValueError, match="handler_already_registered"):
+        gw.register_handler("dart", lambda event: event)
+
+
 # ------------------------------------------------------------------
 # 5. dispatch_next: 핸들러 없는 event_type 은 dead-letter 기록
 # ------------------------------------------------------------------

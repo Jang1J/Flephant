@@ -74,6 +74,8 @@ class EventGateway:
           api_contracts.md message_taxonomy.publish_channels 에서 1개 선택.
           pubsub 미주입 시 publish_channel 등록해도 auto_publish 실행 안 됨.
         """
+        if event_type in self._handlers:
+            raise ValueError(f"handler_already_registered: event_type={event_type}")
         self._handlers[event_type] = handler
         if publish_channel is not None:
             self._auto_publish[event_type] = publish_channel
