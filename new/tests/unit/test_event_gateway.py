@@ -184,12 +184,32 @@ def test_register_handler_and_dispatch(tmp_path: Path) -> None:
     assert gw.backlog_size() == 0
 
 
-def test_register_handler_duplicate_event_type_raises(tmp_path: Path) -> None:
+def test_register_handler_fanout_same_event_type(tmp_path: Path) -> None:
     gw = _gateway(tmp_path)
-    gw.register_handler("dart", lambda event: event)
+    handled: list[str] = []
 
-    with pytest.raises(ValueError, match="handler_already_registered"):
-        gw.register_handler("dart", lambda event: event)
+    def news_handler(event: dict) -> dict:
+        handled.append("news")
+        return {"event_id": event["event_id"], "status": "news_processed"}
+
+    def risk_handler(event: dict) -> dict:
+        handled.append("risk")
+        return {"event_id": event["event_id"], "status": "risk_processed"}
+
+    gw.register_handler("dart", news_handler)
+    gw.register_handler("dart", risk_handler)
+
+    gw.ingest(_dart_raw(), source="dart")
+    result = gw.dispatch_next()
+
+    assert handled == ["news", "risk"]
+    assert result is not None
+    assert result["status"] == "processed"
+    assert result["handler_count"] == 2
+    assert [item["status"] for item in result["handler_results"]] == [
+        "news_processed",
+        "risk_processed",
+    ]
 
 
 # ------------------------------------------------------------------
