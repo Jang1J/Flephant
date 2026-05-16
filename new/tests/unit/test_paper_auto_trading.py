@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.execution import paper_auto_trading as paper_auto_module
+from src.execution.kill_switch import KillSwitch
 from src.execution.paper_auto_trading import PaperAutoTrader
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -37,6 +38,10 @@ def _paper_preopen_now() -> datetime:
 
 def _paper_weekend_now() -> datetime:
     return datetime(2026, 5, 16, 10, 0, tzinfo=_KST)
+
+
+def _paper_close_now() -> datetime:
+    return datetime(2026, 5, 12, 15, 31, tzinfo=_KST)
 
 
 class FakePaperKIS:
@@ -323,6 +328,68 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
     assert cycle["order_history_verification"]["status"] == "PASS"
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
+
+
+def test_paper_auto_respects_active_kill_switch(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    kill_switch = KillSwitch()
+    kill_switch.trigger("overnight_test")
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+        kill_switch=kill_switch,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "rejected"
+    assert "kill_switch_active" in cycle["execution"]["execution_report"]["rejection_reason"]
+    assert client.orders == []
+
+
+def test_paper_auto_checks_market_session_each_cycle(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    times = iter([
+        datetime(2026, 5, 12, 15, 29, tzinfo=_KST),
+        datetime(2026, 5, 12, 15, 29, tzinfo=_KST),
+        _paper_close_now(),
+    ])
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=lambda: next(times),
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=2,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycles = report["stages"]["cycles"]["items"]
+    assert len(cycles) == 2
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
+    assert cycles[1]["market_session_guard"]["reason"] == "outside_market_session"
+    assert cycles[1]["execution"] is None
 
 
 def test_paper_auto_skips_before_market_open(tmp_path: Path) -> None:

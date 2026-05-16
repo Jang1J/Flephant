@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from src.connectors.kis_rest import KISRestClient
 from src.execution.execution_gateway import ExecutionGateway
+from src.execution.kill_switch import KillSwitch
 from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
 from src.ops.audit_logger import AuditLogger
@@ -43,6 +44,7 @@ class PaperAutoTrader:
         sleep_fn: Callable[[float], None] | None = None,
         now_fn: Callable[[], datetime] | None = None,
         required_bundle_id: str | None = None,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -59,6 +61,7 @@ class PaperAutoTrader:
         self._sleep = sleep_fn or time.sleep
         self._now = now_fn or (lambda: datetime.now(_KST))
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
+        self._kill_switch = kill_switch or KillSwitch()
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
         self._enforce_market_session = safe_bool(
@@ -186,6 +189,15 @@ class PaperAutoTrader:
                 "started_at": started_at,
                 "reason": "run_once_requires_start_guard",
             }
+        market_session_guard = self._market_session_check()
+        if market_session_guard["status"] != "PASS":
+            return {
+                "status": "PASS" if market_session_guard.get("safe_skip") else "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "market_session_guard": market_session_guard,
+                "execution": None,
+            }
         padded = [pad_ticker(str(t)) for t in tickers]
         balance = self._kis_client.get_balance()
         bars_by_ticker = self._fetch_recent_bars(padded)
@@ -237,6 +249,7 @@ class PaperAutoTrader:
             }
 
         gateway = ExecutionGateway(
+            kill_switch=self._kill_switch,
             audit_logger=self._audit_logger,
             kis_client=self._kis_client,
             mode_override="paper",

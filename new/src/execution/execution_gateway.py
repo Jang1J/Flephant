@@ -406,9 +406,37 @@ class ExecutionGateway:
         """실계좌 주문은 C10 경계에서도 명시 proof 없으면 fail-closed."""
         proof = self._live_approval_proof
         missing: list[str] = []
-        for field in ("prelive_gate", "deploy_quality"):
-            if not self._proof_status_is_pass(proof.get(field)):
-                missing.append(field)
+        prelive_gate = proof.get("prelive_gate")
+        if not self._proof_status_is_pass(prelive_gate):
+            missing.append("prelive_gate")
+        elif not isinstance(prelive_gate, dict) or list(prelive_gate.get("blockers") or []) != []:
+            missing.append("prelive_gate.blockers")
+
+        deploy_quality = proof.get("deploy_quality")
+        if not self._proof_status_is_pass(deploy_quality):
+            missing.append("deploy_quality")
+        elif not isinstance(deploy_quality, dict):
+            missing.extend([
+                "deploy_quality.service_policy_gate_pass",
+                "deploy_quality.registry_mutated",
+            ])
+        else:
+            if not safe_bool(deploy_quality.get("service_policy_gate_pass"), default=False):
+                missing.append("deploy_quality.service_policy_gate_pass")
+            if safe_bool(deploy_quality.get("registry_mutated"), default=True):
+                missing.append("deploy_quality.registry_mutated")
+
+        sanitized_release = proof.get("sanitized_release")
+        if not self._proof_status_is_pass(sanitized_release):
+            missing.append("sanitized_release")
+        elif not isinstance(sanitized_release, dict):
+            missing.append("sanitized_release.clean")
+        else:
+            if list(sanitized_release.get("forbidden_entries") or []) != []:
+                missing.append("sanitized_release.forbidden_entries")
+            if list(sanitized_release.get("secret_sources_in_zip") or []) != []:
+                missing.append("sanitized_release.secret_sources_in_zip")
+
         broker_evidence = proof.get("broker_evidence")
         if not isinstance(broker_evidence, dict):
             broker_evidence = proof.get("kis_broker_evidence")

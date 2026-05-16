@@ -247,6 +247,32 @@ def test_negative_target_weight_does_not_create_unheld_sell(pm: PortfolioManager
     assert result["ppo_violations"][0]["type"] == "negative_target_weight"
 
 
+def test_malformed_target_weight_does_not_exit_existing_position(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": "bad"},  # type: ignore[dict-item]
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": 0.2}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["malformed_weight_tickers"] == ["005930"]
+    assert result["errors"][0]["error"] == "MALFORMED_TARGET_WEIGHT"
+
+
+def test_malformed_current_weight_does_not_create_buy_order(pm: PortfolioManager) -> None:
+    result = pm.plan(
+        target_weights={"005930": 0.1},
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": "bad"}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["malformed_weight_tickers"] == ["005930"]
+    assert result["errors"][0]["error"] == "MALFORMED_CURRENT_WEIGHT"
+
+
 def test_malformed_position_qty_is_fail_safe(monkeypatch) -> None:
     """외부/BE 포지션 qty가 깨져도 예외 대신 sell 불가 오류로 닫는다."""
     monkeypatch.setattr(

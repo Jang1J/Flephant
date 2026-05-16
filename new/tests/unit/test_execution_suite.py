@@ -595,8 +595,17 @@ def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_
 
 def _live_approval_proof(**overrides) -> dict:
     proof = {
-        "prelive_gate": "PASS",
-        "deploy_quality": "PASS",
+        "prelive_gate": {"status": "PASS", "blockers": []},
+        "deploy_quality": {
+            "status": "PASS",
+            "service_policy_gate_pass": True,
+            "registry_mutated": False,
+        },
+        "sanitized_release": {
+            "status": "PASS",
+            "forbidden_entries": [],
+            "secret_sources_in_zip": [],
+        },
         "broker_evidence": {
             "status": "PASS",
             "external_kis_api": True,
@@ -730,6 +739,44 @@ def test_execute_live_with_complete_approval_proof_submits(
     assert report["execution_mode"] == "live"
     assert report["fills"][0]["broker_order_id"] == "OD-LIVE"
     assert client.calls == [("005930", "buy", 1, 70000.0)]
+
+
+def test_execute_live_rejects_registry_mutated_deploy_quality(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("registry_mutated proof must not submit")
+
+    proof = _live_approval_proof(
+        deploy_quality={
+            "status": "PASS",
+            "service_policy_gate_pass": True,
+            "registry_mutated": True,
+        }
+    )
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=proof,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "deploy_quality.registry_mutated" in result["execution_report"]["rejection_reason"]
 
 
 def test_execute_live_rejects_unknown_universe_ticker_before_submit(
