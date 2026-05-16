@@ -304,6 +304,19 @@ def materialize_exogenous_history(
                     us_client=us_client,
                     ecos_client=ecos_client,
                 )
+                if str(global_stats.get("us_market_source")) != "yfinance":
+                    blocker = "us_market_source_not_yfinance"
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                    per_date.append({
+                        "date": date_key,
+                        "status": "BLOCKED",
+                        "reason": blocker,
+                        "artifact_written": False,
+                        "non_neutral": False,
+                        "source_stats": global_stats,
+                    })
+                    continue
                 per_ticker, investor_stats = _collect_investor_features(
                     date_key,
                     tickers,

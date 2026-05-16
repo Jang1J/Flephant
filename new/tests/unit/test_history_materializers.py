@@ -224,6 +224,58 @@ def test_exogenous_active_tickers_include_pending_for_final_dataset(monkeypatch)
     assert mod._active_tickers() == ["005930", "105560"]
 
 
+def test_exogenous_history_blocks_us_market_mock_result_after_real_client_init(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            return SimpleNamespace(
+                us_sp500_change=0.01,
+                us_nasdaq_change=0.02,
+                us_vix=18.5,
+                us_soxx_change=0.03,
+                source="mock",
+                as_of_date=as_of,
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 3.5, "usd_krw": 1350.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            raise AssertionError("mock US market source should block before KRX fetch")
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260508",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["files_written"] == []
+    assert "us_market_source_not_yfinance" in report["blockers"]
+    assert report["per_date"][0]["source_stats"]["us_market_source"] == "mock"
+    assert not (tmp_path / "exogenous" / "20260508.json").exists()
+
+
 def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_path):
     mod = _load_script("materialize_exogenous_history")
 
@@ -236,7 +288,7 @@ def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_p
                 us_nasdaq_change=0.02,
                 us_vix=18.5,
                 us_soxx_change=0.03,
-                source="fake_real",
+                source="yfinance",
                 as_of_date=as_of,
             )
 
