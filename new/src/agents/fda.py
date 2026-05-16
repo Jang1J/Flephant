@@ -226,6 +226,7 @@ class FDAAgent(AgentBase):
                 risk_warnings=risk_warnings or [],
                 debate_result=debate_result,
                 agent_signals=agent_signals or [],
+                active_reports=active_reports or [],
                 t0=t0,
                 uncertainty_score=float(uncertainty_score),
             )
@@ -359,6 +360,7 @@ class FDAAgent(AgentBase):
         order_deltas: list[dict[str, Any]],
         portfolio_patch_ref: str,
         t0: float,
+        active_reports: list[str] | None = None,
         risk_overrides: list[dict[str, Any]] | None = None,
         confidence: float | None = None,
     ) -> dict[str, Any]:
@@ -370,6 +372,7 @@ class FDAAgent(AgentBase):
             order_deltas=order_deltas,
             portfolio_patch_ref=portfolio_patch_ref,
             t0=t0,
+            active_reports=active_reports,
             risk_overrides=risk_overrides,
             confidence=confidence,
         )
@@ -460,6 +463,7 @@ class FDAAgent(AgentBase):
         risk_warnings: list[dict[str, Any]],
         debate_result: dict[str, Any] | None,
         agent_signals: list[dict[str, Any]],
+        active_reports: list[str],
         t0: float,
         uncertainty_score: float = 0.0,
     ) -> dict[str, Any]:
@@ -481,6 +485,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref or "",
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 1. 기본 규칙 (Hot과 동일): portfolio_patch 없으면 veto
@@ -492,6 +497,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref="",
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 2. debate_result: 충돌 있고 uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
@@ -513,6 +519,7 @@ class FDAAgent(AgentBase):
                     order_deltas=order_deltas,
                     portfolio_patch_ref=portfolio_patch_ref,
                     t0=t0,
+                    active_reports=active_reports,
                 )
 
         # 3. risk_warnings 검토 (risk_warning stance=veto_recommendation)
@@ -529,6 +536,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 4. LLM CoT: router 미주입 또는 호출 실패 시 approve하지 않고 fail-closed
@@ -541,6 +549,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 5. Kanana-o CoT 판단
@@ -560,6 +569,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
             )
 
         parsed = self._parse_cold_llm(llm_result.content)
@@ -568,7 +578,7 @@ class FDAAgent(AgentBase):
                 target_weights=target_weights,
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
-                active_reports=[],
+                active_reports=active_reports,
                 t0=t0,
                 reason_code=parsed["reason_code"],
                 confidence=parsed.get("confidence"),
@@ -581,6 +591,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
                 confidence=parsed.get("confidence"),
             )
 

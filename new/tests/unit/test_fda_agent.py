@@ -295,6 +295,52 @@ def test_cold_llm_invalid_reason_code_fail_closed() -> None:
     assert fd["reason_code"] == "NEWS_DIVERGENCE"
 
 
+def test_cold_approve_preserves_active_reports() -> None:
+    class ApprovedRouter:
+        def call(self, *args, **kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "content": (
+                        '{"approved": true, "reason_code": "NORMAL_APPROVE", '
+                        '"veto_reason": null, "confidence": 0.82}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    fda = FDAAgent(llm_router=ApprovedRouter())
+    reports = ["RPT-NEWS-001", "RPT-RISK-001", "RPT-DEBATE-001"]
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        risk_warnings=[],
+        debate_result={"conflict_detected": False},
+        agent_signals=[],
+        active_reports=reports,
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is True
+    assert fd["active_reports"] == reports
+
+
+def test_cold_veto_preserves_active_reports(fda: FDAAgent) -> None:
+    reports = ["RPT-NEWS-001", "RPT-RISK-001"]
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        active_reports=reports,
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+    assert fd["active_reports"] == reports
+
+
 # ====================================================================== #
 # 6. reason_code 필수
 # ====================================================================== #
