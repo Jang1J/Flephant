@@ -32,7 +32,6 @@ logger = get_logger("event_injector")
 _KST = ZoneInfo("Asia/Seoul")
 
 _AUDIT_DIR = Path(__file__).resolve().parents[3] / "artifacts" / "audit"
-_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class EventInjector:
@@ -52,7 +51,6 @@ class EventInjector:
         self._log_path: Path = audit_log_path or (
             _AUDIT_DIR / "injected_events.jsonl"
         )
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._injected: list[dict[str, Any]] = []
         logger.info("[event_injector] 초기화 완료. audit=%s", self._log_path)
 
@@ -187,6 +185,7 @@ class EventInjector:
 
     def flush_audit_log(self) -> Path:
         """주입된 이벤트 전체를 JSONL로 기록. 경로 반환."""
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_path.open("w", encoding="utf-8") as f:
             for entry in self._injected:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")

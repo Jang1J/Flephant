@@ -13,6 +13,7 @@ from src.jobs.run_final_demo import (
     run_demo_mode_b,
 )
 from src.runner.e2e_scenario_runner import E2EScenarioRunner
+from src.runner.event_injector import EventInjector
 
 
 def test_e2e_summary_treats_string_false_sla_as_failure() -> None:
@@ -188,6 +189,20 @@ def test_e2e_no_write_redirects_dead_letter_to_devnull(monkeypatch) -> None:
     assert gateway.admission is captured["admission"]
     assert captured["dead_letter_path"] == Path(os.devnull)
     assert runner._event_injector_audit_path() == Path(os.devnull)
+
+
+def test_event_injector_does_not_create_audit_dir_until_flush(tmp_path) -> None:
+    class FakeGateway:
+        def ingest(self, raw, source):
+            return {"status": "accepted", "event_id": raw["event_id"], "source": source}
+
+    audit_path = tmp_path / "audit" / "injected_events.jsonl"
+
+    injector = EventInjector(FakeGateway(), audit_log_path=audit_path)
+
+    assert not audit_path.parent.exists()
+    injector.flush_audit_log()
+    assert audit_path.exists()
 
 
 def test_mode_b_stage_blocking_treats_string_true_critical_alert_as_blocking() -> None:
