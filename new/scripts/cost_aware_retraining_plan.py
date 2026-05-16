@@ -461,8 +461,20 @@ def build_retraining_plan(
     )
     if requires_label_ssot_update:
         predeploy_blockers.append("label_ssot_update_required_before_prelive")
+    pretraining_status = "READY" if not pretraining_blockers else "BLOCKED"
+    predeploy_status = "READY" if not predeploy_blockers else "BLOCKED"
+    deployment_status = (
+        "READY"
+        if pretraining_status == "READY" and predeploy_status == "READY"
+        else "BLOCKED"
+    )
     plan = {
-        "status": "READY" if not pretraining_blockers else "BLOCKED",
+        "status": pretraining_status,
+        "status_scope": "pretraining",
+        "pretraining_status": pretraining_status,
+        "predeploy_status": predeploy_status,
+        "deployment_status": deployment_status,
+        "safe_to_auto_deploy": False,
         "generated_at": datetime.now(_KST).isoformat(),
         "bundle_id": bundle_id,
         "read_only": True,

@@ -25,6 +25,11 @@ def test_cost_aware_retraining_plan_is_blocked_without_evidence(tmp_path, monkey
     )
 
     assert plan["status"] == "BLOCKED"
+    assert plan["status_scope"] == "pretraining"
+    assert plan["pretraining_status"] == "BLOCKED"
+    assert plan["predeploy_status"] == "BLOCKED"
+    assert plan["deployment_status"] == "BLOCKED"
+    assert plan["safe_to_auto_deploy"] is False
     assert "phase2_feature_backfill_not_pass" in plan["blockers"]
     assert "service_policy_replay_not_pass" in plan["predeploy_blockers"]
     assert plan["read_only"] is True
@@ -115,6 +120,11 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
 
     assert plan["status"] == "READY"
+    assert plan["status_scope"] == "pretraining"
+    assert plan["pretraining_status"] == "READY"
+    assert plan["predeploy_status"] == "BLOCKED"
+    assert plan["deployment_status"] == "BLOCKED"
+    assert plan["safe_to_auto_deploy"] is False
     assert "service_policy_replay_not_pass" not in plan["blockers"]
     assert "phase2_input_readiness_not_pass" not in plan["blockers"]
     assert plan["evidence"]["phase2_input_readiness"]["blocking"] is False
@@ -414,6 +424,9 @@ def test_cost_aware_plan_allows_research_trainable_warn_label_scan(
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
 
     assert plan["status"] == "READY"
+    assert plan["pretraining_status"] == "READY"
+    assert plan["predeploy_status"] == "BLOCKED"
+    assert plan["deployment_status"] == "BLOCKED"
     assert "label_horizon_scan_not_pass" not in plan["pretraining_blockers"]
     assert "label_horizon_scan_not_deployable" not in plan["pretraining_blockers"]
     assert "label_horizon_scan_not_deployable_for_prelive" in plan["predeploy_blockers"]
@@ -525,6 +538,9 @@ def test_cost_aware_plan_allows_research_training_with_neutral_phase2_features(
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
 
     assert plan["status"] == "READY"
+    assert plan["pretraining_status"] == "READY"
+    assert plan["predeploy_status"] == "BLOCKED"
+    assert plan["deployment_status"] == "BLOCKED"
     assert "phase2_feature_backfill_not_pass" not in plan["pretraining_blockers"]
     assert "phase2_feature_backfill_not_pass" in plan["predeploy_blockers"]
     phase2_evidence = plan["evidence"]["phase2_feature_backfill"]
