@@ -268,6 +268,24 @@ def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     assert len(result["bar_errors"]) == 1
 
 
+def test_run_once_malformed_numeric_bar_fails_closed(runner: HotRunner) -> None:
+    """숫자 필드가 깨진 warm buffer도 루프 raise 대신 structured veto로 닫는다."""
+    runner.start()
+    bars = [_make_bar("005930", 50000.0 + i, i) for i in range(65)]
+    bars[-1]["close"] = "bad"
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "TIMEOUT"
+
+
 def test_run_once_requires_asof_for_bar_batch(runner: HotRunner) -> None:
     """bar batch는 asof 없이 buffer에 넣지 않는다."""
     runner.start()

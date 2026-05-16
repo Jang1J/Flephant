@@ -255,8 +255,20 @@ class HotRunner:
 
         # 2. QuantAgent: score + anomaly (S4-4 stage timer)
         t_quant = self._profiler.start_stage("quant")
-        quant_output = self._quant.score_cross_section(tickers, asof)
-        anomalies = self._quant.detect_anomalies(tickers, asof)
+        try:
+            quant_output = self._quant.score_cross_section(tickers, asof)
+            anomalies = self._quant.detect_anomalies(tickers, asof)
+        except Exception as e:
+            quant_ms = self._profiler.end_stage("quant", t_quant)
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="quant",
+                error=e,
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={"quant": quant_ms},
+            )
         quant_ms = self._profiler.end_stage("quant", t_quant)
 
         # 3. PPOAllocator (S4-4 stage timer)
@@ -320,14 +332,30 @@ class HotRunner:
         # 4. PortfolioManager (anomaly tickers = cold_path_exits, S4-4 stage timer)
         t_pm = self._profiler.start_stage("pm")
         cold_path_exits = [a["ticker"] for a in anomalies]
-        pm_result = self._pm.plan(
-            target_weights=target_weights,
-            current_positions=current_positions or [],
-            latest_prices=latest_prices or {},
-            portfolio_value=portfolio_value,
-            based_on_ts=asof,
-            cold_path_exits=cold_path_exits,
-        )
+        try:
+            pm_result = self._pm.plan(
+                target_weights=target_weights,
+                current_positions=current_positions or [],
+                latest_prices=latest_prices or {},
+                portfolio_value=portfolio_value,
+                based_on_ts=asof,
+                cold_path_exits=cold_path_exits,
+            )
+        except Exception as e:
+            pm_ms = self._profiler.end_stage("pm", t_pm)
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="pm",
+                error=e,
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={"quant": quant_ms, "ppo": ppo_ms, "pm": pm_ms},
+                quant_output=quant_output,
+                anomalies=anomalies,
+                allocation=allocation,
+                ppo_guard_warnings=ppo_guard_warnings,
+            )
         portfolio_patch = pm_result["portfolio_patch"]
         pm_guard_warnings = self._portfolio_manager_guard_warnings(pm_result)
         pm_ms = self._profiler.end_stage("pm", t_pm)
@@ -336,14 +364,37 @@ class HotRunner:
         ts_dt = asof_dt or datetime.now(tz=timezone.utc)
 
         t_rf = self._profiler.start_stage("risk_fast")
-        risk_eval = self._risk_fast.evaluate(
-            snapshot={
-                "ranking": quant_output.get("scores", {}),
-                "portfolio_patch": portfolio_patch,
-                "recent_bars": recent_bars,
-            },
-            ts=ts_dt,
-        )
+        try:
+            risk_eval = self._risk_fast.evaluate(
+                snapshot={
+                    "ranking": quant_output.get("scores", {}),
+                    "portfolio_patch": portfolio_patch,
+                    "recent_bars": recent_bars,
+                },
+                ts=ts_dt,
+            )
+        except Exception as e:
+            risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="risk_fast",
+                error=e,
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={
+                    "quant": quant_ms,
+                    "ppo": ppo_ms,
+                    "pm": pm_ms,
+                    "risk_fast": risk_fast_ms,
+                },
+                quant_output=quant_output,
+                anomalies=anomalies,
+                allocation=allocation,
+                pm_result=pm_result,
+                ppo_guard_warnings=ppo_guard_warnings,
+                pm_guard_warnings=pm_guard_warnings,
+            )
         risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
 
         if risk_eval["risk_level"] == "critical":
@@ -364,18 +415,43 @@ class HotRunner:
         combined_risk_warnings.extend(ppo_guard_warnings)
         combined_risk_warnings.extend(pm_guard_warnings)
         t_fda = self._profiler.start_stage("fda")
-        fda_result = self._fda.decide(
-            portfolio_patch_ref=portfolio_patch["portfolio_patch_id"],
-            target_weights=portfolio_patch["target_weights"],
-            order_deltas=portfolio_patch["order_deltas"],
-            dependency_status=dependency_status or {
-                "news": "done", "risk": "done", "quant": "done", "debate": "skipped"
-            },
-            anomalies=anomalies,
-            risk_warnings=combined_risk_warnings,
-            mode="hot",
-            risk_fast_eval=risk_eval,
-        )
+        try:
+            fda_result = self._fda.decide(
+                portfolio_patch_ref=portfolio_patch["portfolio_patch_id"],
+                target_weights=portfolio_patch["target_weights"],
+                order_deltas=portfolio_patch["order_deltas"],
+                dependency_status=dependency_status or {
+                    "news": "done", "risk": "done", "quant": "done", "debate": "skipped"
+                },
+                anomalies=anomalies,
+                risk_warnings=combined_risk_warnings,
+                mode="hot",
+                risk_fast_eval=risk_eval,
+            )
+        except Exception as e:
+            fda_ms = self._profiler.end_stage("fda", t_fda)
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="fda",
+                error=e,
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={
+                    "quant": quant_ms,
+                    "ppo": ppo_ms,
+                    "pm": pm_ms,
+                    "risk_fast": risk_fast_ms,
+                    "fda": fda_ms,
+                },
+                quant_output=quant_output,
+                anomalies=anomalies,
+                allocation=allocation,
+                pm_result=pm_result,
+                risk_eval=risk_eval,
+                ppo_guard_warnings=ppo_guard_warnings,
+                pm_guard_warnings=pm_guard_warnings,
+            )
         fda_ms = self._profiler.end_stage("fda", t_fda)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -424,6 +500,71 @@ class HotRunner:
                 "risk_fast": risk_fast_ms,
                 "fda": fda_ms,
             },
+        }
+
+    def _fail_closed_result(
+        self,
+        *,
+        asof: str,
+        t0: float,
+        stage: str,
+        error: Exception,
+        n_bars_consumed: int,
+        bar_errors: list[str],
+        stage_ms: dict[str, float] | None = None,
+        quant_output: dict[str, Any] | None = None,
+        anomalies: list[dict[str, Any]] | None = None,
+        allocation: dict[str, Any] | None = None,
+        pm_result: dict[str, Any] | None = None,
+        risk_eval: dict[str, Any] | None = None,
+        ppo_guard_warnings: list[dict[str, Any]] | None = None,
+        pm_guard_warnings: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Stage exception을 Hot Path 루프 crash 대신 structured veto로 닫는다."""
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self._latency_records.append(elapsed_ms)
+        reason = f"{stage}_exception: {type(error).__name__}: {error}"
+        final_decision = {
+            "decision_id": "",
+            "approved": False,
+            "target_weights": {},
+            "order_deltas": [],
+            "veto_reason": reason,
+            "reason_code": "TIMEOUT",
+            "confidence": 0.0,
+        }
+        logger.exception("[hot_runner] %s stage fail-closed: %s", stage, error)
+        return {
+            "pipeline_state": self._sm.state.value,
+            "asof": asof,
+            "status": "FAIL",
+            "failure_stage": stage,
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "n_bars_consumed": n_bars_consumed,
+            "bar_errors": bar_errors,
+            "quant_output": quant_output or {},
+            "anomalies": anomalies or [],
+            "allocation": allocation or {},
+            "pm_result": pm_result or {},
+            "ppo_guard_warnings": ppo_guard_warnings or [],
+            "pm_guard_warnings": pm_guard_warnings or [],
+            "risk_eval": risk_eval or {
+                "risk_level": "critical",
+                "triggered_rules": [f"{stage}_exception"],
+                "affected_tickers": [],
+                "recommended_action": "halt",
+                "stance": "veto_recommendation",
+                "rationale": reason,
+            },
+            "fda_result": {
+                "final_decision": final_decision,
+                "mode": "hot",
+                "latency_ms": 0.0,
+            },
+            "final_decision": final_decision,
+            "latency_ms": elapsed_ms,
+            "stage_ms": stage_ms or {},
         }
 
     @staticmethod
