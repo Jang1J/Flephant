@@ -48,6 +48,19 @@ _FINBERT_PIPELINE: Any = None
 _FINBERT_AVAILABLE: bool | None = None  # None = 아직 시도 안 함
 
 
+def _asof_from_snapshot(snapshot_ts: str | datetime | None) -> str:
+    """C3A asof는 명시 snapshot_ts가 있으면 그 시각을 사용한다."""
+    if snapshot_ts is None:
+        return datetime.now(_KST).isoformat()
+    if isinstance(snapshot_ts, datetime):
+        dt = snapshot_ts
+    else:
+        dt = datetime.fromisoformat(str(snapshot_ts))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt.astimezone(_KST).isoformat()
+
+
 def _try_load_finbert(model_name: str = "snunlp/KR-FinBert-SC") -> bool:
     """FinBERT 모델 lazy load. 성공 시 True, 실패 시 False.
 
@@ -577,7 +590,7 @@ class DualSourceScorer:
         if data_ts is not None:
             assert_pit_safe(data_ts, snapshot_ts)
 
-        asof = datetime.now(_KST).isoformat()
+        asof = _asof_from_snapshot(snapshot_ts)
 
         # Sub-task 1: news_score_t
         news_score_t, source_note = self.score_news(
@@ -685,7 +698,7 @@ class DualSourceScorer:
                 results.append(
                     {
                         "ticker": str(ticker).zfill(6),
-                        "asof": datetime.now(_KST).isoformat(),
+                        "asof": _asof_from_snapshot(snapshot_ts),
                         "news_score_t": 0.0,
                         "comm_score_t_1": 0.0,
                         "comm_score_t_2": 0.0,
