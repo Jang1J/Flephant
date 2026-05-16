@@ -206,6 +206,35 @@ def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[
     return {}
 
 
+def _target_col_for_horizon(horizon: Any) -> str | None:
+    if horizon is None:
+        return None
+    if str(horizon) == "session_close":
+        return "label_session_close_net_ret"
+    return f"label_{horizon}m_net_ret"
+
+
+def _target_changes_rank(
+    *,
+    best_horizon: Any,
+    active_horizon: Any,
+    best_horizon_report: dict[str, Any],
+) -> bool:
+    if best_horizon is None:
+        return False
+    if str(best_horizon) == str(active_horizon):
+        return False
+    impact = best_horizon_report.get("selection_impact")
+    if not isinstance(impact, dict):
+        return True
+    if safe_bool(impact.get("rank_equivalent_to_active_horizon"), default=False):
+        return False
+    selection_changes = impact.get("selection_changes")
+    if selection_changes is None:
+        return True
+    return safe_int(selection_changes, default=0, min_value=0) > 0
+
+
 def _label_scan_pretraining_blockers(
     *,
     label_scan: dict[str, Any] | None,
@@ -279,12 +308,15 @@ def build_retraining_plan(
     active_horizon_report = _horizon_report(label_scan, active_horizon)
     best_horizon = (label_scan or {}).get("best_horizon")
     best_horizon_report = _horizon_report(label_scan, best_horizon)
-    if best_horizon is None:
-        target_col_override = None
-    elif str(best_horizon) == "session_close":
-        target_col_override = "label_session_close_net_ret"
-    else:
-        target_col_override = f"label_{best_horizon}m_net_ret"
+    target_col_candidate = _target_col_for_horizon(best_horizon)
+    rank_changing_target = _target_changes_rank(
+        best_horizon=best_horizon,
+        active_horizon=active_horizon,
+        best_horizon_report=best_horizon_report,
+    )
+    target_col_override = target_col_candidate if rank_changing_target else None
+    if target_col_candidate and not rank_changing_target:
+        pretraining_blockers.append("cost_aware_target_no_rank_change")
     requires_label_ssot_update = bool(
         target_col_override and str(target_col_override) != str(active_target_col)
     )
@@ -338,11 +370,19 @@ def build_retraining_plan(
         },
         "recommended_experiment": {
             "target_horizon": best_horizon,
+            "target_col_candidate": target_col_candidate,
             "target_col_override": target_col_override,
+            "rank_changing_target": rank_changing_target,
+            "blocked_reason": (
+                "cost_aware_target_no_rank_change"
+                if target_col_candidate and not rank_changing_target
+                else None
+            ),
             "active_horizon_mean_net_bps": active_horizon_report.get("mean_net_bps"),
             "active_horizon_positive_net_rate": active_horizon_report.get("positive_net_rate"),
             "best_horizon_mean_net_bps": best_horizon_report.get("mean_net_bps"),
             "best_horizon_positive_net_rate": best_horizon_report.get("positive_net_rate"),
+            "best_horizon_selection_impact": best_horizon_report.get("selection_impact"),
             "train_target": "net_of_cost_return",
             "selection_gate": "trade_no_trade_or_expected_net_bps",
             "deploy_policy": "manual_review_then_c12_service_policy_replay",

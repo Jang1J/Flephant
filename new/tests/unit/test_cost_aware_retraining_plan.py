@@ -302,10 +302,18 @@ def test_cost_aware_plan_ready_to_train_without_existing_service_policy(
 
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
 
-    assert plan["status"] == "READY"
-    assert plan["blockers"] == []
+    assert plan["status"] == "BLOCKED"
+    assert plan["blockers"] == ["cost_aware_target_no_rank_change"]
     assert "service_policy_replay_not_pass" in plan["predeploy_blockers"]
-    assert plan["recommended_experiment"]["target_col_override"] == "label_5m_net_ret"
+    assert "cost_aware_target_no_rank_change" in plan["pretraining_blockers"]
+    assert plan["recommended_experiment"]["target_col_candidate"] == "label_5m_net_ret"
+    assert plan["recommended_experiment"]["target_col_override"] is None
+    assert plan["recommended_experiment"]["rank_changing_target"] is False
+    assert (
+        plan["recommended_experiment"]["blocked_reason"]
+        == "cost_aware_target_no_rank_change"
+    )
+    assert "--target-col-override" not in plan["next_commands"][1]
 
 
 def test_cost_aware_plan_blocks_stale_label_scan_window_and_universe(

@@ -398,6 +398,30 @@ def test_generate_labels_materializes_cost_aware_horizon_candidates(
     )
 
 
+def test_generate_labels_materializes_service_policy_min_holding_horizon(
+    builder: DatasetBuilder,
+) -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 220,
+            "ts_close": pd.date_range("2026-04-20 09:00:00+09:00", periods=220, freq="1min"),
+            "open": np.arange(100.0, 320.0),
+            "high": np.arange(100.0, 320.0) + 1,
+            "low": np.arange(100.0, 320.0) - 1,
+            "close": np.arange(100.0, 320.0),
+            "volume": np.ones(220) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+
+    assert "label_195m_net_ret" in out.columns
+    assert "label_195m_tradeable" in out.columns
+    assert out["label_195m_net_ret"].iloc[0] == pytest.approx(
+        ((295.0 / 100.0 - 1.0) * 10_000.0 - builder._label_total_cost_bps) / 10_000.0
+    )
+
+
 def test_generate_labels_too_short(builder: DatasetBuilder) -> None:
     df = pd.DataFrame(
         {

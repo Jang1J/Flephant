@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pandas as pd
+import pytest
+
 
 def _load_script(name: str):
     script_path = Path(__file__).resolve().parents[2] / "scripts" / f"{name}.py"
@@ -78,3 +81,86 @@ def test_label_horizon_scan_thresholds_loaded_from_risk_config(monkeypatch):
         "min_positive_net_rate": 0.61,
         "allow_warn_for_research_only": False,
     }
+
+
+def test_default_horizons_include_service_policy_min_holding(monkeypatch):
+    mod = _load_script("cost_aware_label_horizon_scan")
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "label":
+            return {"horizon_bars": 5}
+        if key == "preprocessor":
+            return {"multi_scale_windows": [5, 30, 60]}
+        if key == "service_policy_replay":
+            return {"min_holding_bars": 195}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    assert mod._default_horizons() == ["5", "30", "60", "195", "session_close"]
+
+
+def test_horizon_summary_reports_selection_impact_for_active_noop():
+    mod = _load_script("cost_aware_label_horizon_scan")
+    panel = pd.DataFrame(
+        {
+            "ticker": ["005930", "000660", "005930", "000660"],
+            "ts_close": pd.to_datetime([
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+            ]),
+            "close": [100.0, 100.0, 102.0, 101.0],
+        }
+    )
+
+    summary = mod._summarize_horizon(
+        panel=panel,
+        horizon="1",
+        active_horizon="1",
+        total_cost_bps=1.0,
+        thresholds={"min_mean_net_bps": 0.0, "min_positive_net_rate": 0.0},
+        top_k_fraction=0.5,
+    )
+
+    assert summary["selection_impact"] == {
+        "active_horizon": "1",
+        "topk_overlap_rate": 1.0,
+        "rank_correlation": 1.0,
+        "selection_changes": 0,
+        "groups_compared": 0,
+        "rank_equivalent_to_active_horizon": True,
+    }
+
+
+def test_horizon_summary_reports_selection_changes():
+    mod = _load_script("cost_aware_label_horizon_scan")
+    panel = pd.DataFrame(
+        {
+            "ticker": ["005930", "000660", "005930", "000660", "005930", "000660"],
+            "ts_close": pd.to_datetime([
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+                "2026-05-01 09:02:00+09:00",
+                "2026-05-01 09:02:00+09:00",
+            ]),
+            "close": [100.0, 100.0, 103.0, 101.0, 104.0, 106.0],
+        }
+    )
+
+    summary = mod._summarize_horizon(
+        panel=panel,
+        horizon="2",
+        active_horizon="1",
+        total_cost_bps=1.0,
+        thresholds={"min_mean_net_bps": 0.0, "min_positive_net_rate": 0.0},
+        top_k_fraction=0.5,
+    )
+
+    impact = summary["selection_impact"]
+    assert impact["selection_changes"] == 1
+    assert impact["topk_overlap_rate"] == pytest.approx(0.0)
+    assert impact["rank_equivalent_to_active_horizon"] is False

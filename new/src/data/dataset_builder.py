@@ -832,6 +832,12 @@ class DatasetBuilder:
                 continue
             if horizon > 0 and horizon not in horizons:
                 horizons.append(horizon)
+        try:
+            min_holding_horizon = int(self._cfg_service_policy.get("min_holding_bars", 0) or 0)
+        except (TypeError, ValueError):
+            min_holding_horizon = 0
+        if min_holding_horizon > 0 and min_holding_horizon not in horizons:
+            horizons.append(min_holding_horizon)
         if self._horizon not in horizons:
             horizons.insert(0, self._horizon)
         return horizons

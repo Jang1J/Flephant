@@ -102,6 +102,7 @@ def _available_dates(artifacts_dir: Path, tickers: list[str]) -> list[date]:
 def _default_horizons() -> list[str]:
     label_cfg = config_load("risk_config.yaml", "label") or {}
     pre_cfg = config_load("risk_config.yaml", "preprocessor") or {}
+    service_policy_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
     horizons: list[int] = []
     label_horizon = int(label_cfg.get("horizon_bars", 0) or 0)
     if label_horizon > 0:
@@ -110,6 +111,9 @@ def _default_horizons() -> list[str]:
         as_int = int(value)
         if as_int > 1:
             horizons.append(as_int)
+    min_holding = int(service_policy_cfg.get("min_holding_bars", 0) or 0)
+    if min_holding > 1:
+        horizons.append(min_holding)
     deduped = [str(v) for v in sorted(set(horizons))]
     return deduped + ["session_close"]
 
@@ -217,7 +221,7 @@ def _quantiles(values: np.ndarray) -> dict[str, float | None]:
     }
 
 
-def _horizon_returns(panel, horizon: str) -> np.ndarray:
+def _horizon_return_series(panel, horizon: str):
     df = panel.copy()
     df["_session"] = df["ts_close"].dt.date
     if horizon == "session_close":
@@ -234,16 +238,105 @@ def _horizon_returns(panel, horizon: str) -> np.ndarray:
     close = df["close"].astype(float)
     with np.errstate(divide="ignore", invalid="ignore"):
         returns = np.where(close > 1e-8, future_close.astype(float) / close - 1.0, np.nan)
-    values = np.asarray(returns[mask], dtype=float)
+    pd = __import__("pandas")
+    series = pd.Series(returns, index=panel.index, dtype=float)
+    return series.where(mask)
+
+
+def _horizon_returns(panel, horizon: str) -> np.ndarray:
+    values = np.asarray(_horizon_return_series(panel, horizon).dropna(), dtype=float)
     return values[np.isfinite(values)]
+
+
+def _selection_impact(
+    *,
+    panel,
+    horizon: str,
+    active_horizon: str,
+    top_k_fraction: float,
+) -> dict[str, Any]:
+    if horizon == active_horizon:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": 1.0,
+            "rank_correlation": 1.0,
+            "selection_changes": 0,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": True,
+        }
+
+    pd = __import__("pandas")
+    active = _horizon_return_series(panel, active_horizon)
+    candidate = _horizon_return_series(panel, horizon)
+    joined = panel[["ticker", "ts_close"]].copy()
+    joined["_active"] = active
+    joined["_candidate"] = candidate
+    joined = joined.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["_active", "_candidate"]
+    )
+    if joined.empty:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": None,
+            "rank_correlation": None,
+            "selection_changes": None,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": False,
+        }
+
+    overlaps: list[float] = []
+    rank_corrs: list[float] = []
+    selection_changes = 0
+    for _, group in joined.groupby("ts_close", sort=False):
+        if len(group) < 2:
+            continue
+        k = max(1, int(np.ceil(len(group) * top_k_fraction)))
+        active_top = set(group.nlargest(k, "_active")["ticker"].astype(str))
+        candidate_top = set(group.nlargest(k, "_candidate")["ticker"].astype(str))
+        overlaps.append(len(active_top & candidate_top) / max(len(active_top), 1))
+        if active_top != candidate_top:
+            selection_changes += 1
+
+        active_rank = group["_active"].rank(method="average")
+        candidate_rank = group["_candidate"].rank(method="average")
+        corr = active_rank.corr(candidate_rank, method="spearman")
+        if pd.notna(corr):
+            rank_corrs.append(float(corr))
+
+    groups_compared = len(overlaps)
+    if groups_compared == 0:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": None,
+            "rank_correlation": None,
+            "selection_changes": None,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": False,
+        }
+    topk_overlap_rate = float(np.mean(overlaps))
+    rank_correlation = float(np.mean(rank_corrs)) if rank_corrs else None
+    return {
+        "active_horizon": active_horizon,
+        "topk_overlap_rate": topk_overlap_rate,
+        "rank_correlation": rank_correlation,
+        "selection_changes": int(selection_changes),
+        "groups_compared": groups_compared,
+        "rank_equivalent_to_active_horizon": (
+            selection_changes == 0
+            and topk_overlap_rate == 1.0
+            and (rank_correlation is None or rank_correlation >= 0.999999)
+        ),
+    }
 
 
 def _summarize_horizon(
     *,
     panel,
     horizon: str,
+    active_horizon: str,
     total_cost_bps: float,
     thresholds: dict[str, float],
+    top_k_fraction: float,
 ) -> dict[str, Any]:
     returns = _horizon_returns(panel, horizon)
     gross_bps = returns * 10000.0
@@ -255,6 +348,12 @@ def _summarize_horizon(
             "status": "BLOCKED",
             "valid_rows": 0,
             "reason": "no_valid_rows",
+            "selection_impact": _selection_impact(
+                panel=panel,
+                horizon=horizon,
+                active_horizon=active_horizon,
+                top_k_fraction=top_k_fraction,
+            ),
         }
 
     mean_gross = float(gross_bps.mean())
@@ -276,6 +375,12 @@ def _summarize_horizon(
         "net_bps_quantiles": _quantiles(net_bps),
         "pass_mean_net_threshold": bool(pass_mean),
         "pass_positive_net_rate_threshold": bool(pass_hit),
+        "selection_impact": _selection_impact(
+            panel=panel,
+            horizon=horizon,
+            active_horizon=active_horizon,
+            top_k_fraction=top_k_fraction,
+        ),
     }
 
 
@@ -311,12 +416,23 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     total_cost_bps = _cost_bps()
     thresholds = _diagnostic_thresholds(total_cost_bps)
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    active_horizon = str(label_cfg.get("horizon_bars", 5))
+    eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
+    top_k_fraction = safe_float(
+        eval_cfg.get("top_k_fraction"),
+        default=0.25,
+        min_value=0.0,
+        max_value=1.0,
+    )
     horizon_reports = [
         _summarize_horizon(
             panel=panel,
             horizon=horizon,
+            active_horizon=active_horizon,
             total_cost_bps=total_cost_bps,
             thresholds=thresholds,
+            top_k_fraction=top_k_fraction,
         )
         for horizon in horizons
     ]
@@ -341,6 +457,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "cost_model": {
             "total_cost_bps": total_cost_bps,
             "thresholds": thresholds,
+        },
+        "selection_impact_baseline": {
+            "active_horizon": active_horizon,
+            "top_k_fraction": top_k_fraction,
         },
         "best_horizon": best.get("horizon") if best else None,
         "deployable_label_recommendation": deployable,
