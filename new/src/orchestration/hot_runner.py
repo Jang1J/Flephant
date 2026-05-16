@@ -422,17 +422,17 @@ class HotRunner:
             )
         except Exception as e:
             risk_fast_ms = self._profiler.end_stage("risk_fast", t_rf)
-            logger.warning("[hot_runner] RiskFast sidecar 비활성화: %s", e)
+            logger.warning("[hot_runner] RiskFast sidecar fail-closed veto 입력: %s", e)
             risk_eval = {
-                "risk_level": "low",
-                "severity": "low",
+                "risk_level": "high",
+                "severity": "high",
                 "fast_rule_match": None,
-                "triggered_rules": [],
+                "triggered_rules": ["risk_fast_sidecar_unavailable"],
                 "affected_tickers": [],
-                "recommended_action": "pass",
-                "stance": "neutral",
+                "recommended_action": "halt",
+                "stance": "veto_recommendation",
                 "rationale": (
-                    "RiskFast sidecar disabled_nonblocking: "
+                    "RiskFast sidecar failed_nonblocking_but_fda_veto: "
                     f"{type(e).__name__}: {e}"
                 ),
                 "latency_ms": risk_fast_ms,
@@ -467,8 +467,11 @@ class HotRunner:
                 portfolio_patch_ref=portfolio_patch["portfolio_patch_id"],
                 target_weights=portfolio_patch["target_weights"],
                 order_deltas=portfolio_patch["order_deltas"],
-                dependency_status=dependency_status or {
-                    "news": "done", "risk": "done", "quant": "done", "debate": "skipped"
+                dependency_status=dependency_status if dependency_status is not None else {
+                    "news": "missing",
+                    "risk": "missing",
+                    "quant": "done",
+                    "debate": "skipped",
                 },
                 anomalies=anomalies,
                 risk_warnings=combined_risk_warnings,

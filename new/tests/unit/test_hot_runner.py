@@ -122,6 +122,10 @@ def _prime_buffer(runner: HotRunner, tickers: list[str], n: int = 65) -> None:
             runner._quant.on_bar(_make_bar(t, price, i))
 
 
+def _deps_done() -> dict[str, str]:
+    return {"news": "done", "risk": "done", "quant": "done", "debate": "skipped"}
+
+
 @pytest.fixture
 def runner(tmp_path) -> HotRunner:
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm")
@@ -185,6 +189,7 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
         latest_prices={t: 50000.0 + i * 1000 for i, t in enumerate(tickers)},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     # QuantAgent passive → 비중 전무 → PM 주문 없음 → FDA approve (empty)
@@ -193,6 +198,27 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
     assert result["final_decision"]["approved"] is True
     assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
     assert "latency_ms" in result
+
+
+def test_run_once_missing_dependency_status_vetoes(runner: HotRunner) -> None:
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "TIMEOUT"
+    assert "news" in result["final_decision"]["veto_reason"]
+    assert "risk" in result["final_decision"]["veto_reason"]
 
 
 def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
@@ -314,6 +340,7 @@ def test_run_once_risk_fast_exception_degrades_nonblocking(
         latest_prices={t: 50000.0 for t in tickers},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     assert result["pipeline_state"] == "HOT_RUNNING"
@@ -321,8 +348,10 @@ def test_run_once_risk_fast_exception_degrades_nonblocking(
     assert result.get("failure_stage") != "risk_fast"
     assert result["risk_eval"]["enabled"] is False
     assert result["risk_eval"]["status"] == "DISABLED"
-    assert result["risk_eval"]["risk_level"] == "low"
-    assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
+    assert result["risk_eval"]["risk_level"] == "high"
+    assert result["risk_eval"]["recommended_action"] == "halt"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
 
 def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
@@ -413,6 +442,7 @@ def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
         latest_prices={"005930": 50000.0},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_ALLOCATION_PLAN_INVALID"
@@ -440,6 +470,7 @@ def test_run_once_vetoes_ppo_policy_universe_mismatch(runner: HotRunner) -> None
         latest_prices={"005930": 50000.0},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_POLICY_UNIVERSE_MISMATCH"
@@ -467,6 +498,7 @@ def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
         bars_batch=[],
         latest_prices={"005930": 50000.0},
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
     # Anomaly는 상황에 따라 감지될 수도 안 될 수도 (random seed). 양쪽 허용.
     if result["anomalies"]:
@@ -523,6 +555,7 @@ def test_run_once_vetoes_pm_price_unavailable(runner: HotRunner) -> None:
         latest_prices={},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     assert result["pm_result"]["n_errors"] == 1
@@ -568,6 +601,7 @@ def test_run_once_vetoes_ppo_constraint_violation(runner: HotRunner) -> None:
         latest_prices={"005930": 50_000.0},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     assert result["pm_guard_warnings"][0]["reason"] == "ppo_constraint_violation"
@@ -585,6 +619,7 @@ def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
         latest_prices={"005930": 50000.0},
         risk_warnings=[{"ticker": "005930", "severity": "high", "reason": "fake"}],
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
     assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
     assert result["final_decision"]["approved"] is False

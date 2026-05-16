@@ -174,6 +174,18 @@ def test_veto_dependency_timeout_normalizes_status(fda: FDAAgent) -> None:
     assert "news" in fd["veto_reason"]
 
 
+def test_veto_dependency_missing_or_unknown(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        dependency_status={"news": "missing", "risk": "unknown", "quant": "done"},
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert "news" in fd["veto_reason"]
+    assert "risk" in fd["veto_reason"]
+
+
 def test_veto_risk_high_severity(fda: FDAAgent) -> None:
     result = fda.decide(
         portfolio_patch_ref="PP-001",

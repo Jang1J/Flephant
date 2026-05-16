@@ -259,16 +259,23 @@ class FDAAgent(AgentBase):
         anomalies = anomalies or []
         risk_warnings = risk_warnings or []
 
-        # 2. dependency timeout 체크
+        # 2. dependency timeout/missing 체크
         # (risk_fast_eval은 step 3에서 처리)
         timeout_deps = [
             name for name, status in dependency_status.items()
-            if str(status).strip().lower() == "timeout"
+            if str(status).strip().lower() in {
+                "timeout",
+                "missing",
+                "unknown",
+                "error",
+                "failed",
+                "fail",
+            }
         ]
         if timeout_deps:
             return self._build_veto_decision(
                 reason_code="TIMEOUT",
-                veto_reason=f"dependency timeout: {sorted(timeout_deps)}",
+                veto_reason=f"dependency unavailable: {sorted(timeout_deps)}",
                 target_weights=target_weights or {},
                 order_deltas=order_deltas or [],
                 portfolio_patch_ref=portfolio_patch_ref,
@@ -277,8 +284,10 @@ class FDAAgent(AgentBase):
                     {
                         "rule": "dependency_wait",
                         "original": "all_done",
-                        "override": f"timeout_{name}",
-                        "justification": "agent did not respond within SLA",
+                        "override": (
+                            f"{str(dependency_status.get(name)).strip().lower()}_{name}"
+                        ),
+                        "justification": "agent did not provide usable dependency evidence",
                     }
                     for name in timeout_deps
                 ],
