@@ -413,13 +413,14 @@ def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_p
         _is_mock = False
 
         def get_indices(self, as_of):
+            assert as_of == "2026-05-08"
             return SimpleNamespace(
                 us_sp500_change=0.01,
                 us_nasdaq_change=0.02,
                 us_vix=18.5,
                 us_soxx_change=0.03,
                 source="yfinance",
-                as_of_date=as_of,
+                as_of_date="2026-05-07",
             )
 
     class DummyECOS:
@@ -476,6 +477,10 @@ def test_exogenous_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_
         _is_mock = False
 
         def get_indices(self, as_of):
+            as_of_dates = {
+                "2026-05-08": "2026-05-07",
+                "2026-05-09": "2026-05-08",
+            }
             non_neutral = as_of == "2026-05-08"
             return SimpleNamespace(
                 us_sp500_change=0.01 if non_neutral else 0.0,
@@ -483,7 +488,7 @@ def test_exogenous_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_
                 us_vix=0.0,
                 us_soxx_change=0.0,
                 source="yfinance",
-                as_of_date=as_of,
+                as_of_date=as_of_dates[as_of],
             )
 
     class DummyECOS:
@@ -573,4 +578,52 @@ def test_exogenous_history_blocks_future_us_market_asof(monkeypatch, tmp_path):
 
     assert report["status"] == "BLOCKED"
     assert "us_market_as_of_after_expected_close" in report["blockers"]
+    assert not (tmp_path / "exogenous" / "20260508.json").exists()
+
+
+def test_exogenous_history_blocks_stale_us_market_asof(monkeypatch, tmp_path):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            assert as_of == "2026-05-08"
+            return SimpleNamespace(
+                us_sp500_change=0.01,
+                us_nasdaq_change=0.0,
+                us_vix=18.5,
+                us_soxx_change=0.0,
+                source="yfinance",
+                as_of_date="2026-05-06",
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 3.5, "usd_krw": 1350.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            raise AssertionError("stale US market date should block before KRX fetch")
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260508",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "us_market_as_of_mismatch" in report["blockers"]
     assert not (tmp_path / "exogenous" / "20260508.json").exists()

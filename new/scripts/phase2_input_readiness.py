@@ -41,6 +41,73 @@ def _candidate_raw_paths(raw_events_dir: Path, date_key: str) -> list[Path]:
     ]
 
 
+def _raw_payload_readiness(path: Path, date_key: str) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as e:
+        return {
+            "valid": False,
+            "reason": f"raw_payload_unreadable:{type(e).__name__}",
+            "event_count": 0,
+        }
+    if not isinstance(payload, dict):
+        return {"valid": False, "reason": "raw_payload_not_object", "event_count": 0}
+    reason = dual_source_history._non_deploy_quality_reason(payload)
+    if reason:
+        return {"valid": False, "reason": reason, "event_count": 0}
+
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return {"valid": False, "reason": "raw_payload_missing_events", "event_count": 0}
+    if not events:
+        return {"valid": False, "reason": "raw_payload_empty_events", "event_count": 0}
+
+    provenance = payload.get("provenance") or {}
+    try:
+        declared_event_count = int(provenance.get("event_count"))
+    except (TypeError, ValueError):
+        return {
+            "valid": False,
+            "reason": "raw_payload_missing_provenance_event_count",
+            "event_count": len(events),
+        }
+    if declared_event_count != len(events):
+        return {
+            "valid": False,
+            "reason": "raw_payload_event_count_mismatch",
+            "event_count": len(events),
+        }
+
+    snapshot = dual_source_history._snapshot_ts(date_key)
+    for idx, event in enumerate(events):
+        if not isinstance(event, dict):
+            return {
+                "valid": False,
+                "reason": f"raw_payload_event_not_object:{idx}",
+                "event_count": len(events),
+            }
+        try:
+            event_ts = dual_source_history._required_ts(
+                event.get("event_ts") or event.get("published_at") or event.get("ts"),
+                field="events[].event_ts",
+                snapshot=snapshot,
+            )
+        except Exception as e:
+            return {
+                "valid": False,
+                "reason": f"raw_payload_event_timestamp_invalid:{type(e).__name__}",
+                "event_count": len(events),
+            }
+        if event_ts > snapshot:
+            return {
+                "valid": False,
+                "reason": "raw_payload_event_after_snapshot",
+                "event_count": len(events),
+            }
+    return {"valid": True, "reason": None, "event_count": len(events)}
+
+
 def _threshold() -> float:
     gate_cfg = (
         config_load("risk_config.yaml", "backtest_agent.deploy_decision_gate")
@@ -63,14 +130,24 @@ def check_phase2_input_readiness(
     dates = dual_source_history._business_dates(end_date, business_days)
     raw_present: list[str] = []
     raw_missing: list[str] = []
+    raw_invalid: list[dict[str, Any]] = []
     raw_examples: dict[str, str] = {}
     for date_key in dates:
         found = next((path for path in _candidate_raw_paths(raw_events_dir, date_key) if path.exists()), None)
         if found is None:
             raw_missing.append(date_key)
-        else:
+            continue
+        readiness = _raw_payload_readiness(found, date_key)
+        if readiness["valid"]:
             raw_present.append(date_key)
             raw_examples[date_key] = str(found)
+        else:
+            raw_invalid.append({
+                "date": date_key,
+                "path": str(found),
+                "reason": readiness["reason"],
+                "event_count": readiness["event_count"],
+            })
 
     us_client = exogenous_history.USMarketClient()
     ecos_client = exogenous_history.ECOSRestClient()
@@ -86,6 +163,8 @@ def check_phase2_input_readiness(
     blockers: list[str] = []
     if dual_coverage < threshold:
         blockers.append("dual_source_raw_archive_coverage_below_threshold")
+    if raw_invalid:
+        blockers.append("dual_source_raw_archive_invalid")
     if not providers_ok:
         blockers.append("exogenous_required_provider_unavailable")
     report = {
@@ -99,9 +178,11 @@ def check_phase2_input_readiness(
         "dual_source_raw": {
             "present_date_count": len(raw_present),
             "missing_date_count": len(raw_missing),
+            "invalid_date_count": len(raw_invalid),
             "coverage": dual_coverage,
             "present_dates": raw_present,
             "missing_dates_sample": raw_missing[:10],
+            "invalid_dates_sample": raw_invalid[:10],
             "examples": raw_examples,
         },
         "exogenous_providers": provider_availability,

@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -136,8 +136,9 @@ def _collect_global_features(
     ecos_client: ECOSRestClient,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     expected_us_date = previous_kospi_trading_day(_parse_date(date_key).date())
-    as_of_dash = expected_us_date.isoformat()
-    us = us_client.get_indices(as_of=as_of_dash)
+    expected_us_as_of = expected_us_date.isoformat()
+    request_as_of = (expected_us_date + timedelta(days=1)).isoformat()
+    us = us_client.get_indices(as_of=request_as_of)
     macro = ecos_client.get_macro_pack(date_key)
     features = {
         "us_sp500_change": float(us.us_sp500_change),
@@ -150,7 +151,8 @@ def _collect_global_features(
     return features, {
         "us_market_source": us.source,
         "us_market_as_of_date": us.as_of_date,
-        "us_market_expected_as_of_date": as_of_dash,
+        "us_market_expected_as_of_date": expected_us_as_of,
+        "us_market_request_as_of_date": request_as_of,
         "ecos_macro_pack_date": date_key,
     }
 
@@ -334,8 +336,12 @@ def materialize_exogenous_history(
                 expected_us_date = _normalize_date_key(
                     global_stats.get("us_market_expected_as_of_date")
                 )
-                if actual_us_date and expected_us_date and actual_us_date > expected_us_date:
-                    blocker = "us_market_as_of_after_expected_close"
+                if actual_us_date != expected_us_date:
+                    blocker = (
+                        "us_market_as_of_after_expected_close"
+                        if actual_us_date and expected_us_date and actual_us_date > expected_us_date
+                        else "us_market_as_of_mismatch"
+                    )
                     if blocker not in blockers:
                         blockers.append(blocker)
                     per_date.append({
