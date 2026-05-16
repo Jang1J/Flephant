@@ -108,6 +108,8 @@ def _valid_bar_artifact(path: Path, *, date_key: str, ticker: str, min_rows: int
         and inspection.get("ticker_matches") is True
         and int(inspection.get("duplicate_ts_count") or 0) == 0
         and int(inspection.get("out_of_hours_count") or 0) == 0
+        and inspection.get("session_span_ok") is True
+        and inspection.get("max_gap_ok") is True
     )
 
 

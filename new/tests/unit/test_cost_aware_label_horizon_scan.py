@@ -56,3 +56,25 @@ def test_label_horizon_scan_uses_final_gate_pending_data_universe(monkeypatch):
 
     assert mod._active_tickers() == ["005930", "105560"]
 
+
+def test_label_horizon_scan_thresholds_loaded_from_risk_config(monkeypatch):
+    mod = _load_script("cost_aware_label_horizon_scan")
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "cost_aware_retraining":
+            return {
+                "label_horizon_gate": {
+                    "min_mean_net_bps": "7.5",
+                    "min_positive_net_rate": "0.61",
+                    "allow_warn_for_research_only": "false",
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    assert mod._diagnostic_thresholds(2.5) == {
+        "min_mean_net_bps": 7.5,
+        "min_positive_net_rate": 0.61,
+        "allow_warn_for_research_only": False,
+    }

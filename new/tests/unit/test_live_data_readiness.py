@@ -572,6 +572,40 @@ def test_train_gate_reports_only_valid_artifact_dates(monkeypatch, tmp_path):
     assert result["date_quality_sample"]["20260507"]["is_valid"] is False
 
 
+def test_train_gate_requires_all_requested_dates_when_require_train(monkeypatch, tmp_path):
+    """require_train=True면 요청한 전체 거래일이 유효해야 학습에 진입한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {"train_window_days": 1, "test_window_days": 1, "trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260508",
+        require_train=True,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "invalid_requested_artifact_dates"
+    assert result["available_dates"] == 1
+    assert result["required_dates"] == 2
+    assert result["invalid_requested_dates_sample"] == ["20260507"]
+
+
 def test_run_backfill_skips_existing_valid_artifacts(monkeypatch, tmp_path):
     """이미 유효한 parquet/jsonl 날짜는 재호출하지 않고 부족 날짜만 fetch한다."""
     readiness = _load_script_module()

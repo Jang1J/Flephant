@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 def _load_script(name: str):
@@ -13,17 +16,40 @@ def _load_script(name: str):
     return module
 
 
-def _write_jsonl(path: Path, rows: int) -> None:
+def _write_jsonl(
+    path: Path,
+    rows: int,
+    *,
+    gap_after: int | None = None,
+    gap_minutes: int = 0,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    date_key = path.name.removeprefix("bars_1m_").split(".", 1)[0]
+    if path.name.startswith("bars_1m_"):
+        date_key = path.name.removeprefix("bars_1m_").split(".", 1)[0]
+    else:
+        match = re.search(r"(20\d{6})", path.name)
+        assert match
+        date_key = match.group(1)
     ticker = path.parent.name
+    start = datetime(
+        int(date_key[:4]),
+        int(date_key[4:6]),
+        int(date_key[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
     lines = []
     for idx in range(rows):
+        offset = idx
+        if gap_after is not None and idx > gap_after:
+            offset += gap_minutes
+        ts = start + timedelta(minutes=offset)
         lines.append(
             (
                 "{"
                 f'"ticker": "{ticker}", '
-                f'"ts_close": "{date_key[:4]}-{date_key[4:6]}-{date_key[6:]}T09:{idx:02d}:00+09:00", '
+                f'"ts_close": "{ts.isoformat()}", '
                 '"close": 1'
                 "}\n"
             )
@@ -36,18 +62,18 @@ def test_select_dates_requires_valid_bar_artifacts_for_all_tickers(tmp_path):
     artifacts = tmp_path / "data"
     tickers = ["005930", "105560"]
 
-    _write_jsonl(artifacts / "005930" / "bars_1m_20260514.jsonl", 2)
-    _write_jsonl(artifacts / "105560" / "bars_1m_20260514.jsonl", 3)
-    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 3)
-    _write_jsonl(artifacts / "105560" / "bars_1m_20260515.jsonl", 3)
-    _write_jsonl(artifacts / "105560" / "unrelated_20260513.jsonl", 3)
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260514.jsonl", 299)
+    _write_jsonl(artifacts / "105560" / "bars_1m_20260514.jsonl", 301)
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 301)
+    _write_jsonl(artifacts / "105560" / "bars_1m_20260515.jsonl", 301)
+    _write_jsonl(artifacts / "105560" / "unrelated_20260513.jsonl", 301)
 
     assert mod._select_dates(
         artifacts,
         tickers,
         end_date="20260515",
         business_days=10,
-        min_rows=3,
+        min_rows=300,
     ) == ["20260515"]
 
 
@@ -56,8 +82,8 @@ def test_select_dates_rejects_timestamp_ticker_and_duplicate_defects(tmp_path):
     artifacts = tmp_path / "data"
     tickers = ["005930", "105560"]
 
-    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 3)
-    _write_jsonl(artifacts / "105560" / "bars_1m_20260515.jsonl", 3)
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 301)
+    _write_jsonl(artifacts / "105560" / "bars_1m_20260515.jsonl", 301)
     bad = artifacts / "105560" / "bars_1m_20260515.jsonl"
     bad.write_text(
         (
@@ -73,7 +99,29 @@ def test_select_dates_rejects_timestamp_ticker_and_duplicate_defects(tmp_path):
         tickers,
         end_date="20260515",
         business_days=10,
-        min_rows=3,
+        min_rows=300,
+    ) == []
+
+
+def test_select_dates_rejects_large_intraday_gap(tmp_path):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    tickers = ["005930", "105560"]
+
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 301)
+    _write_jsonl(
+        artifacts / "105560" / "bars_1m_20260515.jsonl",
+        301,
+        gap_after=150,
+        gap_minutes=20,
+    )
+
+    assert mod._select_dates(
+        artifacts,
+        tickers,
+        end_date="20260515",
+        business_days=10,
+        min_rows=300,
     ) == []
 
 
@@ -124,7 +172,7 @@ def test_phase2_blocks_when_requested_artifact_dates_are_missing(
     tickers = ["005930", "105560"]
 
     for ticker in tickers:
-        _write_jsonl(artifacts / ticker / "bars_1m_20260515.jsonl", 3)
+        _write_jsonl(artifacts / ticker / "bars_1m_20260515.jsonl", 301)
 
     monkeypatch.setattr(mod, "_active_tickers", lambda: tickers)
     monkeypatch.setattr(
@@ -136,12 +184,12 @@ def test_phase2_blocks_when_requested_artifact_dates_are_missing(
     def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
         if key == "phase2_feature_backfill":
             return {
-                "min_rows_per_day": 3,
+                "min_rows_per_day": 300,
                 "min_dual_source_non_neutral_date_coverage": 0.0,
                 "min_exogenous_non_neutral_date_coverage": 0.0,
             }
         if key == "live_data_readiness":
-            return {"train_min_rows_per_day": 3}
+            return {"train_min_rows_per_day": 300}
         if key == "exogenous_features":
             return {"neutral_defaults": {}}
         return {}

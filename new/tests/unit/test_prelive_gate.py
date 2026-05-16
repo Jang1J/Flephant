@@ -128,6 +128,8 @@ def _write_parquet_day(
     rows: int = 301,
     row_ticker: str | None = None,
     ts_yyyymmdd: str | None = None,
+    gap_after: int | None = None,
+    gap_minutes: int = 0,
 ) -> None:
     import pandas as pd
 
@@ -144,9 +146,12 @@ def _write_parquet_day(
     )
     records = []
     for i in range(rows):
+        offset = i
+        if gap_after is not None and i > gap_after:
+            offset += gap_minutes
         records.append({
             "ticker": row_ticker or ticker,
-            "ts_close": (start + timedelta(minutes=i)).isoformat(),
+            "ts_close": (start + timedelta(minutes=offset)).isoformat(),
             "open": 1.0,
             "high": 1.0,
             "low": 1.0,
@@ -216,6 +221,49 @@ def test_80_day_artifact_gate_rejects_ticker_mismatch(monkeypatch, tmp_path):
     assert result["status"] == "BLOCKED"
     first = result["sample_missing_or_short"]["20260508"][0]
     assert first["ticker_matches"] is False
+
+
+def test_80_day_artifact_gate_rejects_morning_only_session_span(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", rows=300)
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["session_span_ok"] is False
+    assert first["session_span_minutes"] == 299.0
+
+
+def test_80_day_artifact_gate_rejects_large_intraday_gap(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=301,
+        gap_after=150,
+        gap_minutes=20,
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["max_gap_ok"] is False
+    assert first["max_gap_minutes"] == 21.0
 
 
 def test_latest_matching_report_skips_non_matching_and_bad_json(tmp_path):

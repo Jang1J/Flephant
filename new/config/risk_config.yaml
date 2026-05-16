@@ -926,6 +926,10 @@ cost_aware_retraining:
     min_expected_net_alpha_bps_from_service_policy: true
     require_phase2_non_neutral_coverage: true
     require_service_policy_replay_before_deploy: true
+  label_horizon_gate:
+    min_mean_net_bps: 2.5
+    min_positive_net_rate: 0.53
+    allow_warn_for_research_only: false
 
 # S4-4 추가 (2026-05-02) — Hot Path 성능 최적화
 # HotPathProfiler 단계별 SLA 임계값. 전체 p95 SSOT = quant_agent.latency_p95_target_ms.

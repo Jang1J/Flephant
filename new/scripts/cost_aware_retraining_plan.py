@@ -206,6 +206,30 @@ def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[
     return {}
 
 
+def _label_scan_pretraining_blockers(
+    *,
+    label_scan: dict[str, Any] | None,
+    final_window: dict[str, str | None],
+    final_tickers: list[str],
+) -> list[str]:
+    if not isinstance(label_scan, dict):
+        return ["label_horizon_scan_missing"]
+
+    data = label_scan.get("data") if isinstance(label_scan.get("data"), dict) else {}
+    blockers: list[str] = []
+    expected_start = final_window.get("start_date")
+    expected_end = final_window.get("end_date")
+    if expected_start and data.get("start_date") != expected_start:
+        blockers.append("label_horizon_scan_window_mismatch")
+    if expected_end and data.get("end_date") != expected_end:
+        blockers.append("label_horizon_scan_window_mismatch")
+    if final_tickers:
+        expected_ticker_count = len(final_tickers)
+        if int(data.get("ticker_count") or 0) != expected_ticker_count:
+            blockers.append("label_horizon_scan_ticker_mismatch")
+    return sorted(set(blockers))
+
+
 def build_retraining_plan(
     *,
     bundle_id: str,
@@ -225,10 +249,11 @@ def build_retraining_plan(
     final_window = _final_dataset_window()
     final_tickers = _final_training_tickers()
 
-    blockers: list[str] = []
+    pretraining_blockers: list[str] = []
+    predeploy_blockers: list[str] = []
     phase2_pass = (phase2 or {}).get("status") == "PASS"
     if not phase2_pass:
-        blockers.append("phase2_feature_backfill_not_pass")
+        pretraining_blockers.append("phase2_feature_backfill_not_pass")
 
     phase2_input_blocking = bool(phase2_input and phase2_input.get("status") != "PASS")
     phase2_input_superseded = bool(
@@ -237,14 +262,20 @@ def build_retraining_plan(
         and _is_newer(phase2_path, input_path)
     )
     if phase2_input_blocking and not phase2_input_superseded:
-        blockers.append("phase2_input_readiness_not_pass")
+        pretraining_blockers.append("phase2_input_readiness_not_pass")
     if (service or {}).get("status") != "PASS":
-        blockers.append("service_policy_replay_not_pass")
-    if not label_scan:
-        blockers.append("label_horizon_scan_missing")
+        predeploy_blockers.append("service_policy_replay_not_pass")
+    pretraining_blockers.extend(
+        _label_scan_pretraining_blockers(
+            label_scan=label_scan,
+            final_window=final_window,
+            final_tickers=final_tickers,
+        )
+    )
 
     objective_cfg = cfg.get("objective", {}) or {}
     active_horizon = label_cfg.get("horizon_bars")
+    active_target_col = label_cfg.get("target_col")
     active_horizon_report = _horizon_report(label_scan, active_horizon)
     best_horizon = (label_scan or {}).get("best_horizon")
     best_horizon_report = _horizon_report(label_scan, best_horizon)
@@ -254,8 +285,13 @@ def build_retraining_plan(
         target_col_override = "label_session_close_net_ret"
     else:
         target_col_override = f"label_{best_horizon}m_net_ret"
+    requires_label_ssot_update = bool(
+        target_col_override and str(target_col_override) != str(active_target_col)
+    )
+    if requires_label_ssot_update:
+        predeploy_blockers.append("label_ssot_update_required_before_prelive")
     plan = {
-        "status": "READY" if not blockers else "BLOCKED",
+        "status": "READY" if not pretraining_blockers else "BLOCKED",
         "generated_at": datetime.now(_KST).isoformat(),
         "bundle_id": bundle_id,
         "read_only": True,
@@ -311,6 +347,12 @@ def build_retraining_plan(
             "selection_gate": "trade_no_trade_or_expected_net_bps",
             "deploy_policy": "manual_review_then_c12_service_policy_replay",
             "do_not_auto_deploy": True,
+            "requires_label_ssot_update_before_prelive": requires_label_ssot_update,
+            "prelive_gate_expected": (
+                "BLOCKED_UNTIL_LABEL_SSOT_APPROVED"
+                if requires_label_ssot_update
+                else "NORMAL_GATE"
+            ),
         },
         "evidence": {
             "phase2_feature_backfill": {
@@ -339,11 +381,14 @@ def build_retraining_plan(
                 "deployable_label_recommendation": (
                     (label_scan or {}).get("deployable_label_recommendation")
                 ),
+                "data": (label_scan or {}).get("data", {}),
                 "active_horizon": active_horizon_report,
                 "best_horizon_report": best_horizon_report,
             },
         },
-        "blockers": sorted(set(blockers)),
+        "blockers": sorted(set(pretraining_blockers)),
+        "pretraining_blockers": sorted(set(pretraining_blockers)),
+        "predeploy_blockers": sorted(set(predeploy_blockers)),
         "next_commands": [
             _label_scan_command(
                 start_date=final_window["start_date"],

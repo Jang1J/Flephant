@@ -25,7 +25,7 @@ if str(SRC) not in sys.path:
 
 from src.data.dataset_builder import DatasetBuilder  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -122,12 +122,25 @@ def _cost_bps() -> float:
     )
 
 
-def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, float]:
-    pos_cfg = config_load("risk_config.yaml", "position_limits") or {}
-    min_confidence = float(pos_cfg.get("min_confidence", 0.0))
+def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, Any]:
+    cost_cfg = config_load("risk_config.yaml", "cost_aware_retraining") or {}
+    gate_cfg = cost_cfg.get("label_horizon_gate", {}) or {}
     return {
-        "min_mean_net_bps": float(total_cost_bps),
-        "min_positive_net_rate": min(1.0, 0.5 + min_confidence),
+        "min_mean_net_bps": safe_float(
+            gate_cfg.get("min_mean_net_bps"),
+            default=total_cost_bps,
+            min_value=0.0,
+        ),
+        "min_positive_net_rate": safe_float(
+            gate_cfg.get("min_positive_net_rate"),
+            default=1.0,
+            min_value=0.0,
+            max_value=1.0,
+        ),
+        "allow_warn_for_research_only": safe_bool(
+            gate_cfg.get("allow_warn_for_research_only"),
+            default=False,
+        ),
     }
 
 

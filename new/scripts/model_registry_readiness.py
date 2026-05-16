@@ -170,7 +170,7 @@ def build_report(
         checks["deploy_quality"] = {
             "status": "PASS" if deploy_quality else "WARN",
             "value": deploy_quality,
-            "metric_scope": metrics.get("metric_scope"),
+            "metric_scope": metadata.get("metric_scope") or metrics.get("metric_scope"),
         }
         if not deploy_quality:
             warnings.append("candidate_not_marked_deploy_quality")

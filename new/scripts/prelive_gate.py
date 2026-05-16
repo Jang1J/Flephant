@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_start_date,
     previous_kospi_trading_day,
 )
+from scripts.live_data_readiness import _inspect_bar_file as _inspect_live_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATA_ROOT = REPO_ROOT / "artifacts" / "data"
@@ -286,66 +287,33 @@ def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
             "valid_artifact": False,
             "reason": "missing_file",
         }
-    try:
-        df = pd.read_parquet(path)
-    except Exception as e:
-        return {
-            "ticker": ticker,
-            "rows": None,
-            "valid_artifact": False,
-            "reason": "read_error",
-            "error": str(e),
-        }
-
-    expected_date = f"{day[:4]}-{day[4:6]}-{day[6:]}"
-    timestamp_dates_match: bool | None = None
-    duplicate_ts_count: int | None = None
-    out_of_hours_count: int | None = None
-    for field in ("ts_close", "timestamp", "ts", "datetime"):
-        if field not in df.columns:
-            continue
-        raw_ts = df[field].astype(str)
-        dates = set(raw_ts.str.slice(0, 10).dropna().unique())
-        timestamp_dates_match = bool(dates) and dates == {expected_date}
-        parsed = pd.to_datetime(df[field], errors="coerce")
-        parsed_kst = parsed.dt.tz_convert(_KST) if getattr(parsed.dt, "tz", None) else parsed
-        valid_ts = parsed_kst.dropna()
-        ts_keys = valid_ts.astype(str)
-        duplicate_ts_count = int(len(ts_keys) - len(set(ts_keys)))
-        market_open = time(9, 0)
-        market_close = time(15, 30)
-        out_of_hours_count = int(
-            sum(
-                ts.time() < market_open or ts.time() > market_close
-                for ts in valid_ts
-            )
-        )
-        break
-
-    ticker_matches: bool | None = None
-    if "ticker" in df.columns:
-        tickers = {
-            pad_ticker(str(value))
-            for value in df["ticker"].dropna().astype(str).unique()
-        }
-        ticker_matches = bool(tickers) and tickers == {pad_ticker(ticker)}
-
+    inspection = _inspect_live_bar_file(path, day, pad_ticker(ticker), min_rows_per_day=300)
+    rows = inspection.get("rows")
     valid_artifact = (
-        timestamp_dates_match is True
-        and ticker_matches is True
-        and int(duplicate_ts_count or 0) == 0
-        and int(out_of_hours_count or 0) == 0
+        rows is not None
+        and inspection.get("timestamp_dates_match") is True
+        and inspection.get("ticker_matches") is True
+        and int(inspection.get("duplicate_ts_count") or 0) == 0
+        and int(inspection.get("out_of_hours_count") or 0) == 0
+        and inspection.get("session_span_ok") is True
+        and inspection.get("max_gap_ok") is True
     )
     reason = None if valid_artifact else "artifact_integrity_failed"
     return {
         "ticker": ticker,
-        "rows": int(len(df)),
+        "rows": rows,
         "valid_artifact": valid_artifact,
         "reason": reason,
-        "timestamp_dates_match": timestamp_dates_match,
-        "ticker_matches": ticker_matches,
-        "duplicate_ts_count": duplicate_ts_count,
-        "out_of_hours_count": out_of_hours_count,
+        "timestamp_dates_match": inspection.get("timestamp_dates_match"),
+        "ticker_matches": inspection.get("ticker_matches"),
+        "duplicate_ts_count": inspection.get("duplicate_ts_count"),
+        "out_of_hours_count": inspection.get("out_of_hours_count"),
+        "first_ts": inspection.get("first_ts"),
+        "last_ts": inspection.get("last_ts"),
+        "session_span_minutes": inspection.get("session_span_minutes"),
+        "session_span_ok": inspection.get("session_span_ok"),
+        "max_gap_minutes": inspection.get("max_gap_minutes"),
+        "max_gap_ok": inspection.get("max_gap_ok"),
         "path": _repo_relative(path),
     }
 

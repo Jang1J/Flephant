@@ -954,10 +954,32 @@ def run_train_if_ready(
     min_rows = _readiness_min_rows("train_min_rows_per_day")
     require_all = safe_bool(cfg.get("require_all_tickers_for_train", True), default=True)
     quality = _artifact_date_quality(tickers, start_date, end_date, min_rows)
+    requested_dates = list(quality.keys())
     if require_all:
         dates = sorted(day for day, item in quality.items() if item["is_valid"])
     else:
         dates = [d for d in _artifact_dates(tickers) if start_date <= d <= end_date]
+    invalid_requested_dates = [
+        day for day in requested_dates if day not in set(dates)
+    ]
+    if require_train and require_all and invalid_requested_dates:
+        return {
+            "status": "FAIL",
+            "reason": "invalid_requested_artifact_dates",
+            "available_dates": len(dates),
+            "required_dates": len(requested_dates),
+            "invalid_requested_date_count": len(invalid_requested_dates),
+            "invalid_requested_dates_sample": invalid_requested_dates[:10],
+            "first_date": dates[0] if dates else None,
+            "last_date": dates[-1] if dates else None,
+            "min_rows_per_day": min_rows,
+            "require_all_tickers": require_all,
+            "date_quality_sample": {
+                day: quality[day]
+                for day in invalid_requested_dates[:5]
+                if day in quality
+            },
+        }
     if len(dates) < min_dates:
         status = "FAIL" if require_train else "SKIP"
         return {
