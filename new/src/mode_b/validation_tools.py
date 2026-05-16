@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from src.utils.trading_calendar import kospi_trading_dates_between
 logger = get_logger("BacktestEngine")
 _KST = ZoneInfo("Asia/Seoul")
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
+_ALPHA_FACTOR_FEATURE_RE = re.compile(r"^alpha_factor_\d+$")
 
 # ────────────────────────────────────────────────────────────────────
 # C13 forbidden_callers 검증 (불변 원칙 3: Backtest Agent Mode B 전용)
@@ -85,6 +87,27 @@ class NaNInMetrics(BacktestError):
 class LeakageDetected(BacktestError):
     def __init__(self, detail: str = "") -> None:
         super().__init__("LEAKAGE_DETECTED", detail)
+
+
+def add_neutral_candidate_alpha_features(builder: Any, feature_cols: list[str]) -> list[str]:
+    """Mirror NightlyLGBMRetrainer's neutral alpha-factor feature staging."""
+    alpha_cols = sorted({
+        str(col)
+        for col in feature_cols
+        if _ALPHA_FACTOR_FEATURE_RE.fullmatch(str(col))
+    })
+    if not alpha_cols:
+        return []
+    if hasattr(builder, "add_neutral_feature_columns"):
+        builder.add_neutral_feature_columns(alpha_cols)
+        return alpha_cols
+
+    existing = [str(col) for col in getattr(builder, "_neutral_feature_cols", []) or []]
+    for col in alpha_cols:
+        if col not in existing:
+            existing.append(col)
+    setattr(builder, "_neutral_feature_cols", existing)
+    return alpha_cols
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -873,6 +896,7 @@ class BacktestEngine:
             builder = DatasetBuilder(
                 artifacts_dir=self._artifacts_root / "data",
             )
+            add_neutral_candidate_alpha_features(builder, feature_cols)
             panel = self._build_replay_panel(builder, universe, start_date, end_date)
             target_col = self._candidate_target_col(candidate_artifact, builder.target_col)
             if target_col != builder.target_col:

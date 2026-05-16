@@ -26,6 +26,7 @@ from src.mode_b.validation_tools import (
     BundleLoadFailed,
     DataUnavailable,
     NaNInMetrics,
+    add_neutral_candidate_alpha_features,
 )
 from src.mode_b.service_policy_verifier import (
     normalize_service_policy_universe,
@@ -174,6 +175,7 @@ class ServicePolicyReplayEngine:
         from src.data.dataset_builder import DatasetBuilder
 
         builder = DatasetBuilder(artifacts_dir=self._artifacts_root / "data")
+        add_neutral_candidate_alpha_features(builder, feature_cols)
         panel = self._engine._build_replay_panel(
             builder,
             active_universe,

@@ -221,6 +221,63 @@ def test_replay_panel_includes_manifest_side_features() -> None:
     assert "ts_close" not in panel.columns
 
 
+def test_real_bar_replay_materializes_neutral_alpha_factor_features(monkeypatch, tmp_path):
+    """C12 real-bar replay도 active alpha factor 후보 컬럼을 neutral feature로 맞춘다."""
+    import pandas as pd
+
+    class _Builder:
+        target_col = "label_5m_ret"
+        _ds_enabled_for_lgbm = False
+        _exog_enabled_for_lgbm = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            self._neutral_feature_cols: list[str] = []
+
+        def add_neutral_feature_columns(self, columns: list[str]) -> None:
+            self._neutral_feature_cols.extend(columns)
+
+        def _load_ticker_bars(self, ticker, start_date, end_date):
+            _ = start_date, end_date
+            return pd.DataFrame(
+                {
+                    "ticker": [ticker],
+                    "ts_close": [pd.Timestamp("2026-01-12 09:00:00", tz="Asia/Seoul")],
+                    "close": [100.0],
+                }
+            )
+
+        def _compute_rolling_features(self, raw):
+            raw = raw.copy()
+            raw["feature_score"] = 3.0
+            return raw
+
+        def _generate_labels(self, with_feats):
+            with_feats = with_feats.copy()
+            with_feats["label_5m_ret"] = 0.01
+            return with_feats
+
+        def _join_neutral_feature_columns(self, panel):
+            panel = panel.copy()
+            for col in self._neutral_feature_cols:
+                panel[col] = 0.0
+            return panel
+
+    monkeypatch.setattr("src.data.dataset_builder.DatasetBuilder", _Builder)
+    engine = _make_engine(artifacts_root=tmp_path)
+
+    result = engine._run_single_fold_real_bars(
+        fold={"fold_idx": 0, "test_trading_dates": ["20260112"]},
+        universe=["005930"],
+        model_callable=lambda features: features[0] + features[1],
+        feature_cols=["feature_score", "alpha_factor_0"],
+        candidate_artifact={"metadata": {"target_col": "label_5m_ret"}},
+    )
+
+    assert result["bar_count"] == 1
+    assert result["predicted_signals"] == [3.0]
+
+
 def test_service_policy_expected_date_range_uses_first_test_fold() -> None:
     from datetime import datetime
 

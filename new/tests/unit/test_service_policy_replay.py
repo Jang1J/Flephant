@@ -353,6 +353,79 @@ def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:
     assert result["orders"][0]["ticker"] == "005930"
 
 
+def test_run_materializes_neutral_alpha_factor_features(monkeypatch) -> None:
+    """service-policy replay는 active alpha factor 후보 컬럼을 neutral feature로 맞춘다."""
+
+    class _FakeBuilder:
+        target_col = "label_5m_ret"
+        _ds_enabled_for_lgbm = False
+        _exog_enabled_for_lgbm = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            self._neutral_feature_cols: list[str] = []
+
+        def add_neutral_feature_columns(self, columns: list[str]) -> None:
+            self._neutral_feature_cols.extend(columns)
+
+        def _load_ticker_bars(self, ticker, start_date, end_date):
+            _ = start_date, end_date
+            return pd.DataFrame(
+                {
+                    "ticker": [ticker],
+                    "ts_close": [pd.Timestamp("2026-05-01 09:00:00", tz="Asia/Seoul")],
+                    "close": [100.0],
+                }
+            )
+
+        def _compute_rolling_features(self, raw):
+            raw = raw.copy()
+            raw["feature_score"] = 3.0
+            return raw
+
+        def _generate_labels(self, with_feats):
+            with_feats = with_feats.copy()
+            with_feats["label_5m_ret"] = 0.01
+            return with_feats
+
+        def _join_neutral_feature_columns(self, panel):
+            panel = panel.copy()
+            for col in self._neutral_feature_cols:
+                panel[col] = 0.0
+            return panel
+
+    class _FakeEngine:
+        def _resolve_candidate_model(self, bundle_id: str):
+            assert bundle_id == "BUNDLE-ALPHA"
+            return _model, 2, {
+                "feature_cols": ["feature_score", "alpha_factor_0"],
+                "metadata": {"version": "v-alpha", "target_col": "label_5m_ret"},
+                "metadata_path": "",
+            }
+
+        def _build_replay_panel(self, builder, universe, start_date, end_date):
+            from src.mode_b.validation_tools import BacktestEngine
+
+            assert "alpha_factor_0" in builder._neutral_feature_cols
+            return BacktestEngine._build_replay_panel(builder, universe, start_date, end_date)
+
+    monkeypatch.setattr("src.data.dataset_builder.DatasetBuilder", _FakeBuilder)
+    engine = ServicePolicyReplayEngine(
+        engine=_FakeEngine(),
+        policy=_policy(min_expected_net_alpha_bps=0.0),
+    )
+
+    result = engine.run(
+        "BUNDLE-ALPHA",
+        start_date="20260501",
+        end_date="20260501",
+        universe=["005930"],
+    )
+
+    assert result["signal_quality"]["prediction_count"] == 1
+    assert result["orders"][0]["ticker"] == "005930"
+
+
 def test_explicit_replay_window_fails_closed_after_pit_snapshot() -> None:
     from src.mode_b.validation_tools import DataUnavailable
 
