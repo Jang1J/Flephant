@@ -237,8 +237,12 @@ class ExecutionGateway:
                         order_plan_id, decision_id, order_deltas, t0,
                     )
         else:
-            raise ExecutionModeError(
-                f"invalid execution_mode={self._mode}"
+            report = self._rejected(
+                order_plan_id,
+                decision_id,
+                f"invalid execution_mode={self._mode}",
+                order_deltas,
+                t0,
             )
 
         # 4. Audit log. Rejected reports already emit execution_rejected in _rejected().

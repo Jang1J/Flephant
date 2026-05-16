@@ -210,11 +210,13 @@ class FakeHotRunner:
         )
         self.qty = qty
         self.approved = approved
+        self.calls: list[dict[str, Any]] = []
 
     def start(self) -> None:
         self.state = SimpleNamespace(value="HOT_RUNNING")
 
-    def run_once(self, **_: Any) -> dict[str, Any]:
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
         return {
             "final_decision": {
                 "decision_id": "FDA-TEST",
@@ -301,9 +303,10 @@ def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
 
 def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
     trader = PaperAutoTrader(
         kis_client=client,
-        hot_runner=FakeHotRunner(qty=1),
+        hot_runner=hot_runner,
         report_dir=tmp_path,
         now_fn=_paper_session_now,
     )
@@ -328,6 +331,12 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
     assert cycle["order_history_verification"]["status"] == "PASS"
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
+    assert hot_runner.calls[0]["dependency_status"] == {
+        "news": "skipped",
+        "risk": "done",
+        "quant": "done",
+        "debate": "skipped",
+    }
 
 
 def test_paper_auto_respects_active_kill_switch(tmp_path: Path) -> None:

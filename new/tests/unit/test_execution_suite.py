@@ -1217,6 +1217,31 @@ def test_execute_rejects_non_list_order_deltas(gateway: ExecutionGateway) -> Non
     assert "order_deltas_must_be_list" in result["execution_report"]["rejection_reason"]
 
 
+def test_execute_rejects_invalid_mode_without_raise(tmp_path: Path) -> None:
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        mode_override="invalid_mode",
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "buy",
+                "qty": 1,
+                "price": 70000.0,
+                "reason": "rebalance",
+            }
+        ],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert result["execution_report"]["rejection_reason"] == "invalid execution_mode=invalid_mode"
+
+
 def test_execute_mock_rejects_invalid_order_delta(gateway: ExecutionGateway) -> None:
     fd = _final_decision(
         approved=True,

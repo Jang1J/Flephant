@@ -222,6 +222,12 @@ class PaperAutoTrader:
             portfolio_value=portfolio_value,
             asof=started_at,
             recent_bars=bars_by_ticker,
+            dependency_status={
+                "news": "skipped",
+                "risk": "done",
+                "quant": "done",
+                "debate": "skipped",
+            },
         )
 
         if hot_result.get("skipped"):

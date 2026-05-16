@@ -64,6 +64,10 @@ class BarBuffer:
         필수 필드 검증: ticker, ts_close, open, high, low, close, volume.
         누락 시 ValueError.
         """
+        if not isinstance(bar, dict):
+            raise ValueError(
+                f"BarBuffer.push: bar must be dict. got={type(bar).__name__}"
+            )
         missing = _REQUIRED_FIELDS - bar.keys()
         if missing:
             raise ValueError(

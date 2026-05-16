@@ -371,6 +371,26 @@ def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     assert len(result["bar_errors"]) == 1
 
 
+def test_run_once_non_dict_bar_survives(runner: HotRunner) -> None:
+    """non-dict bar도 AttributeError crash 대신 bar_errors로 흡수한다."""
+    runner.start()
+    bars = [
+        _make_bar("005930", 50000.0, 0),
+        None,
+        _make_bar("005930", 50100.0, 1),
+    ]
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,  # type: ignore[list-item]
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["n_bars_consumed"] == 2
+    assert len(result["bar_errors"]) == 1
+    assert "bar must be dict" in result["bar_errors"][0]
+
+
 def test_run_once_malformed_numeric_bar_fails_closed(runner: HotRunner) -> None:
     """숫자 필드가 깨진 warm buffer도 루프 raise 대신 structured veto로 닫는다."""
     runner.start()
