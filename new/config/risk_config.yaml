@@ -173,6 +173,7 @@ event_admission:
   comparator_sort_key: ["priority", "trigger_type", "scope", "recency"]
   dedupe_ttl_sec: 300          # dedupe cache TTL (5분)
   dead_letter_path: "artifacts/dead_letter.jsonl"   # C11 dead_letter_log 경로
+  dead_letter_retention_days: 30   # C11 dead_letter_log.retention_days
 
 llm_budget:
   kanana_daily_limit: 100        # Kanana-o 일일 호출 한도

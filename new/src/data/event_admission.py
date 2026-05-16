@@ -9,13 +9,13 @@ import heapq
 import json
 import time as time_module
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_int
 
 logger = get_logger("event_admission")
 
@@ -87,14 +87,17 @@ class EventAdmission:
         self._dead_letter_path: Path = Path(
             dead_letter_path or cfg.get("dead_letter_path", "artifacts/dead_letter.jsonl")
         )
+        self._dead_letter_retention_days: int = safe_int(
+            cfg.get("dead_letter_retention_days", cfg.get("retention_days")),
+            default=30,
+            min_value=0,
+        )
         self._dead_letter_path.parent.mkdir(parents=True, exist_ok=True)
 
         # In-memory dedupe cache: {event_id: expiry_epoch}
         self._seen: dict[str, float] = {}
-        # supersedes cache: 이미 처리된 event_id 집합 (무기한 유지, 재처리 방지)
-        self._seen_supersedes: set[str] = set()
-        # TODO(Sprint4): 장기 운영 시 메모리 bound. TTL 기반 eviction 추가 검토.
-        # 현 실용 상한: 분당 10건 × 6.5시간 = ~3900 entry/day, 단일 거래일 수용 가능.
+        # supersedes cache: {event_id: expiry_epoch}
+        self._seen_supersedes: dict[str, float] = {}
 
         # Priority Queue (heapq, lowest sort_key = highest priority)
         self._backlog: list[_PrioritizedEvent] = []
@@ -180,8 +183,9 @@ class EventAdmission:
 
         # dedupe cache 등록
         if event_id:
-            self._seen[event_id] = now_epoch + self._dedupe_ttl_sec
-            self._seen_supersedes.add(event_id)
+            expiry_epoch = now_epoch + self._dedupe_ttl_sec
+            self._seen[event_id] = expiry_epoch
+            self._seen_supersedes[event_id] = expiry_epoch
 
         self._recent_admitted_ts.append(now_epoch)
         logger.info("허용: event_id=%s priority=%s", event_id, event.get("priority", "unknown"))
@@ -218,6 +222,11 @@ class EventAdmission:
         expired = [eid for eid, exp in self._seen.items() if exp <= now_epoch]
         for eid in expired:
             del self._seen[eid]
+        expired_supersedes = [
+            eid for eid, exp in self._seen_supersedes.items() if exp <= now_epoch
+        ]
+        for eid in expired_supersedes:
+            del self._seen_supersedes[eid]
 
     def _compute_sort_key(self, event: dict) -> tuple:
         """comparator sort key 생성.
@@ -258,11 +267,41 @@ class EventAdmission:
 
         return (priority_rank, trigger_rank, scope_rank, recency_neg)
 
+    def _prune_dead_letter(self) -> None:
+        """C11 retention_days 초과 dead_letter JSONL 라인 제거."""
+        if self._dead_letter_retention_days <= 0 or not self._dead_letter_path.exists():
+            return
+        cutoff = datetime.now(_KST) - timedelta(days=self._dead_letter_retention_days)
+        kept: list[str] = []
+        pruned = 0
+        try:
+            lines = self._dead_letter_path.read_text(encoding="utf-8").splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = datetime.fromisoformat(str(entry.get("timestamp") or ""))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=_KST)
+                except Exception as e:
+                    _ = e
+                    kept.append(line)
+                    continue
+                if ts >= cutoff:
+                    kept.append(line)
+                else:
+                    pruned += 1
+            if pruned:
+                payload = "\n".join(kept)
+                if payload:
+                    payload += "\n"
+                self._dead_letter_path.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            logger.warning("dead_letter retention 정리 실패: err=%s", e)
+
     def _write_dead_letter(self, event: dict, reason: str) -> None:
         """C11 format 준수: {timestamp, event_id, drop_reason, original_event_ref}
-
-        # TODO(Sprint4-DQR): C11 dead_letter_log.retention_days=30 enforcement.
-        # 현재는 append-only. Sprint 4 DQR (Data Quality Run) 에서 30일 초과 라인 purge.
         """
         entry = {
             "timestamp": datetime.now(_KST).isoformat(),
@@ -271,6 +310,7 @@ class EventAdmission:
             "original_event_ref": event.get("raw_payload_ref") or event.get("event_id"),
         }
         try:
+            self._prune_dead_letter()
             with open(self._dead_letter_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:

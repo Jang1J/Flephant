@@ -37,6 +37,7 @@ def _cfg(overrides: dict | None = None) -> dict:
             "comparator_sort_key": ["priority", "trigger_type", "scope", "recency"],
             "dedupe_ttl_sec": 5,   # 테스트에서 짧은 TTL 사용
             "dead_letter_path": "artifacts/dead_letter.jsonl",
+            "dead_letter_retention_days": 30,
         }
     }
     if overrides:
@@ -133,6 +134,18 @@ def test_supersedes_blocks_reprocess(tmp_path: Path) -> None:
 
     lines = (tmp_path / "dl.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert any(json.loads(l)["drop_reason"] == "SUPERSEDED" for l in lines)
+
+
+def test_supersedes_ttl_expiry_allows_reference_again(tmp_path: Path) -> None:
+    cfg = _cfg({"dedupe_ttl_sec": 0})
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    original = _make_event(event_id="EVT-ORIG-TTL")
+    later = _make_event(event_id="EVT-LATER-TTL", supersedes="EVT-ORIG-TTL")
+
+    assert ea.admit(original) is True
+    assert ea.admit(later) is True
+    assert ea.backlog_size() == 2
 
 
 # ------------------------------------------------------------------
@@ -318,6 +331,44 @@ def test_dead_letter_log_jsonl_format(tmp_path: Path, _enable_stale_check) -> No
     datetime.fromisoformat(entry["timestamp"])
 
 
+def test_dead_letter_retention_prunes_old_entries(
+    tmp_path: Path,
+    _enable_stale_check,
+) -> None:
+    path = tmp_path / "dl.jsonl"
+    old_ts = (datetime.now(_KST) - timedelta(days=31)).isoformat()
+    recent_ts = (datetime.now(_KST) - timedelta(days=1)).isoformat()
+    path.write_text(
+        "\n".join([
+            json.dumps({
+                "timestamp": old_ts,
+                "event_id": "EVT-OLD",
+                "drop_reason": "STALE",
+                "original_event_ref": "EVT-OLD",
+            }, ensure_ascii=False),
+            json.dumps({
+                "timestamp": recent_ts,
+                "event_id": "EVT-RECENT",
+                "drop_reason": "STALE",
+                "original_event_ref": "EVT-RECENT",
+            }, ensure_ascii=False),
+            "{malformed-json",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    cfg = _cfg({"dead_letter_retention_days": 30})
+    ea = EventAdmission(config=cfg, dead_letter_path=path)
+
+    past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
+    assert ea.admit(_make_event(event_id="EVT-NEW", expires_at=past_expires)) is False
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert all("EVT-OLD" not in line for line in lines)
+    assert any("EVT-RECENT" in line for line in lines)
+    assert any("malformed-json" in line for line in lines)
+    assert any("EVT-NEW" in line for line in lines)
+
+
 # ------------------------------------------------------------------
 # 11. config YAML 연동 (실제 risk_config.yaml 로드)
 # ------------------------------------------------------------------
@@ -334,11 +385,13 @@ def test_config_loads_from_yaml(tmp_path: Path) -> None:
     assert ea_cfg.get("max_cold_path_jobs_per_minute") == 10
     assert ea_cfg.get("dedupe_ttl_sec") == 300
     assert ea_cfg.get("dead_letter_path") == "artifacts/dead_letter.jsonl"
+    assert ea_cfg.get("dead_letter_retention_days") == 30
 
     # EventAdmission 실제 인스턴스화
     ea = EventAdmission(dead_letter_path=tmp_path / "dl.jsonl")
     assert ea._max_backlog == 3
     assert ea._dedupe_ttl_sec == 300
+    assert ea._dead_letter_retention_days == 30
 
 
 # ------------------------------------------------------------------
