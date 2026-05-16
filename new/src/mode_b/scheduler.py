@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -139,6 +138,7 @@ class ModeBScheduler:
         deployer: Any = None,
         llm_router: Any = None,
         backtest_agent: Any = None,
+        dqr_skip_pit_guard_for_tests: bool = False,
     ) -> None:
         cfg = config_load("risk_config.yaml", "mode_b_scheduler") or {}
         self._stage_timeouts: dict[str, int] = cfg.get("stage_timeouts", {})
@@ -149,6 +149,10 @@ class ModeBScheduler:
         self._deployer = deployer
         self._llm_router = llm_router
         self._backtest_agent = backtest_agent
+        self._dqr_skip_pit_guard_for_tests = safe_bool(
+            dqr_skip_pit_guard_for_tests,
+            default=False,
+        )
         self._bundle_id: str | None = None
         self._current_verdict: str | None = None
         self._current_regression_risk: dict[str, Any] | None = None
@@ -463,8 +467,10 @@ class ModeBScheduler:
             from src.dqr.dqr_runner import DQRRunner
 
             runner = DQRRunner()
-            _test_pit_skip = os.getenv("ELEPHANT_TEST_PIT_SKIP") == "1"
-            report = runner.run_daily(date=date, skip_pit_guard=_test_pit_skip)
+            report = runner.run_daily(
+                date=date,
+                skip_pit_guard=self._dqr_skip_pit_guard_for_tests,
+            )
             output_path = runner.save_report(report)
             alerts = report.get("alerts", [])
             critical_alerts = [a for a in alerts if a.get("severity") == "CRITICAL"]

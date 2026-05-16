@@ -551,7 +551,10 @@ class E2EScenarioRunner:
 
         sm.transition(PipelineState.MODE_B_EVOLVING)
         bundle_id = generate_bundle_id()
-        scheduler = ModeBScheduler(state_machine=sm)
+        scheduler = ModeBScheduler(
+            state_machine=sm,
+            dqr_skip_pit_guard_for_tests=self._short_mode,
+        )
         scheduler._bundle_id = bundle_id
 
         if self._short_mode:

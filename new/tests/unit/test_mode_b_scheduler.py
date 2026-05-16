@@ -89,7 +89,10 @@ def scheduler(tmp_audit_path: Path, mock_state_machine, monkeypatch):
     with patch("src.mode_b.scheduler.config_load", return_value=cfg):
         from src.mode_b.scheduler import ModeBScheduler
 
-        s = ModeBScheduler(state_machine=mock_state_machine)
+        s = ModeBScheduler(
+            state_machine=mock_state_machine,
+            dqr_skip_pit_guard_for_tests=True,
+        )
     return s
 
 
@@ -209,6 +212,85 @@ def test_scheduler_init_loads_timeouts(scheduler):
         "stage_1", "stage_2", "stage_3", "stage_4", "stage_5", "stage_6", "stage_7"
     }
     assert expected_keys == set(timeouts.keys())
+
+
+def test_stage_0_env_var_alone_does_not_skip_dqr_pit_guard(
+    tmp_audit_path,
+    mock_state_machine,
+    monkeypatch,
+):
+    """ELEPHANT_TEST_PIT_SKIP=1만으로는 DQR PIT guard를 우회하지 않는다."""
+    monkeypatch.setenv("ELEPHANT_TEST_PIT_SKIP", "1")
+    captured: dict[str, object] = {}
+
+    class FakeDQRRunner:
+        def run_daily(self, *, date, skip_pit_guard=False):
+            captured["date"] = date
+            captured["skip_pit_guard"] = skip_pit_guard
+            return {"alerts": []}
+
+        def save_report(self, report):
+            captured["report"] = report
+            return tmp_audit_path.parent / "dqr.json"
+
+    cfg = {
+        "stage_timeouts": {},
+        "audit_log_path": str(tmp_audit_path),
+    }
+    fake_dqr_module = MagicMock()
+    fake_dqr_module.DQRRunner = MagicMock(return_value=FakeDQRRunner())
+
+    with patch("src.mode_b.scheduler.config_load", return_value=cfg), patch.dict(
+        "sys.modules",
+        {"src.dqr.dqr_runner": fake_dqr_module},
+    ):
+        from src.mode_b.scheduler import ModeBScheduler
+
+        s = ModeBScheduler(state_machine=mock_state_machine)
+        result = s.stage_0_dqr("2026-04-27")
+
+    assert result["status"] == "done"
+    assert captured["skip_pit_guard"] is False
+
+
+def test_stage_0_explicit_test_injection_skips_dqr_pit_guard(
+    tmp_audit_path,
+    mock_state_machine,
+):
+    """명시적 test-only 생성자 주입 시에만 DQR PIT guard 우회가 전달된다."""
+    captured: dict[str, object] = {}
+
+    class FakeDQRRunner:
+        def run_daily(self, *, date, skip_pit_guard=False):
+            captured["date"] = date
+            captured["skip_pit_guard"] = skip_pit_guard
+            return {"alerts": []}
+
+        def save_report(self, report):
+            captured["report"] = report
+            return tmp_audit_path.parent / "dqr.json"
+
+    cfg = {
+        "stage_timeouts": {},
+        "audit_log_path": str(tmp_audit_path),
+    }
+    fake_dqr_module = MagicMock()
+    fake_dqr_module.DQRRunner = MagicMock(return_value=FakeDQRRunner())
+
+    with patch("src.mode_b.scheduler.config_load", return_value=cfg), patch.dict(
+        "sys.modules",
+        {"src.dqr.dqr_runner": fake_dqr_module},
+    ):
+        from src.mode_b.scheduler import ModeBScheduler
+
+        s = ModeBScheduler(
+            state_machine=mock_state_machine,
+            dqr_skip_pit_guard_for_tests=True,
+        )
+        result = s.stage_0_dqr("2026-04-27")
+
+    assert result["status"] == "done"
+    assert captured["skip_pit_guard"] is True
 
 
 def test_stage_4_passes_final_dataset_gate_to_lgbm(scheduler, monkeypatch):
