@@ -266,6 +266,26 @@ def test_train_accepts_cost_aware_target_override(
     assert metadata["target_horizon_kind"] == "session_close"
 
 
+def test_train_blocks_production_active_write_without_explicit_approval(
+    trainer_small: LGBMTrainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """production registry active/latest 저장은 direct API에서도 명시 승인 없이는 차단한다."""
+    monkeypatch.setattr(
+        trainer_module,
+        "_PRODUCTION_LGBM_DIR",
+        trainer_small.registry.base_dir,
+    )
+
+    with pytest.raises(RuntimeError, match="production registry active/latest"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="baseline",
+        )
+
+
 def test_cli_blocks_target_override_on_production_registry() -> None:
     """cost-aware 실험 label은 명시 research registry 없이 CLI에서 production에 저장하지 않는다."""
     result = trainer_module.main(
@@ -280,6 +300,24 @@ def test_cli_blocks_target_override_on_production_registry() -> None:
             "cost-aware",
             "--target-col-override",
             "label_session_close_net_ret",
+        ]
+    )
+
+    assert result == 1
+
+
+def test_cli_blocks_production_active_write_without_bundle() -> None:
+    """CLI production 기본 registry에는 bundle_id 없는 active/latest 저장을 차단한다."""
+    result = trainer_module.main(
+        [
+            "--tickers",
+            "005930",
+            "--start",
+            "20260101",
+            "--end",
+            "20260107",
+            "--version",
+            "baseline",
         ]
     )
 

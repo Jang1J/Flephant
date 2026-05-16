@@ -82,10 +82,12 @@ class LGBMTrainer:
         dataset_builder: DatasetBuilder | None = None,
         splitter: WalkForwardSplitter | None = None,
         registry: ModelRegistry | None = None,
+        allow_production_active_write: bool = False,
     ) -> None:
         self.builder = dataset_builder or DatasetBuilder()
         self.splitter = splitter or WalkForwardSplitter()
         self.registry = registry or ModelRegistry()
+        self._allow_production_active_write = bool(allow_production_active_write)
 
         self.feature_cols: list[str] = _load_feature_cols()
         # target_col / top_k_fraction은 yaml 경유 (불변 원칙 5).
@@ -130,6 +132,15 @@ class LGBMTrainer:
                 resolved_bundle_id,
             )
             effective_is_latest = False
+        if (
+            effective_is_latest
+            and self._uses_production_registry()
+            and not self._allow_production_active_write
+        ):
+            raise RuntimeError(
+                "production registry active/latest write는 명시 승인 없이는 차단됨. "
+                "bundle_id 후보 저장 또는 allow_production_active_write=True 필요"
+            )
 
         start_date_norm = self._normalize_yyyymmdd(start_date)
         end_date_norm = self._normalize_yyyymmdd(end_date)
@@ -337,6 +348,13 @@ class LGBMTrainer:
         if target == "label_session_close_ret" or target == "label_session_close_net_ret":
             return 0, "session_close"
         return int(default_horizon), "unknown"
+
+    def _uses_production_registry(self) -> bool:
+        base_dir = Path(getattr(self.registry, "base_dir", ""))
+        try:
+            return base_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
+        except OSError:
+            return base_dir == _PRODUCTION_LGBM_DIR
 
     def _train_fold(
         self,
@@ -591,6 +609,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="target_col_override를 production artifacts/lgbm에 쓰는 것을 명시 허용",
     )
+    p.add_argument(
+        "--allow-production-active-write",
+        action="store_true",
+        help="bundle_id 없는 active/latest production 저장을 명시 허용",
+    )
     return p.parse_args(argv)
 
 
@@ -624,8 +647,22 @@ def main(argv: list[str] | None = None) -> int:
             "--registry-dir artifacts/lgbm_research/... 또는 --allow-production-candidate-write 필요"
         )
         return 1
+    if (
+        not args.bundle_id
+        and _uses_production_registry(registry_dir)
+        and not bool(args.allow_production_active_write)
+    ):
+        logger.error(
+            "[lgbm_trainer] production active/latest 저장은 명시 승인 없이는 차단됨. "
+            "--bundle-id 또는 --registry-dir artifacts/lgbm_research/... 또는 "
+            "--allow-production-active-write 필요"
+        )
+        return 1
     registry = ModelRegistry(artifacts_dir=registry_dir) if registry_dir is not None else None
-    trainer = LGBMTrainer(registry=registry)
+    trainer = LGBMTrainer(
+        registry=registry,
+        allow_production_active_write=bool(args.allow_production_active_write),
+    )
     try:
         result = trainer.train(
             tickers=tickers,
