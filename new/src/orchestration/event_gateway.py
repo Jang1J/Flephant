@@ -170,6 +170,13 @@ class EventGateway:
         publish_message = result.get("message") if isinstance(result, dict) else None
         if not isinstance(publish_message, dict):
             publish_message = result if isinstance(result, dict) else None
+        if isinstance(publish_message, dict):
+            for trace_key in ("event_id", "occurred_at", "asof", "supersedes"):
+                value = event.get(trace_key)
+                if value is not None and publish_message.get(trace_key) is None:
+                    publish_message[trace_key] = value
+                    if isinstance(result, dict) and result.get(trace_key) is None:
+                        result[trace_key] = value
         if (
             self._pubsub is not None
             and publish_channel is not None

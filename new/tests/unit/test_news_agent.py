@@ -214,6 +214,8 @@ class TestAnalyze:
             "title": "test",
             "summary": "test",
             "event_id": "E-1",
+            "occurred_at": "2026-04-20T09:30:00+09:00",
+            "asof": "2026-04-20T09:31:00+09:00",
         })
         assert result["channel"] == "news_signal"
         for key in ("cause_by", "sent_from", "priority", "action_type", "timestamp"):
@@ -222,6 +224,12 @@ class TestAnalyze:
         assert result["payload"]["confidence"] == pytest.approx(0.5)
         assert result["payload"]["scope"] == "ticker:005930"
         assert result["payload"]["ticker"] == "005930"
+        assert result["payload"]["event_id"] == "E-1"
+        assert result["payload"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert result["payload"]["asof"] == "2026-04-20T09:31:00+09:00"
+        assert result["message"]["event_id"] == "E-1"
+        assert result["message"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert result["message"]["asof"] == "2026-04-20T09:31:00+09:00"
 
     def test_analyze_tickers_string_uses_full_code(self):
         """event.tickers가 문자열이어도 첫 글자만 쓰지 않고 6자리 코드를 유지한다."""
@@ -247,14 +255,20 @@ class TestAnalyze:
             "title": "test",
             "summary": "test",
             "event_id": "E-cache",
+            "occurred_at": "2026-04-20T09:30:00+09:00",
+            "asof": "2026-04-20T09:31:00+09:00",
         }
 
         first = agent.analyze(event)
         second = agent.analyze(event)
 
         assert first["message"]["scope"] == "ticker:005930"
+        assert first["message"]["event_id"] == "E-cache"
         assert second["republished_from_cache"] is True
         assert second["message_id"] == "MSG-CACHED"
+        assert second["message"]["event_id"] == "E-cache"
+        assert second["message"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert second["message"]["asof"] == "2026-04-20T09:31:00+09:00"
         assert pubsub.publish.call_count == 2
 
     def test_analyze_cache_hit_treats_string_false_fallback_as_false(self):

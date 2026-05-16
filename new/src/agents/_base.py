@@ -141,6 +141,17 @@ class AgentBase:
         risk_level = payload.get("risk_level")
         if risk_level in _VALID_MESSAGE_RISK_LEVELS:
             message["risk_level"] = risk_level
+        for trace_key in (
+            "event_id",
+            "occurred_at",
+            "asof",
+            "supersedes",
+            "ttl",
+            "expires_at",
+            "evidence_ids",
+        ):
+            if trace_key in payload and payload.get(trace_key) is not None:
+                message[trace_key] = payload[trace_key]
         return message
 
     @staticmethod

@@ -142,6 +142,16 @@ def test_publish_malformed_timestamp_raises() -> None:
     assert pool.pool_size() == 0
 
 
+def test_publish_malformed_trace_asof_raises() -> None:
+    pool = _pool()
+    msg = _valid_msg(asof="not-a-datetime")
+
+    with pytest.raises(ValueError, match="MESSAGE_SCHEMA_INVALID: asof"):
+        pool.publish("news_signal", msg)
+
+    assert pool.pool_size() == 0
+
+
 def test_publish_valid_expires_at_still_publishes() -> None:
     pool = _pool()
     expires_at = (now_kst() + timedelta(minutes=5)).isoformat()

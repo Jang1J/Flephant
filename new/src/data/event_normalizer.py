@@ -195,6 +195,8 @@ class EventNormalizer:
             "pit_safe": pit_safe_result,
             "payload": partial.get("payload", {}),
         }
+        if snapshot_ts:
+            result["asof"] = snapshot_ts
         payload_ticker = result["payload"].get("ticker")
         scope = str(result["scope"])
         if payload_ticker:

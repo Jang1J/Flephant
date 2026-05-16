@@ -43,7 +43,8 @@ _MESSAGE_REQUIRED_FIELDS: frozenset[str] = frozenset({
 })
 _MESSAGE_OPTIONAL_FIELDS: frozenset[str] = frozenset({
     "message_id", "send_to", "evidence_ids", "uncertainty", "prediction",
-    "risk_level", "ttl", "expires_at", "event_id", "supersedes", "portfolio_patch_id",
+    "risk_level", "ttl", "expires_at", "event_id", "occurred_at", "asof",
+    "supersedes", "portfolio_patch_id",
 })
 
 # publish_channels SSOT (api_contracts.md message_taxonomy L57~72): 15개
@@ -190,6 +191,9 @@ class MessagePool:
         _parse_iso_datetime_field(message, "timestamp")
         if "expires_at" in message:
             _parse_iso_datetime_field(message, "expires_at")
+        for trace_ts_field in ("occurred_at", "asof"):
+            if trace_ts_field in message:
+                _parse_iso_datetime_field(message, trace_ts_field)
 
         # 2. message_id
         message_id = message.get("message_id") or generate_message_id()

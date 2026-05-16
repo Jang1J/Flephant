@@ -297,6 +297,45 @@ def test_dispatch_next_auto_publish_success(tmp_path: Path) -> None:
     assert active[0]["content"] == "뉴스 분석 결과"
 
 
+def test_dispatch_next_auto_publish_preserves_event_trace(tmp_path: Path) -> None:
+    """auto_publish 메시지는 원 이벤트의 event_id/occurred_at/asof를 보존한다."""
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+    asof = datetime.now(_KST).isoformat()
+
+    def news_handler(event: dict) -> dict:
+        return {
+            "content": "뉴스 분석 결과",
+            "cause_by": "NewsAgent",
+            "sent_from": "news_agent",
+            "priority": "normal",
+            "confidence": 0.8,
+            "reasoning": "뉴스 긍정 신호 감지",
+            "scope": "005930",
+            "action_type": "signal",
+            "timestamp": _recent_ts(),
+        }
+
+    gw.register_handler("dart", news_handler, publish_channel="news_signal")
+    admitted = gw.ingest(_dart_raw(), source="dart", asof=asof)
+    result = gw.dispatch_next()
+
+    assert result is not None
+    active = pool.get_active_messages("news_signal")
+    assert len(active) == 1
+    assert active[0]["event_id"] == admitted["event_id"]
+    assert active[0]["occurred_at"] == result["occurred_at"]
+    assert active[0]["asof"] == asof
+
+
 def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> None:
     """NewsAgent attach_to_gateway 결과가 EventGateway auto_publish C4 schema를 만족한다."""
     from src.agents.cold.news import NewsAgent
@@ -320,7 +359,8 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
     )
     NewsAgent(llm_router=router).attach_to_gateway(gw)
 
-    gw.ingest(
+    asof = datetime.now(_KST).isoformat()
+    admitted = gw.ingest(
         {
             "title": "삼성전자 호재",
             "summary": "영업이익 증가",
@@ -328,6 +368,7 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
             "ticker": "005930",
         },
         source="naver_news",
+        asof=asof,
     )
     result = gw.dispatch_next()
 
@@ -338,6 +379,9 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
     assert len(messages) == 1
     assert messages[0]["confidence"] == pytest.approx(0.82)
     assert messages[0]["scope"] == "ticker:005930"
+    assert messages[0]["event_id"] == admitted["event_id"]
+    assert messages[0]["occurred_at"] == result["occurred_at"]
+    assert messages[0]["asof"] == asof
 
 
 def test_news_agent_gateway_skips_fallback_neutral_publish(tmp_path: Path) -> None:

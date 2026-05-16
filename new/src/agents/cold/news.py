@@ -127,6 +127,10 @@ class NewsAgent(AgentBase):
                 "confidence": self._parse_confidence(payload.get("confidence", 0.5)),
                 **({"scope": payload["scope"]} if payload.get("scope") else {}),
                 **({"ticker": payload["ticker"]} if payload.get("ticker") else {}),
+                **({"event_id": payload["event_id"]} if payload.get("event_id") else {}),
+                **({"occurred_at": payload["occurred_at"]} if payload.get("occurred_at") else {}),
+                **({"asof": payload["asof"]} if payload.get("asof") else {}),
+                **({"supersedes": payload["supersedes"]} if payload.get("supersedes") else {}),
             },
             "agent": type(self).__name__,
             "ts": ts,
@@ -265,7 +269,11 @@ class NewsAgent(AgentBase):
             **parsed,
             "confidence": parsed_confidence,
             "scope": message_scope,
+            "event_id": event_id,
         }
+        for trace_key in ("occurred_at", "asof", "supersedes"):
+            if event.get(trace_key) is not None:
+                report_payload[trace_key] = event[trace_key]
         if ticker:
             report_payload["ticker"] = ticker
 
