@@ -137,6 +137,7 @@ paper_auto_trading:
 
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"
+  confirm_deploy_phrase: "DEPLOY_CANDIDATE_OK"
 
 bounded_execution:
   news_agent_max_sec: 10
@@ -275,7 +276,7 @@ backtest_agent:
       rehearsal_business_days: 80
       rationale: "80거래일 수집은 paper/flow rehearsal 전용이다. v1 실계좌 직전 C12/C14/deploy_quality PASS는 KIS retention probe로 확인된 20250509~20260515 30종목 1분봉 학습 메타데이터가 있어야만 허용한다. 10년 벤더 데이터는 v2 research 목표로 분리한다."
     on_pass:
-      human_approval_required: false
+      human_approval_required: true
       action: "deploy"
     on_warn:
       human_approval_required: true    # operator 수동 확인

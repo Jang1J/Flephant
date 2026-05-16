@@ -118,6 +118,7 @@ def _candidate_lgbm_metadata(bundle_id: str = _BUNDLE_ID) -> dict:
         "train_start": "2026-01-01",
         "train_end": "2026-05-01",
         "feature_cols": ["feat_a", "feat_b"],
+        "target_col": "label_5m_ret",
         "label_horizon_bars": 5,
         "label_generation_version": "session_local_v2",
         "label_session_scope": "ticker_trading_day",

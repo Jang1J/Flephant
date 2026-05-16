@@ -193,6 +193,8 @@ def test_deploy_candidate_treats_string_false_regression_flag_as_false(
     rc = deploy_candidate.main([
         "--bundle-id",
         "BUNDLE-TEST",
+        "--confirm-deploy",
+        "DEPLOY_CANDIDATE_OK",
         "--no-write-report",
     ])
 
@@ -200,3 +202,50 @@ def test_deploy_candidate_treats_string_false_regression_flag_as_false(
     assert rc == 0
     assert out["status"] == "PASS"
     assert captured["regression_risk"].flagged is False
+
+
+def test_deploy_candidate_blocks_non_dry_run_without_confirm_phrase(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    backtest_path = tmp_path / "backtest_BUNDLE-TEST_pass.json"
+    backtest_payload = {
+        "bundle_id": "BUNDLE-TEST",
+        "verdict": "pass",
+        "metrics": {"sr": 1.0},
+        "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+        "minute_bar_leakage_check": {"verdict": "pass"},
+        "feature_quality": {
+            "dual_source_rows": 100,
+            "dual_source_non_neutral_rows": 90,
+            "exogenous_rows": 100,
+            "exogenous_non_neutral_rows": 90,
+        },
+        "service_policy_replay": _service_policy_evidence(tmp_path, "BUNDLE-TEST"),
+        "candidate_model_metadata": _final_dataset_metadata(),
+    }
+    monkeypatch.setattr(
+        deploy_candidate,
+        "_latest_deployable_backtest",
+        lambda _: (backtest_path, backtest_payload),
+    )
+
+    class _FailIfCalled:
+        def deploy(self, **kwargs):
+            raise AssertionError("deploy should not be called without confirm phrase")
+
+    monkeypatch.setattr(deploy_candidate, "ModeBDeployer", _FailIfCalled)
+
+    rc = deploy_candidate.main([
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--no-write-report",
+    ])
+
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert out["status"] == "BLOCKED"
+    assert out["reason"] == "production_deploy_confirmation_required"
+    assert out["registry_mutated"] is False
+    assert out["live_trading_allowed"] is False
