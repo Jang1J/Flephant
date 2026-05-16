@@ -238,3 +238,88 @@ def test_phase2_blocks_when_requested_artifact_dates_are_missing(
     assert report["artifact_date_coverage"]["expected_date_count"] == 2
     assert report["artifact_date_coverage"]["missing_date_count"] == 1
     assert report["artifact_date_coverage"]["missing_dates_sample"] == ["20260514"]
+
+
+def test_phase2_blocks_sparse_feature_rows_for_final_universe(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    tickers = ["005930", "105560"]
+
+    for ticker in tickers:
+        _write_jsonl(artifacts / ticker / "bars_1m_20260515.jsonl", 301)
+
+    monkeypatch.setattr(mod, "_active_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        mod,
+        "_expected_artifact_dates",
+        lambda *, end_date, business_days: ["20260515"],
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "phase2_feature_backfill":
+            return {
+                "min_rows_per_day": 300,
+                "min_dual_source_non_neutral_date_coverage": 0.8,
+                "min_exogenous_non_neutral_date_coverage": 0.8,
+            }
+        if key == "live_data_readiness":
+            return {"train_min_rows_per_day": 300}
+        if key == "exogenous_features":
+            return {"neutral_defaults": {}}
+        return {}
+
+    exog_feature = mod.EXOGENOUS_FEATURES[0]
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(
+        mod,
+        "load_latest_scores",
+        lambda date_key: [
+            {
+                "ticker": "005930",
+                "news_score_t": 0.1,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.1,
+                "community_noise_multiplier": 1.0,
+            },
+            {
+                "ticker": "105560",
+                "news_score_t": 0.0,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.0,
+                "community_noise_multiplier": 1.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_exogenous_scores",
+        lambda date_key, feature_cols, defaults: (
+            {
+                "005930": {exog_feature: 1.0},
+                "105560": {exog_feature: 0.0},
+            },
+            {"status": "found", "record_count": 2},
+        ),
+    )
+
+    report = mod.run_phase2_feature_backfill(
+        end_date="20260515",
+        business_days=1,
+        write_neutral_placeholders=False,
+        artifacts_dir=artifacts,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "dual_source_non_neutral_row_coverage_below_threshold" in report["blockers"]
+    assert "exogenous_non_neutral_row_coverage_below_threshold" in report["blockers"]
+    assert report["coverage"]["dual_source_ticker_coverage"] == 1.0
+    assert report["coverage"]["exogenous_ticker_coverage"] == 1.0
+    assert report["coverage"]["dual_source_non_neutral_row_coverage"] == 0.5
+    assert report["coverage"]["exogenous_non_neutral_row_coverage"] == 0.5
