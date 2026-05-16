@@ -620,6 +620,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     valid_reports = [r for r in horizon_reports if r.get("valid_rows", 0)]
     best = _select_best_horizon_report(valid_reports)
     deployable = bool(best and best.get("status") == "PASS")
+    best_topk = best.get("label_topk") if isinstance(best, dict) else {}
+    if not isinstance(best_topk, dict):
+        best_topk = {}
+    research_trainable = bool(
+        best
+        and safe_float(best_topk.get("mean_net_bps"), default=-1e18)
+        >= thresholds["min_mean_net_bps"]
+        and safe_float(best_topk.get("positive_net_rate"), default=-1.0)
+        >= thresholds["min_positive_net_rate"]
+    )
     return {
         "status": "PASS" if deployable else "WARN",
         "action": "cost_aware_label_horizon_scan",
@@ -657,6 +667,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "note": "label_topk is label separability diagnostic, not model OOS PnL",
         },
         "deployable_label_recommendation": deployable,
+        "research_trainable_label_recommendation": research_trainable,
         "warnings": warnings,
         "horizons": horizon_reports,
     }

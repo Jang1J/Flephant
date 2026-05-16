@@ -257,9 +257,17 @@ def _label_scan_pretraining_blockers(
 
     data = label_scan.get("data") if isinstance(label_scan.get("data"), dict) else {}
     blockers: list[str] = []
-    if label_scan.get("status") != "PASS":
+    research_trainable = safe_bool(
+        label_scan.get("research_trainable_label_recommendation"),
+        default=False,
+    )
+    deployable_label = safe_bool(
+        label_scan.get("deployable_label_recommendation"),
+        default=False,
+    )
+    if label_scan.get("status") != "PASS" and not research_trainable:
         blockers.append("label_horizon_scan_not_pass")
-    if safe_bool(label_scan.get("deployable_label_recommendation"), default=False) is not True:
+    if not (deployable_label or research_trainable):
         blockers.append("label_horizon_scan_not_deployable")
     expected_start = final_window.get("start_date")
     expected_end = final_window.get("end_date")
@@ -324,6 +332,11 @@ def build_retraining_plan(
         pretraining_blockers.append("phase2_input_readiness_not_pass")
     if (service or {}).get("status") != "PASS":
         predeploy_blockers.append("service_policy_replay_not_pass")
+    if (
+        isinstance(label_scan, dict)
+        and not safe_bool(label_scan.get("deployable_label_recommendation"), default=False)
+    ):
+        predeploy_blockers.append("label_horizon_scan_not_deployable_for_prelive")
     pretraining_blockers.extend(
         _label_scan_pretraining_blockers(
             label_scan=label_scan,
@@ -450,6 +463,9 @@ def build_retraining_plan(
                 "best_horizon": best_horizon,
                 "deployable_label_recommendation": (
                     (label_scan or {}).get("deployable_label_recommendation")
+                ),
+                "research_trainable_label_recommendation": (
+                    (label_scan or {}).get("research_trainable_label_recommendation")
                 ),
                 "data": (label_scan or {}).get("data", {}),
                 "active_horizon": active_horizon_report,

@@ -191,6 +191,64 @@ def test_best_horizon_selection_uses_label_topk_before_mean_net():
     assert best["horizon"] == "30"
 
 
+def test_label_scan_marks_research_trainable_from_topk_even_when_mean_warn(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    mod = _load_script("cost_aware_label_horizon_scan")
+
+    panel = pd.DataFrame(
+        {
+            "ticker": ["005930", "000660", "005930", "000660"],
+            "ts_close": pd.to_datetime([
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:00:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+                "2026-05-01 09:01:00+09:00",
+            ]),
+            "close": [100.0, 100.0, 101.0, 99.0],
+        }
+    )
+
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930", "000660"])
+    monkeypatch.setattr(mod, "_infer_date_range", lambda *_args: ("20260501", "20260501", []))
+    monkeypatch.setattr(mod, "_load_raw_panel", lambda **_kwargs: (panel, []))
+    monkeypatch.setattr(mod, "_cost_bps", lambda: 0.0)
+    monkeypatch.setattr(
+        mod,
+        "_diagnostic_thresholds",
+        lambda _cost: {
+            "min_mean_net_bps": 1.0,
+            "min_positive_net_rate": 0.5,
+            "allow_warn_for_research_only": False,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "_label_generation_settings",
+        lambda: {"active_horizon_bars": 1, "drop_last_n_bars": 0},
+    )
+    monkeypatch.setattr(mod, "config_load", lambda *_args, **_kwargs: {"top_k_fraction": 0.5})
+
+    args = type(
+        "Args",
+        (),
+        {
+            "artifacts_dir": str(tmp_path),
+            "tickers": "005930,000660",
+            "start_date": "20260501",
+            "end_date": "20260501",
+            "horizons": "1",
+        },
+    )()
+
+    report = mod.build_report(args)
+
+    assert report["status"] == "WARN"
+    assert report["deployable_label_recommendation"] is False
+    assert report["research_trainable_label_recommendation"] is True
+
+
 def test_horizon_summary_reports_selection_impact_for_active_noop():
     mod = _load_script("cost_aware_label_horizon_scan")
     panel = pd.DataFrame(
