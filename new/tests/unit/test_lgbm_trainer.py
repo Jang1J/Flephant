@@ -148,6 +148,16 @@ def test_compute_data_version_string_format() -> None:
     assert "20260419" in v
 
 
+def test_tradeable_col_for_target_mapping() -> None:
+    assert LGBMTrainer._tradeable_col_for_target("label_5m_ret") == "label_5m_tradeable"
+    assert LGBMTrainer._tradeable_col_for_target("label_5m_net_ret") == "label_5m_tradeable"
+    assert (
+        LGBMTrainer._tradeable_col_for_target("label_session_close_net_ret")
+        == "label_session_close_tradeable"
+    )
+    assert LGBMTrainer._tradeable_col_for_target("cs_rank") is None
+
+
 def test_normalize_yyyymmdd_accepts_hyphen() -> None:
     assert LGBMTrainer._normalize_yyyymmdd("2026-01-07") == "20260107"
     assert LGBMTrainer._normalize_yyyymmdd("20260107") == "20260107"
@@ -264,6 +274,12 @@ def test_train_accepts_cost_aware_target_override(
     assert metadata["label_horizon_bars"] == trainer_small.builder.horizon_bars
     assert metadata["target_horizon_bars"] == 0
     assert metadata["target_horizon_kind"] == "session_close"
+    classifier = metadata["trade_no_trade_classifier"]
+    assert classifier["enabled"] is True
+    assert classifier["tradeable_col"] == "label_session_close_tradeable"
+    if classifier["status"] == "PASS":
+        assert Path(classifier["model_path"]).exists()
+        assert result["trade_no_trade_classifier"]["model_path"] == classifier["model_path"]
 
 
 def test_train_blocks_production_active_write_without_explicit_approval(

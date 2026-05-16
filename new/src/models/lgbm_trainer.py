@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -249,6 +251,14 @@ class LGBMTrainer:
             lgb,
             num_boost_round=final_num_boost_round,
         )
+        trade_classifier = self._train_trade_no_trade_classifier(
+            final_train_panel,
+            params,
+            lgb,
+            version=version,
+            target_col=effective_target_col,
+            num_boost_round=final_num_boost_round,
+        )
 
         preprocessor_cfg = config_load("risk_config.yaml", "preprocessor")
         feature_set = set(self.feature_cols)
@@ -301,6 +311,7 @@ class LGBMTrainer:
             "lgbm_params": params,
             "training_control": tc,
             "metric_scope": metric_scope,
+            "trade_no_trade_classifier": trade_classifier,
         }
         pkl_path = self.registry.save(
             final_booster,
@@ -337,6 +348,7 @@ class LGBMTrainer:
             "target_horizon_bars": target_horizon_bars,
             "target_horizon_kind": target_horizon_kind,
             "metric_scope": metric_scope,
+            "trade_no_trade_classifier": trade_classifier,
         }
 
     # ================================================================== #
@@ -359,6 +371,110 @@ class LGBMTrainer:
         if target == "label_session_close_ret" or target == "label_session_close_net_ret":
             return 0, "session_close"
         return int(default_horizon), "unknown"
+
+    @staticmethod
+    def _tradeable_col_for_target(target_col: str) -> str | None:
+        target = str(target_col)
+        match = re.match(r"^label_(\d+)m(?:_net)?_ret$", target)
+        if match:
+            return f"label_{match.group(1)}m_tradeable"
+        if target in {"label_session_close_ret", "label_session_close_net_ret"}:
+            return "label_session_close_tradeable"
+        return None
+
+    @staticmethod
+    def _binary_classifier_params(params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "learning_rate": float(params.get("learning_rate", 0.05)),
+            "num_leaves": int(params.get("num_leaves", 31)),
+            "min_child_samples": int(params.get("min_child_samples", 20)),
+            "subsample": float(params.get("subsample", 1.0)),
+            "colsample_bytree": float(params.get("colsample_bytree", 1.0)),
+            "random_state": int(params.get("random_state", 42)),
+            "verbose": -1,
+        }
+
+    def _train_trade_no_trade_classifier(
+        self,
+        final_train_panel,
+        params: dict[str, Any],
+        lgb,
+        *,
+        version: str,
+        target_col: str,
+        num_boost_round: int,
+    ) -> dict[str, Any]:
+        objective_cfg = (config_load("risk_config.yaml", "cost_aware_retraining") or {}).get(
+            "objective",
+            {},
+        )
+        enabled = safe_bool(
+            (objective_cfg or {}).get("trade_no_trade_classifier"),
+            default=False,
+        )
+        tradeable_col = self._tradeable_col_for_target(target_col)
+        base = {
+            "enabled": enabled,
+            "status": "DISABLED" if not enabled else "BLOCKED",
+            "target_col": target_col,
+            "tradeable_col": tradeable_col,
+            "model_path": None,
+        }
+        if not enabled:
+            return base
+        if tradeable_col is None:
+            return {**base, "reason": "unsupported_target_col"}
+        if tradeable_col not in final_train_panel.columns:
+            return {**base, "reason": "tradeable_label_missing"}
+
+        import pandas as pd_
+
+        work = final_train_panel[self.feature_cols + [tradeable_col]].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        work = work.dropna(subset=self.feature_cols + [tradeable_col])
+        if work.empty:
+            return {**base, "reason": "no_trade_classifier_rows"}
+        y = pd_.Series(work[tradeable_col]).astype(float).round().clip(0, 1).astype(int)
+        class_counts = {str(k): int(v) for k, v in y.value_counts().sort_index().items()}
+        positive_rate = float((y == 1).mean())
+        if y.nunique() < 2:
+            return {
+                **base,
+                "status": "SKIPPED",
+                "reason": "single_class_tradeable_label",
+                "n_train_rows": int(len(y)),
+                "positive_rate": positive_rate,
+                "class_counts": class_counts,
+            }
+
+        classifier_path = Path(self.registry.base_dir) / f"{version}_trade_classifier.pkl"
+        X = work[self.feature_cols].to_numpy(dtype=float)
+        ds = lgb.Dataset(X, label=y.to_numpy(dtype=int), free_raw_data=False)
+        binary_params = self._binary_classifier_params(params)
+        booster = lgb.train(
+            binary_params,
+            ds,
+            num_boost_round=max(1, int(num_boost_round)),
+        )
+        with classifier_path.open("wb") as fh:
+            pickle.dump(booster, fh)
+        try:
+            model_path = str(classifier_path.resolve().relative_to(_REPO_ROOT))
+        except ValueError:
+            model_path = str(classifier_path)
+        return {
+            **base,
+            "status": "PASS",
+            "model_path": model_path,
+            "n_train_rows": int(len(y)),
+            "positive_rate": positive_rate,
+            "class_counts": class_counts,
+            "params": binary_params,
+        }
 
     def _uses_production_registry(self) -> bool:
         base_dir = Path(getattr(self.registry, "base_dir", ""))
