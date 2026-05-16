@@ -52,6 +52,7 @@ def _make_event(
     scope: str = "market",
     occurred_at: str | None = None,
     expires_at: str | None = None,
+    asof: str | None = None,
     supersedes: str | None = None,
 ) -> dict:
     """테스트용 정규화 이벤트 dict 생성."""
@@ -60,7 +61,7 @@ def _make_event(
         occurred_at = (now - timedelta(minutes=5)).isoformat()
     if expires_at is None:
         expires_at = (now + timedelta(hours=1)).isoformat()
-    return {
+    event = {
         "event_id": event_id,
         "source": "naver_news",
         "event_type": event_type,
@@ -77,6 +78,9 @@ def _make_event(
         "pit_safe": True,
         "payload": {},
     }
+    if asof is not None:
+        event["asof"] = asof
+    return event
 
 
 # ------------------------------------------------------------------
@@ -163,6 +167,25 @@ def test_stale_drop_expired_event(tmp_path: Path, _enable_stale_check) -> None:
     lines = (tmp_path / "dl.jsonl").read_text(encoding="utf-8").strip().splitlines()
     entry = json.loads(lines[0])
     assert entry["drop_reason"] == "STALE"
+
+
+def test_stale_drop_uses_event_asof_for_historical_replay(
+    tmp_path: Path,
+    _enable_stale_check,
+) -> None:
+    """과거 시나리오 이벤트는 wall-clock now가 아니라 event asof 기준으로 stale 판단."""
+    cfg = _cfg()
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    asof = datetime(2026, 5, 4, 9, 30, 0, tzinfo=_KST)
+    ev = _make_event(
+        event_id="EVT-HIST-ASOF-001",
+        occurred_at=asof.isoformat(),
+        expires_at=(asof + timedelta(minutes=30)).isoformat(),
+        asof=asof.isoformat(),
+    )
+
+    assert ea.admit(ev) is True
 
 
 def test_leaked_test_freshness_skip_does_not_bypass_runtime_stale_drop(

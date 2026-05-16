@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -47,11 +47,13 @@ _KST = ZoneInfo("Asia/Seoul")
 _TICKERS = ["005930", "000660", "035420"]
 
 
-def _today_intraday(hour: int = 9, minute: int = 30) -> datetime:
-    """오늘 날짜 기준 장중 시각 (KST). PIT-Safety 통과용 (오늘 18:00 이전)."""
-    from datetime import date as _date
-    today = _date.today()
-    return datetime(today.year, today.month, today.day, hour, minute, 0, tzinfo=_KST)
+def _pit_safe_intraday(hour: int = 9, minute: int = 30) -> datetime:
+    """현재 시각 기준 미래가 되지 않는 장중 시각 (KST)."""
+    now = datetime.now(_KST)
+    ts = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if ts > now:
+        ts -= timedelta(days=1)
+    return ts
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -108,8 +110,8 @@ class TestEventInjector:
     def test_inject_news_returns_gateway_result(
         self, injector: EventInjector
     ) -> None:
-        # PIT-Safety: 오늘 장중 시각 사용 (하드코딩 미래 날짜 금지)
-        ts = _today_intraday(9, 30)
+        # PIT-Safety: 현재 시각 기준 미래가 아닌 장중 시각 사용
+        ts = _pit_safe_intraday(9, 30)
         result = injector.inject_news(
             ticker="005930",
             headline="삼성전자 신규 HBM4 계약",
@@ -125,8 +127,8 @@ class TestEventInjector:
     def test_inject_dart_ticker_zero_padded(
         self, injector: EventInjector
     ) -> None:
-        # PIT-Safety: 오늘 장중 시각 사용
-        ts = _today_intraday(13, 0)
+        # PIT-Safety: 현재 시각 기준 미래가 아닌 장중 시각 사용
+        ts = _pit_safe_intraday(13, 0)
         result = injector.inject_dart(
             ticker="5930",  # zero-pad 필요
             disclosure_type="주요사항보고서",
@@ -139,8 +141,8 @@ class TestEventInjector:
         )
 
     def test_inject_community(self, injector: EventInjector) -> None:
-        # PIT-Safety: 오늘 장중 시각 사용
-        ts = _today_intraday(9, 5)
+        # PIT-Safety: 현재 시각 기준 미래가 아닌 장중 시각 사용
+        ts = _pit_safe_intraday(9, 5)
         result = injector.inject_community(
             ticker="035420",
             post_text="네이버 AI 검색 루머",
@@ -152,8 +154,8 @@ class TestEventInjector:
         )
 
     def test_inject_macro_no_ticker(self, injector: EventInjector) -> None:
-        # PIT-Safety: 오늘 장중 시각 사용
-        ts = _today_intraday(10, 15)
+        # PIT-Safety: 현재 시각 기준 미래가 아닌 장중 시각 사용
+        ts = _pit_safe_intraday(10, 15)
         result = injector.inject_macro(
             indicator="usd_krw",
             value=1380.5,
@@ -246,7 +248,7 @@ class TestOneDayModeA:
         self, gateway: EventGateway, injector: EventInjector
     ) -> None:
         """Cold Path 이벤트 주입 + dispatch_next 정상 동작."""
-        ts = _today_intraday(9, 30)
+        ts = _pit_safe_intraday(9, 30)
         injector.inject_news(
             ticker="005930",
             headline="삼성전자 호재 뉴스",
@@ -781,7 +783,7 @@ class TestEventInjectorAdmitted:
 
     def test_inject_news_admitted(self, injector: EventInjector) -> None:
         """inject_news → status == admitted (normalize_failed 금지)."""
-        ts = _today_intraday(9, 30)
+        ts = _pit_safe_intraday(9, 30)
         result = injector.inject_news(
             ticker="005930",
             headline="삼성전자 HBM4 계약",
@@ -794,7 +796,7 @@ class TestEventInjectorAdmitted:
 
     def test_inject_dart_admitted(self, injector: EventInjector) -> None:
         """inject_dart → status == admitted (normalize_failed 금지)."""
-        ts = _today_intraday(13, 0)
+        ts = _pit_safe_intraday(13, 0)
         result = injector.inject_dart(
             ticker="000660",
             disclosure_type="주요사항보고서",
@@ -808,7 +810,7 @@ class TestEventInjectorAdmitted:
 
     def test_inject_community_admitted(self, injector: EventInjector) -> None:
         """inject_community → status == admitted (normalize_failed 금지)."""
-        ts = _today_intraday(9, 5)
+        ts = _pit_safe_intraday(9, 5)
         result = injector.inject_community(
             ticker="035420",
             post_text="NAVER AI 검색 루머",
@@ -821,7 +823,7 @@ class TestEventInjectorAdmitted:
 
     def test_inject_macro_admitted(self, injector: EventInjector) -> None:
         """inject_macro → status == admitted (normalize_failed 금지)."""
-        ts = _today_intraday(10, 15)
+        ts = _pit_safe_intraday(10, 15)
         result = injector.inject_macro(
             indicator="usd_krw",
             value=1380.5,
@@ -835,7 +837,7 @@ class TestEventInjectorAdmitted:
         self, gateway: EventGateway, injector: EventInjector
     ) -> None:
         """inject_news admitted → gateway.backlog_size() >= 1."""
-        ts = _today_intraday(9, 30)
+        ts = _pit_safe_intraday(9, 30)
         result = injector.inject_news(
             ticker="005930",
             headline="삼성전자 테스트",
@@ -850,7 +852,7 @@ class TestEventInjectorAdmitted:
         self, injector: EventInjector
     ) -> None:
         """flush_audit_log() 결과가 비어있지 않음 (주입 후)."""
-        ts = _today_intraday(9, 30)
+        ts = _pit_safe_intraday(9, 30)
         injector.inject_news(ticker="005930", headline="테스트", ts=ts)
         log_path = injector.flush_audit_log()
         lines = log_path.read_text(encoding="utf-8").strip().splitlines()

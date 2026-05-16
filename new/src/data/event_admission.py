@@ -63,7 +63,7 @@ class EventAdmission:
 
     3 필터 + 백로그 + dead_letter_log:
       1. dedupe (event_id + supersedes TTL)
-      2. stale_drop (expires_at < now)
+      2. stale_drop (expires_at < admission asof/now)
       3. priority comparator 정렬 후 backlog 상한 초과 시 lowest drop
 
     config SSOT: risk_config.yaml event_admission.
@@ -144,11 +144,13 @@ class EventAdmission:
             expires_at_str: str | None = event.get("expires_at")
             if expires_at_str:
                 try:
-                    expires_dt = datetime.fromisoformat(expires_at_str)
-                    if expires_dt.tzinfo is None:
-                        expires_dt = expires_dt.replace(tzinfo=_KST)
-                    now_kst = datetime.now(_KST)
-                    if expires_dt < now_kst:
+                    expires_dt = self._parse_kst_datetime(expires_at_str)
+                    if expires_dt is None:
+                        raise ValueError("expires_at parse returned None")
+                    reference_dt = (
+                        self._parse_kst_datetime(event.get("asof")) or datetime.now(_KST)
+                    )
+                    if expires_dt < reference_dt:
                         self._write_dead_letter(event, "STALE")
                         return False
                 except Exception as e:
@@ -227,6 +229,19 @@ class EventAdmission:
         ]
         for eid in expired_supersedes:
             del self._seen_supersedes[eid]
+
+    @staticmethod
+    def _parse_kst_datetime(value: object) -> datetime | None:
+        """ISO datetime을 KST aware datetime으로 정규화."""
+        if value is None:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
 
     def _compute_sort_key(self, event: dict) -> tuple:
         """comparator sort key 생성.
