@@ -1045,6 +1045,8 @@ class BacktestEngine:
             feature_cols = []
         if not feature_cols:
             raise BundleLoadFailed(f"candidate metadata feature_cols 없음: {metadata_path}")
+        if not isinstance(metadata.get("target_col"), str) or not metadata["target_col"].strip():
+            raise BundleLoadFailed(f"candidate metadata target_col 없음: {metadata_path}")
         feature_width = len(feature_cols) if feature_cols else 4
         metadata_synthetic_fallback = safe_bool(
             metadata.get("synthetic_fallback", False),
@@ -1067,6 +1069,8 @@ class BacktestEngine:
             "label_session_scope",
             "label_horizon_bars",
             "target_col",
+            "target_horizon_bars",
+            "target_horizon_kind",
         ]
 
         return model_callable, feature_width, {

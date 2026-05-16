@@ -1004,6 +1004,7 @@ model_registry:
     - data_version
     - created_at
     - label_horizon_bars
+    - target_col
     - label_generation_version
     - label_session_scope
 

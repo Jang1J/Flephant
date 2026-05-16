@@ -152,6 +152,29 @@ def test_stale_drop_expired_event(tmp_path: Path, _enable_stale_check) -> None:
     assert entry["drop_reason"] == "STALE"
 
 
+def test_leaked_test_freshness_skip_does_not_bypass_runtime_stale_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """테스트용 env 가 런타임으로 새도 stale live/cold 이벤트는 거부."""
+    monkeypatch.setenv("ELEPHANT_TEST_FRESHNESS_SKIP", "1")
+    cfg = _cfg()
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
+    ev = _make_event(
+        event_id="EVT-STALE-LEAKED-ENV",
+        event_type="news",
+        expires_at=past_expires,
+    )
+    assert ea.admit(ev) is False
+
+    lines = (tmp_path / "dl.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    entry = json.loads(lines[0])
+    assert entry["drop_reason"] == "STALE"
+    assert entry["event_id"] == "EVT-STALE-LEAKED-ENV"
+
+
 # ------------------------------------------------------------------
 # 5. stale_drop=false 시 만료 이벤트도 허용
 # ------------------------------------------------------------------

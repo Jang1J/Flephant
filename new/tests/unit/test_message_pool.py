@@ -122,6 +122,38 @@ def test_publish_expires_at_auto_computed_from_ttl() -> None:
     assert timedelta(seconds=58) < diff < timedelta(seconds=62)
 
 
+def test_publish_malformed_expires_at_raises() -> None:
+    pool = _pool()
+    msg = _valid_msg(expires_at="not-a-datetime")
+
+    with pytest.raises(ValueError, match="MESSAGE_SCHEMA_INVALID: expires_at"):
+        pool.publish("news_signal", msg)
+
+    assert pool.pool_size() == 0
+
+
+def test_publish_malformed_timestamp_raises() -> None:
+    pool = _pool()
+    msg = _valid_msg(timestamp="2026-99-99T99:99:99")
+
+    with pytest.raises(ValueError, match="MESSAGE_SCHEMA_INVALID: timestamp"):
+        pool.publish("news_signal", msg)
+
+    assert pool.pool_size() == 0
+
+
+def test_publish_valid_expires_at_still_publishes() -> None:
+    pool = _pool()
+    expires_at = (now_kst() + timedelta(minutes=5)).isoformat()
+    msg = _valid_msg(expires_at=expires_at)
+
+    msg_id = pool.publish("news_signal", msg)
+
+    assert msg_id.startswith("MSG-")
+    assert pool.pool_size() == 1
+    assert msg["expires_at"] == expires_at
+
+
 def test_publish_normalizes_malformed_confidence_and_ttl() -> None:
     pool = _pool()
     msg = _valid_msg(confidence="high", ttl="bad")
@@ -292,8 +324,6 @@ def test_expire_removes_stale_messages() -> None:
     msg["expires_at"] = past
     msg["ttl"] = 1
     msg_id = pool.publish("news_signal", msg)
-    # publish 후 expires_at 을 과거로 덮어씀 (pool 내부 entry 직접 조작)
-    pool._messages[msg_id].message["expires_at"] = past
 
     removed = pool.expire(now=now_kst())
 

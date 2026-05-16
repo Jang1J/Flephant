@@ -207,6 +207,25 @@ def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
     assert result["n_bars_consumed"] == 5
 
 
+def test_run_once_rejects_future_bar_before_quant_buffer(runner: HotRunner) -> None:
+    """asof보다 미래인 1분봉은 Quant buffer에 넣지 않는다."""
+    runner.start()
+    future_bar = _make_bar("005930", 50000.0, 61)  # 10:01 KST
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[future_bar],
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["n_bars_consumed"] == 0
+    assert result["bar_errors"] == [
+        "future_bar_rejected: ticker=005930 "
+        "ts_close=2026-04-20T10:01:00+09:00 asof=2026-04-20T10:00:00+09:00"
+    ]
+    assert runner._quant._bar_buffer.get_latest("005930", n=1) == []
+
+
 def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
     """timezone-aware KST asof를 UTC로 변환하고 replace로 덮어쓰지 않는다."""
     runner.start()

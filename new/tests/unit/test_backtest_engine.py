@@ -470,7 +470,8 @@ def test_loads_candidate_bundle_model(tmp_path: Path):
                     "feat_5m_ret",
                     "feat_30m_vol",
                     "feat_60m_trend",
-                ]
+                ],
+                "target_col": "label_5m_ret",
             },
             fh,
             ensure_ascii=False,
@@ -512,6 +513,7 @@ def test_candidate_bundle_metadata_synthetic_fallback_is_exposed(tmp_path: Path)
         json.dump(
             {
                 "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_5m_ret",
                 "data_source": "synthetic_fallback",
                 "synthetic_fallback": True,
             },
@@ -546,6 +548,7 @@ def test_candidate_bundle_metadata_synthetic_fallback_string_false(tmp_path: Pat
         json.dump(
             {
                 "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_5m_ret",
                 "data_source": "artifact_bars",
                 "synthetic_fallback": "false",
             },
@@ -608,6 +611,29 @@ def test_candidate_bundle_requires_metadata(tmp_path: Path):
                 universe=["005930"],
                 date_range=_default_date_range(25),
             )
+
+
+def test_candidate_bundle_requires_target_col_metadata(tmp_path: Path):
+    """staged candidate는 target_col 누락 시 기본 5m 평가로 fallback하지 않는다."""
+    from src.mode_b.validation_tools import BundleLoadFailed
+
+    bundle_id = "BUNDLE-20260509-NOTARGET"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {"feature_cols": ["f1", "f2", "f3", "f4"]},
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+
+    with pytest.raises(BundleLoadFailed, match="target_col"):
+        engine._resolve_candidate_model(bundle_id)
 
 
 # ────────────────────────────────────────────────────────────────────────

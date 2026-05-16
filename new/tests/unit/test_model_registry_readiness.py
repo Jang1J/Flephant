@@ -70,6 +70,7 @@ class _StringFalseDeployQualityRegistry:
             "data_version": "test",
             "created_at": "2026-05-15T00:00:00+09:00",
             "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
             "label_generation_version": "test",
             "label_session_scope": "regular",
             "model_path": str(model_path.name),

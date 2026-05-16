@@ -56,6 +56,7 @@ class ExecutionGateway:
         kis_client: Any | None = None,
         mode_override: str | None = None,
         live_enabled_override: bool | None = None,
+        live_approval_proof: dict[str, Any] | None = None,
     ) -> None:
         exec_cfg = config_load("risk_config.yaml", "execution")
         self._mode: str = str(mode_override or exec_cfg["mode"]).lower()
@@ -70,6 +71,7 @@ class ExecutionGateway:
         self._kill_switch = kill_switch
         self._audit_logger = audit_logger
         self._kis_client = kis_client
+        self._live_approval_proof: dict[str, Any] = dict(live_approval_proof or {})
 
         logger.info(
             "[execution_gateway] 초기화: mode=%s, live_enabled=%s, "
@@ -169,7 +171,11 @@ class ExecutionGateway:
                     t0,
                 )
             else:
-                mode_rejection = self._broker_mode_rejection(expected_mode="real")
+                approval_rejection = self._live_approval_rejection()
+                mode_rejection = (
+                    approval_rejection
+                    or self._broker_mode_rejection(expected_mode="real")
+                )
                 if mode_rejection:
                     report = self._rejected(
                         order_plan_id,
@@ -310,6 +316,41 @@ class ExecutionGateway:
                 f"{self._mode}_mode_requires_{expected_mode}_kis_client: "
                 f"client_mode={client_mode or 'unknown'}"
             )
+        return None
+
+    @staticmethod
+    def _proof_status_is_pass(value: Any) -> bool:
+        """Accept plain PASS or nested {status: PASS} proof fields."""
+        if isinstance(value, dict):
+            value = (
+                value.get("status")
+                or value.get("overall_status")
+                or value.get("gate_status")
+            )
+        return str(value or "").strip().upper() == "PASS"
+
+    def _live_approval_rejection(self) -> str | None:
+        """실계좌 주문은 C10 경계에서도 명시 proof 없으면 fail-closed."""
+        proof = self._live_approval_proof
+        missing: list[str] = []
+        for field in ("prelive_gate", "deploy_quality", "broker_evidence"):
+            if not self._proof_status_is_pass(proof.get(field)):
+                missing.append(field)
+
+        registry = proof.get("production_registry")
+        active_version = ""
+        if isinstance(registry, dict):
+            active_version = str(registry.get("active_version") or "").strip()
+        if not active_version:
+            active_version = str(proof.get("active_version") or "").strip()
+        if not active_version:
+            missing.append("production_registry.active_version")
+
+        if not safe_bool(proof.get("live_trading_allowed", False), default=False):
+            missing.append("live_trading_allowed")
+
+        if missing:
+            return "live_approval_missing: " + ",".join(missing)
         return None
 
     def _execute_broker(

@@ -192,6 +192,9 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     assert metadata["n_final_train_rows"] > metadata["n_cv_last_train_rows"]
     assert metadata["label_generation_version"] == trainer_small.builder.label_generation_version
     assert metadata["label_session_scope"] == trainer_small.builder.label_session_scope
+    assert metadata["target_col"] == "label_5m_ret"
+    assert metadata["target_horizon_bars"] == 5
+    assert metadata["target_horizon_kind"] == "minute"
     assert metadata["data_source"] == "artifact_bars"
     assert metadata["synthetic_fallback"] is False
     # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
@@ -253,8 +256,13 @@ def test_train_accepts_cost_aware_target_override(
     )
 
     assert result["target_col"] == "label_session_close_net_ret"
+    assert result["target_horizon_bars"] == 0
+    assert result["target_horizon_kind"] == "session_close"
     _, metadata = trainer_small.registry.load_latest()
     assert metadata["target_col"] == "label_session_close_net_ret"
+    assert metadata["label_horizon_bars"] == trainer_small.builder.horizon_bars
+    assert metadata["target_horizon_bars"] == 0
+    assert metadata["target_horizon_kind"] == "session_close"
 
 
 def test_train_blocks_missing_feature_manifest(trainer_small: LGBMTrainer) -> None:

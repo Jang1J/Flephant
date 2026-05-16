@@ -35,6 +35,23 @@ logger = get_logger("llm_router")
 _KST = ZoneInfo("Asia/Seoul")
 
 
+class LLMRouterConfigError(ValueError):
+    """LLMRouter 운영 임계값 config 누락."""
+
+
+def _required_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if not isinstance(value, dict) or not value:
+        raise LLMRouterConfigError(f"llm_budget.{key} config required")
+    return value
+
+
+def _required_value(config: dict[str, Any], key: str) -> Any:
+    if key not in config:
+        raise LLMRouterConfigError(f"llm_budget.{key} config required")
+    return config[key]
+
+
 class LLMModel(str, Enum):
     """사용 가능한 LLM 모델 식별자."""
 
@@ -104,6 +121,16 @@ class _BudgetTracker:
             self._reset_day = today
             logger.info(f"일일 예산 리셋: {today}")
 
+    def _quota_key_for(self, caller: str) -> str | None:
+        """예산 차감 key. 명시 caller가 없으면 buffer에만 태운다."""
+        if not self._allocation:
+            return caller
+        if caller in self._allocation:
+            return caller
+        if "buffer" in self._allocation:
+            return "buffer"
+        return None
+
     def can_call(self, caller: str) -> tuple[bool, str]:
         """호출 허용 여부 + 사유 반환.
 
@@ -111,22 +138,28 @@ class _BudgetTracker:
             (True, 'OK') 허용.
             (False, 'DAILY_LIMIT_REACHED: N/M') 총 한도 초과.
             (False, 'CALLER_QUOTA_EXCEEDED: caller N/M') caller 할당 초과.
+            (False, 'CALLER_NOT_CONFIGURED: caller') caller 정책 누락.
         """
         self._maybe_reset()
 
         if self._total >= self._daily_limit:
             return False, f"DAILY_LIMIT_REACHED: {self._total}/{self._daily_limit}"
 
-        alloc = self._allocation.get(caller)
-        if alloc is not None and self._counts[caller] >= alloc:
-            return False, f"CALLER_QUOTA_EXCEEDED: {caller} {self._counts[caller]}/{alloc}"
+        quota_key = self._quota_key_for(caller)
+        if quota_key is None:
+            return False, f"CALLER_NOT_CONFIGURED: {caller}"
+
+        alloc = self._allocation.get(quota_key)
+        if alloc is not None and self._counts[quota_key] >= alloc:
+            return False, f"CALLER_QUOTA_EXCEEDED: {quota_key} {self._counts[quota_key]}/{alloc}"
 
         return True, "OK"
 
     def record(self, caller: str) -> None:
         """호출 1회 기록. can_call() 통과 후 반드시 호출."""
         self._maybe_reset()
-        self._counts[caller] += 1
+        quota_key = self._quota_key_for(caller) or caller
+        self._counts[quota_key] += 1
         self._total += 1
 
     def remaining_total(self) -> int:
@@ -137,10 +170,13 @@ class _BudgetTracker:
     def remaining_for(self, caller: str) -> int:
         """특정 caller의 잔여 호출 횟수. allocation 없으면 총 잔여 반환."""
         self._maybe_reset()
-        alloc = self._allocation.get(caller)
+        quota_key = self._quota_key_for(caller)
+        if quota_key is None:
+            return 0
+        alloc = self._allocation.get(quota_key)
         if alloc is None:
             return self.remaining_total()
-        return max(0, alloc - self._counts[caller])
+        return max(0, alloc - self._counts[quota_key])
 
     @property
     def total_today(self) -> int:
@@ -260,28 +296,26 @@ class LLMRouter:
         else:
             cfg = config_load("risk_config.yaml", "llm_budget") or {}
         if not cfg:
-            logger.warning(
-                "[llm_router] llm_budget 섹션 없음. "
-                "기본값(daily_limit=100, cb_threshold=3, cb_duration=300) 사용"
-            )
+            raise LLMRouterConfigError("llm_budget config required")
 
-        self._daily_limit: int = int(cfg.get("kanana_daily_limit", 100))
+        self._daily_limit: int = int(_required_value(cfg, "kanana_daily_limit"))
         self._budget_allocation: dict[str, int] = dict(cfg.get("budget_allocation", {}))
-        self._overflow_to: str = str(cfg.get("overflow_to", "gpt-4o"))
+        raw_overflow_to = str(_required_value(cfg, "overflow_to")).strip().lower()
+        if raw_overflow_to in {"none", "disabled", "off", "false", ""}:
+            self._overflow_to = "none"
+        elif raw_overflow_to == LLMModel.GPT_4O.value:
+            self._overflow_to = LLMModel.GPT_4O.value
+        else:
+            raise LLMRouterConfigError("llm_budget.overflow_to must be gpt-4o or none")
 
         # circuit breaker 설정
-        cb_cfg = cfg.get("circuit_breaker", {})
-        if not cb_cfg:
-            logger.warning(
-                "[llm_router] circuit_breaker 섹션 없음. "
-                "기본값(cb_threshold=3, cb_duration=300) 사용"
-            )
-        self._cb_failure_threshold: int = int(cb_cfg.get("failure_threshold", 3))
-        self._cb_open_duration_sec: int = int(cb_cfg.get("open_duration_sec", 300))
+        cb_cfg = _required_mapping(cfg, "circuit_breaker")
+        self._cb_failure_threshold: int = int(_required_value(cb_cfg, "failure_threshold"))
+        self._cb_open_duration_sec: int = int(_required_value(cb_cfg, "open_duration_sec"))
 
         # SLA 설정
-        sla_cfg = cfg.get("sla", {})
-        self._timeout_sec: float = float(sla_cfg.get("timeout_sec", 30.0))
+        sla_cfg = _required_mapping(cfg, "sla")
+        self._timeout_sec: float = float(_required_value(sla_cfg, "timeout_sec"))
         self._gpt4o_cost_placeholder: float = float(sla_cfg.get("gpt4o_cost_placeholder_usd", 0.0))
         self._kanana_cost_placeholder: float = float(sla_cfg.get("kanana_cost_placeholder_usd", 0.0))
 
@@ -300,7 +334,6 @@ class LLMRouter:
         self._allow_mock_provider: bool = (
             safe_bool(cfg.get("allow_mock_provider", False), default=False)
             or os.environ.get("ELEPHANT_ALLOW_LLM_MOCK") == "1"
-            or bool(os.environ.get("PYTEST_CURRENT_TEST"))
         )
 
         logger.info(
@@ -363,19 +396,25 @@ class LLMRouter:
         # 1) 예산 체크
         ok, reason = self._budget.can_call(caller)
         if not ok:
-            logger.info(f"예산 차단 → GPT-4o fallback: {reason}")
-            result = self._call_gpt4o(prompt, caller, structured_schema, is_fallback=True)
-            result.fallback_used = True
-            return result
+            if reason.startswith("CALLER_NOT_CONFIGURED"):
+                logger.warning("[llm_router] caller 예산 정책 누락: %s", reason)
+                return LLMCallResult(
+                    success=False,
+                    model_used=LLMModel.KANANA_O.value,
+                    content=None,
+                    latency_ms=0.0,
+                    error=reason,
+                    fallback_used=False,
+                    circuit_state=self._kanana_cb.state,
+                )
+            logger.info("예산 차단: %s", reason)
+            return self._fallback_or_failure(prompt, caller, structured_schema, reason)
 
         # 2) Kanana-o circuit breaker 체크
         if not self._kanana_cb.can_attempt():
-            logger.info(
-                f"Kanana-o circuit {self._kanana_cb.state} → GPT-4o fallback, caller={caller}"
-            )
-            result = self._call_gpt4o(prompt, caller, structured_schema, is_fallback=True)
-            result.fallback_used = True
-            return result
+            reason = f"KANANA_CIRCUIT_{self._kanana_cb.state.upper()}"
+            logger.info("Kanana-o circuit %s: caller=%s", self._kanana_cb.state, caller)
+            return self._fallback_or_failure(prompt, caller, structured_schema, reason)
 
         # 3) Kanana-o 호출 시도
         result = self._call_kanana(prompt, caller, structured_schema)
@@ -389,9 +428,12 @@ class LLMRouter:
         logger.warning(
             f"Kanana-o 실패 → GPT-4o fallback: {result.error}, caller={caller}"
         )
-        fb_result = self._call_gpt4o(prompt, caller, structured_schema, is_fallback=True)
-        fb_result.fallback_used = True
-        return fb_result
+        return self._fallback_or_failure(
+            prompt,
+            caller,
+            structured_schema,
+            result.error or "KANANA_CALL_FAILED",
+        )
 
     def budget_remaining(self, caller: str | None = None) -> int:
         """잔여 예산 조회.
@@ -424,6 +466,30 @@ class LLMRouter:
     # ------------------------------------------------------------------ #
     # Provider 래퍼
     # ------------------------------------------------------------------ #
+
+    def _fallback_or_failure(
+        self,
+        prompt: str,
+        caller: str,
+        schema: dict | None,
+        reason: str,
+    ) -> LLMCallResult:
+        """overflow_to 정책에 따라 fallback 또는 fail-closed."""
+        if self._overflow_to != LLMModel.GPT_4O.value:
+            logger.warning("[llm_router] GPT-4o fallback disabled: %s", reason)
+            return LLMCallResult(
+                success=False,
+                model_used=LLMModel.KANANA_O.value,
+                content=None,
+                latency_ms=0.0,
+                error=f"FALLBACK_DISABLED: {reason}",
+                fallback_used=False,
+                circuit_state=self._kanana_cb.state,
+            )
+
+        result = self._call_gpt4o(prompt, caller, schema, is_fallback=True)
+        result.fallback_used = True
+        return result
 
     def _call_kanana(
         self,

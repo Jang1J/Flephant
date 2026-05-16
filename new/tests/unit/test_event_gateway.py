@@ -102,6 +102,27 @@ def test_ingest_admitted_event_goes_to_backlog(tmp_path: Path) -> None:
     assert gw.backlog_size() == 1
 
 
+def test_ingest_rejects_event_after_asof(tmp_path: Path, monkeypatch) -> None:
+    """EventGateway는 장중 asof 이후 이벤트를 backlog에 넣지 않는다."""
+    import src.data.event_normalizer as en
+    from src.utils.pit_guard import is_pit_safe as real_is_pit_safe
+
+    monkeypatch.setattr(en, "is_pit_safe", real_is_pit_safe)
+    gw = _gateway(tmp_path)
+    raw = {
+        "title": "장중 미래 공시",
+        "corp_name": "테스트",
+        "disclosure_time": "2026-04-19T10:01:00+09:00",
+        "ticker": "005930",
+    }
+
+    result = gw.ingest(raw, source="dart", asof="2026-04-19T10:00:00+09:00")
+
+    assert result["status"] == "normalize_failed"
+    assert "PIT-Safety" in str(result["reason"])
+    assert gw.backlog_size() == 0
+
+
 # ------------------------------------------------------------------
 # 3. 거부 이벤트 status = rejected
 # ------------------------------------------------------------------

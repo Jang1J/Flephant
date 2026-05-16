@@ -397,6 +397,134 @@ def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_
     assert "live_enabled=false" in report["rejection_reason"]
 
 
+def _live_approval_proof(**overrides) -> dict:
+    proof = {
+        "prelive_gate": "PASS",
+        "deploy_quality": "PASS",
+        "broker_evidence": "PASS",
+        "production_registry": {"active_version": "MODEL-LIVE-1"},
+        "live_trading_allowed": True,
+    }
+    proof.update(overrides)
+    return proof
+
+
+def test_execute_live_enabled_real_broker_requires_live_approval_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """live_enabled=True만으로는 실계좌 broker 호출까지 갈 수 없다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("live broker must require approval proof")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "live_approval_missing" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_rejects_incomplete_live_approval_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("live broker must not be called")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(live_trading_allowed=False),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "live_trading_allowed" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_with_complete_approval_proof_submits(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """완전한 proof가 있을 때만 live broker까지 도달한다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int, float]] = []
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.calls.append((ticker, side, qty, price))
+            return {"status": "submitted", "order_id": "OD-LIVE", "price": price}
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "submitted"
+    assert report["execution_mode"] == "live"
+    assert report["fills"][0]["broker_order_id"] == "OD-LIVE"
+    assert client.calls == [("005930", "buy", 1, 70000.0)]
+
+
 def test_execute_broker_partial_fill_reports_rejections(monkeypatch, tmp_path: Path) -> None:
     """broker 제출 일부 실패는 C10 partial_filled와 rejections로 남긴다."""
     _patch_execution_config(monkeypatch, mode="paper")

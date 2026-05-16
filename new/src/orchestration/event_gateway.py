@@ -9,6 +9,7 @@ S2-1: PubSubBroker 연동 + auto_publish 옵션 추가.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Callable
 
 from src.data.event_admission import EventAdmission
@@ -81,7 +82,13 @@ class EventGateway:
             event_type, publish_channel,
         )
 
-    def ingest(self, raw_event: dict, source: str) -> dict:
+    def ingest(
+        self,
+        raw_event: dict,
+        source: str,
+        *,
+        asof: datetime | str | None = None,
+    ) -> dict:
         """raw 이벤트 수신 -> 정규화 -> admission -> backlog. 결과 요약 반환.
 
         Returns:
@@ -92,7 +99,7 @@ class EventGateway:
             }
         """
         try:
-            normalized = self._normalizer.normalize(raw_event, source)
+            normalized = self._normalizer.normalize(raw_event, source, asof=asof)
         except Exception as e:
             logger.warning("[event_gateway] 정규화 실패: source=%s error=%s", source, e)
             return {"event_id": None, "status": "normalize_failed", "reason": str(e)}

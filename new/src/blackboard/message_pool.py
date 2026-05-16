@@ -81,6 +81,24 @@ _VALID_PRIORITIES: frozenset[str] = frozenset({"urgent", "normal", "low"})
 _VALID_RISK_LEVELS: frozenset[str | None] = frozenset({"low", "medium", "high", None})
 
 
+def _parse_iso_datetime_field(message: dict, field_name: str) -> datetime:
+    """publish-time ISO datetime validation for C4 timestamp fields."""
+    raw = message.get(field_name)
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"MESSAGE_SCHEMA_INVALID: {field_name} must be ISO datetime string"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"MESSAGE_SCHEMA_INVALID: {field_name} invalid ISO datetime '{raw}'"
+        ) from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed
+
+
 @dataclass
 class _MessageEntry:
     """내부 저장소 entry. 외부 공개 금지."""
@@ -168,6 +186,10 @@ class MessagePool:
         risk_level = message.get("risk_level")
         if risk_level not in _VALID_RISK_LEVELS:
             raise ValueError(f"MESSAGE_SCHEMA_INVALID: risk_level='{risk_level}' not valid")
+
+        _parse_iso_datetime_field(message, "timestamp")
+        if "expires_at" in message:
+            _parse_iso_datetime_field(message, "expires_at")
 
         # 2. message_id
         message_id = message.get("message_id") or generate_message_id()

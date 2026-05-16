@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -38,6 +39,19 @@ from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 
 logger = get_logger("hot_runner")
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _parse_hot_ts(value: Any) -> datetime:
+    """Hot Path timestamp parser. naive 값은 KST로 간주."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt.astimezone(timezone.utc)
 
 
 class HotRunner:
@@ -203,12 +217,27 @@ class HotRunner:
             }
 
         t0 = time.perf_counter()
+        asof_dt: datetime | None = None
+        if asof:
+            try:
+                asof_dt = _parse_hot_ts(asof)
+            except (TypeError, ValueError):
+                asof_dt = None
 
         # 1. on_bar 호출 (BarBuffer 저장, 경량)
         n_bars_consumed = 0
         bar_errors: list[str] = []
         for bar in bars_batch:
             try:
+                if asof_dt is not None and isinstance(bar, dict) and bar.get("ts_close"):
+                    bar_ts = _parse_hot_ts(bar["ts_close"])
+                    if bar_ts > asof_dt:
+                        bar_errors.append(
+                            "future_bar_rejected: "
+                            f"ticker={bar.get('ticker', '')} "
+                            f"ts_close={bar.get('ts_close')} asof={asof}"
+                        )
+                        continue
                 self._quant.on_bar(bar)
                 n_bars_consumed += 1
             except ValueError as e:
@@ -246,16 +275,7 @@ class HotRunner:
         pm_ms = self._profiler.end_stage("pm", t_pm)
 
         # 5. RiskFast sidecar (PM 이후, FDA 이전, S4-4 stage timer)
-        ts_dt = datetime.now(tz=timezone.utc)
-        try:
-            if asof:
-                parsed_asof = datetime.fromisoformat(asof)
-                if parsed_asof.tzinfo is None:
-                    ts_dt = parsed_asof.replace(tzinfo=timezone.utc)
-                else:
-                    ts_dt = parsed_asof.astimezone(timezone.utc)
-        except ValueError:
-            pass  # asof 파싱 실패 시 now() 사용
+        ts_dt = asof_dt or datetime.now(tz=timezone.utc)
 
         t_rf = self._profiler.start_stage("risk_fast")
         risk_eval = self._risk_fast.evaluate(

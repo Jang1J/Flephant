@@ -132,6 +132,10 @@ class LGBMTrainer:
         end_date_norm = self._normalize_yyyymmdd(end_date)
 
         effective_target_col = str(target_col_override or self.target_col)
+        target_horizon_bars, target_horizon_kind = self._target_horizon_metadata(
+            effective_target_col,
+            default_horizon=int(self.builder.horizon_bars),
+        )
 
         # 1. Panel 생성
         logger.info(
@@ -242,6 +246,8 @@ class LGBMTrainer:
                 ),
             },
             "label_horizon_bars": self.builder.horizon_bars,
+            "target_horizon_bars": target_horizon_bars,
+            "target_horizon_kind": target_horizon_kind,
             "label_generation_version": self.builder.label_generation_version,
             "label_session_scope": self.builder.label_session_scope,
             "target_col": effective_target_col,
@@ -303,12 +309,31 @@ class LGBMTrainer:
             "label_generation_version": self.builder.label_generation_version,
             "label_session_scope": self.builder.label_session_scope,
             "target_col": effective_target_col,
+            "target_horizon_bars": target_horizon_bars,
+            "target_horizon_kind": target_horizon_kind,
             "metric_scope": metric_scope,
         }
 
     # ================================================================== #
     # Internal
     # ================================================================== #
+
+    @staticmethod
+    def _target_horizon_metadata(
+        target_col: str,
+        *,
+        default_horizon: int,
+    ) -> tuple[int, str]:
+        """Infer target horizon metadata from generated label column names."""
+        import re
+
+        target = str(target_col)
+        match = re.match(r"^label_(\d+)m(?:_net)?_ret$", target)
+        if match:
+            return int(match.group(1)), "minute"
+        if target == "label_session_close_ret" or target == "label_session_close_net_ret":
+            return 0, "session_close"
+        return int(default_horizon), "unknown"
 
     def _train_fold(
         self,

@@ -19,6 +19,7 @@ from src.orchestration.llm_router import (
     LLMCallResult,
     LLMModel,
     LLMRouter,
+    LLMRouterConfigError,
     _BudgetTracker,
     _CircuitBreaker,
 )
@@ -47,6 +48,7 @@ def minimal_config() -> dict:
             "sla": {
                 "timeout_sec": 30.0,
             },
+            "allow_mock_provider": True,
         }
     }
 
@@ -87,6 +89,33 @@ def test_budget_tracker_daily_limit_enforced() -> None:
     assert "3/3" in reason
 
 
+def test_router_requires_llm_budget_section() -> None:
+    """LLM 운영 임계값은 기본값으로 부활하지 않고 config 누락 시 실패한다."""
+    with pytest.raises(LLMRouterConfigError, match="llm_budget"):
+        LLMRouter(config={})
+
+
+def test_router_requires_circuit_breaker_and_sla(minimal_config: dict) -> None:
+    """circuit/timeout 누락은 하드코딩 기본값 대신 fail-closed."""
+    missing_circuit = {"llm_budget": dict(minimal_config["llm_budget"])}
+    missing_circuit["llm_budget"].pop("circuit_breaker")
+    with pytest.raises(LLMRouterConfigError, match="circuit_breaker"):
+        LLMRouter(config=missing_circuit)
+
+    missing_sla = {"llm_budget": dict(minimal_config["llm_budget"])}
+    missing_sla["llm_budget"].pop("sla")
+    with pytest.raises(LLMRouterConfigError, match="sla"):
+        LLMRouter(config=missing_sla)
+
+
+def test_router_requires_known_overflow_policy(minimal_config: dict) -> None:
+    """fallback 대상은 gpt-4o 또는 none만 허용한다."""
+    bad = {"llm_budget": dict(minimal_config["llm_budget"])}
+    bad["llm_budget"]["overflow_to"] = "gpt-3"
+    with pytest.raises(LLMRouterConfigError, match="overflow_to"):
+        LLMRouter(config=bad)
+
+
 def test_budget_tracker_caller_allocation_enforced() -> None:
     """caller별 allocation 초과 시 can_call() False 반환."""
     tracker = _BudgetTracker(daily_limit=100, allocation={"news_analysis": 2})
@@ -103,13 +132,26 @@ def test_budget_tracker_caller_allocation_enforced() -> None:
     assert "2/2" in reason
 
 
-def test_budget_tracker_caller_without_allocation_uses_total() -> None:
-    """allocation 미지정 caller는 총 잔여량 기준으로 허용."""
+def test_budget_tracker_caller_without_allocation_rejected_without_buffer() -> None:
+    """allocation 미지정 caller는 buffer 정책이 없으면 차단."""
     tracker = _BudgetTracker(daily_limit=5, allocation={"a": 3})
-    # 총 한도 내라면 allocation 없는 caller도 허용
+    ok, reason = tracker.can_call("b_no_alloc")
+    assert not ok
+    assert reason == "CALLER_NOT_CONFIGURED: b_no_alloc"
+
+
+def test_budget_tracker_caller_without_allocation_uses_buffer() -> None:
+    """allocation 미지정 caller는 명시 buffer quota로만 허용."""
+    tracker = _BudgetTracker(daily_limit=5, allocation={"a": 3, "buffer": 1})
+
     ok, reason = tracker.can_call("b_no_alloc")
     assert ok
     assert reason == "OK"
+    tracker.record("b_no_alloc")
+
+    ok, reason = tracker.can_call("another_no_alloc")
+    assert not ok
+    assert "CALLER_QUOTA_EXCEEDED: buffer 1/1" in reason
 
 
 def test_budget_tracker_daily_reset_at_midnight(monkeypatch) -> None:
@@ -289,6 +331,40 @@ def test_cold_mode_fallback_on_kanana_circuit_open(
     assert result.fallback_used
 
 
+def test_cold_mode_overflow_none_disables_fallback(
+    minimal_config: dict, monkeypatch
+) -> None:
+    """overflow_to=none이면 예산 차단 시 GPT-4o를 호출하지 않고 실패한다."""
+    monkeypatch.setenv("KANANA_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_API_KEY", "o")
+    minimal_config["llm_budget"]["overflow_to"] = "none"
+    router = LLMRouter(config=minimal_config)
+
+    for _ in range(5):
+        assert router.call("p", mode="cold", caller="news_analysis").success
+
+    result = router.call("p", mode="cold", caller="news_analysis")
+
+    assert result.success is False
+    assert result.model_used == LLMModel.KANANA_O.value
+    assert result.fallback_used is False
+    assert result.error.startswith("FALLBACK_DISABLED: CALLER_QUOTA_EXCEEDED")
+
+
+def test_unknown_caller_rejected_without_buffer(minimal_config: dict, monkeypatch) -> None:
+    """caller 오타는 암묵적으로 total budget을 쓰지 못한다."""
+    monkeypatch.setenv("KANANA_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_API_KEY", "o")
+    router = LLMRouter(config=minimal_config)
+
+    result = router.call("p", mode="cold", caller="news_anlaysis_typo")
+
+    assert result.success is False
+    assert result.error == "CALLER_NOT_CONFIGURED: news_anlaysis_typo"
+    assert result.fallback_used is False
+    assert router.budget_remaining() == 10
+
+
 def test_missing_kanana_key_returns_failure(
     minimal_config: dict, monkeypatch
 ) -> None:
@@ -296,6 +372,7 @@ def test_missing_kanana_key_returns_failure(
     monkeypatch.delenv("KANANA_API_KEY", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = False
     monkeypatch.setenv("OPENAI_API_KEY", "o")
     router = LLMRouter(config=minimal_config)
 
@@ -313,6 +390,7 @@ def test_missing_openai_key_returns_failure(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = False
     router = LLMRouter(config=minimal_config)
 
     # Kanana circuit OPEN → GPT-4o fallback 시도 → 키 없음
@@ -343,6 +421,7 @@ def test_kanana_malformed_tokens_out_does_not_fail_call(
     monkeypatch.setenv("KANANA_API_URL", "https://kanana.example.invalid")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = False
     monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Response())
     router = LLMRouter(config=minimal_config)
 
@@ -493,6 +572,7 @@ def test_mode_b_unauthorized_caller_raises(monkeypatch) -> None:
             "budget_allocation": {},
             "circuit_breaker": {"failure_threshold": 3, "open_duration_sec": 300},
             "sla": {"timeout_sec": 30.0},
+            "allow_mock_provider": True,
             "mode_b_allowed_callers": [
                 "backtest_reasoning",
                 "factor_hypothesis",
@@ -517,6 +597,7 @@ def test_mode_b_authorized_caller_passes(monkeypatch) -> None:
             "budget_allocation": {},
             "circuit_breaker": {"failure_threshold": 3, "open_duration_sec": 300},
             "sla": {"timeout_sec": 30.0},
+            "allow_mock_provider": True,
             "mode_b_allowed_callers": [
                 "backtest_reasoning",
                 "factor_hypothesis",
