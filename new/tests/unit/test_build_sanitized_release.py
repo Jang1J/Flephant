@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib.util
 import zipfile
 from pathlib import Path
@@ -24,8 +25,30 @@ def test_root_operational_scripts_are_release_sources() -> None:
         assert module._is_source_candidate(rel_path), rel_path
 
 
-def test_sanitized_release_includes_root_scripts_and_excludes_forbidden(tmp_path: Path) -> None:
+def test_sanitized_release_includes_root_scripts_and_excludes_forbidden(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     module = _load_release_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    for rel_path in (".gitignore", "init.sh", "demo.sh", "eval.sh", "smoke.sh"):
+        path = tmp_path / rel_path
+        path.write_text("# test\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SECRET=never-package\n", encoding="utf-8")
+    report_dir = tmp_path / "artifacts" / "reports" / "paper_trading"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "report.json").write_text(
+        json.dumps({"status": "PASS"}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        module,
+        "_git_file_candidates",
+        lambda: [".gitignore", "init.sh", "demo.sh", "eval.sh", "smoke.sh", ".env"],
+    )
+
     zip_path = tmp_path / "release.zip"
     manifest_path = tmp_path / "release.manifest.json"
 
