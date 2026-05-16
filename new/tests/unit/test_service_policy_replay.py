@@ -43,6 +43,8 @@ def _policy(**overrides) -> ServicePolicyConfig:
         "min_expected_net_alpha_bps": 15.0,
         "expected_net_alpha_source": "rank_score",
         "min_service_policy_sharpe": 0.0,
+        "trade_probability_gate_enabled": False,
+        "min_trade_probability": 0.5,
     }
     base.update(overrides)
     return ServicePolicyConfig(**base)
@@ -128,6 +130,8 @@ def test_policy_config_maps_risk_config_values() -> None:
     assert policy.turnover_budget_hard_stop is True
     assert policy.min_service_policy_sharpe == 0.0
     assert policy.expected_net_alpha_source == "rank_score"
+    assert policy.trade_probability_gate_enabled is False
+    assert policy.min_trade_probability == 0.5
 
 
 def test_policy_config_treats_string_false_flags_as_false(monkeypatch) -> None:
@@ -292,6 +296,43 @@ def test_min_expected_net_alpha_does_not_convert_rank_score_to_bps() -> None:
 
     assert result["order_stats"]["buy_orders"] == 1
     assert result["orders"][0]["ticker"] == "005930"
+
+
+def test_trade_probability_gate_filters_service_replay_candidate() -> None:
+    class _TradeModel:
+        def predict(self, rows):
+            return [0.2 if row[0] >= 3.0 else 0.9 for row in rows]
+
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        )
+    )
+    panel = _panel([
+        ("005930", "2026-05-01 09:00:00", 3.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 2.0, 0.001, 100.0),
+    ])
+
+    result = engine._simulate_panel(
+        panel=panel,
+        model_callable=_model,
+        feature_cols=["feature_score"],
+        target_col="label_5m_ret",
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        ),
+        trade_probability_model=_TradeModel(),
+    )
+
+    assert result["order_stats"]["buy_orders"] == 1
+    assert result["orders"][0]["ticker"] == "000660"
+    assert result["trade_probability_gate"]["applied"] is True
+    assert result["trade_probability_gate"]["candidates_rejected"] == 1
+    assert result["order_stats"]["trade_probability_rejected_candidates"] == 1
 
 
 def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:

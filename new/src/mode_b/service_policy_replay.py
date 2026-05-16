@@ -15,11 +15,14 @@ paper-auto cash-account policy:
 from __future__ import annotations
 
 import math
+import pickle
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import numpy as np
 
 from src.mode_b.validation_tools import (
     BacktestEngine,
@@ -33,7 +36,7 @@ from src.mode_b.service_policy_verifier import (
     service_policy_universe_hash,
 )
 from src.utils.config_loader import load as config_load
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -66,6 +69,8 @@ class ServicePolicyConfig:
     min_expected_net_alpha_bps: float
     expected_net_alpha_source: str
     min_service_policy_sharpe: float
+    trade_probability_gate_enabled: bool
+    min_trade_probability: float
 
     @property
     def total_cost_bps(self) -> float:
@@ -91,6 +96,11 @@ class ServicePolicyConfig:
         cost_components = cost_cfg.get("components", {}) or {}
         label_cfg = config_load("risk_config.yaml", "label") or {}
         replay_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
+        trade_gate_cfg = (
+            (config_load("risk_config.yaml", "cost_aware_retraining") or {})
+            .get("trade_probability_gate", {})
+            or {}
+        )
 
         return cls(
             initial_capital=float(backtest_cfg.get("initial_capital", 100_000_000.0)),
@@ -127,6 +137,16 @@ class ServicePolicyConfig:
                 replay_cfg.get("expected_net_alpha_source", "rank_score")
             ),
             min_service_policy_sharpe=float(replay_cfg.get("min_service_policy_sharpe", 0.0)),
+            trade_probability_gate_enabled=safe_bool(
+                trade_gate_cfg.get("enabled"),
+                default=False,
+            ),
+            min_trade_probability=safe_float(
+                trade_gate_cfg.get("min_probability"),
+                default=0.5,
+                min_value=0.0,
+                max_value=1.0,
+            ),
         )
 
 
@@ -204,6 +224,7 @@ class ServicePolicyReplayEngine:
             feature_cols=feature_cols,
             target_col=target_col,
             policy=self._policy,
+            trade_probability_model=self._load_trade_probability_model(candidate_artifact),
         )
         result.update({
             "schema_version": "1.0.0",
@@ -365,6 +386,42 @@ class ServicePolicyReplayEngine:
                 return ""
         return ""
 
+    @staticmethod
+    def _candidate_metadata(candidate_artifact: dict[str, Any]) -> dict[str, Any]:
+        metadata = candidate_artifact.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+        metadata_path = Path(str(candidate_artifact.get("metadata_path", "")))
+        if metadata_path.is_file():
+            try:
+                import json
+
+                with metadata_path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                _ = e
+        return {}
+
+    @staticmethod
+    def _load_trade_probability_model(candidate_artifact: dict[str, Any]) -> Any | None:
+        metadata = ServicePolicyReplayEngine._candidate_metadata(candidate_artifact)
+        classifier = metadata.get("trade_no_trade_classifier")
+        if not isinstance(classifier, dict) or classifier.get("status") != "PASS":
+            return None
+        raw_path = str(classifier.get("model_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        try:
+            with path.open("rb") as fh:
+                return pickle.load(fh)
+        except Exception as e:
+            _ = e
+            return None
+
     def _simulate_panel(
         self,
         *,
@@ -374,6 +431,7 @@ class ServicePolicyReplayEngine:
         target_col: str,
         policy: ServicePolicyConfig,
         initial_holdings: dict[str, int] | None = None,
+        trade_probability_model: Any | None = None,
     ) -> dict[str, Any]:
         cash = float(policy.initial_capital)
         holdings: dict[str, int] = {
@@ -397,9 +455,20 @@ class ServicePolicyReplayEngine:
         min_holding_skipped_sells = 0
         turnover_budget_skipped_orders = 0
         already_held_skipped_buys = 0
+        trade_gate_stats: dict[str, Any] = {
+            "enabled": policy.trade_probability_gate_enabled,
+            "applied": False,
+            "min_probability": policy.min_trade_probability,
+            "cycles": 0,
+            "candidates_seen": 0,
+            "candidates_rejected": 0,
+            "missing_probability": 0,
+            "model_loaded": trade_probability_model is not None,
+        }
 
         for cycle_idx, (ts_close, ts_group) in enumerate(panel.groupby(level="ts_close", sort=True)):
             bar_preds: list[tuple[str, float, float, float]] = []
+            trade_probs_by_ticker: dict[str, float] = {}
             for (ticker, _), row in ts_group.iterrows():
                 ticker_s = pad_ticker(ticker)
                 try:
@@ -424,6 +493,12 @@ class ServicePolicyReplayEngine:
                     )
                 latest_prices[ticker_s] = price
                 bar_preds.append((ticker_s, pred, actual_ret, price))
+                trade_prob = self._predict_trade_probability(
+                    trade_probability_model,
+                    features,
+                )
+                if trade_prob is not None:
+                    trade_probs_by_ticker[ticker_s] = trade_prob
                 predicted_signals.append(pred)
                 actual_returns.append(actual_ret)
 
@@ -445,7 +520,25 @@ class ServicePolicyReplayEngine:
                 daily_equity[day_key] = equity_after
                 continue
 
-            desired = self._desired_tickers(bar_preds, policy)
+            gated_bar_preds, trade_gate_state = self._apply_trade_probability_gate(
+                bar_preds,
+                policy,
+                trade_probs_by_ticker,
+                trade_probability_model=trade_probability_model,
+            )
+            if trade_gate_state.get("applied"):
+                trade_gate_stats["applied"] = True
+                trade_gate_stats["cycles"] += 1
+                trade_gate_stats["candidates_seen"] += int(trade_gate_state.get("n_input", 0))
+                trade_gate_stats["candidates_rejected"] += int(
+                    trade_gate_state.get("n_rejected", 0)
+                )
+                trade_gate_stats["missing_probability"] += int(
+                    trade_gate_state.get("missing_probability", 0)
+                )
+            elif policy.trade_probability_gate_enabled and not trade_gate_stats.get("reason"):
+                trade_gate_stats["reason"] = trade_gate_state.get("reason")
+            desired = self._desired_tickers(gated_bar_preds, policy)
             pred_by_ticker = {ticker: pred for ticker, pred, _, _ in bar_preds}
             price_by_ticker = {ticker: price for ticker, _, _, price in bar_preds}
             orders_this_cycle = 0
@@ -627,7 +720,11 @@ class ServicePolicyReplayEngine:
                 "min_holding_skipped_sells": min_holding_skipped_sells,
                 "turnover_budget_skipped_orders": turnover_budget_skipped_orders,
                 "already_held_skipped_buys": already_held_skipped_buys,
+                "trade_probability_rejected_candidates": int(
+                    trade_gate_stats.get("candidates_rejected", 0)
+                ),
             },
+            "trade_probability_gate": trade_gate_stats,
             "daily_turnover": turnover,
             "daily_equity": daily_equity,
             "orders": orders,
@@ -637,6 +734,67 @@ class ServicePolicyReplayEngine:
                 "prediction_count": len(predicted_signals),
             },
         }
+
+    @staticmethod
+    def _predict_trade_probability(
+        trade_probability_model: Any | None,
+        features: list[float],
+    ) -> float | None:
+        if trade_probability_model is None:
+            return None
+        try:
+            raw = np.asarray(trade_probability_model.predict([features]), dtype=float)
+        except Exception as e:
+            _ = e
+            return None
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if len(raw) < 1 or not math.isfinite(float(raw[0])):
+            return None
+        return safe_float(float(raw[0]), default=0.0, min_value=0.0, max_value=1.0)
+
+    @staticmethod
+    def _apply_trade_probability_gate(
+        bar_preds: list[tuple[str, float, float, float]],
+        policy: ServicePolicyConfig,
+        trade_probs_by_ticker: dict[str, float],
+        *,
+        trade_probability_model: Any | None,
+    ) -> tuple[list[tuple[str, float, float, float]], dict[str, Any]]:
+        state: dict[str, Any] = {
+            "enabled": policy.trade_probability_gate_enabled,
+            "applied": False,
+            "min_probability": policy.min_trade_probability,
+        }
+        if not policy.trade_probability_gate_enabled:
+            state["reason"] = "disabled"
+            return bar_preds, state
+        if trade_probability_model is None:
+            state["reason"] = "classifier_missing"
+            return bar_preds, state
+        filtered: list[tuple[str, float, float, float]] = []
+        missing = 0
+        rejected = 0
+        for row in bar_preds:
+            ticker = row[0]
+            prob = trade_probs_by_ticker.get(ticker)
+            if prob is None:
+                missing += 1
+                rejected += 1
+                continue
+            if prob < policy.min_trade_probability:
+                rejected += 1
+                continue
+            filtered.append(row)
+        state.update({
+            "applied": True,
+            "n_input": len(bar_preds),
+            "n_passed": len(filtered),
+            "n_rejected": rejected,
+            "missing_probability": missing,
+        })
+        return filtered, state
 
     @staticmethod
     def _desired_tickers(
