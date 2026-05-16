@@ -312,7 +312,7 @@ def test_score_cross_section_happy_path(agent_active: QuantAgent) -> None:
     for t in tickers:
         for bar in _make_bars(t, n=65, start_price=50000 + int(t) % 1000, seed=int(t[-1])):
             agent_active.on_bar(bar)
-    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
     assert result["mode"] == "active"
     assert result["n_tickers"] == 4
     assert set(result["scores"].keys()) == set(tickers)
@@ -328,11 +328,42 @@ def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
     for bar in _make_bars("000660", n=30):   # 부족
         agent_active.on_bar(bar)
     result = agent_active.score_cross_section(
-        ["005930", "000660"], asof="2026-04-20T10:00:00+09:00"
+        ["005930", "000660"], asof="2026-04-20T10:04:00+09:00"
     )
     assert result["n_tickers"] == 1
     assert "005930" in result["scores"]
     assert "000660" not in result["scores"]
+
+
+def test_score_cross_section_excludes_future_buffered_bars(
+    populated_registry: ModelRegistry,
+) -> None:
+    """이미 buffer에 들어간 미래 bar도 asof 이후면 추론 feature에서 제외한다."""
+    agent_active = QuantAgent(
+        registry=populated_registry,
+        bar_buffer=BarBuffer(max_bars=120),
+    )
+    bars = _make_bars("005930", n=65, seed=11)
+    for bar in bars:
+        agent_active.on_bar(bar)
+    future_bar = dict(bars[-1])
+    future_bar["ts_close"] = "2026-04-20T10:05:00+09:00"
+    future_bar["close"] = future_bar["close"] * 10.0
+    agent_active.on_bar(future_bar)
+
+    result = agent_active.score_cross_section(
+        ["005930"],
+        asof="2026-04-20T10:04:00+09:00",
+    )
+    expected = agent_active._compute_features(bars)
+
+    assert result["mode"] == "active"
+    assert expected is not None
+    assert agent_active._booster.last_X is not None
+    assert agent_active._booster.last_X[0, 0] == pytest.approx(
+        expected["feat_1m_close_robust_z"]
+    )
+    assert agent_active._booster.last_X[0, 0] < agent_active._outlier_cap_z
 
 
 def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> None:
@@ -345,7 +376,7 @@ def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> No
     for t in tickers:
         for bar in _make_bars(t, n=65, seed=int(t[-1])):
             agent_active.on_bar(bar)
-    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
     # Mock inference + feature 계산은 50ms 이내 (실측 ~5ms)
     assert result["latency_ms"] < 50.0, f"latency={result['latency_ms']}ms"
 
@@ -375,13 +406,43 @@ def test_score_cross_section_uses_dual_source_scores(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert loader_calls == ["20260420"]
     assert agent._booster.last_X is not None
     ds_values = agent._booster.last_X[0, 4:9].tolist()
     assert ds_values == pytest.approx([0.7, 0.3, 0.1, 0.4, 0.8])
+
+
+def test_score_cross_section_blocks_future_dual_source_scores(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """asof 이후 생성된 Dual-Source score는 Hot Path 추론에 섞지 않는다."""
+    def loader(_date_str: str | None) -> list[dict[str, Any]]:
+        return [{
+            "ticker": "005930",
+            "snapshot_ts": "2026-04-20T10:30:00+09:00",
+            "generated_at": "2026-04-20T10:31:00+09:00",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
 
 
 def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None:
@@ -427,7 +488,7 @@ def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None
         received_at="2026-04-20T10:00:00+09:00",
     )
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert agent._booster.last_X is not None
@@ -469,15 +530,15 @@ def test_score_cross_section_ignores_future_investor_flow(tmp_path: Path) -> Non
     agent.update_investor_flow_snapshot(
         "005930",
         {"foreign_net_buy": 999999},
-        received_at="2026-04-20T10:01:00+09:00",
+        received_at="2026-04-20T10:05:00+09:00",
     )
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert agent.get_investor_flow_snapshot(
         "005930",
-        asof="2026-04-20T10:00:00+09:00",
+        asof="2026-04-20T10:04:00+09:00",
     )["is_future"] is True
     assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
 
@@ -537,7 +598,7 @@ def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
@@ -559,7 +620,7 @@ def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
@@ -587,7 +648,7 @@ def test_score_cross_section_blocks_dual_source_model_when_values_invalid(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
@@ -700,6 +761,30 @@ def test_detect_anomalies_noisy_history_detects_drop(agent_active: QuantAgent) -
     assert anomalies[0]["z_score"] < -3.0
 
 
+def test_detect_anomalies_excludes_future_buffered_bars(
+    populated_registry: ModelRegistry,
+) -> None:
+    """asof 이후 미래 급락 bar는 anomaly 판단에 쓰지 않는다."""
+    agent_active = QuantAgent(
+        registry=populated_registry,
+        bar_buffer=BarBuffer(max_bars=120),
+    )
+    bars = _make_bars("005930", n=65, seed=7)
+    for bar in bars:
+        agent_active.on_bar(bar)
+    future_drop = dict(bars[-1])
+    future_drop["ts_close"] = "2026-04-20T10:05:00+09:00"
+    future_drop["close"] = future_drop["close"] * 0.1
+    agent_active.on_bar(future_drop)
+
+    anomalies = agent_active.detect_anomalies(
+        ["005930"],
+        asof="2026-04-20T10:04:00+09:00",
+    )
+
+    assert anomalies == []
+
+
 def test_detect_anomalies_warmup_insufficient(agent_active: QuantAgent) -> None:
     for bar in _make_bars("005930", n=30):
         agent_active.on_bar(bar)
@@ -725,7 +810,7 @@ def test_latency_percentiles_records(agent_active: QuantAgent) -> None:
             agent_active.on_bar(bar)
     # score 여러번 호출 → 레이턴시 기록
     for _ in range(5):
-        agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+        agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
 
     p = agent_active.latency_percentiles()
     assert p["n"] == 5

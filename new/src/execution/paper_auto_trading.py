@@ -184,10 +184,7 @@ class PaperAutoTrader:
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
         ]
-        qty_clipping = self._clip_order_quantities(final_decision)
         order_guard = self._order_guard(final_decision)
-        if qty_clipping["items"]:
-            order_guard["qty_clipping"] = qty_clipping
         if order_guard["status"] != "PASS":
             return {
                 "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
@@ -387,6 +384,13 @@ class PaperAutoTrader:
                     "qty": qty,
                     "max_order_qty_per_order": self._max_order_qty_per_order,
                 })
+            elif qty > self._max_order_qty_per_order:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "qty_out_of_limit",
+                    "qty": qty,
+                    "max_order_qty_per_order": self._max_order_qty_per_order,
+                })
             if order_type == "01" and not self._allow_market_order:
                 violations.append({
                     "ticker": ticker,
@@ -401,26 +405,6 @@ class PaperAutoTrader:
         if violations:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
         return {"status": "PASS", "n_orders": len(order_deltas)}
-
-    def _clip_order_quantities(self, final_decision: dict[str, Any]) -> dict[str, Any]:
-        """paper-safe qty clipping. 수량은 감소만 허용한다."""
-        clipped: list[dict[str, Any]] = []
-        for od in final_decision.get("order_deltas", []):
-            if not isinstance(od, dict):
-                continue
-            original_qty = safe_int(od.get("qty", 0), default=0)
-            if original_qty > self._max_order_qty_per_order:
-                od["qty"] = self._max_order_qty_per_order
-                clipped.append({
-                    "ticker": od.get("ticker"),
-                    "original_qty": original_qty,
-                    "clipped_qty": self._max_order_qty_per_order,
-                    "direction": "decrease_only",
-                })
-        return {
-            "status": "PASS",
-            "items": clipped,
-        }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(self._kis_client, "get_order_history"):

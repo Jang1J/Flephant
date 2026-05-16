@@ -301,9 +301,13 @@ class QuantAgent(AgentBase):
                 "n_tickers": 0,
             }
 
-        # BarBuffer batch load
+        # BarBuffer batch load. asof 이후 bar가 buffer에 선적재되어도 추론에서 제외한다.
         max_window = int(self._multi_scale_windows[-1])
-        bars_batch = self._bar_buffer.get_batch(padded_all, max_window)
+        bars_batch = self._bar_buffer.get_batch_asof(
+            padded_all,
+            max_window,
+            asof=asof_str,
+        )
 
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
@@ -386,7 +390,7 @@ class QuantAgent(AgentBase):
         out: list[dict[str, Any]] = []
 
         for ticker in padded_all:
-            bars = self._bar_buffer.get_latest(ticker, max_window)
+            bars = self._bar_buffer.get_latest_asof(ticker, max_window, asof=asof)
             if len(bars) < self._warmup_bars:
                 continue
             is_anom, z = self._is_intraday_drop_anomaly(bars)
@@ -673,6 +677,8 @@ class QuantAgent(AgentBase):
                 records = []
             ticker_map: dict[str, dict[str, float]] = {}
             for item in records:
+                if not self._dual_source_record_usable(item, asof):
+                    continue
                 padded = pad_ticker(str(item.get("ticker", "")))
                 if not padded or padded == "000000":
                     continue
@@ -686,6 +692,32 @@ class QuantAgent(AgentBase):
             self._dual_source_cache[date_key] = ticker_map
 
         return self._dual_source_cache.get(date_key, {}).get(pad_ticker(ticker), {})
+
+    def _dual_source_record_usable(self, item: dict[str, Any], asof: str) -> bool:
+        """Dual-Source score metadata must not be newer than Hot Path asof."""
+        asof_dt = self._parse_snapshot_dt(asof)
+        for key in ("snapshot_ts", "generated_at"):
+            raw = item.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                ts = self._parse_snapshot_dt(raw)
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "[quant_agent] Dual-Source %s 파싱 실패: %s. record skip",
+                    key,
+                    e,
+                )
+                return False
+            if ts > asof_dt:
+                logger.warning(
+                    "[quant_agent] Dual-Source future %s=%s > asof=%s. record skip",
+                    key,
+                    ts.isoformat(),
+                    asof_dt.isoformat(),
+                )
+                return False
+        return True
 
     @staticmethod
     def _asof_to_yyyymmdd(asof: str) -> str:

@@ -326,7 +326,7 @@ def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
     )
 
 
-def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:
+def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
         kis_client=client,
@@ -342,13 +342,14 @@ def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:
         write_report=False,
     )
 
-    assert report["status"] == "PASS"
-    assert client.orders[0]["qty"] == 1
+    assert report["status"] == "FAIL"
+    assert client.orders == []
     cycle = report["stages"]["cycles"]["items"][0]
-    clipping = cycle["order_guard"]["qty_clipping"]["items"][0]
-    assert clipping["original_qty"] == 2
-    assert clipping["clipped_qty"] == 1
-    assert clipping["direction"] == "decrease_only"
+    assert cycle["order_guard"]["reason"] == "order_guard_violations"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
+    assert cycle["order_guard"]["violations"][0]["qty"] == 2
+    assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["qty"] == 2
+    assert cycle["execution"] is None
 
 
 def test_paper_auto_treats_string_false_market_order_as_disabled(

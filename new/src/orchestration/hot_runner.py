@@ -272,6 +272,7 @@ class HotRunner:
             cold_path_exits=cold_path_exits,
         )
         portfolio_patch = pm_result["portfolio_patch"]
+        pm_guard_warnings = self._portfolio_manager_guard_warnings(pm_result)
         pm_ms = self._profiler.end_stage("pm", t_pm)
 
         # 5. RiskFast sidecar (PM 이후, FDA 이전, S4-4 stage timer)
@@ -302,6 +303,8 @@ class HotRunner:
             )
 
         # 6. FDA Hot Path (risk_fast_eval 전달, S4-4 stage timer)
+        combined_risk_warnings = list(risk_warnings or [])
+        combined_risk_warnings.extend(pm_guard_warnings)
         t_fda = self._profiler.start_stage("fda")
         fda_result = self._fda.decide(
             portfolio_patch_ref=portfolio_patch["portfolio_patch_id"],
@@ -311,7 +314,7 @@ class HotRunner:
                 "news": "done", "risk": "done", "quant": "done", "debate": "skipped"
             },
             anomalies=anomalies,
-            risk_warnings=risk_warnings or [],
+            risk_warnings=combined_risk_warnings,
             mode="hot",
             risk_fast_eval=risk_eval,
         )
@@ -350,6 +353,7 @@ class HotRunner:
             "anomalies": anomalies,
             "allocation": allocation,
             "pm_result": pm_result,
+            "pm_guard_warnings": pm_guard_warnings,
             "risk_eval": risk_eval,
             "fda_result": fda_result,
             "final_decision": fda_result["final_decision"],
@@ -362,6 +366,41 @@ class HotRunner:
                 "fda": fda_ms,
             },
         }
+
+    @staticmethod
+    def _portfolio_manager_guard_warnings(
+        pm_result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Convert PM planning failures into FDA veto warnings."""
+        warnings: list[dict[str, Any]] = []
+        errors = list(pm_result.get("errors") or [])
+        if int(pm_result.get("n_errors") or len(errors)) > 0 or errors:
+            tickers = sorted({
+                str(item.get("ticker", "")).strip()
+                for item in errors
+                if str(item.get("ticker", "")).strip()
+            })
+            warnings.append({
+                "ticker": ",".join(tickers),
+                "severity": "high",
+                "reason": "portfolio_manager_errors",
+                "details": errors,
+            })
+
+        ppo_violations = list(pm_result.get("ppo_violations") or [])
+        if ppo_violations:
+            tickers = sorted({
+                str(item.get("ticker", "")).strip()
+                for item in ppo_violations
+                if str(item.get("ticker", "")).strip()
+            })
+            warnings.append({
+                "ticker": ",".join(tickers),
+                "severity": "high",
+                "reason": "ppo_constraint_violation",
+                "details": ppo_violations,
+            })
+        return warnings
 
     def latency_stats(self) -> dict[str, float]:
         """최근 run_once 레이턴시 통계."""

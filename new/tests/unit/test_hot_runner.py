@@ -321,6 +321,77 @@ def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> No
     assert result["final_decision"]["order_deltas"][0]["reason"] == "risk_reduce"
 
 
+def test_run_once_vetoes_pm_price_unavailable(runner: HotRunner) -> None:
+    """PM이 주문 생성 오류를 보고하면 FDA는 partial patch를 approve하지 않는다."""
+    runner.start()
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.10}}
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        latest_prices={},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["pm_result"]["n_errors"] == 1
+    assert result["pm_guard_warnings"][0]["reason"] == "portfolio_manager_errors"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_run_once_vetoes_ppo_constraint_violation(runner: HotRunner) -> None:
+    """PM이 PPO boundary violation을 보고하면 FDA는 해당 patch를 veto한다."""
+    runner.start()
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.90}}
+    }
+    runner._pm.plan = lambda **kwargs: {  # type: ignore[method-assign]
+        "portfolio_patch": {
+            "portfolio_patch_id": "PP-TEST",
+            "based_on_ts": "2026-04-20T10:05:00+09:00",
+            "target_weights": {"005930": 0.90},
+            "order_deltas": [{"ticker": "005930", "side": "buy", "qty": 1}],
+        },
+        "n_errors": 0,
+        "errors": [],
+        "ppo_violations": [
+            {
+                "type": "max_single_name_exceeded",
+                "ticker": "005930",
+                "weight": 0.90,
+                "limit": 0.10,
+            }
+        ],
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        latest_prices={"005930": 50_000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["pm_guard_warnings"][0]["reason"] == "ppo_constraint_violation"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
 def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930"]

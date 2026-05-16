@@ -247,3 +247,35 @@ def test_run_dual_source_batch_real_path_does_not_mix_connector_mocks(tmp_path) 
     assert payload["batch_date"] == "2026-05-08"
     assert payload["source_stats"]["news_mode"] == "unavailable_empty"
     assert payload["source_stats"]["community_mode"] == "unavailable_empty"
+
+
+def test_load_latest_scores_preserves_batch_metadata(tmp_path) -> None:
+    """QuantAgent가 PIT guard를 걸 수 있도록 score별 배치 메타를 보존한다."""
+    payload = {
+        "batch_date": "2026-05-08",
+        "snapshot_ts": "2026-05-08T08:30:00+09:00",
+        "generated_at": "2026-05-08T08:31:00+09:00",
+        "scores": [
+            {
+                "ticker": "005930",
+                "news_score_t": 0.1,
+                "comm_score_t_1": 0.2,
+            }
+        ],
+    }
+    path = tmp_path / "20260508.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(dual_source_runner, "_ARTIFACT_DIR", tmp_path):
+        scores = dual_source_runner.load_latest_scores("20260508")
+
+    assert scores == [
+        {
+            "ticker": "005930",
+            "news_score_t": 0.1,
+            "comm_score_t_1": 0.2,
+            "batch_date": "2026-05-08",
+            "snapshot_ts": "2026-05-08T08:30:00+09:00",
+            "generated_at": "2026-05-08T08:31:00+09:00",
+        }
+    ]

@@ -374,7 +374,16 @@ def load_latest_scores(date_str: str | None = None) -> list[dict]:
     with path.open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    return payload.get("scores", [])
+    scores: list[dict] = []
+    for item in payload.get("scores", []):
+        if not isinstance(item, dict):
+            continue
+        enriched = dict(item)
+        enriched.setdefault("batch_date", payload.get("batch_date"))
+        enriched.setdefault("snapshot_ts", payload.get("snapshot_ts"))
+        enriched.setdefault("generated_at", payload.get("generated_at"))
+        scores.append(enriched)
+    return scores
 
 
 if __name__ == "__main__":
