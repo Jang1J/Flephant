@@ -562,6 +562,33 @@ def test_candidate_bundle_metadata_synthetic_fallback_string_false(tmp_path: Pat
     assert artifact["data_source"] == "artifact_bars"
 
 
+def test_candidate_bundle_exposes_target_col_metadata(tmp_path: Path):
+    """C12 replay는 candidate metadata의 target_col을 artifact summary로 보존한다."""
+    bundle_id = "BUNDLE-20260509-TARGET01"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_30m_net_ret",
+                "label_horizon_bars": 30,
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    _, _, artifact = engine._resolve_candidate_model(bundle_id)
+
+    assert artifact["metadata"]["target_col"] == "label_30m_net_ret"
+    assert artifact["metadata"]["label_horizon_bars"] == 30
+    assert engine._candidate_target_col(artifact, "label_5m_ret") == "label_30m_net_ret"
+
+
 def test_candidate_bundle_requires_metadata(tmp_path: Path):
     """candidate pkl만 있고 feature metadata가 없으면 backtest를 실패시킨다."""
     from src.mode_b.validation_tools import BundleLoadFailed

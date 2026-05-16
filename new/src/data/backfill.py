@@ -10,8 +10,11 @@ parquet 미지원 시 JSON Lines fallback (pyarrow 미설치 환경 대응).
 from __future__ import annotations
 
 import json
+import os
+from importlib.util import find_spec
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from src.connectors.kis_rest import KISRestClient
@@ -26,6 +29,47 @@ _KST = ZoneInfo("Asia/Seoul")
 
 # artifacts 루트 (new/ 기준)
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts" / "data"
+
+
+def _has_pyarrow() -> bool:
+    """parquet writer 사용 가능 여부."""
+    return find_spec("pyarrow") is not None
+
+
+def _temp_artifact_path(target_path: Path) -> Path:
+    """같은 디렉토리 temp 경로. 같은 FS에서 replace되어 atomic 보장."""
+    token = uuid4().hex
+    return target_path.with_name(f".{target_path.stem}.{token}.tmp{target_path.suffix}")
+
+
+def _atomic_replace(temp_path: Path, target_path: Path) -> None:
+    """temp artifact를 final artifact로 atomic replace."""
+    temp_path.replace(target_path)
+
+
+def _alternate_bar_artifact_path(target_path: Path) -> Path | None:
+    """동일 ticker/date의 alternate suffix 경로."""
+    if target_path.suffix == ".parquet":
+        return target_path.with_suffix(".jsonl")
+    if target_path.suffix == ".jsonl":
+        return target_path.with_suffix(".parquet")
+    return None
+
+
+def _cleanup_alternate_bar_artifact(target_path: Path) -> None:
+    """새 artifact 저장 성공 후 stale alternate suffix 제거."""
+    alternate_path = _alternate_bar_artifact_path(target_path)
+    if alternate_path is None or not alternate_path.exists():
+        return
+    try:
+        alternate_path.unlink()
+        logger.info("[backfill] stale alternate artifact 제거: %s", alternate_path)
+    except Exception as e:
+        logger.warning(
+            "[backfill] stale alternate artifact 제거 실패: %s (%s)",
+            alternate_path,
+            e,
+        )
 
 
 def _load_market_hours() -> tuple[time, time]:
@@ -234,12 +278,18 @@ class Backfill:
         try:
             import pandas as pd  # type: ignore[import]
             try:
-                from importlib.util import find_spec
-                if find_spec("pyarrow") is None:
+                if not _has_pyarrow():
                     raise ImportError
                 out_path = save_dir / f"bars_1m_{date}.parquet"
+                temp_path = _temp_artifact_path(out_path)
                 df = pd.DataFrame(bars)
-                df.to_parquet(out_path, index=False)
+                try:
+                    df.to_parquet(temp_path, index=False)
+                    _atomic_replace(temp_path, out_path)
+                except Exception as e:
+                    temp_path.unlink(missing_ok=True)
+                    raise BackfillError(f"parquet 저장 실패: {out_path}: {e}") from e
+                _cleanup_alternate_bar_artifact(out_path)
                 logger.info("[backfill] parquet 저장: %s (%d rows)", out_path, len(bars))
                 return out_path
             except ImportError:
@@ -254,9 +304,18 @@ class Backfill:
     ) -> Path:
         """JSON Lines fallback 저장."""
         out_path = save_dir / f"bars_1m_{date}.jsonl"
-        with out_path.open("w", encoding="utf-8") as fh:
-            for bar in bars:
-                fh.write(json.dumps(bar, ensure_ascii=False) + "\n")
+        temp_path = _temp_artifact_path(out_path)
+        try:
+            with temp_path.open("w", encoding="utf-8") as fh:
+                for bar in bars:
+                    fh.write(json.dumps(bar, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            _atomic_replace(temp_path, out_path)
+        except Exception as e:
+            temp_path.unlink(missing_ok=True)
+            raise BackfillError(f"JSONL 저장 실패: {out_path}: {e}") from e
+        _cleanup_alternate_bar_artifact(out_path)
         logger.info("[backfill] JSONL 저장: %s (%d rows)", out_path, len(bars))
         return out_path
 

@@ -291,6 +291,65 @@ def test_min_expected_net_alpha_does_not_convert_rank_score_to_bps() -> None:
     assert result["orders"][0]["ticker"] == "005930"
 
 
+def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:
+    """service replay는 후보 모델이 학습한 target_col로 실제 수익률을 평가한다."""
+
+    class _FakeBuilder:
+        target_col = "label_5m_ret"
+
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+
+        def relabel_panel_for_target(self, panel, target_col: str):
+            assert target_col == "label_30m_net_ret"
+            return panel.dropna(subset=[target_col]).copy()
+
+    class _FakeEngine:
+        def _resolve_candidate_model(self, bundle_id: str):
+            assert bundle_id == "BUNDLE-TARGET"
+            return _model, 1, {
+                "feature_cols": ["feature_score"],
+                "metadata": {
+                    "version": "v-target",
+                    "target_col": "label_30m_net_ret",
+                },
+                "metadata_path": "",
+            }
+
+        def _build_replay_panel(self, builder, universe, start_date, end_date):
+            assert universe == ["005930"]
+            assert start_date == "20260501"
+            assert end_date == "20260501"
+            index = pd.MultiIndex.from_tuples(
+                [("005930", pd.Timestamp("2026-05-01 09:00:00", tz="Asia/Seoul"))],
+                names=["ticker", "ts_close"],
+            )
+            return pd.DataFrame(
+                {
+                    "feature_score": [3.0],
+                    "label_5m_ret": [float("nan")],
+                    "label_30m_net_ret": [0.03],
+                    "close": [100.0],
+                },
+                index=index,
+            )
+
+    monkeypatch.setattr("src.data.dataset_builder.DatasetBuilder", _FakeBuilder)
+    engine = ServicePolicyReplayEngine(engine=_FakeEngine(), policy=_policy())
+
+    result = engine.run(
+        "BUNDLE-TARGET",
+        start_date="20260501",
+        end_date="20260501",
+        universe=["005930"],
+    )
+
+    assert result["target_col"] == "label_30m_net_ret"
+    assert result["model_version"] == ""
+    assert result["signal_quality"]["prediction_count"] == 1
+    assert result["orders"][0]["ticker"] == "005930"
+
+
 def test_explicit_replay_window_fails_closed_after_pit_snapshot() -> None:
     from src.mode_b.validation_tools import DataUnavailable
 

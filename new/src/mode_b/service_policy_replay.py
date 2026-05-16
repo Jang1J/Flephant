@@ -174,7 +174,12 @@ class ServicePolicyReplayEngine:
             replay_start,
             replay_end,
         )
-        target_col = builder.target_col
+        target_col = BacktestEngine._candidate_target_col(
+            candidate_artifact,
+            builder.target_col,
+        )
+        if target_col != builder.target_col:
+            panel = builder.relabel_panel_for_target(panel, target_col)
 
         missing_features = [col for col in feature_cols if col not in panel.columns]
         if missing_features:
@@ -201,6 +206,7 @@ class ServicePolicyReplayEngine:
             "date_range": {"start": replay_start, "end": replay_end},
             "universe": active_universe,
             "universe_count": len(active_universe),
+            "target_col": target_col,
             "valid_rows": int(len(panel)),
             "external_kis_api": False,
             "registry_mutated": False,

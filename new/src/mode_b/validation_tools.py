@@ -345,6 +345,7 @@ class BacktestEngine:
             # 현재는 메타 필드만 명시 (실 KB write 없음).
             "_persistence_target": "kb_30d",  # TODO Sprint 4: KB integration
             "candidate_artifact": candidate_artifact,
+            "target_col": str(fold_results[0].get("target_col", "")) if fold_results else "",
             "backtest_data_sources": backtest_data_sources,
             "feature_quality": _feature_quality,
             "service_policy_expected_date_range": self._service_policy_expected_date_range(folds),
@@ -515,6 +516,7 @@ class BacktestEngine:
                 universe=universe,
                 model_callable=effective_model,
                 feature_cols=feature_cols,
+                candidate_artifact=candidate_artifact,
             )
 
         import pandas as pd
@@ -645,6 +647,9 @@ class BacktestEngine:
             min_expected_net_alpha_bps=float(
                 self._cfg_service_policy.get("min_expected_net_alpha_bps", 0.0)
             ),
+            expected_net_alpha_source=str(
+                self._cfg_service_policy.get("expected_net_alpha_source", "rank_score")
+            ),
             min_service_policy_sharpe=float(
                 self._cfg_service_policy.get("min_service_policy_sharpe", 0.0)
             ),
@@ -705,6 +710,7 @@ class BacktestEngine:
             "daily_pnl": daily_pnl,
             "trade_log": trade_log,
             "bar_count": len(predicted_signals),
+            "target_col": target_col,
             "data_source": data_source,
             "feature_quality": feature_quality,
             "service_policy_gate": replay_result.get("gate", {}),
@@ -807,6 +813,7 @@ class BacktestEngine:
         universe: list[str],
         model_callable: Any,
         feature_cols: list[str],
+        candidate_artifact: dict[str, Any],
     ) -> dict[str, Any]:
         """candidate bundle backtest를 real artifact 1분봉 replay로 실행한다."""
         if not feature_cols:
@@ -823,7 +830,9 @@ class BacktestEngine:
                 artifacts_dir=self._artifacts_root / "data",
             )
             panel = self._build_replay_panel(builder, universe, start_date, end_date)
-            target_col = builder.target_col
+            target_col = self._candidate_target_col(candidate_artifact, builder.target_col)
+            if target_col != builder.target_col:
+                panel = builder.relabel_panel_for_target(panel, target_col)
             feature_quality = self._panel_feature_quality(panel)
         except Exception as e:
             raise DataUnavailable(
@@ -858,6 +867,19 @@ class BacktestEngine:
             data_source="artifact_bars",
             feature_quality=feature_quality,
         )
+
+    @staticmethod
+    def _candidate_target_col(
+        candidate_artifact: dict[str, Any],
+        default_target_col: str,
+    ) -> str:
+        """Resolve candidate evaluation target from model metadata."""
+        metadata = candidate_artifact.get("metadata", {})
+        if isinstance(metadata, dict):
+            raw_target = metadata.get("target_col")
+            if isinstance(raw_target, str) and raw_target.strip():
+                return raw_target.strip()
+        return str(default_target_col)
 
     @staticmethod
     def _panel_feature_quality(panel: Any) -> dict[str, int]:
@@ -1043,6 +1065,8 @@ class BacktestEngine:
             "n_train_rows",
             "label_generation_version",
             "label_session_scope",
+            "label_horizon_bars",
+            "target_col",
         ]
 
         return model_callable, feature_width, {
