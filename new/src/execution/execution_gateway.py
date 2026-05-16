@@ -437,6 +437,14 @@ class ExecutionGateway:
                 order_deltas,
                 t0,
             )
+        audit_rejection = self._broker_audit_preflight_rejection(
+            order_plan_id,
+            decision_id,
+            order_deltas,
+            t0,
+        )
+        if audit_rejection is not None:
+            return audit_rejection
 
         now = datetime.now(tz=timezone.utc).isoformat()
         fills: list[dict[str, Any]] = []
@@ -476,18 +484,24 @@ class ExecutionGateway:
                 )
                 if not isinstance(broker_response, dict):
                     broker_response = {"raw_response": repr(broker_response)}
-                broker_status = str(
-                    broker_response.get("status", "submitted")
-                ).lower()
-                if broker_status in {"rejected", "failed", "error", "cancelled"}:
+                broker_order_id = self._broker_order_id(broker_response)
+                broker_rejection = self._broker_response_rejection_reason(
+                    broker_response,
+                    broker_order_id=broker_order_id,
+                )
+                if broker_rejection:
                     rejections.append({
                         "ticker": ticker,
                         "side": side,
                         "qty": qty,
-                        "reason": broker_status,
+                        "reason": broker_rejection,
                         "broker_response": broker_response,
                     })
                     continue
+                broker_status = str(
+                    broker_response.get("status")
+                    or "submitted"
+                ).strip().lower()
 
                 avg_fill_price = safe_float(
                     broker_response.get(
@@ -504,11 +518,7 @@ class ExecutionGateway:
                     "avg_fill_price": avg_fill_price,
                     "fill_ts": str(broker_response.get("fill_ts", now)),
                     "broker_status": broker_status,
-                    "broker_order_id": (
-                        broker_response.get("order_id")
-                        or broker_response.get("order_no")
-                        or broker_response.get("odno")
-                    ),
+                    "broker_order_id": broker_order_id,
                     "broker_response": broker_response,
                 })
             except Exception as e:
@@ -657,6 +667,82 @@ class ExecutionGateway:
         if kwargs:
             return submit_order(ticker, side, qty, **kwargs)
         return submit_order(ticker, side, qty)
+
+    @staticmethod
+    def _broker_order_id(broker_response: dict[str, Any]) -> str:
+        return str(
+            broker_response.get("order_id")
+            or broker_response.get("order_no")
+            or broker_response.get("odno")
+            or broker_response.get("ODNO")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _broker_response_rejection_reason(
+        broker_response: dict[str, Any],
+        *,
+        broker_order_id: str,
+    ) -> str | None:
+        status_raw = broker_response.get("status")
+        status = str(status_raw or "").strip().lower()
+        rt_cd = str(broker_response.get("rt_cd") or "").strip()
+        if rt_cd and rt_cd not in {"0", "0000"}:
+            return f"broker_rt_cd_{rt_cd}"
+
+        rejected_statuses = {"rejected", "failed", "fail", "error", "cancelled"}
+        success_statuses = {
+            "submitted",
+            "accepted",
+            "success",
+            "filled",
+            "partial_filled",
+            "partial",
+        }
+        if status in rejected_statuses:
+            return status
+        if status and status not in success_statuses:
+            return f"broker_status_unknown:{status}"
+        if not status and rt_cd not in {"0", "0000"}:
+            return "broker_status_missing"
+        if not broker_order_id:
+            return "broker_order_id_missing"
+        return None
+
+    def _broker_audit_preflight_rejection(
+        self,
+        order_plan_id: str,
+        decision_id: str,
+        order_deltas: list[dict[str, Any]],
+        t0: float,
+    ) -> dict[str, Any] | None:
+        if self._audit_logger is None:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "audit_logger_missing. broker submit 차단.",
+                order_deltas,
+                t0,
+            )
+        try:
+            self._audit_logger.log(
+                "execution_broker_pre_submit",
+                {
+                    "order_plan_id": order_plan_id,
+                    "decision_id": decision_id,
+                    "execution_mode": self._mode,
+                    "n_orders": len(order_deltas),
+                },
+            )
+        except Exception as e:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                f"audit_logger_unavailable: {e}",
+                order_deltas,
+                t0,
+            )
+        return None
 
     # ================================================================== #
     # Internal: REJECTED

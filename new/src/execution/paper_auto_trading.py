@@ -16,6 +16,7 @@ from src.connectors.kis_rest import KISRestClient
 from src.execution.execution_gateway import ExecutionGateway
 from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
+from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.safe_cast import safe_bool, safe_float, safe_int, safe_lossless_int
@@ -49,6 +50,9 @@ class PaperAutoTrader:
         self._hot_runner = hot_runner or HotRunner(ppo=self._make_ppo_allocator())
         self._report_dir = Path(report_dir) if report_dir else default_report_dir
         self._report_dir.mkdir(parents=True, exist_ok=True)
+        self._audit_logger = AuditLogger(
+            log_path=self._report_dir / "paper_auto_execution_audit.jsonl"
+        )
         self._sleep = sleep_fn or time.sleep
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
@@ -208,6 +212,7 @@ class PaperAutoTrader:
             }
 
         gateway = ExecutionGateway(
+            audit_logger=self._audit_logger,
             kis_client=self._kis_client,
             mode_override="paper",
             live_enabled_override=False,
@@ -219,7 +224,7 @@ class PaperAutoTrader:
         ok_statuses = {"submitted", "filled", "partial_filled"}
         order_history = self._order_history_verification(execution)
         status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
-        if order_history.get("status") == "FAIL":
+        if order_history.get("status") != "PASS":
             status = "FAIL"
         return {
             "status": status,
@@ -427,10 +432,10 @@ class PaperAutoTrader:
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(self._kis_client, "get_order_history"):
-            return {"status": "SKIP", "reason": "kis_client_no_get_order_history"}
+            return {"status": "FAIL", "reason": "kis_client_no_get_order_history"}
         fills = list(execution.get("execution_report", {}).get("fills", []))
         if not fills:
-            return {"status": "SKIP", "reason": "no_broker_fills"}
+            return {"status": "FAIL", "reason": "no_broker_fills"}
 
         queries: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []

@@ -54,7 +54,9 @@ class PaperTradingRunner:
         self._kis_client = kis_client or KISRestClient()
         self._report_dir = Path(report_dir) if report_dir else default_report_dir
         self._report_dir.mkdir(parents=True, exist_ok=True)
-        self._audit_logger = audit_logger
+        self._audit_logger = audit_logger or AuditLogger(
+            log_path=self._report_dir / "paper_trading_execution_audit.jsonl"
+        )
         self._kill_switch = kill_switch or KillSwitch()
         self._confirm_phrase = str(cfg["confirm_order_phrase"])
         self._require_virtual_mode = safe_bool(cfg.get("require_virtual_mode", True), default=True)
@@ -176,7 +178,7 @@ class PaperTradingRunner:
                 ),
                 "result": result,
             }
-            if report["stages"]["execution"]["status"] == "PASS" and not broker_order_ids:
+            if not broker_order_ids:
                 report["stages"]["order_id_guard"] = {
                     "status": "FAIL",
                     "error_code": "BROKER_ORDER_ID_MISSING",
@@ -188,12 +190,19 @@ class PaperTradingRunner:
                     "status": "PASS",
                     "broker_order_ids": broker_order_ids,
                 }
-            report["stages"]["order_history"] = self._read_order_history_stage(
-                ticker=guard["ticker"],
-                side=guard["side"],
-                order_id=broker_order_ids[0] if broker_order_ids else None,
-                execution_filter="all",
-            )
+            if broker_order_ids:
+                report["stages"]["order_history"] = self._read_order_history_stage(
+                    ticker=guard["ticker"],
+                    side=guard["side"],
+                    order_id=broker_order_ids[0],
+                    execution_filter="all",
+                )
+            else:
+                report["stages"]["order_history"] = {
+                    "status": "FAIL",
+                    "reason": "broker_order_id_missing",
+                    "matched_order_count": 0,
+                }
             report["stages"]["balance_after"] = self._read_balance_stage()
             report["status"] = self._overall_status(report)
         except Exception as e:

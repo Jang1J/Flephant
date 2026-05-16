@@ -84,9 +84,18 @@ def _feature_quality_gate_pass(backtest: dict[str, Any]) -> bool:
     gate_cfg = (
         config_load("risk_config.yaml", "backtest_agent.deploy_decision_gate")
         or {}
-    ).get("feature_quality_gate", {}) or {}
-    min_dual = float(gate_cfg.get("min_dual_source_non_neutral_row_coverage", 0.8))
-    min_exog = float(gate_cfg.get("min_exogenous_non_neutral_row_coverage", 0.8))
+    ).get("feature_quality_gate")
+    if not isinstance(gate_cfg, dict):
+        return False
+    min_dual_raw = gate_cfg.get("min_dual_source_non_neutral_row_coverage")
+    min_exog_raw = gate_cfg.get("min_exogenous_non_neutral_row_coverage")
+    if min_dual_raw is None or min_exog_raw is None:
+        return False
+    try:
+        min_dual = float(min_dual_raw)
+        min_exog = float(min_exog_raw)
+    except (TypeError, ValueError):
+        return False
     feature_quality = backtest.get("feature_quality") or {}
     dual_rows = int(feature_quality.get("dual_source_rows", 0) or 0)
     dual_non_neutral = int(feature_quality.get("dual_source_non_neutral_rows", 0) or 0)
@@ -302,14 +311,21 @@ def _backtest_state(root: Path, bundle_id: str) -> dict[str, Any]:
         _backtest_state_from_report(root, bundle_id, path, data)
         for path, data in reports
     ]
-    for idx, state in enumerate(states):
-        if safe_bool(state.get("deployable"), default=False):
-            state["selection"] = "latest_deployable"
-            state["ignored_newer_non_deployable_reports"] = idx
-            return state
-    states[0]["selection"] = "latest_non_deployable"
+    latest = states[0]
+    latest["selection"] = (
+        "latest_report"
+        if safe_bool(latest.get("deployable"), default=False)
+        else "latest_non_deployable"
+    )
     states[0]["ignored_newer_non_deployable_reports"] = 0
-    return states[0]
+    older_deployable = [
+        state for state in states[1:]
+        if safe_bool(state.get("deployable"), default=False)
+    ]
+    if older_deployable:
+        latest["older_deployable_report_path"] = older_deployable[0].get("report_path")
+        latest["older_deployable_ignored"] = True
+    return latest
 
 
 def _report_status(data: dict[str, Any]) -> str:

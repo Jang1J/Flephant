@@ -53,6 +53,26 @@ def _final_dataset_metadata() -> dict:
     }
 
 
+def test_feature_quality_gate_blocks_missing_config(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service_readiness_status,
+        "config_load",
+        lambda file_name, section: {}
+        if section == "backtest_agent.deploy_decision_gate"
+        else {},
+    )
+    backtest = {
+        "feature_quality": {
+            "dual_source_rows": 10,
+            "dual_source_non_neutral_rows": 10,
+            "exogenous_rows": 10,
+            "exogenous_non_neutral_rows": 10,
+        }
+    }
+
+    assert service_readiness_status._feature_quality_gate_pass(backtest) is False
+
+
 def test_service_status_is_read_only_and_blocks_without_broker(tmp_path: Path) -> None:
     bundle_id = "BUNDLE-TEST"
     _write_json(
@@ -348,7 +368,7 @@ def test_service_status_summarizes_latest_paper_smoke_market_closed(
     )
 
 
-def test_service_status_prefers_deployable_evidence_over_newer_failed_experiment(
+def test_service_status_blocks_newer_failed_experiment_even_with_older_pass(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -462,14 +482,18 @@ def test_service_status_prefers_deployable_evidence_over_newer_failed_experiment
         root=tmp_path,
     )
 
-    assert payload["status"] == "PASS"
-    assert payload["deploy_quality"] == "PASS"
-    assert payload["c12_backtest"]["selection"] == "latest_deployable"
-    assert payload["c12_backtest"]["ignored_newer_non_deployable_reports"] == 1
-    assert payload["c12_backtest"]["report_path"].endswith("20260514_202334.json")
+    assert payload["status"] == "PARTIAL"
+    assert payload["deploy_quality"] == "BLOCKED"
+    assert payload["c12_backtest"]["selection"] == "latest_non_deployable"
+    assert payload["c12_backtest"]["ignored_newer_non_deployable_reports"] == 0
+    assert payload["c12_backtest"]["report_path"].endswith("20260516_035526.json")
+    assert payload["c12_backtest"]["older_deployable_ignored"] is True
+    assert payload["c12_backtest"]["older_deployable_report_path"].endswith(
+        "20260514_202334.json"
+    )
     assert payload["service_policy_replay"]["status"] == "PASS"
     assert payload["service_policy_replay"]["report_path"].endswith("20260514.json")
-    assert payload["c12_backtest"]["regression_risk_flagged"] == "false"
+    assert payload["c12_backtest"]["regression_risk_flagged"] is True
 
 
 def test_broker_evidence_treats_string_false_external_flag_as_false(

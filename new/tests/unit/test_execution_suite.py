@@ -292,6 +292,99 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     assert client.calls == [("005930", "buy", 10, 70000.0)]
 
 
+def test_execute_paper_rejects_kis_error_without_status(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            return {"rt_cd": "1", "msg_cd": "EGW00001", "msg1": "주문거부"}
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=FakeKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert report["fills"] == []
+    assert report["rejections"][0]["reason"] == "broker_rt_cd_1"
+
+
+def test_execute_paper_accepts_kis_success_code_with_order_id(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            return {"rt_cd": "0", "odno": "OD-RTCD", "price": price}
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=FakeKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "submitted"
+    assert report["fills"][0]["broker_order_id"] == "OD-RTCD"
+
+
+def test_execute_paper_requires_audit_logger_before_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("broker submit must require audit sink")
+
+    client = FakeKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=None,
+        kis_client=client,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "audit_logger_missing" in result["execution_report"]["rejection_reason"]
+    assert client.called is False
+
+
 def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
     """paper/live는 명시적인 broker client 없이 조용히 mock으로 흐르지 않는다."""
     _patch_execution_config(monkeypatch, mode="paper")

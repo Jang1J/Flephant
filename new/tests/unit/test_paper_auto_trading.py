@@ -142,6 +142,44 @@ class FakePaperKISNoBrokerOrderId(FakePaperKIS):
         }
 
 
+class FakePaperKISNoHistoryMethod:
+    mode = "virtual"
+
+    def __init__(self) -> None:
+        self.orders: list[dict[str, Any]] = []
+
+    def get_balance(self) -> dict[str, Any]:
+        return {
+            "balance": {"cash": 1_000_000.0, "net_asset": 1_000_000.0},
+            "positions": [],
+            "_mode": self.mode,
+        }
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        return FakePaperKIS().inquire_minute_bar(ticker, n_bars)
+
+    def submit_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> dict[str, Any]:
+        self.orders.append({
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {
+            "status": "submitted",
+            "order_id": "PAPER-AUTO-NO-HISTORY",
+            "price": price,
+        }
+
+
 class FakeHotRunner:
     def __init__(self, qty: int = 1, approved: bool = True) -> None:
         self.state = SimpleNamespace(value="BOOTSTRAP")
@@ -396,10 +434,32 @@ def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
 
     cycle = report["stages"]["cycles"]["items"][0]
     assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "rejected"
+    assert cycle["broker_blockers"][0]["reason"] == "broker_order_id_missing"
     assert cycle["order_history_verification"]["status"] == "FAIL"
-    assert cycle["order_history_verification"]["failures"][0]["error_code"] == (
-        "BROKER_ORDER_ID_MISSING"
+    assert cycle["order_history_verification"]["reason"] == "no_broker_fills"
+
+
+def test_paper_auto_fails_when_order_history_method_missing(tmp_path: Path) -> None:
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKISNoHistoryMethod(),
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
     )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "submitted"
+    assert cycle["order_history_verification"]["status"] == "FAIL"
+    assert cycle["order_history_verification"]["reason"] == "kis_client_no_get_order_history"
 
 
 def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: Path) -> None:
