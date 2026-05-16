@@ -280,13 +280,15 @@ class RiskAgentSlow(AgentBase):
         else:
             stance = "neutral"
 
-        tickers = re.findall(r"\b(\d{6})\b", content)
+        ticker_candidates = re.findall(r"(?<!\d)(\d{6})(?!\d)", content)
 
         return {
             "stance": stance,
             "risk_level": "high" if stance == "veto_recommendation" else "medium",
             "regime_signal": "regime" in lower or "체제" in content,
-            "affected_tickers": list(dict.fromkeys(tickers)),
+            "affected_tickers": self._safe_ticker_list(
+                [f"mentioned {ticker}" for ticker in ticker_candidates]
+            ),
             "narrative": content[:self._narrative_max_chars],
         }
 
@@ -298,7 +300,11 @@ class RiskAgentSlow(AgentBase):
         if value is None:
             return default
         if isinstance(value, (int, float)):
-            return bool(value)
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+            return default
         if isinstance(value, str):
             normalized = value.strip().lower()
             if normalized in {"true", "yes", "y", "1", "regime", "regime_change", "체제", "변화"}:
@@ -315,12 +321,9 @@ class RiskAgentSlow(AgentBase):
         for item in raw_items:
             if item is None:
                 continue
-            text = str(item).strip()
-            if not text:
-                continue
-            match = re.search(r"\d{1,6}", text)
-            if match:
-                tickers.append(match.group(0).zfill(6))
+            ticker = normalize_ticker(item)
+            if ticker:
+                tickers.append(ticker)
         return list(dict.fromkeys(tickers))
 
     def _choose_publish_channel(self, parsed: dict[str, Any]) -> str:

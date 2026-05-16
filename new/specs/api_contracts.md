@@ -514,7 +514,7 @@ sla:
       memory:
         debate_history_path: "artifacts/agent_memory/debate_agent/{YYYYMMDD}.jsonl"
         format: "JSONL append (ensure_ascii=False)"
-      llm_caller: "debate"
+      llm_caller: "debate_agent"
       llm_mode: "cold"
       status: "done"
     # S2-9 FDA Cold Path 실구현 완료 (2026-04-26)
@@ -526,9 +526,9 @@ sla:
           - "MISSING_PORTFOLIO_PATCH check"
           - "debate uncertainty > threshold → DEBATE_CONFLICT veto"
           - "risk_warnings veto_recommendation → RISK_FAST_TRIGGER veto"
-          - "Kanana-o CoT (llm_router 없으면 heuristic approve)"
+          - "Kanana-o CoT (llm_router 없으면 fail-closed veto)"
       uncertainty_threshold_source: "risk_config.yaml debate.uncertainty_threshold (SSOT)"
-      llm_caller: "fda"
+      llm_caller: "fda_cold_path"
       llm_mode: "cold"
       can_change_weight: false
       status: "done"

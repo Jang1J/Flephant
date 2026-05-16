@@ -458,6 +458,28 @@ def test_slow_parse_string_bool_and_string_ticker() -> None:
     assert parsed["affected_tickers"] == ["005930"]
 
 
+def test_slow_parse_rejects_ambiguous_numeric_bool_and_free_text_ticker() -> None:
+    """숫자 2/자유 텍스트 연도는 regime/ticker로 오인하지 않는다."""
+    slow = _make_slow()
+    parsed = slow._parse_llm_content(
+        '{"stance":"risk_reduce","risk_level":"medium",'
+        '"regime_signal":2,"affected_tickers":"2026 outlook",'
+        '"narrative":"위험"}'
+    )
+    assert parsed["regime_signal"] is False
+    assert parsed["affected_tickers"] == []
+
+
+def test_slow_parse_heuristic_tickers_reject_non_universe_numbers() -> None:
+    """heuristic fallback도 날짜/임의 숫자를 affected_tickers로 오인하지 않는다."""
+    slow = _make_slow()
+    parsed = slow._parse_llm_content(
+        "20260517 regime risk_reduce 공시번호 999999, 005930 위험"
+    )
+    assert parsed["regime_signal"] is True
+    assert parsed["affected_tickers"] == ["005930"]
+
+
 def test_slow_parse_llm_json_array_falls_back_without_crash() -> None:
     """JSON array 응답은 crash 없이 fallback으로 처리된다."""
     slow = _make_slow()

@@ -201,8 +201,8 @@ class TestAnalyze:
         agent = NewsAgent(llm_router=llm)
         event = {
             "event_type": "news",
-            "ticker": "005930",
-            "title": "삼성 실적 호조",
+            "ticker": "000660",
+            "title": "SK하이닉스 실적 호조",
             "summary": "영업이익 증가",
             "event_id": "E-001",
         }
@@ -212,6 +212,8 @@ class TestAnalyze:
         assert kwargs.get("mode") == "cold" or llm.call.call_args[0][1] == "cold"
         assert kwargs.get("caller") == "news_agent" or llm.call.call_args[0][2] == "news_agent"
         prompt = llm.call.call_args[0][0]
+        assert '"impacted_tickers": ["000660"]' in prompt
+        assert '"impacted_tickers": ["005930"]' not in prompt
         assert '"confidence": 0.0' in prompt
 
     def test_analyze_news_event_returns_news_signal_channel(self):
@@ -488,6 +490,14 @@ class TestParseLlmContent:
             '"impacted_sectors":["반도체"],"narrative":"호재","confidence":0.7}'
         )
         assert parsed["impacted_tickers"] == ["005930", "000660"]
+
+    def test_parse_llm_heuristic_tickers_reject_non_universe_numbers(self):
+        """heuristic fallback도 날짜/공시번호 같은 6자리 숫자를 ticker로 오인하지 않는다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content(
+            "20260517 공시번호 999999 관련 뉴스. 005930은 호재."
+        )
+        assert parsed["impacted_tickers"] == ["005930"]
 
     def test_parse_confidence_clamps_invalid_values(self):
         """confidence는 finite 0.0~1.0 값으로 정규화된다."""

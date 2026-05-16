@@ -231,6 +231,9 @@ class NewsAgent(AgentBase):
                 return cached
 
         # LLM 프롬프트 구성
+        impacted_ticker_example = json.dumps(
+            [ticker] if ticker else [], ensure_ascii=False
+        )
         prompt = (
             f"[종목 {ticker}] 뉴스 분석 요청.\n"
             f"제목: {title}\n"
@@ -238,7 +241,7 @@ class NewsAgent(AgentBase):
             "투자 관점에서 매수(buy)/매도(sell)/중립(neutral) 중 하나와 "
             "간단한 근거와 confidence(0.0~1.0)를 한국어로 답하세요.\n\n"
             'Respond strictly in JSON: {"stance": "buy|sell|neutral", '
-            '"impacted_tickers": ["005930"], '
+            f'"impacted_tickers": {impacted_ticker_example}, '
             '"impacted_sectors": ["반도체"], '
             '"narrative": "한국어 1~3문장", '
             '"confidence": 0.0}'
@@ -467,9 +470,12 @@ class NewsAgent(AgentBase):
                     stance = "sell"
                     break
 
-        # regex로 6자리 ticker 추출
-        ticker_matches = re.findall(r"\b(\d{6})\b", content)
-        impacted_tickers = list(dict.fromkeys(ticker_matches))  # 순서 유지 중복 제거
+        # regex로 6자리 ticker 후보를 찾되, 자유 텍스트 안에서 active/watch universe에
+        # 있는 값만 인정한다.
+        ticker_matches = re.findall(r"(?<!\d)(\d{6})(?!\d)", content)
+        impacted_tickers = self._normalize_ticker_list(
+            [f"mentioned {ticker}" for ticker in ticker_matches]
+        )
 
         narrative = content[: self._narrative_max_chars]
 
