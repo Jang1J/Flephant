@@ -128,12 +128,20 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
     assert plan["research_registry"] == {
         "registry_dir": "artifacts/lgbm_research/BUNDLE-TEST",
         "production_registry_mutated": False,
+        "staging_script": "new/scripts/post_backfill_prelive.py",
+        "allow_production_candidate_write": False,
     }
-    retrain_command = plan["next_commands"][1]
-    assert "python -m src.models.lgbm_trainer" in retrain_command
-    assert "--bundle-id BUNDLE-TEST" in retrain_command
-    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in retrain_command
-    assert "--target-col-override label_session_close_net_ret" in retrain_command
+    all_commands = "\n".join(plan["next_commands"])
+    assert "python -m src.models.lgbm_trainer" not in all_commands
+    assert "new/scripts/service_policy_replay.py" not in all_commands
+    staged_command = plan["next_commands"][1]
+    assert "new/scripts/post_backfill_prelive.py" in staged_command
+    assert "--bundle-id BUNDLE-TEST" in staged_command
+    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in staged_command
+    assert "--target-col-override label_session_close_net_ret" in staged_command
+    assert "--run-paper-balance" in staged_command
+    assert "--allow-production-candidate-write" not in staged_command
+    assert plan["recommended_experiment"]["do_not_auto_deploy"] is True
 
 
 def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch, tmp_path):
@@ -170,6 +178,7 @@ def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch
                     "final_dataset_gate": {
                         "expected_start_date": "20250509",
                         "expected_end_date": "20260515",
+                        "min_business_days": 249,
                         "min_tickers": 30,
                         "include_pending_data_tickers": True,
                         "allowed_stock_statuses": ["active", "pending_data"],
@@ -187,7 +196,7 @@ def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch
 
     plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
     command = plan["next_commands"][0]
-    retrain_command = plan["next_commands"][1]
+    staged_command = plan["next_commands"][1]
 
     assert plan["training_window"] == {
         "source": "final_dataset_gate",
@@ -199,11 +208,13 @@ def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch
     assert "--end-date 20260515" in command
     assert "--tickers 005930,105560" in command
     assert "20260508" not in command
-    assert "--start 20250509" in retrain_command
-    assert "--end 20260515" in retrain_command
-    assert "--tickers 005930,105560" in retrain_command
-    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in retrain_command
-    assert "20260508" not in retrain_command
+    assert "new/scripts/post_backfill_prelive.py" in staged_command
+    assert "--end-date 20260515" in staged_command
+    assert "--business-days 249" in staged_command
+    assert "--max-tickers 30" in staged_command
+    assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in staged_command
+    assert "--tickers 005930,105560" not in staged_command
+    assert "20260508" not in staged_command
 
 
 def test_cost_aware_objective_string_false(monkeypatch, tmp_path):

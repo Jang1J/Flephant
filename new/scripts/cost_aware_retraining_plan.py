@@ -98,6 +98,16 @@ def _final_dataset_window() -> dict[str, str | None]:
     }
 
 
+def _final_dataset_business_days() -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(gate_cfg.get("min_business_days"), default=0, min_value=0)
+
+
+def _final_dataset_min_tickers() -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+
+
 def _final_training_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
     gate_cfg = _final_dataset_gate_cfg()
@@ -129,7 +139,7 @@ def _final_training_tickers() -> list[str]:
     if not tickers:
         fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
         tickers.extend(pad_ticker(str(ticker)) for ticker in fallback)
-    max_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+    max_tickers = _final_dataset_min_tickers()
     deduped = sorted({ticker for ticker in tickers if ticker != "000000"})
     return deduped[:max_tickers] if max_tickers else deduped
 
@@ -159,30 +169,31 @@ def _research_registry_dir(bundle_id: str) -> str:
     return f"artifacts/lgbm_research/{safe_bundle}"
 
 
-def _retrain_command(
+def _staged_retrain_gate_command(
     *,
     bundle_id: str,
-    start_date: str | None,
     end_date: str | None,
     tickers: list[str],
     target_col_override: str | None,
 ) -> str:
     registry_dir = _research_registry_dir(bundle_id)
-    version = "cost_aware_" + "".join(
-        ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in bundle_id
-    )
+    business_days = _final_dataset_business_days()
+    max_tickers = _final_dataset_min_tickers() or len(tickers)
     parts = [
-        "PYTHONPATH=new python -m src.models.lgbm_trainer",
-        f"--tickers {','.join(tickers)}" if tickers else "",
-        f"--start {start_date}" if start_date else "",
-        f"--end {end_date}" if end_date else "",
-        f"--version {version}",
+        "ELEPHANT_MODE=mode_b PYTHONPATH=new python new/scripts/post_backfill_prelive.py",
         f"--bundle-id {bundle_id}",
         f"--registry-dir {registry_dir}",
+        "--run-paper-balance",
     ]
+    if end_date:
+        parts.append(f"--end-date {end_date}")
+    if business_days:
+        parts.append(f"--business-days {business_days}")
+    if max_tickers:
+        parts.append(f"--max-tickers {max_tickers}")
     if target_col_override:
         parts.append(f"--target-col-override {target_col_override}")
-    return " ".join(part for part in parts if part)
+    return " ".join(parts)
 
 
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
@@ -261,6 +272,8 @@ def build_retraining_plan(
         "research_registry": {
             "registry_dir": _research_registry_dir(bundle_id),
             "production_registry_mutated": False,
+            "staging_script": "new/scripts/post_backfill_prelive.py",
+            "allow_production_candidate_write": False,
         },
         "active_label": {
             "horizon_bars": active_horizon,
@@ -337,14 +350,12 @@ def build_retraining_plan(
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
             ),
-            _retrain_command(
+            _staged_retrain_gate_command(
                 bundle_id=bundle_id,
-                start_date=final_window["start_date"],
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
                 target_col_override=target_col_override,
             ),
-            f"PYTHONPATH=new python new/scripts/service_policy_replay.py --bundle-id {bundle_id}",
         ],
     }
     if write_report:
