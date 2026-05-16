@@ -20,6 +20,7 @@ from src.cache.persistent_cache import PersistentCache
 from src.data.filter_loader import load_news_filter
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("news_agent")
 
@@ -123,6 +124,9 @@ class NewsAgent(AgentBase):
                 "impacted_tickers": tickers,
                 "impacted_sectors": sectors,
                 "narrative": narrative,
+                "confidence": self._parse_confidence(payload.get("confidence", 0.5)),
+                **({"scope": payload["scope"]} if payload.get("scope") else {}),
+                **({"ticker": payload["ticker"]} if payload.get("ticker") else {}),
             },
             "agent": type(self).__name__,
             "ts": ts,
@@ -188,6 +192,27 @@ class NewsAgent(AgentBase):
                     event_id,
                     ticker,
                 )
+                if self._pubsub is not None and isinstance(cached, dict):
+                    cached_message = cached.get("message")
+                    if (
+                        isinstance(cached_message, dict)
+                        and not safe_bool(cached.get("llm_fallback", False), default=False)
+                    ):
+                        try:
+                            msg_id = self._pubsub.publish(
+                                str(cached_message.get("channel") or publish_channel),
+                                cached_message,
+                            )
+                            cached = dict(cached)
+                            cached["message_id"] = msg_id
+                            cached["published_by_agent"] = True
+                            cached["republished_from_cache"] = True
+                        except Exception as e:
+                            logger.warning(
+                                "[news_agent] 캐시 message republish 실패. event_id=%s error=%s",
+                                event_id,
+                                e,
+                            )
                 return cached
 
         # LLM 프롬프트 구성
@@ -234,10 +259,18 @@ class NewsAgent(AgentBase):
         if ticker and not parsed["impacted_tickers"]:
             parsed["impacted_tickers"] = [ticker]
 
-        # C5 report 생성
-        rpt = self.report("news_signal", parsed)
         parsed_confidence = self._parse_confidence(parsed.get("confidence", 0.5))
         message_scope = f"ticker:{ticker}" if ticker else "market"
+        report_payload = {
+            **parsed,
+            "confidence": parsed_confidence,
+            "scope": message_scope,
+        }
+        if ticker:
+            report_payload["ticker"] = ticker
+
+        # C5 report 생성
+        rpt = self.report("news_signal", report_payload)
 
         # micro memory 저장
         if ticker:
@@ -250,6 +283,7 @@ class NewsAgent(AgentBase):
                     "narrative": parsed["narrative"],
                     "event_type": event_type,
                     "title": title,
+                    "confidence": parsed_confidence,
                 },
             )
 

@@ -196,6 +196,71 @@ def test_cold_path_exit_sets_risk_reduce_reason(pm: PortfolioManager) -> None:
     assert od["side"] == "sell"
 
 
+def test_cold_path_exit_overrides_positive_target_to_zero(pm: PortfolioManager) -> None:
+    """Cold Path exit 명령은 PPO target이 남아 있어도 실제 청산 delta로 변환한다."""
+    result = pm.plan(
+        target_weights={"005930": 0.10},
+        current_positions=[{"ticker": "005930", "qty": 8, "weight": 0.2}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        cold_path_exits=["005930"],
+    )
+
+    od = result["portfolio_patch"]["order_deltas"][0]
+    assert result["portfolio_patch"]["target_weights"]["005930"] == 0.0
+    assert result["cold_path_exit_overrides"] == ["005930"]
+    assert od["side"] == "sell"
+    assert od["reason"] == "risk_reduce"
+
+
+def test_sell_qty_is_capped_to_current_position_qty(pm: PortfolioManager) -> None:
+    """PM이 계산한 sell 수량이 보유 수량보다 크면 broker 제출 전 보유 수량으로 제한한다."""
+    result = pm.plan(
+        target_weights={},
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": 0.2}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=100_000_000.0,
+    )
+
+    od = result["portfolio_patch"]["order_deltas"][0]
+    assert od["side"] == "sell"
+    assert od["qty"] == 10
+    assert result["sell_caps_applied"] == [{
+        "ticker": "005930",
+        "requested_qty": 400,
+        "capped_qty": 10,
+    }]
+
+
+def test_malformed_position_qty_is_fail_safe(monkeypatch) -> None:
+    """외부/BE 포지션 qty가 깨져도 예외 대신 sell 불가 오류로 닫는다."""
+    monkeypatch.setattr(
+        "src.portfolio.portfolio_manager.config_load",
+        lambda _file, section: {
+            "position_limits": {
+                "max_names": 10,
+                "max_single_name": 0.2,
+                "max_sector": 0.4,
+                "min_cash": 0.1,
+            },
+            "turnover_cap": {"daily_max": 1.0},
+            "portfolio_manager": {"respect_ppo_weights": "false"},
+        }[section],
+    )
+    pm = PortfolioManager()
+
+    result = pm.plan(
+        target_weights={},
+        current_positions=[{"ticker": "005930", "qty": "abc", "weight": 0.1}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["respect_ppo_weights"] is False
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["errors"][0]["error"] == "SELL_QTY_UNAVAILABLE"
+
+
 # ====================================================================== #
 # 7. Output schema (C8)
 # ====================================================================== #

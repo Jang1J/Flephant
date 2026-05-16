@@ -9,7 +9,6 @@ The script never opens .env.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
 import subprocess
 import sys
@@ -54,8 +53,11 @@ _SOURCE_PREFIXES = (
     "AGENTS.md",
     "CLAUDE.md",
     "README.md",
+    ".gitignore",
     ".env.example",
+    "demo.sh",
     "eval.sh",
+    "init.sh",
     "requirements.txt",
     "smoke.sh",
     "feature_list.json",
@@ -78,6 +80,7 @@ _MINIMAL_ARTIFACT_PATTERNS = (
     "artifacts/reports/cost_aware_retraining/*.json",
     "artifacts/reports/label_horizon_scan/*.json",
     "artifacts/reports/model_registry/*.json",
+    "artifacts/reports/paper_trading/*.json",
     "artifacts/reports/paper_auto_trading/*.json",
 )
 
@@ -178,6 +181,13 @@ def _scan_zip_names(zip_path: Path) -> dict[str, Any]:
     }
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def build_release(output: Path, manifest_path: Path | None = None) -> dict[str, Any]:
     output = output if output.is_absolute() else ROOT / output
     manifest_path = manifest_path or output.with_suffix(".manifest.json")
@@ -200,7 +210,7 @@ def build_release(output: Path, manifest_path: Path | None = None) -> dict[str, 
         "status": status,
         "generated_at": datetime.now(_KST).isoformat(),
         "release_zip": str(output),
-        "release_zip_relative": str(output.relative_to(ROOT)),
+        "release_zip_relative": _display_path(output),
         "zip_entry_count": zip_scan["entry_count"],
         "included_count": len(included),
         "denied_count": len(denied),
@@ -219,7 +229,7 @@ def build_release(output: Path, manifest_path: Path | None = None) -> dict[str, 
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
     manifest["manifest_path"] = str(manifest_path)
-    manifest["manifest_path_relative"] = str(manifest_path.relative_to(ROOT))
+    manifest["manifest_path_relative"] = _display_path(manifest_path)
     return manifest
 
 

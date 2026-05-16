@@ -28,6 +28,7 @@ from src.mode_b.validation_tools import (
     NaNInMetrics,
 )
 from src.utils.config_loader import load as config_load
+from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -105,8 +106,14 @@ class ServicePolicyConfig:
             min_holding_bars=max(0, int(replay_cfg.get("min_holding_bars", 0))),
             rebalance_cooldown_bars=max(0, int(replay_cfg.get("rebalance_cooldown_bars", 0))),
             no_trade_score_spread=max(0.0, float(replay_cfg.get("no_trade_score_spread", 0.0))),
-            allow_position_pyramiding=bool(replay_cfg.get("allow_position_pyramiding", False)),
-            turnover_budget_hard_stop=bool(replay_cfg.get("turnover_budget_hard_stop", True)),
+            allow_position_pyramiding=safe_bool(
+                replay_cfg.get("allow_position_pyramiding", False),
+                default=False,
+            ),
+            turnover_budget_hard_stop=safe_bool(
+                replay_cfg.get("turnover_budget_hard_stop", True),
+                default=True,
+            ),
             min_expected_net_alpha_bps=float(
                 replay_cfg.get("min_expected_net_alpha_bps", cost_components.get("slippage_bps", 0.0))
             ),
@@ -766,11 +773,11 @@ class ServicePolicyReplayEngine:
         policy_checks: dict[str, Any],
     ) -> list[str]:
         blockers: list[str] = []
-        if not policy_checks.get("no_naked_short_exposure", False):
+        if not safe_bool(policy_checks.get("no_naked_short_exposure"), default=False):
             blockers.append("naked_short_exposure")
-        if not policy_checks.get("order_caps_respected", False):
+        if not safe_bool(policy_checks.get("order_caps_respected"), default=False):
             blockers.append("order_cap_violation")
-        if not policy_checks.get("cash_guard_respected", False):
+        if not safe_bool(policy_checks.get("cash_guard_respected"), default=False):
             blockers.append("cash_guard_violation")
         if max_daily_turnover > policy.daily_turnover_cap:
             blockers.append("daily_turnover_cap_violation")

@@ -70,12 +70,13 @@ _MINIMAL_CFG_EVAL = {
 }
 
 
-def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None):
+def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None):
     """config_load 패치용 side_effect."""
     _vt = vt or _MINIMAL_CFG_VT
     _wf = wf or _MINIMAL_CFG_WF
     _cost = cost or _MINIMAL_CFG_COST
     _eval = eval_ or _MINIMAL_CFG_EVAL
+    _service = service or {}
 
     def _loader(file: str = "risk_config.yaml", key: str | None = None):
         if key == "validation_tools.backtest_engine":
@@ -86,6 +87,8 @@ def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None):
             return _cost
         if key == "evaluation":
             return _eval
+        if key == "service_policy_replay":
+            return _service
         # pit_safety 등 기타 키 → 빈 dict
         return {}
 
@@ -127,6 +130,21 @@ def _run_engine(engine, universe=None, date_range=None, purge_bars=None, embargo
             purge_bars=purge_bars,
             embargo_bars=embargo_bars,
         )
+
+
+def test_service_policy_bool_strings_are_not_truthy() -> None:
+    """BacktestEngine C14 policy bridge도 문자열 false를 안전하게 해석한다."""
+    engine = _make_engine(
+        service={
+            "allow_position_pyramiding": "false",
+            "turnover_budget_hard_stop": "false",
+        }
+    )
+
+    policy = engine._service_policy_config()
+
+    assert policy.allow_position_pyramiding is False
+    assert policy.turnover_budget_hard_stop is False
 
 
 class _mode_b_env:
@@ -515,6 +533,33 @@ def test_candidate_bundle_metadata_synthetic_fallback_is_exposed(tmp_path: Path)
     assert artifact["loaded"] is True
     assert artifact["synthetic_fallback"] is True
     assert artifact["data_source"] == "synthetic_fallback"
+
+
+def test_candidate_bundle_metadata_synthetic_fallback_string_false(tmp_path: Path):
+    """candidate metadata 문자열 false가 synthetic artifact로 오판되지 않는다."""
+    bundle_id = "BUNDLE-20260509-REAL0001"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "data_source": "artifact_bars",
+                "synthetic_fallback": "false",
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    _, _, artifact = engine._resolve_candidate_model(bundle_id)
+
+    assert artifact["loaded"] is True
+    assert artifact["synthetic_fallback"] is False
+    assert artifact["data_source"] == "artifact_bars"
 
 
 def test_candidate_bundle_requires_metadata(tmp_path: Path):

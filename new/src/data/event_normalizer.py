@@ -15,6 +15,7 @@ from src.utils.id_factory import generate_event_id
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 from src.utils.time_utils import now_kst
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("event_normalizer")
 
@@ -189,9 +190,15 @@ class EventNormalizer:
         payload_ticker = result["payload"].get("ticker")
         scope = str(result["scope"])
         if payload_ticker:
-            result["ticker"] = str(payload_ticker).zfill(6)
+            ticker = normalize_ticker(payload_ticker)
+            if ticker:
+                result["ticker"] = ticker
+                result["scope"] = f"ticker:{ticker}"
         elif scope.startswith("ticker:"):
-            result["ticker"] = scope.split(":", 1)[1].zfill(6)
+            ticker = normalize_ticker(scope.split(":", 1)[1])
+            if ticker:
+                result["ticker"] = ticker
+                result["scope"] = f"ticker:{ticker}"
 
         logger.info(
             "이벤트 정규화 완료: source=%s event_id=%s event_type=%s occurred_at=%s",
@@ -216,8 +223,8 @@ class EventNormalizer:
 
         occurred_at = _parse_ts_to_kst_str(disclosure_time, "disclosure_time", "dart")
         summary = raw.get("summary", "")
-        ticker = raw.get("ticker", None)
-        scope = f"ticker:{str(ticker).zfill(6)}" if ticker else "market"
+        ticker = normalize_ticker(raw.get("ticker", None))
+        scope = f"ticker:{ticker}" if ticker else "market"
 
         return {
             "event_type": "dart",
@@ -229,7 +236,7 @@ class EventNormalizer:
             "llm_required": True,
             "payload": {
                 "corp_name": corp_name,
-                "ticker": str(ticker).zfill(6) if ticker else None,
+                "ticker": ticker or None,
                 "original_time": str(disclosure_time),
                 **{k: v for k, v in raw.items()
                    if k not in ("title", "corp_name", "disclosure_time", "summary", "ticker")},
@@ -257,7 +264,9 @@ class EventNormalizer:
         else:
             occurred_at = _parse_ts_to_kst_str(date_val, "date", "krx_investor_flow")
 
-        ticker_str = str(ticker).zfill(6)
+        ticker_str = normalize_ticker(ticker)
+        if not ticker_str:
+            raise ValidationError("source=krx_investor_flow: ticker 형식 오류")
 
         # 레거시 키(institutional/retail) → SSOT 키(institutional_net_buy/retail_net_buy) 호환
         institutional_val = raw.get(
@@ -310,8 +319,8 @@ class EventNormalizer:
 
         occurred_at = _parse_ts_to_kst_str(published_at, "published_at", "naver_news")
         summary = raw.get("summary", "")
-        ticker = raw.get("ticker", None)
-        scope = f"ticker:{str(ticker).zfill(6)}" if ticker else "market"
+        ticker = normalize_ticker(raw.get("ticker", None))
+        scope = f"ticker:{ticker}" if ticker else "market"
 
         return {
             "event_type": "news",
@@ -323,7 +332,7 @@ class EventNormalizer:
             "llm_required": True,
             "payload": {
                 "link": raw.get("link", ""),
-                "ticker": str(ticker).zfill(6) if ticker else None,
+                "ticker": ticker or None,
                 **{k: v for k, v in raw.items()
                    if k not in ("title", "summary", "published_at", "link", "ticker")},
             },
@@ -340,9 +349,9 @@ class EventNormalizer:
 
         occurred_at = _parse_ts_to_kst_str(posted_at, "posted_at", "community")
         body = raw.get("body", "")
-        ticker_mentioned = raw.get("ticker_mentioned", None)
+        ticker_mentioned = normalize_ticker(raw.get("ticker_mentioned", None))
         spam_flag = raw.get("spam_flag", False)
-        scope = f"ticker:{str(ticker_mentioned).zfill(6)}" if ticker_mentioned else "market"
+        scope = f"ticker:{ticker_mentioned}" if ticker_mentioned else "market"
 
         return {
             "event_type": "community",
@@ -354,7 +363,7 @@ class EventNormalizer:
             "llm_required": False,  # 1차 규칙 필터 통과 후 일부만 LLM 호출
             "payload": {
                 "body": body,
-                "ticker_mentioned": str(ticker_mentioned).zfill(6) if ticker_mentioned else None,
+                "ticker_mentioned": ticker_mentioned or None,
                 "spam_flag": spam_flag,
                 **{k: v for k, v in raw.items()
                    if k not in ("post_title", "posted_at", "body", "ticker_mentioned", "spam_flag")},
@@ -448,12 +457,12 @@ class EventNormalizer:
         occurred_at = _parse_ts_to_kst_str(ts_val, "ts", "price_snapshot")
         snapshots = raw.get("snapshots", [])
         ticker_count = len(snapshots) if isinstance(snapshots, list) else 0
-        ticker = str(raw.get("ticker", "") or "").zfill(6)
+        ticker = normalize_ticker(raw.get("ticker", ""))
         return_pct = raw.get("return_pct", raw.get("day_change_pct"))
 
         if not ticker or ticker == "000000":
             if isinstance(snapshots, list) and len(snapshots) == 1 and isinstance(snapshots[0], dict):
-                ticker = str(snapshots[0].get("ticker", "") or "").zfill(6)
+                ticker = normalize_ticker(snapshots[0].get("ticker", ""))
                 return_pct = snapshots[0].get(
                     "return_pct",
                     snapshots[0].get("day_change_pct", return_pct),

@@ -24,7 +24,6 @@ SSOT: new/specs/api_contracts.md C3A DualSourceScoreContract
 from __future__ import annotations
 
 import logging
-import math
 import statistics
 from datetime import datetime
 from typing import Any

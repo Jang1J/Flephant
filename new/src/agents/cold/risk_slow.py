@@ -176,6 +176,7 @@ class RiskAgentSlow(AgentBase):
             },
             channel=publish_channel,
         )
+        self._publish_if_available(publish_channel, rpt)
 
         # macro memory 저장
         self._save_macro_memory(event_type, ticker, parsed)
@@ -309,7 +310,7 @@ class RiskAgentSlow(AgentBase):
             stance = fast_eval.get("stance", "neutral")
             risk_level = fast_eval.get("risk_level", "low")
 
-        return self.report(
+        rpt = self.report(
             "risk_warning",
             {
                 "stance": stance,
@@ -321,6 +322,19 @@ class RiskAgentSlow(AgentBase):
                 "affected_tickers": [],
             },
         )
+        self._publish_if_available(str(rpt.get("channel", "risk_warning")), rpt)
+        return rpt
+
+    def _publish_if_available(self, channel: str, message: dict[str, Any]) -> None:
+        """Direct RiskSlow calls should also reach MessagePool when pubsub is injected."""
+        if self._pubsub is None:
+            return
+        try:
+            msg_id = self._pubsub.publish(channel, message)
+            message["message_id"] = msg_id
+            message["published_by_agent"] = True
+        except Exception as e:
+            logger.warning("[risk_slow] C4 publish 실패. channel=%s error=%s", channel, e)
 
     # ------------------------------------------------------------------
     # Memory 저장

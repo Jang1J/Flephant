@@ -72,7 +72,7 @@ def _make_manager(
     max_size: int = 5,
     per_stock_max_weight: float = 0.03,
     total_max_weight: float = 0.10,
-) -> "HoldingsManager":
+) -> object:
     """테스트용 HoldingsManager 생성 헬퍼."""
     from src.dynamic_universe.holdings_manager import HoldingsManager
 

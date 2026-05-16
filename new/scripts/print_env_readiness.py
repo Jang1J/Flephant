@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 
 
 REQUIRED_KIS_ENV = [
@@ -82,7 +83,10 @@ def build_report() -> dict[str, Any]:
         "kis_mode_virtual": mode == "virtual",
         "real_account_not_selected": mode != "real",
         "elephant_live_enabled_false": live_env != "true",
-        "risk_config_live_enabled_false": not bool(exec_cfg.get("live_enabled", False)),
+        "risk_config_live_enabled_false": not safe_bool(
+            exec_cfg.get("live_enabled", False),
+            default=False,
+        ),
         "account_number_shape_ok": len(account_number) == 8 and account_number.isdigit(),
         "product_code_shape_ok": len(product_code) == 2 and product_code.isdigit(),
     }

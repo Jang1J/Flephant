@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -215,6 +215,7 @@ class TestOneDayModeA:
         p95 = float(np.percentile(latencies, 95))
         # 테스트 환경에서는 SLA 비교 정보 제공 (fail 기준은 너무 엄격하지 않게)
         # 실제 운영에서만 100ms 강제
+        assert p95 >= 0.0
         assert len(latencies) == 5
 
     def test_fda_reason_code_always_present(self, hot_runner: HotRunner) -> None:
@@ -246,7 +247,7 @@ class TestOneDayModeA:
     ) -> None:
         """Cold Path 이벤트 주입 + dispatch_next 정상 동작."""
         ts = _today_intraday(9, 30)
-        result = injector.inject_news(
+        injector.inject_news(
             ticker="005930",
             headline="삼성전자 호재 뉴스",
             ts=ts,
@@ -310,6 +311,72 @@ class TestOneDayModeB:
         assert "stages" in mode_b_result
         assert mode_b_result.get("stage_count", 0) >= 7
         assert mode_b_result["verdict"] in ("pass", "warn", "blocked", "skipped_no_candidates")
+
+    def test_mode_b_stage_error_blocks_backtest_and_deploy(self, monkeypatch) -> None:
+        """pre-backtest stage 오류는 stage_6/7 PASS로 덮지 않는다."""
+        from src.mode_b.scheduler import ModeBScheduler
+
+        def fake_stage_0_dqr(self, date: str) -> dict:
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": "forced_dqr_failure",
+            }
+
+        monkeypatch.setattr(ModeBScheduler, "stage_0_dqr", fake_stage_0_dqr)
+
+        sm = StateMachine()
+        sm.transition(PipelineState.HOT_RUNNING)
+        sm.transition(PipelineState.MODE_B_IDLE)
+
+        runner = E2EScenarioRunner(
+            scenario_file="week1_basic.yaml",
+            short_mode=True,
+            skip_mode_b=False,
+        )
+        mode_b_result = runner._run_mode_b_sim(sm, "2026-05-04")
+
+        assert mode_b_result["verdict"] == "blocked"
+        assert mode_b_result["errors"], "stage_0 오류가 errors에 반영되어야 한다"
+        assert any(
+            s.get("stage") == "stage_6_backtest_validation"
+            and s.get("status") == "skipped_stage_failure"
+            for s in mode_b_result["stages"]
+        )
+        assert any(
+            s.get("stage") == "stage_7_deploy"
+            and s.get("status") == "skipped"
+            for s in mode_b_result["stages"]
+        )
+        assert sm.state == PipelineState.MODE_B_IDLE
+
+    def test_mode_b_errors_propagate_to_scenario_summary(self, monkeypatch) -> None:
+        """Mode B 내부 오류는 day summary total_errors에 포함된다."""
+        from src.mode_b.scheduler import ModeBScheduler
+
+        def fake_stage_0_dqr(self, date: str) -> dict:
+            return {
+                "status": "error",
+                "dqr_date": date,
+                "critical_alert": True,
+                "alerts": [],
+                "error": "forced_dqr_failure",
+            }
+
+        monkeypatch.setattr(ModeBScheduler, "stage_0_dqr", fake_stage_0_dqr)
+
+        runner = E2EScenarioRunner(
+            scenario_file="week1_basic.yaml",
+            short_mode=True,
+            skip_mode_b=False,
+        )
+        result = runner.run()
+        summary = result.summary()
+
+        assert summary["total_errors"] == summary["total_days"]
+        assert all(v == "blocked" for v in summary["mode_b_verdicts"])
 
     def test_mode_b_state_machine_transitions(self) -> None:
         """Mode B: MODE_B_IDLE → EVOLVING → BACKTEST → DEPLOY/BLOCKED → IDLE."""
@@ -493,7 +560,7 @@ class TestAuditLogIntegrity:
         )
         audit_dir = pathlib.Path(__file__).resolve().parents[3] / "artifacts" / "audit"
         mode_b_log = audit_dir / "mode_b_20260504.jsonl"
-        assert mode_b_log.exists(), f"mode_b_20260504.jsonl 미생성"
+        assert mode_b_log.exists(), "mode_b_20260504.jsonl 미생성"
 
     def test_cold_path_audit_log_created(self) -> None:
         """cold_path_YYYYMMDD.jsonl 파일 생성 확인."""
@@ -511,7 +578,7 @@ class TestAuditLogIntegrity:
         )
         audit_dir = pathlib.Path(__file__).resolve().parents[3] / "artifacts" / "audit"
         cold_log = audit_dir / "cold_path_20260504.jsonl"
-        assert cold_log.exists(), f"cold_path_20260504.jsonl 미생성"
+        assert cold_log.exists(), "cold_path_20260504.jsonl 미생성"
 
 
 # ──────────────────────────────────────────────────────────────────────

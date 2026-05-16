@@ -71,6 +71,13 @@ def _mock_trainer_result(version: str = "v2") -> dict[str, Any]:
     }
 
 
+def test_synthetic_fallback_enabled_string_false() -> None:
+    """nightly config 문자열 false가 synthetic fallback을 켜지 않도록 한다."""
+    retrainer = _make_retrainer(synthetic_fallback_enabled="false")
+
+    assert retrainer._synthetic_fallback_enabled is False
+
+
 # ================================================================== #
 # 1. _next_version: 빈 registry → "v2"
 # ================================================================== #
@@ -201,19 +208,13 @@ def test_retrain_bundle_candidate_not_promoted_latest():
     with patch.object(retrainer, "_next_version", return_value="v3"):
         with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
             with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
-                with patch.dict("sys.modules", {
-                    "src.models.lgbm_trainer": MagicMock(
-                        LGBMTrainer=MagicMock(return_value=mock_trainer)
-                    ),
-                    "src.models.registry": MagicMock(
-                        ModelRegistry=MagicMock(return_value=mock_registry)
-                    ),
-                }):
-                    result = retrainer.retrain(
-                        tickers=["005930"],
-                        end_date="2026-04-27",
-                        bundle_id=bundle_id,
-                    )
+                with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                    with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                        result = retrainer.retrain(
+                            tickers=["005930"],
+                            end_date="2026-04-27",
+                            bundle_id=bundle_id,
+                        )
 
     kwargs = mock_trainer.train.call_args.kwargs
     assert kwargs["bundle_id"] == bundle_id
@@ -242,24 +243,54 @@ def test_retrain_blocks_synthetic_candidate_staging():
         with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
             with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
                 with patch.object(retrainer, "_stage_candidate_bundle") as stage_mock:
-                    with patch.dict("sys.modules", {
-                        "src.models.lgbm_trainer": MagicMock(
-                            LGBMTrainer=MagicMock(return_value=mock_trainer)
-                        ),
-                        "src.models.registry": MagicMock(
-                            ModelRegistry=MagicMock(return_value=mock_registry)
-                        ),
-                    }):
-                        result = retrainer.retrain(
-                            tickers=["005930"],
-                            end_date="2026-04-27",
-                            bundle_id=bundle_id,
-                        )
+                    with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                        with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                            result = retrainer.retrain(
+                                tickers=["005930"],
+                                end_date="2026-04-27",
+                                bundle_id=bundle_id,
+                            )
 
     stage_mock.assert_not_called()
     assert result["candidate_bundle_staged"] is False
     assert result["candidate_bundle_reason"] == "synthetic_or_missing_real_data"
     assert result["candidate_bundle_blockers"]["synthetic_fallback"] is True
+
+
+def test_retrain_stages_candidate_when_synthetic_fallback_string_false():
+    """trainer 결과의 문자열 false가 candidate staging을 막지 않는다."""
+    retrainer = _make_retrainer()
+    bundle_id = "BUNDLE-20260427-REAL0001"
+
+    mock_trainer = MagicMock()
+    mock_trainer.feature_cols = ["feat_1m_close_robust_z"]
+    mock_trainer.train.return_value = {
+        **_mock_trainer_result("v3"),
+        "synthetic_fallback": "false",
+        "missing_tickers": [],
+    }
+
+    mock_registry = MagicMock()
+    mock_registry.list_versions.return_value = []
+
+    with patch.object(retrainer, "_next_version", return_value="v3"):
+        with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
+            with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
+                with patch.object(
+                    retrainer,
+                    "_stage_candidate_bundle",
+                    return_value={"candidate_bundle_staged": True},
+                ) as stage_mock:
+                    with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                        with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                            result = retrainer.retrain(
+                                tickers=["005930"],
+                                end_date="2026-04-27",
+                                bundle_id=bundle_id,
+                            )
+
+    stage_mock.assert_called_once()
+    assert result["candidate_bundle_staged"] is True
 
 
 def test_retrain_normalizes_dates_for_lgbm_trainer():
@@ -275,20 +306,14 @@ def test_retrain_normalizes_dates_for_lgbm_trainer():
 
     with patch.object(retrainer, "_next_version", return_value="v3"):
         with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
-            with patch.dict("sys.modules", {
-                "src.models.lgbm_trainer": MagicMock(
-                    LGBMTrainer=MagicMock(return_value=mock_trainer)
-                ),
-                "src.models.registry": MagicMock(
-                    ModelRegistry=MagicMock(return_value=mock_registry)
-                ),
-            }):
-                retrainer.retrain(
-                    tickers=["005930"],
-                    start_date="2026-03-28",
-                    end_date="2026-04-27",
-                    bundle_id=None,
-                )
+            with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                    retrainer.retrain(
+                        tickers=["005930"],
+                        start_date="2026-03-28",
+                        end_date="2026-04-27",
+                        bundle_id=None,
+                    )
 
     kwargs = mock_trainer.train.call_args.kwargs
     assert kwargs["start_date"] == "20260328"
@@ -322,15 +347,9 @@ def test_alpha_factor_added_to_feature_cols():
     with patch.object(retrainer, "_next_version", return_value="v2"):
         with patch.object(retrainer, "_load_alpha_factor_columns", return_value=alpha_cols):
             with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
-                with patch.dict("sys.modules", {
-                    "src.models.lgbm_trainer": MagicMock(
-                        LGBMTrainer=MagicMock(return_value=mock_trainer)
-                    ),
-                    "src.models.registry": MagicMock(
-                        ModelRegistry=MagicMock(return_value=mock_registry)
-                    ),
-                }):
-                    result = retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
+                with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                    with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                        result = retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
 
     assert result.get("alpha_factors_used") == 2
     # captured에 alpha factor 컬럼 포함 여부 검증
@@ -357,16 +376,10 @@ def test_retrain_fallback_on_lgbm_error():
     with patch.object(retrainer, "_next_version", return_value="v2"):
         with patch.object(retrainer, "_load_alpha_factor_columns", return_value=[]):
             with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
-                with patch.dict("sys.modules", {
-                    "src.models.lgbm_trainer": MagicMock(
-                        LGBMTrainer=MagicMock(return_value=mock_trainer)
-                    ),
-                    "src.models.registry": MagicMock(
-                        ModelRegistry=MagicMock(return_value=mock_registry)
-                    ),
-                }):
-                    with pytest.raises(RuntimeError, match="학습 실패"):
-                        retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
+                with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                    with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                        with pytest.raises(RuntimeError, match="학습 실패"):
+                            retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
 
 
 # ================================================================== #
@@ -394,18 +407,12 @@ def test_retrain_no_alpha_factors_if_zoo_fails():
     with patch.object(retrainer, "_next_version", return_value="v2"):
         with patch.object(retrainer, "_load_alpha_factor_columns", side_effect=patched_load_raising):
             with patch.object(retrainer, "_compute_start_date", return_value="2026-03-28"):
-                with patch.dict("sys.modules", {
-                    "src.models.lgbm_trainer": MagicMock(
-                        LGBMTrainer=MagicMock(return_value=mock_trainer)
-                    ),
-                    "src.models.registry": MagicMock(
-                        ModelRegistry=MagicMock(return_value=mock_registry)
-                    ),
-                }):
-                    # _load_alpha_factor_columns가 [] 반환하므로 alpha_factors_used=0
-                    # patched_load_raising는 [] 반환. retrain 내부에서 직접 호출.
-                    # 실제 retrain 흐름을 실행하기 위해 patch.object만 사용.
-                    result = retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
+                with patch.object(retrainer, "_make_trainer", return_value=mock_trainer):
+                    with patch.object(retrainer, "_make_registry", return_value=mock_registry):
+                        # _load_alpha_factor_columns가 [] 반환하므로 alpha_factors_used=0
+                        # patched_load_raising는 [] 반환. retrain 내부에서 직접 호출.
+                        # 실제 retrain 흐름을 실행하기 위해 patch.object만 사용.
+                        result = retrainer.retrain(tickers=["005930"], end_date="2026-04-27")
 
     assert result["alpha_factors_used"] == 0
     assert result["version"] == "v2"

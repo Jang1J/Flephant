@@ -357,6 +357,9 @@ report_types:
   news_signal:
     payload:
       stance: "buy|sell|neutral"
+      confidence: "float 0.0~1.0  # C4 MessagePool propagation용, LLM confidence 보존"
+      scope: "ticker:{code}|sector:{name}|market  # C4 MessagePool propagation용"
+      ticker: "ticker|null  # scope가 ticker일 때 선택"
       impacted_tickers: [ticker]
       impacted_sectors: [string]
       narrative: string

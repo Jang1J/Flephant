@@ -30,6 +30,19 @@ def _make_agent(llm=None, memory_root=None):
     return NewsAgent(llm_router=llm, memory_root=memory_root)
 
 
+class _DictCache:
+    news_ttl = 300
+
+    def __init__(self) -> None:
+        self.items = {}
+
+    def get(self, key):
+        return self.items.get(key)
+
+    def set(self, key, value, ttl_seconds=None):
+        self.items[key] = value
+
+
 # ---------------------------------------------------------------------------
 # 인스턴스화
 # ---------------------------------------------------------------------------
@@ -206,7 +219,9 @@ class TestAnalyze:
         for key in ("cause_by", "sent_from", "priority", "action_type", "timestamp"):
             assert key in result
         assert result["scope"] == "ticker:005930"
-        assert "confidence" not in result["payload"]
+        assert result["payload"]["confidence"] == pytest.approx(0.5)
+        assert result["payload"]["scope"] == "ticker:005930"
+        assert result["payload"]["ticker"] == "005930"
 
     def test_analyze_tickers_string_uses_full_code(self):
         """event.tickers가 문자열이어도 첫 글자만 쓰지 않고 6자리 코드를 유지한다."""
@@ -219,6 +234,51 @@ class TestAnalyze:
             "event_id": "E-string-ticker",
         })
         assert result["scope"] == "ticker:005930"
+
+    def test_analyze_cache_hit_republishes_message(self):
+        """cache hit이어도 pubsub가 주입된 direct path에서는 message를 다시 publish한다."""
+        cache = _DictCache()
+        pubsub = MagicMock()
+        pubsub.publish.return_value = "MSG-CACHED"
+        agent = NewsAgent(llm_router=_make_llm(), pubsub=pubsub, cache=cache)
+        event = {
+            "event_type": "news",
+            "ticker": "005930",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-cache",
+        }
+
+        first = agent.analyze(event)
+        second = agent.analyze(event)
+
+        assert first["message"]["scope"] == "ticker:005930"
+        assert second["republished_from_cache"] is True
+        assert second["message_id"] == "MSG-CACHED"
+        assert pubsub.publish.call_count == 2
+
+    def test_analyze_cache_hit_treats_string_false_fallback_as_false(self):
+        """캐시 payload의 llm_fallback 문자열 false도 재게시 가능 상태로 해석한다."""
+        cache = _DictCache()
+        pubsub = MagicMock()
+        pubsub.publish.return_value = "MSG-CACHED"
+        agent = NewsAgent(llm_router=_make_llm(), pubsub=pubsub, cache=cache)
+        event = {
+            "event_type": "news",
+            "ticker": "005930",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-cache-string-false",
+        }
+
+        first = agent.analyze(event)
+        cached = dict(first)
+        cached["llm_fallback"] = "false"
+        cache.set("news:005930:E-cache-string-false", cached)
+        second = agent.analyze(event)
+
+        assert second["republished_from_cache"] is True
+        assert second["message_id"] == "MSG-CACHED"
 
     def test_analyze_dart_event_returns_dart_alert_channel(self):
         """dart event_type → channel=dart_alert."""
@@ -341,7 +401,7 @@ class TestParseLlmContent:
         assert parsed["confidence"] == pytest.approx(0.5)
 
     def test_parse_llm_content_preserves_json_confidence(self):
-        """LLM JSON confidence는 C5 payload가 아니라 C4 top-level confidence로 전달된다."""
+        """LLM JSON confidence는 C5 payload까지 보존한다."""
         agent = _make_agent()
         parsed = agent._parse_llm_content(
             '{"stance":"buy","impacted_tickers":["005930"],'
@@ -350,7 +410,7 @@ class TestParseLlmContent:
         )
         rpt = agent.report("news_signal", parsed)
         assert parsed["confidence"] == pytest.approx(0.82)
-        assert "confidence" not in rpt["payload"]
+        assert rpt["payload"]["confidence"] == pytest.approx(0.82)
 
     def test_parse_confidence_clamps_invalid_values(self):
         """confidence는 finite 0.0~1.0 값으로 정규화된다."""

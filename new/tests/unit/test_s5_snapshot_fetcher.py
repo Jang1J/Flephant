@@ -358,7 +358,6 @@ def test_fetch_once_cache_hit_skips_kis(
 
 def test_get_price_snapshot_mock_mode_returns_n_tickers() -> None:
     """KIS REST mock 모드에서 N종목 요청 시 N개 dict 반환 + 필수 필드 존재."""
-    import os
     os.environ["KIS_MODE"] = "mock"
 
     from src.connectors.kis_rest import KISRestClient

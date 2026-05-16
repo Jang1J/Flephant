@@ -202,7 +202,7 @@ def main() -> int:
     print(f"  Top-3 coverage : {result['top3_coverage']:.3f} (threshold {result['top3_coverage_threshold']:.2f})")
     print(f"  catalog 발생률 : {result['catalog_completeness']:.3f} ({result['catalog_seen']}/{result['catalog_total']})")
     if result["top3"]:
-        print(f"  Top-3:")
+        print("  Top-3:")
         for item in result["top3"]:
             print(f"    {item['reason_code']:30s}  {item['count']:5d}  ({item['share']:.3f})")
     print(f"  산출: {out_path}")

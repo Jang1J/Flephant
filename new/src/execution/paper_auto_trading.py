@@ -18,7 +18,8 @@ from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("paper_auto_trading")
 _KST = ZoneInfo("Asia/Seoul")
@@ -51,11 +52,28 @@ class PaperAutoTrader:
         self._sleep = sleep_fn or time.sleep
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
-        self._require_virtual_mode = bool(self._cfg["require_virtual_mode"])
-        self._require_active_model = bool(self._cfg["require_active_model"])
-        self._max_orders_per_cycle = int(self._cfg["max_orders_per_cycle"])
-        self._max_order_qty_per_order = int(self._cfg["max_order_qty_per_order"])
-        self._allow_market_order = bool(self._cfg["allow_market_order"])
+        self._require_virtual_mode = safe_bool(
+            self._cfg.get("require_virtual_mode", True),
+            default=True,
+        )
+        self._require_active_model = safe_bool(
+            self._cfg.get("require_active_model", True),
+            default=True,
+        )
+        self._max_orders_per_cycle = safe_int(
+            self._cfg["max_orders_per_cycle"],
+            default=1,
+            min_value=1,
+        )
+        self._max_order_qty_per_order = safe_int(
+            self._cfg["max_order_qty_per_order"],
+            default=1,
+            min_value=1,
+        )
+        self._allow_market_order = safe_bool(
+            self._cfg.get("allow_market_order", False),
+            default=False,
+        )
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -98,13 +116,14 @@ class PaperAutoTrader:
             self._hot_runner.start()
 
         cycle_reports: list[dict[str, Any]] = []
-        for idx in range(max(0, int(cycles))):
+        cycles_int = safe_int(cycles, default=0, min_value=0)
+        for idx in range(cycles_int):
             cycle = self.run_once(tickers=tickers, cycle_index=idx)
             cycle_reports.append(cycle)
             if cycle.get("status") == "FAIL":
                 break
-            if idx < int(cycles) - 1:
-                self._sleep(float(interval_sec))
+            if idx < cycles_int - 1:
+                self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
@@ -196,7 +215,10 @@ class PaperAutoTrader:
         }
 
     def _make_ppo_allocator(self) -> PPOAllocator:
-        if not bool(self._cfg.get("use_latest_ppo_policy_if_available", True)):
+        if not safe_bool(
+            self._cfg.get("use_latest_ppo_policy_if_available", True),
+            default=True,
+        ):
             return PPOAllocator()
         ppo_cfg = config_load("risk_config.yaml", "nightly_ppo_retrainer") or {}
         artifacts_path = Path(str(ppo_cfg.get("artifacts_path", "artifacts/ppo")))
@@ -224,14 +246,14 @@ class PaperAutoTrader:
         prices: dict[str, float] = {}
         for ticker, bars in bars_by_ticker.items():
             if bars:
-                prices[ticker] = float(bars[-1].get("close", 0.0))
+                prices[ticker] = safe_float(bars[-1].get("close", 0.0), default=0.0)
         return prices
 
     @staticmethod
     def _portfolio_value(balance: dict[str, Any]) -> float:
         bal = balance.get("balance") if isinstance(balance.get("balance"), dict) else {}
         for key in ("net_asset", "total_eval", "cash"):
-            value = float(bal.get(key, 0.0) or 0.0)
+            value = safe_float(bal.get(key, 0.0), default=0.0)
             if value > 0:
                 return value
         return 0.0
@@ -247,8 +269,11 @@ class PaperAutoTrader:
             ticker = pad_ticker(str(pos.get("ticker", "")))
             if ticker == "000000":
                 continue
-            qty = int(pos.get("qty", 0) or 0)
-            price = latest_prices.get(ticker, float(pos.get("current_price", 0.0) or 0.0))
+            qty = safe_int(pos.get("qty", 0), default=0, min_value=0)
+            price = latest_prices.get(
+                ticker,
+                safe_float(pos.get("current_price", 0.0), default=0.0),
+            )
             weight = (qty * price / portfolio_value) if portfolio_value > 0 and price > 0 else 0.0
             out.append({"ticker": ticker, "qty": qty, "weight": float(weight)})
         return out
@@ -291,14 +316,21 @@ class PaperAutoTrader:
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
-        if not bool(final_decision.get("approved")):
+        if not safe_bool(final_decision.get("approved"), default=False):
             return {
                 "status": "SKIP",
                 "safe_skip": True,
                 "reason": "fda_veto",
                 "reason_code": final_decision.get("reason_code"),
             }
-        order_deltas = list(final_decision.get("order_deltas", []))
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return {
+                "status": "FAIL",
+                "reason": "order_deltas_must_be_list",
+                "type": type(raw_order_deltas).__name__,
+            }
+        order_deltas = list(raw_order_deltas)
         if not order_deltas:
             return {
                 "status": "SKIP",
@@ -314,19 +346,46 @@ class PaperAutoTrader:
             }
         violations: list[dict[str, Any]] = []
         for od in order_deltas:
-            qty = int(od.get("qty", 0) or 0)
+            if not isinstance(od, dict):
+                violations.append({
+                    "ticker": None,
+                    "reason": "order_delta_must_be_dict",
+                    "type": type(od).__name__,
+                })
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
+            qty = safe_int(od.get("qty", 0), default=0)
             order_type = str(od.get("order_type", "00") or "00")
+            price = safe_float(od.get("price", 0.0), default=0.0)
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "invalid_ticker",
+                })
+            if side not in {"buy", "sell"}:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "side_must_be_buy_or_sell",
+                    "side": side,
+                })
             if qty <= 0:
                 violations.append({
-                    "ticker": od.get("ticker"),
+                    "ticker": ticker,
                     "reason": "qty_out_of_limit",
                     "qty": qty,
                     "max_order_qty_per_order": self._max_order_qty_per_order,
                 })
             if order_type == "01" and not self._allow_market_order:
                 violations.append({
-                    "ticker": od.get("ticker"),
+                    "ticker": ticker,
                     "reason": "market_order_not_allowed",
+                })
+            if order_type != "01" and price <= 0:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "positive_price_required",
+                    "price": price,
                 })
         if violations:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
@@ -338,7 +397,7 @@ class PaperAutoTrader:
         for od in final_decision.get("order_deltas", []):
             if not isinstance(od, dict):
                 continue
-            original_qty = int(od.get("qty", 0) or 0)
+            original_qty = safe_int(od.get("qty", 0), default=0)
             if original_qty > self._max_order_qty_per_order:
                 od["qty"] = self._max_order_qty_per_order
                 clipped.append({
@@ -370,6 +429,13 @@ class PaperAutoTrader:
                 "order_id": str(fill.get("broker_order_id") or ""),
                 "execution_filter": "all",
             }
+            if not query["order_id"]:
+                failures.append({
+                    "query": query,
+                    "error_code": "BROKER_ORDER_ID_MISSING",
+                    "reason": "broker_order_id_missing",
+                })
+                continue
             try:
                 try:
                     history = self._kis_client.get_order_history(**query)
@@ -381,9 +447,15 @@ class PaperAutoTrader:
                     )
                 orders = list(history.get("orders", []))
                 matched = self._filter_history_matches(orders, query)
+                if not matched:
+                    failures.append({
+                        "query": query,
+                        "error_code": "BROKER_ORDER_ID_NOT_FOUND_IN_HISTORY",
+                        "matched_order_count": 0,
+                    })
                 queries.append({
                     "query": query,
-                    "status": "PASS",
+                    "status": "PASS" if matched else "FAIL",
                     "matched_order_count": len(matched),
                     "matched_orders": matched,
                 })
@@ -437,6 +509,9 @@ class PaperAutoTrader:
                 str(order.get("odno") or ""),
             }
             if query.get("order_id") and query["order_id"] not in order_ids:
+                continue
+            if query.get("order_id") and query["order_id"] in order_ids:
+                matched.append(order)
                 continue
             if pad_ticker(str(order.get("ticker", ""))) != query.get("ticker"):
                 continue

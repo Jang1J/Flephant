@@ -34,7 +34,7 @@ import html
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,7 +44,6 @@ import yaml
 
 from src.connectors.base import BaseConnector
 from src.data.filter_loader import load_spam_rules, load_manipulation_rules, load_sentiment_dict
-from src.utils.config_loader import load as config_load
 from src.utils.auth import AuthManager
 from src.utils.logger import get_logger
 from src.utils.rate_limiter import RateLimiter
@@ -265,6 +264,9 @@ class CommunityCrawler(BaseConnector):
             post_title (= post.title), posted_at (= post.timestamp.isoformat())
         """
         posts = self.poll(tickers, window_minutes)
+        self._last_raw_post_count = len(posts)
+        self._last_normalize_fail_count = 0
+        self._last_normalize_pit_fail_count = 0
         events: list[dict[str, Any]] = []
         for post in posts:
             raw = {
@@ -284,6 +286,9 @@ class CommunityCrawler(BaseConnector):
                 event = self._normalizer.normalize(raw, source="community")
                 events.append(event)
             except Exception as e:
+                self._last_normalize_fail_count += 1
+                if "PIT" in str(e) or "snapshot" in str(e):
+                    self._last_normalize_pit_fail_count += 1
                 logger.warning(
                     "[community] 정규화 실패 skip: post_id=%s err=%s",
                     post.post_id,

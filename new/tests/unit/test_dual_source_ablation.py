@@ -12,11 +12,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -188,6 +190,25 @@ def test_load_feature_cols_without_dual_source() -> None:
         assert feat not in cols, f"Dual-Source 피처가 있어선 안 됨: {feat}"
 
 
+def test_load_feature_cols_string_false_dual_source_disabled() -> None:
+    """enabled_for_lgbm='false' 문자열도 Dual-Source 피처를 켜지 않는다."""
+    def _loader(key: str, section: str | None = None) -> Any:
+        if section == "preprocessor":
+            return _base_preprocessor_cfg()
+        if section == "dual_source":
+            return {"enabled_for_lgbm": "false"}
+        if section == "exogenous_features":
+            return {"enabled_for_lgbm": "false"}
+        return {}
+
+    with patch("src.models.lgbm_trainer.config_load", side_effect=_loader):
+        cols = _load_feature_cols()
+
+    assert len(cols) == 4
+    for feat in DUAL_SOURCE_FEATURES:
+        assert feat not in cols
+
+
 # ====================================================================== #
 # Test 4: PerformanceAnalyzer ablation_components에 dual_source 등록
 # ====================================================================== #
@@ -303,6 +324,105 @@ def test_join_dual_source_features_missing_file_uses_default(
         assert (result[feat] == expected).all(), (
             f"{feat} neutral 기본값 {expected} 아님: {result[feat].values}"
         )
+
+
+def test_dual_source_ablation_cli_help_does_not_train() -> None:
+    """--help는 학습을 실행하지 않고 argparse usage만 출력해야 함."""
+    repo_root = Path(__file__).resolve().parents[3]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "new"
+
+    proc = subprocess.run(
+        [sys.executable, "new/src/jobs/run_dual_source_ablation.py", "--help"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert "usage:" in proc.stdout
+    assert "Traceback" not in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
+def test_dual_source_ablation_default_tickers_from_universe() -> None:
+    """기본 ablation universe는 universe_config active 종목에서 로드."""
+    from src.jobs.run_dual_source_ablation import _load_default_tickers
+
+    tickers = _load_default_tickers()
+
+    assert len(tickers) >= 4
+    assert "005930" in tickers
+    assert all(ticker.isdigit() and len(ticker) == 6 for ticker in tickers)
+
+
+def test_dual_source_ablation_dataset_error_returns_blocked() -> None:
+    """데이터 부족은 traceback 대신 BLOCKED 리포트로 반환."""
+    from src.data.dataset_builder import DatasetBuildError
+    from src.jobs.run_dual_source_ablation import run_ablation
+
+    with patch(
+        "src.jobs.run_dual_source_ablation._run_config",
+        side_effect=DatasetBuildError("panel empty"),
+    ):
+        result = run_ablation(
+            tickers=["005930", "000660", "042700", "051910"],
+            start_date="20260101",
+            end_date="20260102",
+            write_report=False,
+        )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blockers"] == ["dataset_build_error"]
+    assert result["registry_mutated"] is False
+
+
+def test_dual_source_ablation_runtime_fold_error_returns_blocked() -> None:
+    """walk-forward fold 부족도 traceback 대신 BLOCKED로 보고."""
+    from src.jobs.run_dual_source_ablation import run_ablation
+
+    with patch(
+        "src.jobs.run_dual_source_ablation._run_config",
+        side_effect=RuntimeError("walk-forward fold 0개. 데이터 부족"),
+    ):
+        result = run_ablation(
+            tickers=["005930", "000660", "042700", "051910"],
+            start_date="20260101",
+            end_date="20260102",
+            write_report=False,
+        )
+
+    assert result["status"] == "BLOCKED"
+    assert result["blockers"] == ["walk_forward_fold_unavailable"]
+
+
+def test_dual_source_ablation_infers_artifact_date_range(tmp_path: Path) -> None:
+    """기본 학습 기간은 artifact에 실제 존재하는 cross-sectional 날짜에서 추론."""
+    from src.jobs import run_dual_source_ablation as mod
+
+    tickers = ["005930", "000660", "042700", "051910"]
+    for date in ("20260109", "20260508"):
+        for ticker in tickers:
+            ticker_dir = tmp_path / ticker
+            ticker_dir.mkdir(parents=True, exist_ok=True)
+            (ticker_dir / f"bars_1m_{date}.parquet").write_bytes(b"placeholder")
+    # 4종목 미만 날짜는 cross-sectional 학습 가능 날짜에서 제외.
+    (tmp_path / "005930" / "bars_1m_20260102.parquet").write_bytes(b"placeholder")
+
+    with patch.object(mod, "_DATA_ROOT", tmp_path):
+        assert mod._infer_artifact_date_range(tickers) == ("20260109", "20260508")
+
+
+def test_dual_source_ablation_resolves_relative_output_dir() -> None:
+    """상대 output-dir는 repo root 기준 절대 경로로 변환."""
+    from src.jobs import run_dual_source_ablation as mod
+
+    resolved = mod._resolve_output_dir(Path("artifacts/reports/dual_source_ablation"))
+
+    assert resolved.is_absolute()
+    assert resolved == mod._PROJECT_ROOT / "artifacts/reports/dual_source_ablation"
 
 
 # ====================================================================== #

@@ -106,3 +106,19 @@ def test_c02_supersedes_null_by_default() -> None:
     }
     out = n.normalize(raw, source="naver_news")
     assert out["supersedes"] is None
+
+
+def test_c02_ticker_suffix_normalized() -> None:
+    """C2 ticker는 '005930.KS' 같은 suffix 입력도 6자리 코드로 정규화한다."""
+    n = EventNormalizer()
+    raw = {
+        "title": "뉴스",
+        "published_at": _PAST_TS,
+        "ticker": "005930.KS",
+    }
+
+    out = n.normalize(raw, source="naver_news")
+
+    assert out["ticker"] == "005930"
+    assert out["scope"] == "ticker:005930"
+    assert out["payload"]["ticker"] == "005930"

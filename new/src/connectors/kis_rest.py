@@ -28,7 +28,8 @@ from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 from src.utils.rate_limiter import RateLimiter
-from src.utils.ticker_utils import pad_ticker
+from src.utils.safe_cast import safe_bool
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("kis_rest")
 
@@ -431,6 +432,8 @@ class KISRestClient(BaseConnector):
         주문단가는 0으로 전송한다.
         """
         ticker = pad_ticker(ticker)
+        if ticker == "000000" or not is_valid_ticker(ticker):
+            raise ValueError("ticker must be a valid 6-digit KRX code")
         if self.mode == "mock":
             return {"ticker": ticker, "side": side, "qty": qty,
                     "status": "mock_accepted", "_mode": "mock"}
@@ -775,7 +778,7 @@ class KISRestClient(BaseConnector):
         """requests 예외 URL에 섞인 계좌 파라미터를 로그/리포트에서 제거."""
         out = str(text)
         for key in ("CANO", "ACNT_PRDT_CD"):
-            out = re.sub(rf"({key}=)[^&\\s]+", rf"\1***", out)
+            out = re.sub(rf"({key}=)[^&\\s]+", r"\1***", out)
         return out
 
     @staticmethod
@@ -792,7 +795,7 @@ class KISRestClient(BaseConnector):
 
         env_live = os.getenv("ELEPHANT_LIVE_ENABLED", "").strip().lower() == "true"
         exec_cfg = config_load("risk_config.yaml", "execution") or {}
-        config_live = bool(exec_cfg.get("live_enabled", False))
+        config_live = safe_bool(exec_cfg.get("live_enabled", False), default=False)
         if env_live and config_live:
             return
         raise KISAPIError(

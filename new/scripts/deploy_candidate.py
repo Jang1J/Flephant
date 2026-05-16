@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
 import prelive_gate  # noqa: E402
 from src.mode_b.deployer import ModeBDeployer, RegressionRisk  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -53,6 +54,11 @@ def _deployability_payload(
     leakage = (backtest or {}).get("minute_bar_leakage_check") or {}
     feature_quality = (backtest or {}).get("feature_quality") or {}
     service_policy = (backtest or {}).get("service_policy_replay")
+    final_dataset_gate = (
+        prelive_gate._final_dataset_gate_result(backtest or {})
+        if backtest is not None
+        else {"status": "BLOCKED", "blockers": ["backtest_missing"]}
+    )
     return {
         "deployable": bool(deployable),
         "dry_run": bool(dry_run),
@@ -63,6 +69,7 @@ def _deployability_payload(
         "requires_minute_bar_leakage_verdict": "pass",
         "requires_feature_quality_gate": True,
         "requires_service_policy_gate": True,
+        "requires_final_dataset_gate": True,
         "feature_quality_gate_pass": (
             prelive_gate._feature_quality_gate_pass(backtest or {})
             if backtest is not None
@@ -73,6 +80,8 @@ def _deployability_payload(
             if backtest is not None
             else False
         ),
+        "final_dataset_gate_pass": final_dataset_gate.get("status") == "PASS",
+        "final_dataset_gate": final_dataset_gate,
         "latest_backtest": {
             "report_path": (
                 prelive_gate._repo_relative(backtest_path)
@@ -178,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             backtest_verdict=str(backtest.get("verdict", "fail")),
             sanity_check_result="ok",
             regression_risk=RegressionRisk(
-                flagged=bool(risk_payload.get("flagged", False)),
+                flagged=safe_bool(risk_payload.get("flagged", False), default=False),
                 severity=str(risk_payload.get("severity", "low")),
                 evidence=[str(e) for e in risk_payload.get("evidence", [])],
                 snapshot_metrics=dict(risk_payload.get("snapshot_metrics", {})),

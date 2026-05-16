@@ -271,6 +271,30 @@ def test_slow_llm_call_uses_cold_mode_and_correct_caller() -> None:
     assert caller_val == "risk_agent", f"caller={caller_val!r}, 'risk_agent' 이어야 함"
 
 
+def test_slow_direct_call_publishes_to_pubsub() -> None:
+    """RiskSlow 직접 호출 경로도 MessagePool로 C4 message를 흘린다."""
+    mock_router = MagicMock()
+    mock_router.call.return_value = MagicMock(
+        success=True,
+        model_used="kanana-o",
+        content='{"stance": "risk_reduce", "risk_level": "medium", '
+                '"regime_signal": false, "affected_tickers": "005930", '
+                '"narrative": "외국인 매도 증가"}',
+        latency_ms=10.0,
+        error=None,
+    )
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-RISK-1"
+    slow = RiskAgentSlow(llm_router=mock_router, pubsub=pubsub)
+
+    result = slow.analyze(_make_event())
+
+    pubsub.publish.assert_called_once()
+    assert pubsub.publish.call_args.args[0] == result["channel"]
+    assert result["message_id"] == "MSG-RISK-1"
+    assert result["published_by_agent"] is True
+
+
 def test_fast_intraday_drop_anomaly_trigger() -> None:
     """분봉 수익률 z-score < -3.0 → intraday_drop_anomaly 트리거, veto_recommendation."""
     fast = _make_fast()

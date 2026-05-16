@@ -62,7 +62,7 @@ def _make_engine_result(sr: float = 0.8, ic: float = 0.05) -> dict:
     }
 
 
-def _make_agent(engine_mock=None) -> "BacktestAgent":
+def _make_agent(engine_mock=None) -> object:
     """BacktestAgent 인스턴스 생성 with mock engine."""
     cfg_patch = {
         "verdict_required": "pass",
@@ -110,7 +110,7 @@ def test_backtest_agent_run_calls_engine():
 
     with _mode_b_env():
         with patch("src.agents.mode_b.backtest.config_load", side_effect=_config_load_with_real_universe()):
-            result = agent.run("BUNDLE-20260503-TESTTEST")
+            agent.run("BUNDLE-20260503-TESTTEST")
 
     mock_engine.run.assert_called_once()
     call_kwargs = mock_engine.run.call_args
@@ -119,6 +119,26 @@ def test_backtest_agent_run_calls_engine():
     args, kwargs = call_kwargs
     bundle_ref = kwargs.get("bundle_ref") or (args[0] if args else None)
     assert bundle_ref == "BUNDLE-20260503-TESTTEST"
+
+
+def test_backtest_agent_leakage_check_parses_string_false() -> None:
+    """C12 leakage evidence의 문자열 false를 leakage=True로 오판하지 않는다."""
+    from src.agents.mode_b.backtest import BacktestAgent
+
+    payload = BacktestAgent._normalize_leakage_check(
+        {
+            "verdict": "pass",
+            "leakage_detected": "false",
+            "purge_bars_used": "bad",
+            "embargo_bars_used": "78",
+        },
+        default_verdict="fail",
+    )
+
+    assert payload["verdict"] == "pass"
+    assert payload["leakage_detected"] is False
+    assert payload["purge_bars_used"] == 60
+    assert payload["embargo_bars_used"] == 78
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -340,13 +360,13 @@ def test_backtest_agent_regression_severity():
 
 
 # ────────────────────────────────────────────────────────────────────────
-# 10. SHIP-fix R-3: universe SSOT 20종목 실로드 검증
+# 10. SHIP-fix R-3: universe SSOT 30종목 실로드 검증
 # ────────────────────────────────────────────────────────────────────────
 
-def test_backtest_agent_universe_loads_20_active_tickers():
-    """SHIP-5 핵심 변경 검증: universe_config.yaml.sectors[X].stocks 에서 active 20종목 로드.
+def test_backtest_agent_universe_loads_final_30_tickers():
+    """최종 deploy 기준 검증: active 20 + pending_data 10 = 30종목 로드.
 
-    config_load mock 없이 실제 yaml 참조. status='active' + sector status='confirmed' 필터링 확인.
+    config_load mock 없이 실제 yaml 참조. final_dataset_gate allowed statuses를 확인.
     """
     mock_engine = MagicMock()
     mock_engine.run.return_value = _make_engine_result(sr=0.8, ic=0.05)
@@ -355,14 +375,14 @@ def test_backtest_agent_universe_loads_20_active_tickers():
 
     with _mode_b_env():
         # config_load mock 안 함 → 실제 universe_config.yaml 로드
-        result = agent.run("BUNDLE-UNIVERSE-TEST")
+        agent.run("BUNDLE-UNIVERSE-TEST")
 
     # BacktestEngine.run 에 전달된 universe 인자 검증
     call_args = mock_engine.run.call_args
     universe = call_args.kwargs["universe"]
 
-    # 20종목 (4 confirmed sector × 5 active stocks)
-    assert len(universe) == 20, f"expected 20 active tickers, got {len(universe)}"
+    # 30종목 (active 20 + pending_data 10)
+    assert len(universe) == 30, f"expected 30 final tickers, got {len(universe)}"
 
     # 6자리 zero-padded 종목코드
     for t in universe:
@@ -372,6 +392,9 @@ def test_backtest_agent_universe_loads_20_active_tickers():
     assert "005930" in universe, "삼성전자(005930) 누락"
     assert "000660" in universe, "SK하이닉스(000660) 누락"
     assert "012450" in universe, "한화에어로스페이스(012450) 누락"
+    assert "105560" in universe, "KB금융(105560) 누락"
+    assert "005380" in universe, "현대차(005380) 누락"
+    assert "000270" in universe, "기아(000270) 누락"
 
 
 # ────────────────────────────────────────────────────────────────────────

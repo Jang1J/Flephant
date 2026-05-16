@@ -26,6 +26,7 @@ if str(_NEW_ROOT) not in sys.path:
 
 from src.runner.e2e_scenario_runner import E2EScenarioRunner
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_int
 
 logger = get_logger("run_e2e_scenario")
 
@@ -74,13 +75,13 @@ def _parse_args() -> argparse.Namespace:
 
 def _summary_failures(summary: dict, skip_mode_b: bool) -> list[str]:
     failures: list[str] = []
-    if int(summary.get("pit_violations", 0)) > 0:
+    if _positive_count(summary.get("pit_violations")):
         failures.append("pit_violations")
-    if int(summary.get("fda_missing_reason_code", 0)) > 0:
+    if _positive_count(summary.get("fda_missing_reason_code")):
         failures.append("fda_missing_reason_code")
-    if int(summary.get("total_errors", 0)) > 0:
+    if _positive_count(summary.get("total_errors")):
         failures.append("total_errors")
-    if not bool(summary.get("hot_path_sla", {}).get("sla_ok", False)):
+    if not safe_bool(summary.get("hot_path_sla", {}).get("sla_ok", False), default=False):
         failures.append("hot_path_sla")
     if not skip_mode_b:
         bad_mode_b = [
@@ -90,6 +91,12 @@ def _summary_failures(summary: dict, skip_mode_b: bool) -> list[str]:
         if bad_mode_b:
             failures.append("mode_b_verdict")
     return failures
+
+
+def _positive_count(value: object) -> bool:
+    """Treat malformed counters as positive so CLI summaries fail closed."""
+    default = 0 if value in (None, "") else 1
+    return safe_int(value, default=default, min_value=0) > 0
 
 
 def main() -> int:

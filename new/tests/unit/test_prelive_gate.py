@@ -60,6 +60,27 @@ def _service_policy_evidence(
     }
 
 
+def _final_dataset_metadata() -> dict:
+    tickers = [
+        "005930", "000660", "042700", "403870", "058470",
+        "329180", "042660", "010140", "009540", "267250",
+        "006400", "051910", "373220", "096770", "247540",
+        "012450", "047810", "079550", "298040", "272210",
+        "105560", "055550", "086790", "024110", "000810",
+        "005380", "000270", "012330", "011210", "086280",
+    ]
+    return {
+        "train_start": "2025-05-09",
+        "train_end": "2026-05-15",
+        "data_source": "artifact_bars",
+        "synthetic_fallback": False,
+        "requested_tickers": tickers,
+        "loaded_tickers": tickers,
+        "missing_tickers": [],
+        "n_tickers": len(tickers),
+    }
+
+
 def test_configured_train_min_rows_requires_config_value():
     gate = _load_script_module()
 
@@ -99,6 +120,57 @@ def test_latest_matching_report_skips_non_matching_and_bad_json(tmp_path):
 
     assert path == new
     assert data == {"status": "PASS"}
+
+
+def test_real_readiness_treats_allow_mock_string_false_as_real(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "data_readiness"
+    report_dir.mkdir(parents=True)
+    report = report_dir / "data_readiness_20260516_000000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "end_date": "20260515",
+                "allow_mock": "false",
+                "runtime": {"secret_presence": {"KIS_MODE": True}},
+                "stages": {
+                    "smoke": {"naver": {"status": "PASS"}},
+                    "backfill": {"status": "PASS", "counts": {"005930": 30400}},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_real_readiness("20260515")
+
+    assert result["status"] == "PASS"
+    assert result["backfill_min_rows"] == 30400
+
+
+def test_deployable_backtest_treats_regression_string_false_as_false(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_service_policy_gate_pass", lambda *_args, **_kwargs: True)
+
+    assert gate._is_deployable_backtest_report(
+        {
+            "bundle_id": "BUNDLE-TEST",
+            "verdict": "pass",
+            "regression_risk": {"flagged": "false"},
+            "minute_bar_leakage_check": {"verdict": "pass"},
+            "feature_quality": {
+                "dual_source_rows": 10,
+                "dual_source_non_neutral_rows": 10,
+                "exogenous_rows": 10,
+                "exogenous_non_neutral_rows": 10,
+            },
+            "candidate_model_metadata": _final_dataset_metadata(),
+        },
+        "BUNDLE-TEST",
+    )
 
 
 def test_probe_order_blocked_without_report(monkeypatch, tmp_path):
@@ -218,6 +290,47 @@ def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
     assert result["version"] == "v2"
     assert result["candidate_bundle_id"] == "BUNDLE-TEST"
     assert result["registry_status"] == "candidate"
+
+
+def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
+    monkeypatch, tmp_path
+):
+    gate = _load_script_module()
+    label_version = _required_label_generation_version(gate)
+    label_scope = _required_label_session_scope(gate)
+    repo_root = tmp_path
+    lgbm_dir = repo_root / "artifacts" / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    (lgbm_dir / "candidate.pkl").write_bytes(b"candidate")
+    (lgbm_dir / "registry.json").write_text(
+        json.dumps(
+            {
+                "active_version": None,
+                "versions": [
+                    {
+                        "version": "candidate",
+                        "status": "candidate",
+                        "bundle_id": "BUNDLE-TEST",
+                        "model_path": "artifacts/lgbm/candidate.pkl",
+                        "created_at": "2026-05-11T00:00:00+09:00",
+                        "synthetic_fallback": "false",
+                        "data_source": "artifact_bars",
+                        "n_train_rows": 1000,
+                        "label_generation_version": label_version,
+                        "label_session_scope": label_scope,
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train()
+
+    assert result["status"] == "PASS"
+    assert result["synthetic_fallback"] is False
 
 
 def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatch, tmp_path):
@@ -532,6 +645,7 @@ def test_backtest_gate_passes_when_matching_report_exists(monkeypatch, tmp_path)
                     "exogenous_non_neutral_rows": 90,
                 },
                 "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
             },
             ensure_ascii=False,
         ),
@@ -574,6 +688,7 @@ def test_backtest_gate_blocks_service_policy_date_range_mismatch(monkeypatch, tm
                     "exogenous_non_neutral_rows": 90,
                 },
                 "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
             },
             ensure_ascii=False,
         ),
@@ -618,6 +733,7 @@ def test_backtest_gate_uses_service_policy_expected_date_range(monkeypatch, tmp_
                     "exogenous_non_neutral_rows": 90,
                 },
                 "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
             },
             ensure_ascii=False,
         ),

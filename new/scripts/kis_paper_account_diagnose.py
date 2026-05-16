@@ -24,6 +24,7 @@ if str(SRC) not in sys.path:
 
 from src.connectors.kis_rest import KISRestClient  # noqa: E402
 from src.utils.auth import AuthManager  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "kis_account_diagnostic"
@@ -179,7 +180,7 @@ def _diagnose_probes(
         )
         for probe in probes
     )
-    token_matches = bool(token_scope.get("jti_matches_selected_app_key", False))
+    token_matches = safe_bool(token_scope.get("jti_matches_selected_app_key", False), default=False)
 
     if ready_product_codes:
         likely_root_cause = "paper_account_ready"

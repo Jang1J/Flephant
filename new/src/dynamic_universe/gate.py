@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("gate")
 
@@ -102,7 +103,7 @@ class DynamicUniverseGate:
         """
         cfg = _load_yaml(self._risk_config_path)
         du_cfg = cfg.get("dynamic_universe", {})
-        enabled: bool = bool(du_cfg.get("enabled", False))
+        enabled: bool = safe_bool(du_cfg.get("enabled", False), default=False)
         return enabled
 
     def is_enabled(self) -> bool:

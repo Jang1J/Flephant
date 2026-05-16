@@ -24,7 +24,6 @@ if str(SRC) not in sys.path:
 from src.data.dataset_builder import DUAL_SOURCE_FEATURES, EXOGENOUS_FEATURES  # noqa: E402
 from src.data.dual_source_runner import load_latest_scores  # noqa: E402
 from src.data.exogenous_feature_store import (  # noqa: E402
-    DEFAULT_EXOGENOUS_ARTIFACT_DIR,
     build_neutral_payload as build_neutral_exogenous_payload,
     is_non_neutral,
     load_exogenous_scores,

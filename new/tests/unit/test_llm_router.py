@@ -325,6 +325,34 @@ def test_missing_openai_key_returns_failure(
     assert result.error == "OPENAI_API_KEY_MISSING"
 
 
+def test_kanana_malformed_tokens_out_does_not_fail_call(
+    minimal_config: dict,
+    monkeypatch,
+) -> None:
+    """Provider가 tokens_out을 비정상 문자열로 줘도 호출 자체는 성공 처리한다."""
+    import requests
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"content": "ok", "tokens_out": "many"}
+
+    monkeypatch.setenv("KANANA_API_KEY", "k")
+    monkeypatch.setenv("KANANA_API_URL", "https://kanana.example.invalid")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Response())
+    router = LLMRouter(config=minimal_config)
+
+    result = router.call("p", mode="cold", caller="news_analysis")
+
+    assert result.success is True
+    assert result.tokens_out is None
+    assert result.content == "ok"
+
+
 def test_budget_remaining_tracks_calls(router_with_keys: LLMRouter) -> None:
     """호출 시마다 budget_remaining() 감소 확인."""
     initial = router_with_keys.budget_remaining()
@@ -409,6 +437,24 @@ def test_allow_mock_provider_without_api_keys(monkeypatch, minimal_config: dict)
     assert cold.model_used == LLMModel.KANANA_O.value
     assert mode_b.success is True
     assert mode_b.model_used == LLMModel.GPT_4O.value
+
+
+def test_allow_mock_provider_string_false_does_not_enable_mock(
+    monkeypatch,
+    minimal_config: dict,
+) -> None:
+    """config 문자열 'false'는 mock provider enable로 해석하지 않는다."""
+    monkeypatch.delenv("KANANA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = "false"
+
+    router = LLMRouter(config=minimal_config)
+    result = router.call("test", mode="cold", caller="news_analysis")
+
+    assert result.success is False
+    assert result.error == "OPENAI_API_KEY_MISSING"
 
 
 def test_llm_call_result_dataclass() -> None:

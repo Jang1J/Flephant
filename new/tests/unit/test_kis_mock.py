@@ -200,6 +200,22 @@ def test_kis_rest_virtual_submit_order_requires_price_for_limit(monkeypatch):
         client.submit_order("005930", "buy", 1)
 
 
+def test_kis_rest_submit_order_rejects_invalid_ticker_before_broker(monkeypatch):
+    """KIS connector direct-call도 broker 호출 전 invalid ticker를 차단한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    from src.connectors.kis_rest import KISRestClient
+
+    client = KISRestClient()
+    monkeypatch.setattr(
+        client,
+        "_call_kis_post",
+        lambda *_args, **_kwargs: pytest.fail("broker should not be called"),
+    )
+
+    with pytest.raises(ValueError, match="valid 6-digit"):
+        client.submit_order("ABC", "buy", 1, price=70000)
+
+
 def test_kis_rest_non_retryable_kis_error_short_circuits_post(monkeypatch):
     """장종료/계좌오류처럼 재시도로 해결 안 되는 KIS 오류는 즉시 반환한다."""
     monkeypatch.setenv("KIS_MODE", "virtual")
@@ -237,6 +253,24 @@ def test_kis_rest_real_submit_order_requires_dual_live_enable(monkeypatch):
     monkeypatch.delenv("ELEPHANT_LIVE_ENABLED", raising=False)
     from src.connectors.kis_rest import KISAPIError, KISRestClient
 
+    client = KISRestClient()
+
+    with pytest.raises(KISAPIError, match="KIS_MODE=real 주문 차단"):
+        client.submit_order("005930", "buy", 1, price=70000)
+
+
+def test_kis_rest_real_submit_order_treats_string_false_config_as_disabled(monkeypatch):
+    """risk_config live_enabled='false' 문자열은 실계좌 주문 허용으로 보지 않는다."""
+    monkeypatch.setenv("KIS_MODE", "real")
+    monkeypatch.setenv("ELEPHANT_LIVE_ENABLED", "true")
+    from src.connectors import kis_rest
+    from src.connectors.kis_rest import KISAPIError, KISRestClient
+
+    monkeypatch.setattr(
+        kis_rest,
+        "config_load",
+        lambda file_name, section: {"live_enabled": "false"} if section == "execution" else {},
+    )
     client = KISRestClient()
 
     with pytest.raises(KISAPIError, match="KIS_MODE=real 주문 차단"):

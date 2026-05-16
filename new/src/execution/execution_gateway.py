@@ -24,7 +24,8 @@ from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_order_plan_id
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("execution_gateway")
 
@@ -59,9 +60,9 @@ class ExecutionGateway:
         exec_cfg = config_load("risk_config.yaml", "execution")
         self._mode: str = str(mode_override or exec_cfg["mode"]).lower()
         self._live_enabled: bool = (
-            bool(exec_cfg["live_enabled"])
+            safe_bool(exec_cfg.get("live_enabled", False), default=False)
             if live_enabled_override is None
-            else bool(live_enabled_override)
+            else safe_bool(live_enabled_override, default=False)
         )
         exec_cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
         self._slippage_bps: float = float(exec_cost_cfg.get("slippage_bps", 10))
@@ -102,14 +103,33 @@ class ExecutionGateway:
         t0 = time.perf_counter()
         order_plan_id = generate_order_plan_id()
         decision_id = str(final_decision.get("decision_id", ""))
-        approved = bool(final_decision.get("approved", False))
-        order_deltas = list(final_decision.get("order_deltas", []))
+        approved = safe_bool(final_decision.get("approved", False), default=False)
+        order_deltas, validation_errors = self._normalize_order_deltas(
+            final_decision.get("order_deltas", [])
+        )
+        if validation_errors:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                f"invalid_order_deltas: {validation_errors}",
+                order_deltas,
+                t0,
+            )
 
         # 1. approved=False → no order
         if not approved:
             reason = f"veto ({final_decision.get('reason_code', 'UNKNOWN')})"
             return self._rejected(
                 order_plan_id, decision_id, reason, order_deltas, t0,
+            )
+
+        if not order_deltas:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "no_order_deltas",
+                order_deltas,
+                t0,
             )
 
         # 2. Kill Switch
@@ -177,8 +197,8 @@ class ExecutionGateway:
         slippage_noise = self._slippage_bps / 10000.0
 
         for od in order_deltas:
-            fill_price = float(od.get("price", 0.0))
-            qty = int(od.get("qty", 0))
+            fill_price = safe_float(od.get("price", 0.0), default=0.0)
+            qty = safe_int(od.get("qty", 0), default=0)
 
             # snapshot_vwap: yaml slippage_bps 기반 noise
             vwap_noise = random.uniform(-slippage_noise, slippage_noise)
@@ -204,7 +224,8 @@ class ExecutionGateway:
 
         # portfolio-level realized_slippage: 비용 가중 평균
         total_cost = sum(
-            int(od.get("qty", 0)) * float(od.get("price", 0.0))
+            safe_int(od.get("qty", 0), default=0)
+            * safe_float(od.get("price", 0.0), default=0.0)
             for od in order_deltas
         )
         portfolio_slippage = (
@@ -264,14 +285,13 @@ class ExecutionGateway:
         estimated_cost = 0.0
 
         for od in order_deltas:
-            ticker_raw = od.get("ticker", "")
-            ticker = pad_ticker(str(ticker_raw))
+            ticker = str(od.get("ticker", ""))
             side = str(od.get("side", "")).lower()
-            qty = int(od.get("qty", 0) or 0)
-            price = float(od.get("price", 0.0) or 0.0)
+            qty = safe_int(od.get("qty", 0), default=0)
+            price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
 
-            if ticker == "000000" or side not in {"buy", "sell"} or qty <= 0:
+            if not self._valid_order_delta(ticker, side, qty, price, order_type):
                 rejections.append({
                     "ticker": ticker,
                     "side": side,
@@ -303,11 +323,12 @@ class ExecutionGateway:
                     })
                     continue
 
-                avg_fill_price = float(
+                avg_fill_price = safe_float(
                     broker_response.get(
                         "avg_fill_price",
                         broker_response.get("price", price),
-                    ) or price
+                    ),
+                    default=price,
                 )
                 estimated_cost += qty * avg_fill_price
                 fills.append({
@@ -370,6 +391,69 @@ class ExecutionGateway:
             "latency_ms": elapsed_ms,
             "n_fills": len(fills),
         }
+
+    @staticmethod
+    def _normalize_order_deltas(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Validate and normalize C10 order_deltas before any execution mode."""
+        if raw is None:
+            return [], []
+        if not isinstance(raw, list):
+            return [], [{"reason": "order_deltas_must_be_list", "type": type(raw).__name__}]
+
+        normalized: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for idx, od in enumerate(raw):
+            if not isinstance(od, dict):
+                errors.append({
+                    "index": idx,
+                    "reason": "order_delta_must_be_dict",
+                    "type": type(od).__name__,
+                })
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
+            qty = safe_int(od.get("qty", 0), default=0)
+            price = safe_float(od.get("price", 0.0), default=0.0)
+            order_type = str(od.get("order_type", "00") or "00")
+            if not ExecutionGateway._valid_order_delta(ticker, side, qty, price, order_type):
+                errors.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "order_type": order_type,
+                    "reason": "invalid_order_delta",
+                })
+                continue
+            normalized_od = dict(od)
+            normalized_od.update({
+                "ticker": ticker,
+                "side": side,
+                "qty": qty,
+                "price": price,
+                "order_type": order_type,
+            })
+            normalized.append(normalized_od)
+        return normalized, errors
+
+    @staticmethod
+    def _valid_order_delta(
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str,
+    ) -> bool:
+        if ticker == "000000" or not is_valid_ticker(ticker):
+            return False
+        if side not in {"buy", "sell"}:
+            return False
+        if qty <= 0:
+            return False
+        if order_type != "01" and price <= 0:
+            return False
+        return True
 
     def _submit_broker_order(
         self,

@@ -145,7 +145,6 @@ class RiskAgentFast(AgentBase):
         triggered: list[dict[str, Any]] = []
 
         event_type = event.get("event_type", "")
-        payload = event.get("payload", {})
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # admit_candidate action rule 은 AdmissionEngine 담당. risk_fast 는 skip.

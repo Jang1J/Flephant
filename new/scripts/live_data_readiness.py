@@ -36,6 +36,7 @@ from src.connectors.naver_rest import NaverNewsClient  # noqa: E402
 from src.connectors.us_market import USMarketClient  # noqa: E402
 from src.data.backfill import Backfill  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -124,6 +125,25 @@ def _date_str(value: date) -> str:
 
 def _iso_date_str(yyyymmdd: str) -> str:
     return datetime.strptime(yyyymmdd, "%Y%m%d").strftime("%Y-%m-%d")
+
+
+def _community_post_date(post: Any) -> str | None:
+    """Community raw post timestamp를 YYYYMMDD 문자열로 추출."""
+    raw_ts = getattr(post, "timestamp", None)
+    if raw_ts is None and isinstance(post, dict):
+        raw_ts = post.get("timestamp") or post.get("posted_at")
+
+    if isinstance(raw_ts, datetime):
+        ts = raw_ts
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_KST)
+        return ts.astimezone(_KST).strftime("%Y%m%d")
+
+    if raw_ts:
+        token = str(raw_ts)[:10].replace("-", "")
+        if len(token) == 8 and token.isdigit():
+            return token
+    return None
 
 
 def _load_active_tickers(max_tickers: int | None) -> list[str]:
@@ -433,13 +453,27 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
         if blocked is not None:
             result["community"] = blocked
         else:
-            events = community.poll_and_normalize(tickers[: min(3, len(tickers))])
+            posts = community.poll(tickers[: min(3, len(tickers))])
+            raw_post_count = len(posts)
+            post_dates = [_community_post_date(post) for post in posts]
+            as_of_aligned_post_count = sum(1 for post_date in post_dates if post_date == as_of_date)
+            unknown_date_count = sum(1 for post_date in post_dates if post_date is None)
+            as_of_mismatch_count = raw_post_count - as_of_aligned_post_count - unknown_date_count
             result["community"] = _status(
-                bool(events),
+                raw_post_count > 0,
                 {
-                    "event_count": len(events),
+                    "event_count": 0,
+                    "raw_post_count": raw_post_count,
+                    "as_of_date": as_of_date,
+                    "as_of_aligned_post_count": as_of_aligned_post_count,
+                    "as_of_mismatch_count": as_of_mismatch_count,
+                    "unknown_post_date_count": unknown_date_count,
+                    "normalized_in_smoke": False,
                     "is_mock": getattr(community, "_is_mock", None),
-                    "note": "real scraping is not implemented when is_mock=true",
+                    "note": (
+                        "community connector raw posts are reachable; live readiness "
+                        "does not C2-normalize raw posts to avoid historical as_of drift"
+                    ),
                 },
             )
     except Exception as e:
@@ -475,7 +509,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
         else:
             macro = ecos.get_macro_pack(as_of_date)
             result["ecos_macro"] = _status(
-                bool(macro.get("interest_rate")) and bool(macro.get("usd_krw")),
+                macro.get("interest_rate") is not None and macro.get("usd_krw") is not None,
                 {"macro": macro, "is_mock": getattr(ecos, "_is_mock", None)},
             )
     except Exception as e:
@@ -526,7 +560,7 @@ def run_backfill(
     try:
         cfg = _readiness_cfg()
         min_rows = _readiness_min_rows("min_rows_per_day")
-        require_all = bool(cfg.get("require_all_tickers_for_backfill", True))
+        require_all = safe_bool(cfg.get("require_all_tickers_for_backfill", True), default=True)
         backfill = Backfill()
         counts = {pad_ticker(ticker): 0 for ticker in tickers}
         fetch_counts_by_date: dict[str, dict[str, int]] = {}
@@ -612,7 +646,7 @@ def run_train_if_ready(
     min_dates = int(wf["train_window_days"]) + int(wf["test_window_days"])
     cfg = _readiness_cfg()
     min_rows = _readiness_min_rows("train_min_rows_per_day")
-    require_all = bool(cfg.get("require_all_tickers_for_train", True))
+    require_all = safe_bool(cfg.get("require_all_tickers_for_train", True), default=True)
     quality = _artifact_date_quality(tickers, start_date, end_date, min_rows)
     if require_all:
         dates = sorted(day for day, item in quality.items() if item["is_valid"])
@@ -648,7 +682,7 @@ def run_train_if_ready(
             bundle_id=None,
             is_latest=False,
         )
-        synthetic = bool(train_result.get("synthetic_fallback", False))
+        synthetic = safe_bool(train_result.get("synthetic_fallback", False), default=False)
         missing_tickers = list(train_result.get("missing_tickers", []))
         return _status(
             not synthetic and not missing_tickers,

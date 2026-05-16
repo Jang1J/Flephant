@@ -5,9 +5,11 @@ import pytest
 
 
 def _make_bar(ticker: str = "005930", price: int = 70000, vol: int = 1000) -> dict:
+    minute = (int(price) // 60) % 60
+    second = int(price) % 60
     return {
         "ticker": ticker,
-        "ts_close": "2026-04-17T09:01:00+09:00",
+        "ts_close": f"2026-04-17T09:{minute:02d}:{second:02d}+09:00",
         "open": price,
         "high": price + 100,
         "low": price - 100,
@@ -169,3 +171,35 @@ def test_get_latest_returns_time_ordered():
     result = bb.get_latest("005930", n=5)
     result_prices = [r["open"] for r in result]
     assert result_prices == prices
+
+
+def test_push_replaces_duplicate_ts_close():
+    """동일 ticker/ts_close 중복 bar는 최신 값으로 교체한다."""
+    from src.data.bar_buffer import BarBuffer
+
+    bb = BarBuffer(max_bars=10)
+    first = _make_bar(price=70000)
+    second = {**first, "open": 71000, "high": 71100, "low": 70900, "close": 71050}
+
+    bb.push(first)
+    bb.push(second)
+
+    result = bb.get_latest("005930", n=10)
+    assert len(result) == 1
+    assert result[0]["open"] == 71000
+
+
+def test_push_ignores_out_of_order_bar():
+    """마지막 시각보다 과거 bar는 rolling feature 오염 방지를 위해 무시한다."""
+    from src.data.bar_buffer import BarBuffer
+
+    bb = BarBuffer(max_bars=10)
+    older = {**_make_bar(price=70000), "ts_close": "2026-04-17T09:01:00+09:00"}
+    newer = {**_make_bar(price=70100), "ts_close": "2026-04-17T09:02:00+09:00"}
+
+    bb.push(newer)
+    bb.push(older)
+
+    result = bb.get_latest("005930", n=10)
+    assert len(result) == 1
+    assert result[0]["ts_close"] == "2026-04-17T09:02:00+09:00"

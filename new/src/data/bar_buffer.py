@@ -9,7 +9,6 @@ ticker: 6자리 zero-padded (pad_ticker 경유).
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
@@ -70,8 +69,25 @@ class BarBuffer:
         ticker = pad_ticker(str(bar["ticker"]))
         normalized = dict(bar)
         normalized["ticker"] = ticker
+        ts_close = str(normalized["ts_close"])
 
         buf = self._get_or_create(ticker)
+        items = list(buf)
+        for idx, existing in enumerate(items):
+            if str(existing.get("ts_close")) == ts_close:
+                items[idx] = normalized
+                buf.clear()
+                buf.extend(items)
+                logger.debug("[bar_buffer] duplicate bar replaced: ticker=%s ts_close=%s", ticker, ts_close)
+                return
+        if items and ts_close < str(items[-1].get("ts_close", "")):
+            logger.warning(
+                "[bar_buffer] out-of-order bar ignored: ticker=%s ts_close=%s latest=%s",
+                ticker,
+                ts_close,
+                items[-1].get("ts_close"),
+            )
+            return
         buf.append(normalized)
 
     def get_latest(self, ticker: str, n: int = 60) -> list[dict]:

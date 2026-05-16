@@ -401,7 +401,7 @@ def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch):
                 "metrics": {"sr": 1.0, "ic": 0.1},
                 "verdict": "pass",
                 "regression_severity": "low",
-                "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+                "regression_risk": {"flagged": "false", "severity": "low", "evidence": []},
                 "minute_bar_leakage_check": {"verdict": "pass"},
                 "feature_quality": feature_quality,
                 "service_policy_replay": service_policy_replay,
@@ -427,6 +427,39 @@ def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch):
     assert stage_7["deploy_status"] == "deployed"
     assert deployer.kwargs["feature_quality"] == feature_quality
     assert deployer.kwargs["service_policy_evidence"] == service_policy_replay
+    assert deployer.kwargs["regression_risk"].flagged is False
+
+
+def test_stage_6_treats_string_false_regression_flag_as_false(scheduler, monkeypatch):
+    """regression_risk.flagged='false' 문자열이 C14 critical alert로 과장되지 않는다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    class _MockBacktestAgent:
+        def run(self, bundle_id):
+            return {
+                "backtest_id": "BT-MOCK",
+                "bundle_id": bundle_id,
+                "metrics": {"sr": 1.0, "ic": 0.1},
+                "verdict": "pass",
+                "regression_severity": "low",
+                "regression_risk": {"flagged": "false", "severity": "low", "evidence": []},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": {"status": "PASS"},
+            }
+
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._backtest_agent = _MockBacktestAgent()
+
+    result = scheduler.stage_6_backtest_validation()
+
+    assert result["critical_alert"] is False
+    assert result["regression_risk"]["flagged"] == "false"
 
 
 def test_stage_7_blocks_when_c12_deploy_evidence_missing(scheduler, monkeypatch):

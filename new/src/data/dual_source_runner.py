@@ -38,7 +38,7 @@ from src.connectors.community import CommunityCrawler, CommunityPost
 from src.connectors.naver_rest import NaverNewsClient, NaverNewsItem
 from src.data.dual_source_scorer import DualSourceScorer
 from src.utils.config_loader import load as config_load
-from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.pit_guard import assert_pit_safe
 
 logger = logging.getLogger(__name__)
 

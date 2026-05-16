@@ -7,19 +7,19 @@
 
 mode_b_metadata:
   schema_version: "1.0.0"
-  data_version: "1.2.0"                  # live-data fix: stale/invalid active tickers replaced
-  last_updated: "2026-05-11"
-  updated_by: "codex_live_data_gate"
+  data_version: "1.5.0"                  # sector5/6 selected for v1 KIS 1y dataset
+  last_updated: "2026-05-16"
+  updated_by: "operator_approved_kis_1y_research_universe"
   mode_b_editable: false          # universe는 Mode B가 자동 수정 금지 (수동 업데이트만)
   human_approval_required: true   # 종목 추가/제거는 operator 승인 필수
   backup_retention_days: 365      # universe는 장기 보관
   update_trigger: "manual_only"
-  rationale: "universe는 실거래 대상이므로 Mode B가 자동으로 종목을 추가/제거하지 않는다. pending 10종목 확정도 operator가 수동 승인."
+  rationale: "universe는 실거래 대상이므로 Mode B가 자동으로 종목을 추가/제거하지 않는다. sector5/6 10종목은 operator가 금융+자동차로 확정했으며, KIS 1년 데이터 품질 게이트 통과 전까지 active 전환하지 않는다."
 
 backtest_universe_mode:            # v2.2 — Backtest Agent universe 정책
-  default: "active_only"           # Backtest는 확정 20종목만 사용
-  allow_pending: false             # pending 10종목 제외
-  rationale: "pending 종목은 데이터 검증 미완. Backtest 결과 신뢰도를 위해 active 20만 사용."
+  default: "final_30_after_kis_1y_gate"
+  allow_pending: true
+  rationale: "v1 실계좌 직전 backtest/deploy_quality는 active 20 + pending_data 10 = 30종목 KIS 1년 학습셋 기준만 PASS한다. pending 10종목은 kis_1y_backfill_quality_pass 전까지 주문 active로 승격하지 않는다."
   override_flag: "backtest_config.include_pending"  # Sprint 4에서 overrideable
   # SHIP-fix R-1 (W1 P0 cleanup): yaml 파싱 실패 또는 sectors 비어있을 때만 발동.
   # 정상 운영에서는 sectors[X].stocks 20종목 사용. 불변 5원칙 (하드코딩 금지) 준수.
@@ -28,10 +28,10 @@ backtest_universe_mode:            # v2.2 — Backtest Agent universe 정책
     - "000660"                     # SK하이닉스
 
 version: "1.1.0"
-last_updated: "2026-05-11"
+last_updated: "2026-05-16"
 target_total_stocks: 30          # 최종 목표
-active_stock_count: 20           # 현재 확정
-pending_stock_count: 10          # 미확정 (2섹터)
+active_stock_count: 20           # 현재 paper-ready 확정 active
+pending_stock_count: 10          # 확정됐지만 KIS 1y data activation 대기
 total_sectors: 6
 
 # 확정 섹터 (4개)
@@ -72,16 +72,27 @@ sectors:
       - { ticker: "298040", name: "효성중공업", aliases: [], status: "active" }
       - { ticker: "272210", name: "한화시스템", aliases: ["Hanwha Systems"], status: "active" }
 
-  # 미확정 섹터 (2개) — 종목 분석 후 확정
-  섹터5_미확정:
-    status: "pending"
-    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
-    stocks: []
+  금융:
+    status: "confirmed_pending_data"
+    activation_gate: "kis_1y_backfill_quality_pass"
+    rationale: "금리/환율/Value-up/주주환원 이벤트와 외국인 수급 피처가 강하며 KIS 1년 1분봉 학습셋 확보 가능성이 높다."
+    stocks:
+      - { ticker: "105560", name: "KB금융", aliases: ["KB금융지주", "KB Financial"], status: "pending_data" }
+      - { ticker: "055550", name: "신한지주", aliases: ["신한금융지주", "Shinhan"], status: "pending_data" }
+      - { ticker: "086790", name: "하나금융지주", aliases: ["하나금융", "Hana Financial"], status: "pending_data" }
+      - { ticker: "024110", name: "기업은행", aliases: ["IBK기업은행", "IBK"], status: "pending_data" }
+      - { ticker: "000810", name: "삼성화재", aliases: ["Samsung Fire"], status: "pending_data" }
 
-  섹터6_미확정:
-    status: "pending"
-    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
-    stocks: []
+  자동차:
+    status: "confirmed_pending_data"
+    activation_gate: "kis_1y_backfill_quality_pass"
+    rationale: "환율/관세/미국 정책/수출 이벤트가 Cold Path와 dual-source 검증에 잘 맞고, 금융 섹터의 수급/외생 피처와 다른 이벤트 구조를 제공한다."
+    stocks:
+      - { ticker: "005380", name: "현대차", aliases: ["현대자동차", "Hyundai Motor"], status: "pending_data" }
+      - { ticker: "000270", name: "기아", aliases: ["Kia"], status: "pending_data" }
+      - { ticker: "012330", name: "현대모비스", aliases: ["Hyundai Mobis"], status: "pending_data" }
+      - { ticker: "011210", name: "현대위아", aliases: ["Hyundai Wia"], status: "pending_data" }
+      - { ticker: "086280", name: "현대글로비스", aliases: ["Hyundai Glovis"], status: "pending_data" }
 
 # 필터 규칙
 filter_rules:

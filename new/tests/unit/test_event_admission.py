@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -163,6 +162,16 @@ def test_stale_drop_false_disables_filter(tmp_path: Path) -> None:
 
     past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
     ev = _make_event(event_id="EVT-NOSTALE-001", expires_at=past_expires)
+    assert ea.admit(ev) is True
+
+
+def test_stale_drop_string_false_disables_filter(tmp_path: Path) -> None:
+    """stale_drop='false' 문자열이 만료 이벤트 필터를 켜지 않도록 방어."""
+    cfg = _cfg({"stale_drop": "false"})
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
+    ev = _make_event(event_id="EVT-NOSTALE-STR-001", expires_at=past_expires)
     assert ea.admit(ev) is True
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.ops.profiler import HotPathProfiler, HOT_STAGES
+from src.ops.profiler import HotPathProfiler
 
 
 # ====================================================================== #

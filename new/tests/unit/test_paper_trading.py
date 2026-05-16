@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from src.execution import paper_trading as paper_trading_module
 from src.execution.paper_trading import PaperTradingRunner
 
 
@@ -79,6 +80,28 @@ class FakePaperKISNoOrderHistoryMatch(FakePaperKIS):
                 "status": "submitted",
             }],
             "_mode": "virtual",
+        }
+
+
+class FakePaperKISNoBrokerOrderId(FakePaperKIS):
+    def submit_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> dict:
+        self.orders.append({
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {
+            "status": "submitted",
+            "price": price,
         }
 
 
@@ -190,6 +213,71 @@ def test_paper_submit_probe_fails_without_broker_history_match(tmp_path: Path) -
     assert report["stages"]["order_history"]["reason"] == "broker_order_id_not_found_in_history"
 
 
+def test_paper_submit_probe_fails_without_broker_order_id(tmp_path: Path) -> None:
+    runner = PaperTradingRunner(kis_client=FakePaperKISNoBrokerOrderId(), report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_id_guard"]["status"] == "FAIL"
+    assert report["stages"]["order_id_guard"]["error_code"] == "BROKER_ORDER_ID_MISSING"
+
+
+def test_paper_submit_probe_rejects_invalid_ticker(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="ABC",
+        side="buy",
+        qty=1,
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "invalid_ticker"
+    assert client.orders == []
+
+
+def test_paper_submit_probe_treats_string_false_market_order_as_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        paper_trading_module,
+        "config_load",
+        lambda file_name, section: {
+            "report_dir": str(tmp_path),
+            "confirm_order_phrase": "PAPER_ORDER_OK",
+            "require_virtual_mode": "true",
+            "max_probe_order_qty": 1,
+            "allow_market_order": "false",
+        } if section == "paper_trading" else {},
+    )
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=None,
+        order_type="01",
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "market_order_not_allowed"
+    assert client.orders == []
+
+
 def test_paper_submit_probe_rejects_real_mode(tmp_path: Path) -> None:
     runner = PaperTradingRunner(kis_client=FakeRealKIS(), report_dir=tmp_path)
 
@@ -219,4 +307,38 @@ def test_paper_submit_probe_enforces_probe_qty_limit(tmp_path: Path) -> None:
 
     assert report["status"] == "FAIL"
     assert report["stages"]["order_guard"]["reason"] == "qty_out_of_probe_limit"
+    assert client.orders == []
+
+
+def test_paper_submit_probe_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty="abc",  # type: ignore[arg-type]
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "qty_out_of_probe_limit"
+    assert client.orders == []
+
+
+def test_paper_submit_probe_rejects_malformed_price_without_crash(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price="abc",  # type: ignore[arg-type]
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "positive_price_required"
     assert client.orders == []

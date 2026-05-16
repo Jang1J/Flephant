@@ -201,9 +201,6 @@ class Preprocessor:
             "quant_frame_id": "RPT-...",
           }
         """
-        # 순서 안전 점검: _compute_ticker_features 가 먼저 실행되었는지 확인용 flag.
-        # 외부에서 forward_fill → cross_sectional_mean 순서를 건너뛰면 features가 빈 dict로 남음.
-        _forward_fill_applied = True  # 이 함수 내에서는 항상 compute 먼저 → assert 통과.
         padded_tickers = [pad_ticker(str(t)) for t in tickers]
         features: dict[str, dict[str, float]] = {}
 

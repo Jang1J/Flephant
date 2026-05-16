@@ -101,3 +101,14 @@ def test_external_rehearsal_flattens_broker_evidence_statuses(monkeypatch) -> No
     assert report["stage_statuses"]["balance_reconciliation"] == "PASS"
     assert report["stage_statuses"]["probe_order"] == "PASS"
     assert report["stage_statuses"]["order_history_requery"] == "PASS"
+
+
+def test_internal_fake_hot_runner_uses_safe_price_fallback() -> None:
+    """Demo helper의 malformed price가 rehearsal 전체를 중단시키지 않는다."""
+    runner = paper_auto_service_rehearsal._FakeHotRunner()
+
+    result = runner.run_once(tickers=["005930"], latest_prices={"005930": "bad-price"})
+
+    order = result["final_decision"]["order_deltas"][0]
+    assert order["ticker"] == "005930"
+    assert order["price"] == 70000.0

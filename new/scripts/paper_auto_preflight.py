@@ -23,6 +23,7 @@ if str(SRC) not in sys.path:
 import model_registry_readiness  # noqa: E402
 import print_env_readiness  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -54,16 +55,10 @@ def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
         return 0
     direct = report_or_stage.get("matched_order_count")
     if direct is not None:
-        try:
-            return int(direct)
-        except (TypeError, ValueError):
-            return 0
+        return safe_int(direct, default=0, min_value=0)
     stage = report_or_stage.get("stages", {}).get("order_history")
     if isinstance(stage, dict):
-        try:
-            return int(stage.get("matched_order_count", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return safe_int(stage.get("matched_order_count", 0), default=0, min_value=0)
     return 0
 
 
@@ -150,7 +145,12 @@ def _probe_order_blocker(probe: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(rejection, dict):
             continue
         error = str(rejection.get("error", ""))
-        if "msg_cd=40580000" in error or "장종료" in error:
+        if (
+            "msg_cd=40580000" in error
+            or "msg_cd=40100000" in error
+            or "장종료" in error
+            or "영업일이 아닙니다" in error
+        ):
             return {
                 "error_code": "BROKER_MARKET_CLOSED",
                 "message": "KIS virtual broker rejected probe order because paper market is closed.",
@@ -239,7 +239,7 @@ def _paper_evidence() -> dict[str, Any]:
 
 def _ops_risk() -> dict[str, Any]:
     exec_cfg = config_load("risk_config.yaml", "execution") or {}
-    live_enabled = bool(exec_cfg.get("live_enabled", False))
+    live_enabled = safe_bool(exec_cfg.get("live_enabled", False), default=False)
     return {
         "status": "PASS" if not live_enabled else "BLOCKED",
         "risk_config_live_enabled": live_enabled,

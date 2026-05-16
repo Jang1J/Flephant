@@ -313,7 +313,12 @@ class DebateAgent(AgentBase):
           - quant_buy vs risk_high
           - news_sell vs quant_top5
         """
-        payloads = {s.get("channel", ""): s.get("payload", {}) for s in signals}
+        payloads: dict[str, list[dict[str, Any]]] = {}
+        for signal in signals:
+            channel = str(signal.get("channel", ""))
+            payload = signal.get("payload", {})
+            if isinstance(payload, dict):
+                payloads.setdefault(channel, []).append(payload)
 
         detected_patterns: list[str] = []
 
@@ -334,28 +339,29 @@ class DebateAgent(AgentBase):
     @staticmethod
     def _condition_present(
         condition: str,
-        payloads: dict[str, dict[str, Any]],
+        payloads: dict[str, list[dict[str, Any]]],
     ) -> bool:
         """risk_config.yaml debate.conflict_criteria 조건명을 runtime payload로 평가."""
-        quant_payload = payloads.get("quant_signal", {})
-        risk_payload = payloads.get("risk_warning", {})
-        news_payload = payloads.get("news_signal", {})
+        quant_payloads = payloads.get("quant_signal", [])
+        risk_payloads = payloads.get("risk_warning", [])
+        news_payloads = payloads.get("news_signal", [])
 
         if condition == "quant_top10":
-            return bool(quant_payload.get("top10_candidates", []))
+            return any(bool(p.get("top10_candidates", [])) for p in quant_payloads)
         if condition == "quant_top5":
-            return bool(quant_payload.get("top10_candidates", [])[:5])
+            return any(bool(p.get("top10_candidates", [])[:5]) for p in quant_payloads)
         if condition == "quant_buy":
-            return (
-                str(quant_payload.get("stance", "")).lower() == "buy"
-                or bool(quant_payload.get("top10_candidates", [])[:5])
+            return any(
+                str(p.get("stance", "")).lower() == "buy"
+                or bool(p.get("top10_candidates", [])[:5])
+                for p in quant_payloads
             )
         if condition == "veto_recommendation":
-            return str(risk_payload.get("stance", "")) == "veto_recommendation"
+            return any(str(p.get("stance", "")) == "veto_recommendation" for p in risk_payloads)
         if condition == "risk_high":
-            return str(risk_payload.get("risk_level", "")) == "high"
+            return any(str(p.get("risk_level", "")) == "high" for p in risk_payloads)
         if condition == "news_sell":
-            return str(news_payload.get("stance", "")).lower() == "sell"
+            return any(str(p.get("stance", "")).lower() == "sell" for p in news_payloads)
         logger.warning("[debate] 알 수 없는 conflict condition 무시: %s", condition)
         return False
 

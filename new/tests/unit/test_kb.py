@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from src.knowledge import kb as kb_module
 from src.knowledge.kb import KBValidationError, KnowledgeBase
 from src.utils.pit_guard import PITViolationError
 
@@ -153,6 +154,37 @@ def test_pit_safety_future_timestamp_raises(kb: KnowledgeBase) -> None:
     entry = _base_entry(timestamp=_future_ts())
     with pytest.raises(PITViolationError):
         kb.write(entry, "decision_history")
+
+
+def test_pit_safety_string_false_disables_future_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """config 문자열 false가 Python truthiness로 PIT check를 켜지 않도록 한다."""
+    monkeypatch.setattr(
+        kb_module,
+        "_kb_cfg",
+        lambda: {
+            "storage_root": str(tmp_path / "kb"),
+            "storage_types": [
+                "micro_notes",
+                "macro_notes",
+                "debate_history",
+                "decision_history",
+                "backtest_history",
+                "factor_zoo",
+            ],
+            "required_fields": ["content", "sent_from", "timestamp"],
+            "pit_safety_check": "false",
+            "search_default_top_k": 5,
+            "search_recency_boost_lambda": 0.1,
+        },
+    )
+    kb = KnowledgeBase()
+    entry = _base_entry(ticker="005930", timestamp=_future_ts())
+
+    mid = kb.write(entry, "micro_notes")
+
+    assert mid.startswith("KB-")
 
 
 # ────────────────────────────────────────────────────────────────────────

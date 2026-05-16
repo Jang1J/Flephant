@@ -63,3 +63,20 @@ def test_kis_paper_account_diagnosis_invalid_account_binding() -> None:
         diagnosis["likely_root_cause"]
         == "kis_app_key_account_binding_or_non_openapi_mock_account"
     )
+
+
+def test_kis_paper_account_diagnosis_string_false_token_match_is_false() -> None:
+    status, diagnosis = kis_paper_account_diagnose._diagnose_probes(  # noqa: SLF001
+        [
+            {
+                "product_code": "01",
+                "balance": {"status": "FAIL", "msg_cd": "OTHER"},
+                "buyable": {"status": "FAIL", "msg_cd": "OTHER"},
+            },
+        ],
+        {"status": "PASS", "jti_matches_selected_app_key": "false"},
+    )
+
+    assert status == "FAIL"
+    assert diagnosis["token_jti_matches_selected_app_key"] is False
+    assert diagnosis["likely_root_cause"] == "kis_auth_or_app_key_invalid"

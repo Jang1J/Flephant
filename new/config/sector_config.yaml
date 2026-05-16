@@ -8,16 +8,16 @@
 
 mode_b_metadata:
   schema_version: "1.0.0"
-  data_version: "2026-05-11"
-  last_updated: "2026-05-11"
-  updated_by: "codex_live_data_gate"
+  data_version: "2026-05-16"
+  last_updated: "2026-05-16"
+  updated_by: "operator_approved_kis_1y_research_universe"
   mode_b_editable: false           # 종목 섹터 분류는 KRX 공식 기준. 자동 변경 불가.
   human_approval_required: true
   backup_retention_days: 365
   update_trigger: "manual_only"
-  rationale: "KOSPI 종목 섹터 매핑. L2 sector_exposure_tracking_error 계산 전제. operator 수동 승인만."
+  rationale: "KOSPI 종목 섹터 매핑. L2 sector_exposure_tracking_error 계산 전제. 금융+자동차 10종목은 KIS 1년 데이터 품질 게이트 통과 전 pending_data."
 
-# 6 KOSPI 섹터 (universe_config.yaml 확정 4 + 미확정 2)
+# 6 KOSPI 섹터 (universe_config.yaml 확정 4 + KIS 1y data activation 대기 2)
 sectors:
   - id: "semiconductor"
     name_ko: "반도체"
@@ -31,17 +31,17 @@ sectors:
   - id: "defense"
     name_ko: "방산"
     status: "confirmed"
-  - id: "sector5_pending"
-    name_ko: "섹터5_미확정"
-    status: "pending"
-    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
-  - id: "sector6_pending"
-    name_ko: "섹터6_미확정"
-    status: "pending"
-    candidates: ["바이오시밀러", "K-콘텐츠", "금융"]
+  - id: "financial"
+    name_ko: "금융"
+    status: "confirmed_pending_data"
+    activation_gate: "kis_1y_backfill_quality_pass"
+  - id: "automotive"
+    name_ko: "자동차"
+    status: "confirmed_pending_data"
+    activation_gate: "kis_1y_backfill_quality_pass"
 
-# 종목별 섹터 매핑 (active 20, universe_config.yaml SSOT 기준)
-# 미확정 섹터 10종목은 ticker 확정 후 추가 예정.
+# 종목별 섹터 매핑 (active 20 + pending_data 10, universe_config.yaml SSOT 기준)
+# pending_data 10종목은 kis_1y_backfill_quality_pass 전까지 paper/live active로 승격하지 않는다.
 ticker_to_sector:
   # 반도체 (5종목)
   "005930": "semiconductor"    # 삼성전자
@@ -67,4 +67,15 @@ ticker_to_sector:
   "079550": "defense"          # LIG넥스원
   "298040": "defense"          # 효성중공업
   "272210": "defense"          # 한화시스템
-  # 미확정 섹터 10종목: universe_config.yaml 섹터5/6_미확정 확정 후 추가 예정.
+  # 금융 (5종목, pending_data)
+  "105560": "financial"        # KB금융
+  "055550": "financial"        # 신한지주
+  "086790": "financial"        # 하나금융지주
+  "024110": "financial"        # 기업은행
+  "000810": "financial"        # 삼성화재
+  # 자동차 (5종목, pending_data)
+  "005380": "automotive"       # 현대차
+  "000270": "automotive"       # 기아
+  "012330": "automotive"       # 현대모비스
+  "011210": "automotive"       # 현대위아
+  "086280": "automotive"       # 현대글로비스

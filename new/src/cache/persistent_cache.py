@@ -16,6 +16,7 @@ from typing import Any, Optional
 import yaml
 
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("cache")
 
@@ -75,7 +76,7 @@ class PersistentCache:
             db_path: SQLite 파일 경로. None이면 risk_config.yaml cache.storage_path 사용.
         """
         self._cfg = _load_cache_config()
-        self._enabled: bool = bool(self._cfg.get("enabled", True))
+        self._enabled: bool = safe_bool(self._cfg.get("enabled", True), default=True)
 
         if db_path is not None:
             resolved = Path(db_path)

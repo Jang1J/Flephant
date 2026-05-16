@@ -29,7 +29,6 @@ from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 from src.utils.rate_limiter import RateLimiter
 from src.utils.ticker_utils import pad_ticker
-from src.utils.time_utils import now_kst
 
 logger = get_logger("krx_rest")
 

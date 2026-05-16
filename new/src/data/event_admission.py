@@ -12,11 +12,11 @@ import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("event_admission")
 
@@ -80,7 +80,7 @@ class EventAdmission:
         self._max_backlog: int = int(cfg.get("max_backlog", 3))
         self._max_jobs_per_min: int = int(cfg.get("max_cold_path_jobs_per_minute", 10))
         self._jobs_window_sec: int = int(cfg.get("jobs_per_minute_window_sec", 60))
-        self._stale_drop: bool = bool(cfg.get("stale_drop", True))
+        self._stale_drop: bool = safe_bool(cfg.get("stale_drop", True), default=True)
         self._dedupe_ttl_sec: int = int(cfg.get("dedupe_ttl_sec", _DEFAULT_DEDUPE_TTL_SEC))
         self._comparator_sort_key: list[str] = list(
             cfg.get("comparator_sort_key", ["priority", "trigger_type", "scope", "recency"])

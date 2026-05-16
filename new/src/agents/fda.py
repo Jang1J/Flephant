@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -28,6 +27,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_float
 
 logger = get_logger("fda")
 
@@ -298,6 +298,7 @@ class FDAAgent(AgentBase):
         portfolio_patch_ref: str,
         t0: float,
         risk_overrides: list[dict[str, Any]] | None = None,
+        confidence: float | None = None,
     ) -> dict[str, Any]:
         return self._finalize_decision(
             approved=False,
@@ -308,6 +309,7 @@ class FDAAgent(AgentBase):
             portfolio_patch_ref=portfolio_patch_ref,
             t0=t0,
             risk_overrides=risk_overrides,
+            confidence=confidence,
         )
 
     def _finalize_decision(
@@ -322,6 +324,7 @@ class FDAAgent(AgentBase):
         active_reports: list[str] | None = None,
         risk_overrides: list[dict[str, Any]] | None = None,
         mode: str = "hot",
+        confidence: float | None = None,
     ) -> dict[str, Any]:
         # 불변 원칙 2: read-only echo 검증
         self._assert_readonly(target_weights, order_deltas)
@@ -335,6 +338,11 @@ class FDAAgent(AgentBase):
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         now_iso = datetime.now(tz=timezone.utc).isoformat()
+        final_confidence = (
+            self._safe_confidence(confidence, default=1.0 if approved else 0.5)
+            if confidence is not None
+            else (1.0 if approved else 0.5)
+        )
 
         return {
             "final_decision": {
@@ -345,7 +353,7 @@ class FDAAgent(AgentBase):
                 "veto_reason": veto_reason,
                 "reason_code": reason_code,
                 "risk_overrides": risk_overrides or [],
-                "confidence": 1.0 if approved else 0.5,       # Hot Path = binary
+                "confidence": final_confidence,
                 "expiry": now_iso,                             # Hot Path는 즉시 유효
                 "portfolio_patch_ref": portfolio_patch_ref,
                 "active_reports": list(active_reports or []),
@@ -426,7 +434,12 @@ class FDAAgent(AgentBase):
 
         # 2. debate_result: 충돌 있고 uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
         if debate_result and debate_result.get("conflict_detected"):
-            uncertainty = debate_result.get("uncertainty_delta", 0.0)
+            uncertainty = safe_float(
+                debate_result.get("uncertainty_delta", 0.0),
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
             if uncertainty > self._debate_uncertainty_threshold:
                 return self._build_veto_decision(
                     reason_code="DEBATE_CONFLICT",
@@ -495,6 +508,7 @@ class FDAAgent(AgentBase):
                 active_reports=[],
                 t0=t0,
                 reason_code=parsed.get("reason_code", "NORMAL_APPROVE"),
+                confidence=parsed.get("confidence"),
             )
         else:
             return self._build_veto_decision(
@@ -504,6 +518,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                confidence=parsed.get("confidence"),
             )
 
     def _build_approve_decision(
@@ -514,6 +529,7 @@ class FDAAgent(AgentBase):
         active_reports: list[str],
         t0: float,
         reason_code: str = "NORMAL_APPROVE",
+        confidence: float | None = None,
     ) -> dict[str, Any]:
         return self._finalize_decision(
             approved=True,
@@ -524,6 +540,7 @@ class FDAAgent(AgentBase):
             portfolio_patch_ref=portfolio_patch_ref,
             t0=t0,
             active_reports=active_reports,
+            confidence=confidence,
         )
 
     def _build_cold_prompt(
@@ -543,9 +560,15 @@ class FDAAgent(AgentBase):
         )
         debate_str = ""
         if debate_result:
+            uncertainty = safe_float(
+                debate_result.get("uncertainty_delta", 0),
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
             debate_str = (
                 f"\n토론 결과: winner={debate_result.get('winner_view')}, "
-                f"uncertainty={debate_result.get('uncertainty_delta', 0):.2f}"
+                f"uncertainty={uncertainty:.2f}"
             )
 
         return (

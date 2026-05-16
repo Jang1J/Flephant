@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("nightly_lgbm_retrainer")
 _KST = ZoneInfo("Asia/Seoul")
@@ -53,8 +54,9 @@ class NightlyLGBMRetrainer:
         self._tickers: list[str] = list(cfg.get("tickers", []))
         self._lookback_days: int = int(cfg.get("lookback_days", 30))
         self._max_alpha_factors: int = int(cfg.get("max_alpha_factors", 5))
-        self._synthetic_fallback_enabled: bool = bool(
-            cfg.get("synthetic_fallback_enabled", False)
+        self._synthetic_fallback_enabled: bool = safe_bool(
+            cfg.get("synthetic_fallback_enabled", False),
+            default=False,
         )
         self._synthetic_seed: int = int(cfg.get("synthetic_seed", 42))
         logger.info(
@@ -99,11 +101,8 @@ class NightlyLGBMRetrainer:
         Raises:
             RuntimeError: LGBMTrainer.train() 내부 오류. 호출자(scheduler)가 catch.
         """
-        from src.models.lgbm_trainer import LGBMTrainer
-        from src.models.registry import ModelRegistry
-
         # 1. 다음 버전 결정
-        registry = ModelRegistry()
+        registry = self._make_registry()
         next_version = self._next_version(registry)
 
         # 2. Alpha Factor Zoo에서 active 팩터 → feature column 이름 목록
@@ -119,14 +118,7 @@ class NightlyLGBMRetrainer:
         start_dt = self._normalize_yyyymmdd(start_raw)
 
         # 4. LGBMTrainer 구성 + alpha feature 추가
-        from src.data.dataset_builder import DatasetBuilder
-
-        trainer = LGBMTrainer(
-            dataset_builder=DatasetBuilder(
-                allow_synthetic_fallback=self._synthetic_fallback_enabled,
-                synthetic_seed=self._synthetic_seed,
-            )
-        )
+        trainer = self._make_trainer()
         if alpha_feature_cols:
             if hasattr(trainer.builder, "add_neutral_feature_columns"):
                 trainer.builder.add_neutral_feature_columns(alpha_feature_cols)
@@ -159,13 +151,14 @@ class NightlyLGBMRetrainer:
         result["bundle_id"] = bundle_id
         result["candidate_pending_deploy"] = bundle_id is not None
         if bundle_id is not None:
-            if bool(result.get("synthetic_fallback")) or result.get("missing_tickers"):
+            synthetic_fallback = safe_bool(result.get("synthetic_fallback"), default=False)
+            if synthetic_fallback or result.get("missing_tickers"):
                 stage_info = {
                     "candidate_bundle_staged": False,
                     "candidate_bundle_path": str(_ARTIFACTS_ROOT / "bundles" / bundle_id / "lgbm"),
                     "candidate_bundle_reason": "synthetic_or_missing_real_data",
                     "candidate_bundle_blockers": {
-                        "synthetic_fallback": bool(result.get("synthetic_fallback")),
+                        "synthetic_fallback": synthetic_fallback,
                         "missing_tickers": list(result.get("missing_tickers", [])),
                     },
                 }
@@ -173,7 +166,7 @@ class NightlyLGBMRetrainer:
                     "[nightly_lgbm_retrainer] candidate bundle staging 차단. "
                     "bundle_id=%s synthetic=%s missing_tickers=%s",
                     bundle_id,
-                    bool(result.get("synthetic_fallback")),
+                    synthetic_fallback,
                     list(result.get("missing_tickers", [])),
                 )
             else:
@@ -191,6 +184,24 @@ class NightlyLGBMRetrainer:
     # ================================================================== #
     # Internal helpers
     # ================================================================== #
+
+    def _make_registry(self) -> Any:
+        """Create ModelRegistry. Split out so tests do not patch sys.modules."""
+        from src.models.registry import ModelRegistry
+
+        return ModelRegistry()
+
+    def _make_trainer(self) -> Any:
+        """Create LGBMTrainer with the configured DatasetBuilder."""
+        from src.data.dataset_builder import DatasetBuilder
+        from src.models.lgbm_trainer import LGBMTrainer
+
+        return LGBMTrainer(
+            dataset_builder=DatasetBuilder(
+                allow_synthetic_fallback=self._synthetic_fallback_enabled,
+                synthetic_seed=self._synthetic_seed,
+            )
+        )
 
     def _next_version(self, registry) -> str:
         """현재 최신 버전 다음 버전 결정. baseline → v2 → v3 ...

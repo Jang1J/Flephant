@@ -46,6 +46,7 @@ from src.data.exogenous_feature_store import (
 )
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import pad_ticker
 
 # S4-2: Dual-Source 5피처 컬럼명 (SSOT). risk_config.yaml dual_source_feature_cols와 동기화.
@@ -134,7 +135,10 @@ class DatasetBuilder:
         synthetic_seed: int | None = None,
     ) -> None:
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_ROOT
-        self._allow_synthetic_fallback = bool(allow_synthetic_fallback)
+        self._allow_synthetic_fallback = safe_bool(
+            allow_synthetic_fallback,
+            default=False,
+        )
         self._synthetic_seed = int(synthetic_seed or 0)
 
         # risk_config.yaml 로드 (불변 원칙 5)
@@ -150,7 +154,10 @@ class DatasetBuilder:
         self._horizon: int = int(self._cfg_label["horizon_bars"])
         self._target_col: str = str(self._cfg_label["target_col"])
         self._rank_col: str = str(self._cfg_label["rank_col"])
-        self._leakage_guard: bool = bool(self._cfg_label["leakage_guard"])
+        self._leakage_guard: bool = safe_bool(
+            self._cfg_label["leakage_guard"],
+            default=True,
+        )
         self._drop_last_n: int = int(self._cfg_label["drop_last_n_bars"])
         self._label_generation_version: str = str(
             self._cfg_label.get("generation_version", "")
@@ -176,10 +183,16 @@ class DatasetBuilder:
 
         # S4-2: Dual-Source 피처 주입 설정 (risk_config.yaml dual_source 섹션)
         _cfg_ds: dict = config_load("risk_config.yaml", "dual_source") or {}
-        self._ds_enabled_for_lgbm: bool = bool(_cfg_ds.get("enabled_for_lgbm", False))
+        self._ds_enabled_for_lgbm: bool = safe_bool(
+            _cfg_ds.get("enabled_for_lgbm", False),
+            default=False,
+        )
         self._ds_feature_cols: list[str] = list(DUAL_SOURCE_FEATURES)
         _cfg_exog: dict = config_load("risk_config.yaml", "exogenous_features") or {}
-        self._exog_enabled_for_lgbm: bool = bool(_cfg_exog.get("enabled_for_lgbm", False))
+        self._exog_enabled_for_lgbm: bool = safe_bool(
+            _cfg_exog.get("enabled_for_lgbm", False),
+            default=False,
+        )
         self._exog_feature_cols: list[str] = list(
             self._cfg_preprocessor.get("exogenous_feature_cols", EXOGENOUS_FEATURES)
         )
@@ -628,7 +641,6 @@ class DatasetBuilder:
         feat_30m_vol: rolling std(close_{t-29..t}) / rolling mean
         feat_60m_trend: rolling 60-bar linear slope / mean
         """
-        pd = _import_pandas()
         df = raw.copy()
         closes = df["close"].to_numpy(dtype=float)
         n = len(closes)
@@ -802,8 +814,7 @@ class DatasetBuilder:
 
         그룹 크기 < n_relevance_grades 면 해당 ts_close 그룹 drop.
         """
-        pd = _import_pandas()
-        pd_local = pd
+        _import_pandas()
 
         target = self._target_col
         n_grades = self._n_relevance_grades

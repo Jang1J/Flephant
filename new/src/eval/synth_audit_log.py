@@ -138,7 +138,7 @@ def main() -> int:
             fh.write(json.dumps(e, ensure_ascii=False) + "\n")
 
     print(f"[synth_audit_log] {len(entries)} entries → {args.out}")
-    print(f"[synth_audit_log] reason_code 분포:")
+    print("[synth_audit_log] reason_code 분포:")
     for reason_code, event_type, count, hit_rate in DISTRIBUTION:
         rate = f"{hit_rate:.0%}" if hit_rate else "skip"
         print(f"  {reason_code:28s} ({event_type}) × {count:3d}  hit_rate={rate}")

@@ -21,10 +21,9 @@ from __future__ import annotations
 import ast
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
-import pytest
 import yaml
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -75,7 +74,7 @@ def _make_engine(
     holdings_manager=None,
     admission_engine=None,
     **cfg_overrides,
-) -> "ExitEngine":
+) -> object:
     """테스트용 ExitEngine 생성 헬퍼.
 
     holdings_manager / admission_engine 이 None 이면 MagicMock 사용.
@@ -143,8 +142,6 @@ def _holdings_entry(
 
 def test_exit_market_close_after_1530_kst(tmp_path: Path) -> None:
     """now_kst = 15:30:01 → market_close exit 발생."""
-    from src.dynamic_universe.exit_engine import ExitEngine
-
     holdings_mgr = MagicMock()
     holdings_mgr.get_holdings.return_value = [_holdings_entry("000200")]
     exit_ev = {

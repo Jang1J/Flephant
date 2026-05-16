@@ -119,7 +119,9 @@ class QuantAgent(AgentBase):
         self._dual_source_cache: dict[str, dict[str, dict[str, float]]] = {}
         self._investor_flow_snapshot: dict[str, dict[str, Any]] = {}
         self._exogenous_snapshot: dict[str, dict[str, float]] = {}
+        self._exogenous_snapshot_meta: dict[str, dict[str, Any]] = {}
         self._market_exogenous_snapshot: dict[str, float] = {}
+        self._market_exogenous_snapshot_meta: dict[str, Any] = {}
 
         # --- 의존 컴포넌트 ---
         self._registry = registry or ModelRegistry()
@@ -201,6 +203,8 @@ class QuantAgent(AgentBase):
         self,
         features: dict[str, Any],
         ticker: str | None = None,
+        received_at: datetime | str | None = None,
+        max_age_sec: int | float | None = None,
     ) -> None:
         """US overnight / macro / investor_flow 외생 feature snapshot 갱신."""
         clean = {
@@ -208,10 +212,23 @@ class QuantAgent(AgentBase):
             for col in self._exogenous_feature_cols
             if col in features and features[col] is not None
         }
+        meta: dict[str, Any] = {}
+        if received_at is not None:
+            meta["received_at"] = self._parse_snapshot_dt(received_at)
+            meta["max_age_sec"] = (
+                float(max_age_sec)
+                if max_age_sec is not None
+                else float(self._investor_flow_stale_sec)
+            )
         if ticker:
-            self._exogenous_snapshot[pad_ticker(str(ticker))] = clean
+            ticker_padded = pad_ticker(str(ticker))
+            self._exogenous_snapshot[ticker_padded] = clean
+            if meta:
+                self._exogenous_snapshot_meta[ticker_padded] = meta
         else:
             self._market_exogenous_snapshot.update(clean)
+            if meta:
+                self._market_exogenous_snapshot_meta = meta
 
     def get_investor_flow_snapshot(
         self,
@@ -588,17 +605,42 @@ class QuantAgent(AgentBase):
         ticker: str | None,
         asof: str | None = None,
     ) -> dict[str, float]:
-        values = dict(self._market_exogenous_snapshot)
+        values = (
+            dict(self._market_exogenous_snapshot)
+            if self._exogenous_meta_usable(self._market_exogenous_snapshot_meta, asof)
+            else {}
+        )
         if ticker:
             flow = self.get_investor_flow_snapshot(ticker, asof=asof)
             if flow is not None and not flow.get("is_future") and not flow.get("is_stale"):
                 for col in ("foreign_net_buy", "institutional_net_buy", "retail_net_buy"):
                     if flow.get(col) is not None:
                         values[col] = float(flow[col])
-            values.update(self._exogenous_snapshot.get(pad_ticker(str(ticker)), {}))
+            ticker_padded = pad_ticker(str(ticker))
+            if self._exogenous_meta_usable(
+                self._exogenous_snapshot_meta.get(ticker_padded, {}),
+                asof,
+            ):
+                values.update(self._exogenous_snapshot.get(ticker_padded, {}))
         for col, default in self._exogenous_defaults.items():
             values.setdefault(col, default)
         return values
+
+    def _exogenous_meta_usable(self, meta: dict[str, Any], asof: str | None) -> bool:
+        """Optional freshness guard for generic exogenous snapshots.
+
+        Legacy snapshots without `received_at` remain usable. Snapshots with explicit
+        metadata are blocked if they are from the future or older than max_age_sec.
+        """
+        received_at = meta.get("received_at") if isinstance(meta, dict) else None
+        if received_at is None:
+            return True
+        asof_dt = self._parse_snapshot_dt(asof) if asof else datetime.now(_KST)
+        raw_age_sec = (asof_dt - received_at).total_seconds()
+        if raw_age_sec < 0:
+            return False
+        max_age_sec = float(meta.get("max_age_sec", self._investor_flow_stale_sec))
+        return raw_age_sec <= max_age_sec
 
     def _model_requires_dual_source(self) -> bool:
         """로드된 모델 feature manifest가 Dual-Source 피처를 실제 입력으로 요구하는지."""

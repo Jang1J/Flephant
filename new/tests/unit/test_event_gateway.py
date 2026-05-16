@@ -152,7 +152,7 @@ def test_register_handler_and_dispatch(tmp_path: Path) -> None:
 
 
 # ------------------------------------------------------------------
-# 5. dispatch_next: 핸들러 없는 event_type 은 None 반환
+# 5. dispatch_next: 핸들러 없는 event_type 은 dead-letter 기록
 # ------------------------------------------------------------------
 
 def test_dispatch_next_no_handler_skips(tmp_path: Path) -> None:
@@ -163,10 +163,12 @@ def test_dispatch_next_no_handler_skips(tmp_path: Path) -> None:
     assert gw.backlog_size() == 1
 
     result = gw.dispatch_next()
-    # 핸들러 없으면 None 반환 (skip)
-    assert result is None
+    assert result["status"] == "no_handler"
+    assert result["event_type"] == "dart"
     # backlog 에서는 pop 됨
     assert gw.backlog_size() == 0
+    dead_letter = tmp_path / "dl.jsonl"
+    assert "NO_HANDLER:dart" in dead_letter.read_text(encoding="utf-8")
 
 
 # ------------------------------------------------------------------
@@ -462,6 +464,43 @@ def test_dispatch_next_auto_publish_skipped_when_result_not_dict(tmp_path: Path)
     assert "message_id" not in result, "content 없으면 publish skip, message_id 없어야 함"
     # pool 에도 게시 안 됨
     assert pool.pool_size() == 0
+
+
+def test_auto_publish_treats_string_false_flags_as_false(tmp_path: Path) -> None:
+    """문자열 false 플래그는 auto_publish 차단 조건으로 해석하지 않는다."""
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+
+    def dart_handler(event: dict) -> dict:
+        return {
+            "content": "공시 분석",
+            "cause_by": "DartAgent",
+            "sent_from": "dart_agent",
+            "priority": "normal",
+            "confidence": 0.9,
+            "reasoning": "중요 공시 발생",
+            "scope": "ticker:005930",
+            "action_type": "alert",
+            "timestamp": _recent_ts(),
+            "llm_fallback": "false",
+            "published_by_agent": "false",
+        }
+
+    gw.register_handler("dart", dart_handler, publish_channel="dart_alert")
+    gw.ingest(_dart_raw(), source="dart")
+    result = gw.dispatch_next()
+
+    assert result is not None
+    assert "message_id" in result
+    assert pool.pool_size() == 1
 
 
 # ------------------------------------------------------------------
