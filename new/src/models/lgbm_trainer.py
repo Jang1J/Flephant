@@ -4,8 +4,8 @@
   1. DatasetBuilder로 panel 생성 (raw parquet → 피처 + label + cs_rank + relevance)
   2. WalkForwardSplitter로 fold 분할 (purge/embargo 자동 적용)
   3. 각 fold에서 lgb.train → val 메트릭 수집
-  4. 최종 모델: 마지막 fold의 train set로 학습한 booster
-  5. 평균 메트릭 + 최종 booster → ModelRegistry.save()
+  4. 최종 모델: 전체 요청 window panel로 재학습한 booster
+  5. 평균 fold 메트릭 + 최종 booster → ModelRegistry.save()
 
 S3-6 야간 재학습도 동일 LGBMTrainer 재사용 (version 파라미터만 다르게).
 
@@ -167,6 +167,7 @@ class LGBMTrainer:
         params = build_lgbm_params()
         tc = get_training_control()
         fold_metrics: list[dict[str, float]] = []
+        best_iterations: list[int] = []
         last_booster = None
         last_train_panel = None
         last_val_panel = None
@@ -188,6 +189,9 @@ class LGBMTrainer:
                 target_col=effective_target_col,
             )
             fold_metrics.append({"fold": fold_idx, **metrics})
+            best_iteration = int(getattr(booster, "best_iteration", 0) or 0)
+            if best_iteration > 0:
+                best_iterations.append(best_iteration)
             logger.info(
                 "[lgbm_trainer] fold %d: IC=%.4f, RankIC=%.4f, SR=%.4f, MDD=%.4f",
                 fold_idx, metrics["ic"], metrics["rank_ic"],
@@ -208,6 +212,14 @@ class LGBMTrainer:
         # 5. Registry 저장
         if last_booster is None:
             raise RuntimeError("학습 실패: last_booster None")
+        final_train_panel = panel.sort_index(level="ts_close")
+        final_num_boost_round = self._final_num_boost_round(best_iterations, tc)
+        final_booster = self._train_final_model(
+            final_train_panel,
+            params,
+            lgb,
+            num_boost_round=final_num_boost_round,
+        )
 
         preprocessor_cfg = config_load("risk_config.yaml", "preprocessor")
         feature_set = set(self.feature_cols)
@@ -242,8 +254,17 @@ class LGBMTrainer:
             "missing_tickers": list(data_source.get("missing_tickers", [])),
             "synthetic_tickers": list(data_source.get("synthetic_tickers", [])),
             "n_folds": len(folds),
-            "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
+            "n_train_rows": int(len(final_train_panel)),
+            "n_final_train_rows": int(len(final_train_panel)),
+            "n_cv_last_train_rows": (
+                int(len(last_train_panel)) if last_train_panel is not None else 0
+            ),
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
+            "final_model_scope": "full_requested_window",
+            "final_model_train_start": self._yyyymmdd_to_iso(start_date_norm),
+            "final_model_train_end": self._yyyymmdd_to_iso(end_date_norm),
+            "final_num_boost_round": final_num_boost_round,
+            "cv_best_iterations": best_iterations,
             "fold_metrics": fold_metrics,
             "n_tickers": len(tickers),
             "lgbm_params": params,
@@ -251,7 +272,7 @@ class LGBMTrainer:
             "metric_scope": metric_scope,
         }
         pkl_path = self.registry.save(
-            last_booster,
+            final_booster,
             metadata,
             is_latest=effective_is_latest,
         )
@@ -267,8 +288,14 @@ class LGBMTrainer:
             "metrics": avg_metrics,
             "n_folds": len(folds),
             "fold_metrics": fold_metrics,
-            "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
+            "n_train_rows": int(len(final_train_panel)),
+            "n_final_train_rows": int(len(final_train_panel)),
+            "n_cv_last_train_rows": (
+                int(len(last_train_panel)) if last_train_panel is not None else 0
+            ),
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
+            "final_model_scope": "full_requested_window",
+            "final_num_boost_round": final_num_boost_round,
             "is_latest": effective_is_latest,
             "data_source": data_source.get("data_source", "artifact_bars"),
             "synthetic_fallback": safe_bool(data_source.get("synthetic_fallback", False), default=False),
@@ -326,6 +353,32 @@ class LGBMTrainer:
             daily_pnl=daily_pnl,
         )
         return booster, bundle.to_dict()
+
+    @staticmethod
+    def _final_num_boost_round(best_iterations: list[int], tc: dict[str, int]) -> int:
+        """Choose final full-window training rounds from fold early-stopping results."""
+        if best_iterations:
+            return max(1, int(np.median(best_iterations)))
+        return max(1, int(tc["n_estimators"]))
+
+    def _train_final_model(
+        self,
+        final_train_panel,
+        params: dict[str, Any],
+        lgb,
+        *,
+        num_boost_round: int,
+    ):
+        """Train deploy candidate booster on the full requested panel window."""
+        train_ds = make_lgbm_dataset(
+            final_train_panel,
+            feature_cols=self.feature_cols,
+        )
+        return lgb.train(
+            params,
+            train_ds,
+            num_boost_round=num_boost_round,
+        )
 
     def _assert_feature_manifest(self, panel) -> None:
         """훈련 feature manifest와 실제 panel columns를 강제 일치시킨다."""

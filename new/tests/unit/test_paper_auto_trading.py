@@ -234,6 +234,30 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
 
 
+def test_paper_auto_rejects_zero_cycles_before_starting_hot_runner(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=0,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["cycles"]["reason"] == "cycles_must_be_positive"
+    assert report["stages"]["cycles"]["items"] == []
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
+
+
 def test_paper_auto_broker_rejection_fails_cycle(tmp_path: Path) -> None:
     trader = PaperAutoTrader(
         kis_client=FakePaperKISRejects(),

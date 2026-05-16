@@ -106,15 +106,22 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     mod = _load_script_module()
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
     gate_calls = []
+    retrain_kwargs = {}
 
     def fake_build_report(**kwargs):
         gate_calls.append(kwargs)
         return _gate("PASS")
 
     monkeypatch.setattr(mod.prelive_gate, "build_report", fake_build_report)
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: ["005930", "105560"],
+    )
 
     class FakeLGBM:
         def retrain(self, **kwargs):
+            retrain_kwargs.update(kwargs)
             return {
                 "candidate_bundle_staged": True,
                 "bundle_id": kwargs["bundle_id"],
@@ -166,6 +173,40 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     assert report["stages"]["06_paper_probe_order"]["status"] == "PASS"
     assert gate_calls[0].get("bundle_id") is None
     assert gate_calls[-1]["bundle_id"] == "BUNDLE-TEST"
+    assert report["training_tickers"] == ["005930", "105560"]
+    assert retrain_kwargs["tickers"] == ["005930", "105560"]
+
+
+def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(mod.prelive_gate, "build_report", lambda **kwargs: _gate("PASS"))
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: [],
+    )
+
+    report = mod.run_pipeline(
+        end_date="20260508",
+        business_days=80,
+        max_tickers=30,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=1.0,
+        confirm_phrase=None,
+        order_type="00",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["02_lgbm_bundle"]
+    assert report["stages"]["02_lgbm_bundle"]["status"] == "BLOCKED"
+    assert report["training_ticker_count"] == 0
 
 
 def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):

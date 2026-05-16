@@ -146,9 +146,19 @@ class ExecutionGateway:
                 order_plan_id, decision_id, order_deltas, t0,
             )
         elif self._mode == "paper":
-            report = self._execute_broker(
-                order_plan_id, decision_id, order_deltas, t0,
-            )
+            mode_rejection = self._broker_mode_rejection(expected_mode="virtual")
+            if mode_rejection:
+                report = self._rejected(
+                    order_plan_id,
+                    decision_id,
+                    mode_rejection,
+                    order_deltas,
+                    t0,
+                )
+            else:
+                report = self._execute_broker(
+                    order_plan_id, decision_id, order_deltas, t0,
+                )
         elif self._mode == "live":
             if not self._live_enabled:
                 report = self._rejected(
@@ -159,9 +169,19 @@ class ExecutionGateway:
                     t0,
                 )
             else:
-                report = self._execute_broker(
-                    order_plan_id, decision_id, order_deltas, t0,
-                )
+                mode_rejection = self._broker_mode_rejection(expected_mode="real")
+                if mode_rejection:
+                    report = self._rejected(
+                        order_plan_id,
+                        decision_id,
+                        mode_rejection,
+                        order_deltas,
+                        t0,
+                    )
+                else:
+                    report = self._execute_broker(
+                        order_plan_id, decision_id, order_deltas, t0,
+                    )
         else:
             raise ExecutionModeError(
                 f"invalid execution_mode={self._mode}"
@@ -257,6 +277,40 @@ class ExecutionGateway:
     # ================================================================== #
     # Internal: Broker-backed execution
     # ================================================================== #
+
+    def _broker_client_mode(self) -> str | None:
+        """Return injected broker mode when the client exposes it."""
+        if self._kis_client is None:
+            return None
+        mode = getattr(self._kis_client, "mode", None)
+        if callable(mode):
+            try:
+                mode = mode()
+            except Exception:
+                mode = None
+        if mode is None and hasattr(self._kis_client, "auth"):
+            auth = getattr(self._kis_client, "auth")
+            get_mode = getattr(auth, "get_mode", None)
+            if callable(get_mode):
+                try:
+                    mode = get_mode()
+                except Exception:
+                    mode = None
+        return str(mode).strip().lower() if mode is not None else None
+
+    def _broker_mode_rejection(self, expected_mode: str) -> str | None:
+        """Fail closed when paper/live execution is wired to the wrong KIS mode."""
+        if self._kis_client is None:
+            raise ExecutionDependencyError(
+                f"execution_mode={self._mode} requires kis_client.submit_order"
+            )
+        client_mode = self._broker_client_mode()
+        if client_mode != expected_mode:
+            return (
+                f"{self._mode}_mode_requires_{expected_mode}_kis_client: "
+                f"client_mode={client_mode or 'unknown'}"
+            )
+        return None
 
     def _execute_broker(
         self,

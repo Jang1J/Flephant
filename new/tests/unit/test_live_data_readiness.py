@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -22,11 +22,20 @@ def _write_jsonl_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> N
     ticker_dir = base_dir / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
     out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
     with out.open("w", encoding="utf-8") as fh:
         for i in range(rows):
+            ts = start + timedelta(minutes=i)
             rec = {
                 "ticker": ticker,
-                "ts_close": f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}T09:{i % 60:02d}:00+09:00",
+                "ts_close": ts.isoformat(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -46,11 +55,20 @@ def _write_jsonl_named_day_with_ts_date(
     ticker_dir = base_dir / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
     out = ticker_dir / f"bars_1m_{filename_yyyymmdd}.jsonl"
+    start = datetime(
+        int(ts_yyyymmdd[:4]),
+        int(ts_yyyymmdd[4:6]),
+        int(ts_yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
     with out.open("w", encoding="utf-8") as fh:
         for i in range(rows):
+            ts = start + timedelta(minutes=i)
             rec = {
                 "ticker": ticker,
-                "ts_close": f"{ts_yyyymmdd[:4]}-{ts_yyyymmdd[4:6]}-{ts_yyyymmdd[6:]}T09:{i % 60:02d}:00+09:00",
+                "ts_close": ts.isoformat(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -58,6 +76,96 @@ def _write_jsonl_named_day_with_ts_date(
                 "volume": 1.0,
             }
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _write_jsonl_constant_ts(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    rows: int,
+) -> None:
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    ts = f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}T09:00:00+09:00"
+    with out.open("w", encoding="utf-8") as fh:
+        for _ in range(rows):
+            rec = {
+                "ticker": ticker,
+                "ts_close": ts,
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _write_parquet_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> None:
+    import pandas as pd
+
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    records = []
+    for i in range(rows):
+        records.append({
+            "ticker": ticker,
+            "ts_close": (start + timedelta(minutes=i)).isoformat(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        })
+    pd.DataFrame.from_records(records).to_parquet(
+        ticker_dir / f"bars_1m_{yyyymmdd}.parquet",
+        index=False,
+    )
+
+
+def test_load_active_tickers_includes_pending_for_final_dataset(monkeypatch, tmp_path):
+    """final_dataset_gate가 켜져 있으면 active 20 + pending_data 종목을 함께 로드한다."""
+    readiness = _load_script_module()
+    universe_path = tmp_path / "universe_config.yaml"
+    universe_path.write_text(
+        "\n".join([
+            "sectors:",
+            "  반도체:",
+            "    status: confirmed",
+            "    stocks:",
+            "      - {ticker: '005930', status: active}",
+            "  금융:",
+            "    status: confirmed_pending_data",
+            "    stocks:",
+            "      - {ticker: '105560', status: pending_data}",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(readiness, "_UNIVERSE_PATH", universe_path)
+    monkeypatch.setattr(
+        readiness,
+        "config_load",
+        lambda file_name, section: {
+            "deploy_decision_gate": {
+                "final_dataset_gate": {
+                    "include_pending_data_tickers": True,
+                    "allowed_stock_statuses": ["active", "pending_data"],
+                    "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+                }
+            }
+        } if section == "backtest_agent" else {},
+    )
+
+    assert readiness._load_active_tickers(None) == ["005930", "105560"]
 
 
 def test_artifact_date_quality_rejects_short_stale_files(monkeypatch, tmp_path):
@@ -102,6 +210,79 @@ def test_artifact_date_quality_rejects_timestamp_date_mismatch(monkeypatch, tmp_
     assert first["rows"] == 301
     assert first["timestamp_dates_match"] is False
     assert first["valid_date"] is False
+
+
+def test_artifact_date_quality_rejects_wrong_ticker(monkeypatch, tmp_path):
+    """폴더 ticker와 파일 내부 ticker가 다르면 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [
+        {**json.loads(line), "ticker": "000660"}
+        for line in file_path.read_text(encoding="utf-8").splitlines()
+    ]
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["ticker_matches"] is False
+
+
+def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
+    """row 수만 맞춘 중복 timestamp artifact는 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_constant_ts(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["duplicate_ts_count"] == 300
+
+
+def test_artifact_date_quality_rejects_duplicate_date_artifacts(monkeypatch, tmp_path):
+    """같은 ticker/date에 jsonl과 parquet가 같이 있으면 중복 artifact로 막는다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_parquet_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert len(first["duplicate_date_artifacts"]) == 2
 
 
 def test_artifact_date_quality_skips_krx_holidays(monkeypatch, tmp_path):

@@ -890,6 +890,7 @@ service_policy_replay:
   allow_position_pyramiding: false
   turnover_budget_hard_stop: true
   min_expected_net_alpha_bps: 15.0
+  expected_net_alpha_source: "rank_score"  # LambdaRank score를 bps로 환산하지 않는다. calibrated_net_bps head 생성 전까지 threshold gate 비활성.
   min_service_policy_sharpe: 0.0
 
 # Cost-aware retraining preparation. 이 섹션은 모델을 자동 deploy하지 않는다.

@@ -59,6 +59,7 @@ class ServicePolicyConfig:
     allow_position_pyramiding: bool
     turnover_budget_hard_stop: bool
     min_expected_net_alpha_bps: float
+    expected_net_alpha_source: str
     min_service_policy_sharpe: float
 
     @property
@@ -116,6 +117,9 @@ class ServicePolicyConfig:
             ),
             min_expected_net_alpha_bps=float(
                 replay_cfg.get("min_expected_net_alpha_bps", cost_components.get("slippage_bps", 0.0))
+            ),
+            expected_net_alpha_source=str(
+                replay_cfg.get("expected_net_alpha_source", "rank_score")
             ),
             min_service_policy_sharpe=float(replay_cfg.get("min_service_policy_sharpe", 0.0)),
         )
@@ -583,11 +587,13 @@ class ServicePolicyReplayEngine:
             if not eligible:
                 return set()
             bar_preds = eligible
-        if policy.min_expected_net_alpha_bps > 0:
+        if (
+            policy.min_expected_net_alpha_bps > 0
+            and policy.expected_net_alpha_source == "calibrated_net_bps"
+        ):
             eligible = [
                 row for row in bar_preds
-                if (float(row[1]) * 10_000.0 - policy.total_cost_bps)
-                >= policy.min_expected_net_alpha_bps
+                if float(row[1]) >= policy.min_expected_net_alpha_bps
             ]
             if not eligible:
                 return set()

@@ -185,6 +185,11 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     assert metadata["version"] == "baseline"
     assert metadata["train_start"] == "2026-01-01"
     assert metadata["train_end"] == "2026-01-07"
+    assert metadata["final_model_scope"] == "full_requested_window"
+    assert metadata["final_model_train_start"] == "2026-01-01"
+    assert metadata["final_model_train_end"] == "2026-01-07"
+    assert metadata["n_final_train_rows"] == result["n_train_rows"]
+    assert metadata["n_final_train_rows"] > metadata["n_cv_last_train_rows"]
     assert metadata["label_generation_version"] == trainer_small.builder.label_generation_version
     assert metadata["label_session_scope"] == trainer_small.builder.label_session_scope
     assert metadata["data_source"] == "artifact_bars"

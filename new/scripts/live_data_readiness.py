@@ -15,7 +15,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -146,13 +146,43 @@ def _community_post_date(post: Any) -> str | None:
     return None
 
 
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    cfg = config_load("risk_config.yaml", "backtest_agent") or {}
+    gate_cfg = (
+        cfg.get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
 def _load_active_tickers(max_tickers: int | None) -> list[str]:
     with _UNIVERSE_PATH.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
+    gate_cfg = _final_dataset_gate_cfg()
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    allowed_stock_statuses = {"active"}
+    allowed_sector_statuses = {"confirmed"}
+    if include_pending:
+        allowed_stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        allowed_sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in allowed_sector_statuses:
+            continue
         for stock in sector.get("stocks", []) or []:
-            if stock.get("status") == "active":
+            if str(stock.get("status")) in allowed_stock_statuses:
                 tickers.append(pad_ticker(str(stock["ticker"])))
     if max_tickers is not None:
         tickers = tickers[:max_tickers]
@@ -215,25 +245,44 @@ def _saved_file_summary(
         row_counts: dict[str, int | None] = {}
         valid_dates: dict[str, bool] = {}
         timestamp_dates_match: dict[str, bool | None] = {}
+        ticker_matches: dict[str, bool | None] = {}
+        duplicate_ts_counts: dict[str, int | None] = {}
+        out_of_hours_counts: dict[str, int | None] = {}
+        duplicate_date_artifacts: dict[str, list[str]] = {}
         file_mtime_ns: dict[str, int] = {}
         if ticker_dir.exists():
+            paths_by_date: dict[str, list[Path]] = {}
             for file_path in sorted(ticker_dir.iterdir()):
                 name = file_path.name
                 if not name.startswith("bars_1m_"):
                     continue
                 date_part = name.removeprefix("bars_1m_").split(".", 1)[0]
                 if start <= date_part <= end:
-                    files.append(str(file_path))
-                    relative_files.append(_repo_relative(file_path))
-                    rows = _count_bar_file_rows(file_path)
-                    date_matches = _bar_file_date_matches(file_path, date_part)
-                    row_counts[date_part] = rows
-                    timestamp_dates_match[date_part] = date_matches
-                    file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
-                    valid_dates[date_part] = (
-                        rows is not None and int(rows) >= int(min_rows)
-                        and date_matches is True
-                    )
+                    paths_by_date.setdefault(date_part, []).append(file_path)
+            for date_part, paths in sorted(paths_by_date.items()):
+                if len(paths) > 1:
+                    duplicate_date_artifacts[date_part] = [
+                        _repo_relative(path) for path in paths
+                    ]
+                file_path = _preferred_bar_artifact(paths)
+                files.append(str(file_path))
+                relative_files.append(_repo_relative(file_path))
+                inspection = _inspect_bar_file(file_path, date_part, pad_ticker(ticker))
+                rows = inspection.get("rows")
+                row_counts[date_part] = rows
+                timestamp_dates_match[date_part] = inspection.get("timestamp_dates_match")
+                ticker_matches[date_part] = inspection.get("ticker_matches")
+                duplicate_ts_counts[date_part] = inspection.get("duplicate_ts_count")
+                out_of_hours_counts[date_part] = inspection.get("out_of_hours_count")
+                file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
+                valid_dates[date_part] = (
+                    rows is not None and int(rows) >= int(min_rows)
+                    and inspection.get("timestamp_dates_match") is True
+                    and inspection.get("ticker_matches") is True
+                    and int(inspection.get("duplicate_ts_count") or 0) == 0
+                    and int(inspection.get("out_of_hours_count") or 0) == 0
+                    and date_part not in duplicate_date_artifacts
+                )
         summary[pad_ticker(ticker)] = {
             "files": files,
             "relative_files": relative_files,
@@ -241,6 +290,10 @@ def _saved_file_summary(
             "row_counts": row_counts,
             "valid_dates": valid_dates,
             "timestamp_dates_match": timestamp_dates_match,
+            "ticker_matches": ticker_matches,
+            "duplicate_ts_counts": duplicate_ts_counts,
+            "out_of_hours_counts": out_of_hours_counts,
+            "duplicate_date_artifacts": duplicate_date_artifacts,
             "file_mtime_ns": file_mtime_ns,
         }
     return summary
@@ -267,6 +320,10 @@ def _artifact_date_quality(
             row_counts = info.get("row_counts", {})
             valid_dates = info.get("valid_dates", {})
             timestamp_dates_match = info.get("timestamp_dates_match", {})
+            ticker_matches = info.get("ticker_matches", {})
+            duplicate_ts_counts = info.get("duplicate_ts_counts", {})
+            out_of_hours_counts = info.get("out_of_hours_counts", {})
+            duplicate_date_artifacts = info.get("duplicate_date_artifacts", {})
             rows = row_counts.get(day)
             if valid_dates.get(day) is True:
                 valid_tickers.append(padded)
@@ -275,6 +332,10 @@ def _artifact_date_quality(
                     "ticker": padded,
                     "rows": rows,
                     "timestamp_dates_match": timestamp_dates_match.get(day),
+                    "ticker_matches": ticker_matches.get(day),
+                    "duplicate_ts_count": duplicate_ts_counts.get(day),
+                    "out_of_hours_count": out_of_hours_counts.get(day),
+                    "duplicate_date_artifacts": duplicate_date_artifacts.get(day, []),
                     "valid_date": valid_dates.get(day, False),
                 })
         quality[day] = {
@@ -289,16 +350,109 @@ def _artifact_date_quality(
 def _count_bar_file_rows(file_path: Path) -> int | None:
     """parquet/jsonl row count. 읽기 실패 시 None."""
     try:
-        if file_path.suffix == ".jsonl":
-            with file_path.open("r", encoding="utf-8") as fh:
-                return sum(1 for line in fh if line.strip())
-        if file_path.suffix == ".parquet":
-            import pandas as pd  # type: ignore[import]
-
-            return int(len(pd.read_parquet(file_path)))
+        rows = _load_bar_rows(file_path)
+        return len(rows) if rows is not None else None
     except Exception:
         return None
     return None
+
+
+def _preferred_bar_artifact(paths: list[Path]) -> Path:
+    """Prefer parquet over jsonl for the same ticker/date, then newest mtime."""
+    return sorted(
+        paths,
+        key=lambda path: (
+            0 if path.suffix == ".parquet" else 1,
+            -int(path.stat().st_mtime_ns),
+            path.name,
+        ),
+    )[0]
+
+
+def _load_bar_rows(file_path: Path) -> list[dict[str, Any]] | None:
+    if file_path.suffix == ".jsonl":
+        rows: list[dict[str, Any]] = []
+        with file_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    rows.append(json.loads(line))
+        return rows
+    if file_path.suffix == ".parquet":
+        import pandas as pd  # type: ignore[import]
+
+        return pd.read_parquet(file_path).to_dict("records")
+    return None
+
+
+def _parse_bar_timestamp(row: dict[str, Any]) -> datetime | None:
+    for field in ("ts_close", "timestamp", "ts", "datetime"):
+        raw = row.get(field)
+        if raw is None:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_KST)
+        return parsed.astimezone(_KST)
+    return None
+
+
+def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, Any]:
+    """Inspect one saved bar artifact for date/ticker/timestamp integrity."""
+    expected_date = date(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+    )
+    try:
+        rows = _load_bar_rows(file_path)
+    except Exception:
+        return {
+            "rows": None,
+            "timestamp_dates_match": None,
+            "ticker_matches": None,
+            "duplicate_ts_count": None,
+            "out_of_hours_count": None,
+        }
+    if rows is None:
+        return {
+            "rows": None,
+            "timestamp_dates_match": None,
+            "ticker_matches": None,
+            "duplicate_ts_count": None,
+            "out_of_hours_count": None,
+        }
+
+    timestamps = [_parse_bar_timestamp(row) for row in rows]
+    present_timestamps = [ts for ts in timestamps if ts is not None]
+    timestamp_dates = {ts.date() for ts in present_timestamps}
+    timestamp_dates_match = bool(present_timestamps) and timestamp_dates == {expected_date}
+
+    row_tickers = {
+        pad_ticker(str(row.get("ticker")))
+        for row in rows
+        if row.get("ticker") is not None
+    }
+    ticker_matches = bool(row_tickers) and row_tickers == {pad_ticker(ticker)}
+
+    iso_timestamps = [ts.isoformat() for ts in present_timestamps]
+    duplicate_ts_count = len(iso_timestamps) - len(set(iso_timestamps))
+    market_open = time(9, 0)
+    market_close = time(15, 30)
+    out_of_hours_count = sum(
+        1
+        for ts in present_timestamps
+        if ts.time() < market_open or ts.time() > market_close
+    )
+    return {
+        "rows": len(rows),
+        "timestamp_dates_match": timestamp_dates_match,
+        "ticker_matches": ticker_matches,
+        "duplicate_ts_count": duplicate_ts_count,
+        "out_of_hours_count": out_of_hours_count,
+    }
 
 
 def _bar_file_date_matches(file_path: Path, yyyymmdd: str) -> bool | None:

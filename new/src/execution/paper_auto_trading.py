@@ -109,6 +109,18 @@ class PaperAutoTrader:
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
+        cycles_int = safe_int(cycles, default=0, min_value=0)
+        if cycles_int < 1:
+            report["stages"]["cycles"] = {
+                "status": "FAIL",
+                "reason": "cycles_must_be_positive",
+                "requested_cycles": cycles,
+                "cycles": cycles_int,
+                "items": [],
+            }
+            report["status"] = "FAIL"
+            return self._finish_report(report, write_report)
+
         try:
             if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
                 self._hot_runner.start()
@@ -116,7 +128,6 @@ class PaperAutoTrader:
             self._hot_runner.start()
 
         cycle_reports: list[dict[str, Any]] = []
-        cycles_int = safe_int(cycles, default=0, min_value=0)
         for idx in range(cycles_int):
             cycle = self.run_once(tickers=tickers, cycle_index=idx)
             cycle_reports.append(cycle)

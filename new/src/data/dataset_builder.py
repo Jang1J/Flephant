@@ -150,8 +150,10 @@ class DatasetBuilder:
         self._cfg_nightly: dict = config_load("risk_config.yaml", "nightly_retrainer") or {}
         self._cfg_cost_model: dict = config_load("risk_config.yaml", "execution_cost_model") or {}
         self._cfg_service_policy: dict = config_load("risk_config.yaml", "service_policy_replay") or {}
+        self._cfg_cost_aware: dict = config_load("risk_config.yaml", "cost_aware_retraining") or {}
 
         self._horizon: int = int(self._cfg_label["horizon_bars"])
+        self._aux_label_horizons: list[int] = self._load_aux_label_horizons()
         self._target_col: str = str(self._cfg_label["target_col"])
         self._rank_col: str = str(self._cfg_label["rank_col"])
         self._leakage_guard: bool = safe_bool(
@@ -737,9 +739,6 @@ class DatasetBuilder:
                 f"{sorted(missing_cols)}"
             )
 
-        h = self._horizon
-        drop_count = max(h, self._drop_last_n)
-
         out = df.copy()
         out["ts_close"] = self._normalize_ts_close_kst(out["ts_close"], pd)
         sort_cols = ["ts_close"]
@@ -751,10 +750,32 @@ class DatasetBuilder:
 
         out["_label_session"] = out["ts_close"].dt.date
 
-        labels = np.full(len(out), np.nan, dtype=float)
-        session_close_labels = np.full(len(out), np.nan, dtype=float)
         close_values = out["close"].to_numpy(dtype=float)
         grouped_positions = out.groupby(group_cols, sort=False).indices
+
+        def forward_labels_for_horizon(horizon: int) -> np.ndarray:
+            labels = np.full(len(out), np.nan, dtype=float)
+            drop_count = max(horizon, self._drop_last_n)
+            for positions in grouped_positions.values():
+                positions_arr = np.asarray(positions, dtype=np.int64)
+                valid_count = max(0, len(positions_arr) - drop_count)
+                if valid_count <= 0:
+                    continue
+                closes = close_values[positions_arr]
+                now = closes[:valid_count]
+                future = closes[horizon:horizon + valid_count]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    labels[positions_arr[:valid_count]] = np.where(
+                        now > 1e-8,
+                        future / now - 1.0,
+                        np.nan,
+                    )
+            return labels
+
+        h = self._horizon
+        labels = forward_labels_for_horizon(h)
+        session_close_labels = np.full(len(out), np.nan, dtype=float)
+        drop_count = max(h, self._drop_last_n)
         for positions in grouped_positions.values():
             positions = np.asarray(positions, dtype=np.int64)
             valid_count = max(0, len(positions) - drop_count)
@@ -762,13 +783,6 @@ class DatasetBuilder:
                 continue
             closes = close_values[positions]
             now = closes[:valid_count]
-            future = closes[h:h + valid_count]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                labels[positions[:valid_count]] = np.where(
-                    now > 1e-8,
-                    future / now - 1.0,
-                    np.nan,
-                )
             session_close = float(closes[-1])
             with np.errstate(divide="ignore", invalid="ignore"):
                 session_close_labels[positions[:valid_count]] = np.where(
@@ -785,6 +799,17 @@ class DatasetBuilder:
         out[f"label_{h}m_tradeable"] = (
             out[active_net_col] >= self._label_min_expected_net_bps
         ).astype("Int64")
+        for aux_horizon in self._aux_label_horizons:
+            if aux_horizon == h:
+                continue
+            aux_label_col = f"label_{aux_horizon}m_ret"
+            aux_net_col = f"label_{aux_horizon}m_net_bps"
+            out[aux_label_col] = forward_labels_for_horizon(aux_horizon)
+            out[aux_net_col] = out[aux_label_col] * 10_000.0 - self._label_total_cost_bps
+            out[f"label_{aux_horizon}m_net_ret"] = out[aux_net_col] / 10_000.0
+            out[f"label_{aux_horizon}m_tradeable"] = (
+                out[aux_net_col] >= self._label_min_expected_net_bps
+            ).astype("Int64")
         out["label_session_close_ret"] = session_close_labels
         out["label_session_close_net_bps"] = (
             out["label_session_close_ret"] * 10_000.0 - self._label_total_cost_bps
@@ -796,6 +821,20 @@ class DatasetBuilder:
         out = out.dropna(subset=[self._target_col]).copy()
 
         return out
+
+    def _load_aux_label_horizons(self) -> list[int]:
+        """Cost-aware integer horizon candidates whose labels should exist in panel."""
+        horizons: list[int] = []
+        for raw in self._cfg_cost_aware.get("horizon_candidates", []) or []:
+            try:
+                horizon = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if horizon > 0 and horizon not in horizons:
+                horizons.append(horizon)
+        if self._horizon not in horizons:
+            horizons.insert(0, self._horizon)
+        return horizons
 
     @staticmethod
     def _normalize_ts_close_kst(ts_close, pd):

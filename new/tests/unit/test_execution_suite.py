@@ -262,6 +262,8 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     _patch_execution_config(monkeypatch, mode="paper")
 
     class FakeKISClient:
+        mode = "virtual"
+
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, int, float]] = []
 
@@ -318,6 +320,8 @@ def test_execute_paper_rejects_malformed_numeric_fields(
     _patch_execution_config(monkeypatch, mode="paper")
 
     class FakeKISClient:
+        mode = "virtual"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             raise AssertionError("invalid broker order must not be submitted")
 
@@ -369,6 +373,8 @@ def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_
     _patch_execution_config(monkeypatch, mode="live", live_enabled=False)
 
     class BrokerClient:
+        mode = "real"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             raise AssertionError("live broker must not be called")
 
@@ -396,6 +402,8 @@ def test_execute_broker_partial_fill_reports_rejections(monkeypatch, tmp_path: P
     _patch_execution_config(monkeypatch, mode="paper")
 
     class PartialKISClient:
+        mode = "virtual"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             if ticker == "000660":
                 return {"status": "rejected", "message": "insufficient cash"}
@@ -431,6 +439,8 @@ def test_execute_mode_override_routes_to_paper_and_passes_order_type(
     _patch_execution_config(monkeypatch, mode="mock")
 
     class PaperKISClient:
+        mode = "virtual"
+
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -479,6 +489,40 @@ def test_execute_mode_override_routes_to_paper_and_passes_order_type(
         "price": 70000.0,
         "order_type": "00",
     }]
+
+
+def test_execute_paper_rejects_real_mode_kis_client(monkeypatch, tmp_path: Path) -> None:
+    """paper 경로는 real KIS client를 주입받아도 broker submit 전에 차단한다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class RealKISClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("real broker must not be called from paper mode")
+
+    client = RealKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="paper",
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "paper_mode_requires_virtual_kis_client" in report["rejection_reason"]
+    assert client.called is False
 
 
 def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) -> None:

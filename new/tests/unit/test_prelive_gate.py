@@ -4,8 +4,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import hashlib
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 def _load_script_module():
@@ -81,6 +82,45 @@ def _final_dataset_metadata() -> dict:
     }
 
 
+def _write_parquet_day(
+    root: Path,
+    ticker: str,
+    yyyymmdd: str,
+    *,
+    rows: int = 301,
+    row_ticker: str | None = None,
+    ts_yyyymmdd: str | None = None,
+) -> None:
+    import pandas as pd
+
+    data_dir = root / ticker
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ts_day = ts_yyyymmdd or yyyymmdd
+    start = datetime(
+        int(ts_day[:4]),
+        int(ts_day[4:6]),
+        int(ts_day[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    records = []
+    for i in range(rows):
+        records.append({
+            "ticker": row_ticker or ticker,
+            "ts_close": (start + timedelta(minutes=i)).isoformat(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        })
+    pd.DataFrame.from_records(records).to_parquet(
+        data_dir / f"bars_1m_{yyyymmdd}.parquet",
+        index=False,
+    )
+
+
 def test_configured_train_min_rows_requires_config_value():
     gate = _load_script_module()
 
@@ -102,6 +142,42 @@ def test_business_start_date_counts_krx_trading_days():
         "20260213",
         "20260219",
     ]
+
+
+def test_80_day_artifact_gate_rejects_internal_date_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", ts_yyyymmdd="20260507")
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["rows"] == 301
+    assert first["timestamp_dates_match"] is False
+    assert first["valid_artifact"] is False
+
+
+def test_80_day_artifact_gate_rejects_ticker_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", row_ticker="000660")
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["ticker_matches"] is False
 
 
 def test_latest_matching_report_skips_non_matching_and_bad_json(tmp_path):
@@ -1021,3 +1097,15 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
         "status": "PASS",
         "candidate_bundle_id": "BUNDLE-REQUESTED",
     }
+
+
+def test_next_commands_keep_deploy_candidate_in_dry_run() -> None:
+    gate = _load_script_module()
+
+    commands = gate._next_commands(
+        end_date="20260515",
+        business_days=80,
+        max_tickers=30,
+    )
+
+    assert "--dry-run" in commands["deploy_candidate_after_backtest_pass"]

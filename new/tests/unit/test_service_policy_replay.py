@@ -38,6 +38,7 @@ def _policy(**overrides) -> ServicePolicyConfig:
         "allow_position_pyramiding": False,
         "turnover_budget_hard_stop": True,
         "min_expected_net_alpha_bps": 15.0,
+        "expected_net_alpha_source": "rank_score",
         "min_service_policy_sharpe": 0.0,
     }
     base.update(overrides)
@@ -123,6 +124,7 @@ def test_policy_config_maps_risk_config_values() -> None:
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is True
     assert policy.min_service_policy_sharpe == 0.0
+    assert policy.expected_net_alpha_source == "rank_score"
 
 
 def test_policy_config_treats_string_false_flags_as_false(monkeypatch) -> None:
@@ -242,10 +244,15 @@ def test_default_policy_blocks_position_pyramiding() -> None:
 
 
 def test_min_expected_net_alpha_filters_weak_buy_candidate() -> None:
-    engine = ServicePolicyReplayEngine(policy=_policy(min_expected_net_alpha_bps=15.0))
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(
+            min_expected_net_alpha_bps=15.0,
+            expected_net_alpha_source="calibrated_net_bps",
+        )
+    )
     panel = _panel([
-        ("005930", "2026-05-01 09:00:00", 0.0020, 0.001, 100.0),
-        ("000660", "2026-05-01 09:00:00", 0.0010, 0.001, 100.0),
+        ("005930", "2026-05-01 09:00:00", 14.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 10.0, 0.001, 100.0),
     ])
 
     result = engine._simulate_panel(
@@ -253,11 +260,35 @@ def test_min_expected_net_alpha_filters_weak_buy_candidate() -> None:
         model_callable=_model,
         feature_cols=["feature_score"],
         target_col="label_5m_ret",
-        policy=_policy(min_expected_net_alpha_bps=15.0),
+        policy=_policy(
+            min_expected_net_alpha_bps=15.0,
+            expected_net_alpha_source="calibrated_net_bps",
+        ),
     )
 
     assert result["orders"] == []
     assert result["order_stats"]["total_orders"] == 0
+
+
+def test_min_expected_net_alpha_does_not_convert_rank_score_to_bps() -> None:
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(min_expected_net_alpha_bps=9999.0, expected_net_alpha_source="rank_score")
+    )
+    panel = _panel([
+        ("005930", "2026-05-01 09:00:00", 3.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 2.0, 0.001, 100.0),
+    ])
+
+    result = engine._simulate_panel(
+        panel=panel,
+        model_callable=_model,
+        feature_cols=["feature_score"],
+        target_col="label_5m_ret",
+        policy=_policy(min_expected_net_alpha_bps=9999.0, expected_net_alpha_source="rank_score"),
+    )
+
+    assert result["order_stats"]["buy_orders"] == 1
+    assert result["orders"][0]["ticker"] == "005930"
 
 
 def test_explicit_replay_window_fails_closed_after_pit_snapshot() -> None:

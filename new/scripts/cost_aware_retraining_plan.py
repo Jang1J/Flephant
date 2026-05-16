@@ -146,6 +146,9 @@ def build_retraining_plan(
             "min_expected_net_alpha_bps": float(
                 service_policy_cfg.get("min_expected_net_alpha_bps", 0.0)
             ),
+            "expected_net_alpha_source": str(
+                service_policy_cfg.get("expected_net_alpha_source", "rank_score")
+            ),
             "min_holding_bars": int(service_policy_cfg.get("min_holding_bars", 0)),
             "rebalance_cooldown_bars": int(service_policy_cfg.get("rebalance_cooldown_bars", 0)),
         },

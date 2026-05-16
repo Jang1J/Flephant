@@ -139,22 +139,29 @@ def main(argv: list[str] | None = None) -> int:
             if backtest_path and backtest
             else _latest_any_backtest(bundle_id)
         )
+        deployability = _deployability_payload(
+            bundle_id,
+            latest_path,
+            latest_backtest,
+            deployable=bool(backtest_path and backtest),
+            dry_run=True,
+        )
         report = {
             "status": "PASS" if backtest_path and backtest else "BLOCKED",
             "dry_run": True,
             "bundle_id": bundle_id,
+            "deployable": bool(deployability.get("deployable", False)),
+            "service_policy_gate_pass": bool(
+                deployability.get("service_policy_gate_pass", False)
+            ),
+            "registry_mutated": False,
+            "live_trading_allowed": False,
             "reason": (
                 "deployable_backtest_found"
                 if backtest_path and backtest
                 else "deployable_backtest_not_found"
             ),
-            "deployability": _deployability_payload(
-                bundle_id,
-                latest_path,
-                latest_backtest,
-                deployable=bool(backtest_path and backtest),
-                dry_run=True,
-            ),
+            "deployability": deployability,
         }
         if not args.no_write_report:
             _write_report(report)

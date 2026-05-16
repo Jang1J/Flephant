@@ -93,6 +93,10 @@ def test_deploy_candidate_dry_run_blocks_without_deployable_backtest(
     assert rc == 1
     assert out["status"] == "BLOCKED"
     assert out["dry_run"] is True
+    assert out["deployable"] is False
+    assert out["service_policy_gate_pass"] is False
+    assert out["registry_mutated"] is False
+    assert out["live_trading_allowed"] is False
     assert out["deployability"]["deployable"] is False
     assert out["deployability"]["registry_mutated"] is False
     assert out["deployability"]["latest_backtest"]["verdict"] == "warn"
@@ -135,6 +139,10 @@ def test_deploy_candidate_dry_run_passes_when_deployable_backtest_exists(
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert out["status"] == "PASS"
+    assert out["deployable"] is True
+    assert out["service_policy_gate_pass"] is True
+    assert out["registry_mutated"] is False
+    assert out["live_trading_allowed"] is False
     assert out["deployability"]["deployable"] is True
     assert out["deployability"]["feature_quality_gate_pass"] is True
     assert out["deployability"]["service_policy_gate_pass"] is True

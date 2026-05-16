@@ -106,6 +106,14 @@ def _latest_readiness_status(end_date: str, business_days: int, max_tickers: int
     }
 
 
+def _final_training_tickers(max_tickers: int) -> list[str]:
+    """Resolve the final deploy training universe, including pending_data names."""
+    return prelive_gate._active_tickers(
+        max_tickers=max_tickers,
+        include_pending_data=True,
+    )
+
+
 def run_pipeline(
     *,
     end_date: str,
@@ -164,9 +172,23 @@ def run_pipeline(
         report["blockers"] = ["01_prelive_gate_before"]
         return report
 
+    training_tickers = _final_training_tickers(max_tickers)
+    report["training_tickers"] = training_tickers
+    report["training_ticker_count"] = len(training_tickers)
+    if not training_tickers:
+        stages["02_lgbm_bundle"] = _stage(
+            "BLOCKED",
+            "Final training universe resolved to zero tickers.",
+            {"max_tickers": max_tickers},
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["02_lgbm_bundle"]
+        return report
+
     try:
         lgbm_result = NightlyLGBMRetrainer().retrain(
             bundle_id=resolved_bundle_id,
+            tickers=training_tickers,
             start_date=start_date,
             end_date=end_date,
         )
@@ -338,7 +360,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--end-date", default=default_end, help="YYYYMMDD")
     parser.add_argument("--business-days", type=int, default=80)
-    parser.add_argument("--max-tickers", type=int, default=20)
+    parser.add_argument("--max-tickers", type=int, default=30)
     parser.add_argument("--bundle-id", default="")
     parser.add_argument("--run-paper-balance", action="store_true")
     parser.add_argument("--system-positions-json", default="")

@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -277,6 +277,79 @@ def _count_rows(path: Path) -> int | None:
         return None
 
 
+def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
+    """Inspect saved 1m parquet before counting it as train-ready evidence."""
+    if not path.exists():
+        return {
+            "ticker": ticker,
+            "rows": None,
+            "valid_artifact": False,
+            "reason": "missing_file",
+        }
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        return {
+            "ticker": ticker,
+            "rows": None,
+            "valid_artifact": False,
+            "reason": "read_error",
+            "error": str(e),
+        }
+
+    expected_date = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    timestamp_dates_match: bool | None = None
+    duplicate_ts_count: int | None = None
+    out_of_hours_count: int | None = None
+    for field in ("ts_close", "timestamp", "ts", "datetime"):
+        if field not in df.columns:
+            continue
+        raw_ts = df[field].astype(str)
+        dates = set(raw_ts.str.slice(0, 10).dropna().unique())
+        timestamp_dates_match = bool(dates) and dates == {expected_date}
+        parsed = pd.to_datetime(df[field], errors="coerce")
+        parsed_kst = parsed.dt.tz_convert(_KST) if getattr(parsed.dt, "tz", None) else parsed
+        valid_ts = parsed_kst.dropna()
+        ts_keys = valid_ts.astype(str)
+        duplicate_ts_count = int(len(ts_keys) - len(set(ts_keys)))
+        market_open = time(9, 0)
+        market_close = time(15, 30)
+        out_of_hours_count = int(
+            sum(
+                ts.time() < market_open or ts.time() > market_close
+                for ts in valid_ts
+            )
+        )
+        break
+
+    ticker_matches: bool | None = None
+    if "ticker" in df.columns:
+        tickers = {
+            pad_ticker(str(value))
+            for value in df["ticker"].dropna().astype(str).unique()
+        }
+        ticker_matches = bool(tickers) and tickers == {pad_ticker(ticker)}
+
+    valid_artifact = (
+        timestamp_dates_match is True
+        and ticker_matches is True
+        and int(duplicate_ts_count or 0) == 0
+        and int(out_of_hours_count or 0) == 0
+    )
+    reason = None if valid_artifact else "artifact_integrity_failed"
+    return {
+        "ticker": ticker,
+        "rows": int(len(df)),
+        "valid_artifact": valid_artifact,
+        "reason": reason,
+        "timestamp_dates_match": timestamp_dates_match,
+        "ticker_matches": ticker_matches,
+        "duplicate_ts_count": duplicate_ts_count,
+        "out_of_hours_count": out_of_hours_count,
+        "path": _repo_relative(path),
+    }
+
+
 def _latest_matching_report(
     report_dir: Path,
     prefix: str,
@@ -403,9 +476,14 @@ def _check_80_day_artifacts(
         missing_or_short: list[dict[str, Any]] = []
         for ticker in tickers:
             path = _DATA_ROOT / ticker / f"bars_1m_{day}.parquet"
-            rows = _count_rows(path) if path.exists() else None
-            if rows is None or rows < min_rows_per_day:
-                missing_or_short.append({"ticker": ticker, "rows": rows})
+            inspection = _inspect_bar_artifact(path, ticker, day)
+            rows = inspection.get("rows")
+            if (
+                rows is None
+                or rows < min_rows_per_day
+                or inspection.get("valid_artifact") is not True
+            ):
+                missing_or_short.append(inspection)
         if missing_or_short:
             if len(sample_missing) < 5:
                 sample_missing[day] = missing_or_short[:5]
@@ -982,7 +1060,7 @@ def _next_commands(end_date: str, business_days: int, max_tickers: int) -> dict[
         ),
         "deploy_candidate_after_backtest_pass": (
             f"ELEPHANT_MODE=mode_b {py_prefix} new/scripts/deploy_candidate.py "
-            "--bundle-id {bundle_id}"
+            "--bundle-id {bundle_id} --dry-run"
         ),
         "paper_probe_user_terminal_after_balance_pass": (
             f"{py_prefix} new/scripts/paper_trading_smoke.py --action submit-probe "

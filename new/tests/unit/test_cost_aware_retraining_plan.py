@@ -154,3 +154,4 @@ def test_cost_aware_objective_string_false(monkeypatch, tmp_path):
 
     assert plan["objective"]["net_of_cost_target"] is False
     assert plan["objective"]["trade_no_trade_classifier"] is False
+    assert plan["objective"]["expected_net_alpha_source"] == "rank_score"

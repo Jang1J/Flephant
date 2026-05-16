@@ -369,6 +369,35 @@ def test_generate_labels_adds_cost_aware_auxiliary_labels(
     )
 
 
+def test_generate_labels_materializes_cost_aware_horizon_candidates(
+    builder: DatasetBuilder,
+) -> None:
+    df = pd.DataFrame(
+        {
+            "ticker": ["005930"] * 80,
+            "ts_close": pd.date_range("2026-04-20 09:00:00+09:00", periods=80, freq="1min"),
+            "open": np.arange(100.0, 180.0),
+            "high": np.arange(100.0, 180.0) + 1,
+            "low": np.arange(100.0, 180.0) - 1,
+            "close": np.arange(100.0, 180.0),
+            "volume": np.ones(80) * 1000,
+        }
+    )
+
+    out = builder._generate_labels(df)
+
+    assert "label_30m_net_ret" in out.columns
+    assert "label_60m_net_ret" in out.columns
+    assert "label_30m_tradeable" in out.columns
+    assert "label_60m_tradeable" in out.columns
+    assert out["label_30m_net_ret"].iloc[0] == pytest.approx(
+        ((130.0 / 100.0 - 1.0) * 10_000.0 - builder._label_total_cost_bps) / 10_000.0
+    )
+    assert out["label_60m_net_ret"].iloc[0] == pytest.approx(
+        ((160.0 / 100.0 - 1.0) * 10_000.0 - builder._label_total_cost_bps) / 10_000.0
+    )
+
+
 def test_generate_labels_too_short(builder: DatasetBuilder) -> None:
     df = pd.DataFrame(
         {
