@@ -138,11 +138,20 @@ def gateway(tmp_path: Path) -> ExecutionGateway:
 
 
 def _final_decision(approved: bool, order_deltas: list[dict] | None = None) -> dict:
+    if order_deltas is None or not isinstance(order_deltas, list):
+        contract_order_deltas = order_deltas or []
+    else:
+        contract_order_deltas = []
+        for od in order_deltas:
+            if isinstance(od, dict):
+                contract_order_deltas.append({"reason": "rebalance", **od})
+            else:
+                contract_order_deltas.append(od)
     return {
         "decision_id": "DEC-20260420-001",
         "approved": approved,
         "target_weights": {"005930": 0.1} if approved else {},
-        "order_deltas": order_deltas or [],
+        "order_deltas": contract_order_deltas,
         "veto_reason": None if approved else "some reason",
         "reason_code": "NORMAL_APPROVE" if approved else "RISK_FAST_TRIGGER",
     }
@@ -1240,6 +1249,25 @@ def test_execute_rejects_invalid_mode_without_raise(tmp_path: Path) -> None:
 
     assert result["execution_report"]["status"] == "rejected"
     assert result["execution_report"]["rejection_reason"] == "invalid execution_mode=invalid_mode"
+
+
+def test_execute_rejects_missing_order_delta_reason(gateway: ExecutionGateway) -> None:
+    """C10 order_deltas[].reason은 Portfolio Manager trace 필수 필드다."""
+    fd = {
+        "decision_id": "DEC-20260420-001",
+        "approved": True,
+        "target_weights": {"005930": 0.1},
+        "order_deltas": [
+            {"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}
+        ],
+        "veto_reason": None,
+        "reason_code": "NORMAL_APPROVE",
+    }
+
+    result = gateway.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_delta_reason" in result["execution_report"]["rejection_reason"]
 
 
 def test_execute_mock_rejects_invalid_order_delta(gateway: ExecutionGateway) -> None:

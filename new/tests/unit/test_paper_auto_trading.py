@@ -229,6 +229,7 @@ class FakeHotRunner:
                         "qty": self.qty,
                         "price": 70000.0,
                         "order_type": "00",
+                        "reason": "rebalance",
                     }
                 ] if self.approved else [],
             },

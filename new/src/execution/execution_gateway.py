@@ -29,6 +29,10 @@ from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 logger = get_logger("execution_gateway")
 
+_ALLOWED_ORDER_DELTA_REASONS: frozenset[str] = frozenset(
+    {"rebalance", "exit", "risk_reduce", "cash_raise", "paper_trading_probe"}
+)
+
 
 class ExecutionModeError(ValueError):
     """invalid execution_mode."""
@@ -699,6 +703,7 @@ class ExecutionGateway:
             qty = safe_lossless_int(od.get("qty", 0), default=0)
             price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
+            reason = str(od.get("reason", "") or "").strip()
             if not self._valid_order_delta(
                 ticker,
                 side,
@@ -717,6 +722,15 @@ class ExecutionGateway:
                     "reason": "invalid_order_delta",
                 })
                 continue
+            if reason not in _ALLOWED_ORDER_DELTA_REASONS:
+                errors.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "reason": "invalid_order_delta_reason",
+                    "value": reason,
+                    "allowed": sorted(_ALLOWED_ORDER_DELTA_REASONS),
+                })
+                continue
             normalized_od = dict(od)
             normalized_od.update({
                 "ticker": ticker,
@@ -724,6 +738,7 @@ class ExecutionGateway:
                 "qty": qty,
                 "price": price,
                 "order_type": order_type,
+                "reason": reason,
             })
             normalized.append(normalized_od)
         return normalized, errors

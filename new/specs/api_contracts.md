@@ -640,7 +640,7 @@ output:
       - ticker: string
         side: "buy|sell"
         qty: int
-        reason: "rebalance|exit|risk_reduce|cash_raise"
+        reason: "rebalance|exit|risk_reduce|cash_raise|paper_trading_probe"
 rules:
   source_of_truth: "Portfolio Manager generates order_deltas"
   fda_may_edit: false

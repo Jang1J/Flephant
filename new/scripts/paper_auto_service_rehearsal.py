@@ -122,6 +122,7 @@ class _FakeHotRunner:
                     "qty": 1,
                     "price": price,
                     "order_type": "00",
+                    "reason": "rebalance",
                 }],
             },
             "latency_ms": 1.0,
