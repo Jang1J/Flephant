@@ -27,6 +27,10 @@ from src.mode_b.validation_tools import (
     DataUnavailable,
     NaNInMetrics,
 )
+from src.mode_b.service_policy_verifier import (
+    normalize_service_policy_universe,
+    service_policy_universe_hash,
+)
 from src.utils.config_loader import load as config_load
 from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import pad_ticker
@@ -156,7 +160,9 @@ class ServicePolicyReplayEngine:
             raise BundleLoadFailed("bundle_id is empty")
 
         replay_start, replay_end = self._resolve_replay_window(start_date, end_date)
-        active_universe = [pad_ticker(t) for t in (universe or self._load_active_universe())]
+        active_universe = normalize_service_policy_universe(
+            universe or self._load_active_universe()
+        )
         if not active_universe:
             raise DataUnavailable("active universe is empty")
 
@@ -206,6 +212,10 @@ class ServicePolicyReplayEngine:
             "date_range": {"start": replay_start, "end": replay_end},
             "universe": active_universe,
             "universe_count": len(active_universe),
+            "universe_hash": service_policy_universe_hash(active_universe),
+            "universe_policy": (
+                "operator_override" if universe is not None else "final_dataset_gate"
+            ),
             "target_col": target_col,
             "valid_rows": int(len(panel)),
             "external_kis_api": False,
@@ -289,18 +299,53 @@ class ServicePolicyReplayEngine:
     @staticmethod
     def _load_active_universe() -> list[str]:
         universe_cfg = config_load("universe_config.yaml") or {}
+        gate_cfg = (
+            config_load(
+                "risk_config.yaml",
+                "backtest_agent.deploy_decision_gate.final_dataset_gate",
+            )
+            or {}
+        )
+        include_pending = safe_bool(
+            gate_cfg.get("include_pending_data_tickers"),
+            default=safe_bool(
+                (universe_cfg.get("backtest_universe_mode") or {}).get("allow_pending"),
+                default=False,
+            ),
+        )
+        allowed_stock_statuses = {"active"}
+        if include_pending:
+            allowed_stock_statuses = {
+                str(status)
+                for status in (
+                    gate_cfg.get("allowed_stock_statuses")
+                    or ["active", "pending_data"]
+                )
+            }
+        allowed_sector_statuses = {"confirmed"}
+        if include_pending:
+            allowed_sector_statuses = {
+                str(status)
+                for status in (
+                    gate_cfg.get("allowed_sector_statuses")
+                    or ["confirmed", "confirmed_pending_data"]
+                )
+            }
         sectors = universe_cfg.get("sectors", {}) or {}
         universe: list[str] = []
         for sector_data in sectors.values():
-            if not isinstance(sector_data, dict) or sector_data.get("status") != "confirmed":
+            if (
+                not isinstance(sector_data, dict)
+                or str(sector_data.get("status")) not in allowed_sector_statuses
+            ):
                 continue
             for stock in sector_data.get("stocks", []) or []:
-                if stock.get("status") == "active":
+                if str(stock.get("status")) in allowed_stock_statuses:
                     universe.append(pad_ticker(stock["ticker"]))
         if universe:
-            return universe
+            return normalize_service_policy_universe(universe)
         fallback = universe_cfg.get("backtest_universe_mode", {}).get("fallback_tickers", [])
-        return [pad_ticker(t) for t in fallback]
+        return normalize_service_policy_universe(fallback)
 
     @staticmethod
     def _model_version_from_artifact(candidate_artifact: dict[str, Any]) -> str:

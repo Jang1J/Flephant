@@ -76,6 +76,10 @@ def load_service_policy_evidence(
         "metrics": report.get("metrics", {}),
         "order_stats": report.get("order_stats", {}),
         "policy_checks": report.get("policy_checks", {}),
+        "universe": report.get("universe", []),
+        "universe_count": report.get("universe_count"),
+        "universe_hash": report.get("universe_hash"),
+        "universe_policy": report.get("universe_policy"),
         "external_kis_api": safe_bool(report.get("external_kis_api", False), default=False),
         "registry_mutated": safe_bool(report.get("registry_mutated", False), default=False),
     }

@@ -10,7 +10,10 @@ from src.mode_b.backtest_diagnostics import (
     attach_service_policy_evidence,
     load_service_policy_evidence,
 )
-from src.mode_b.service_policy_verifier import verify_service_policy_evidence
+from src.mode_b.service_policy_verifier import (
+    service_policy_universe_hash,
+    verify_service_policy_evidence,
+)
 from src.mode_b.service_policy_replay import (
     ServicePolicyConfig,
     ServicePolicyReplayEngine,
@@ -358,6 +361,46 @@ def test_explicit_replay_window_fails_closed_after_pit_snapshot() -> None:
         engine._resolve_replay_window("29990101", "29990102")
 
 
+def test_replay_default_universe_includes_pending_final_dataset_tickers(
+    monkeypatch,
+) -> None:
+    from src.mode_b import service_policy_replay as replay_module
+
+    def fake_config_load(file_name: str = "risk_config.yaml", key: str | None = None):
+        if file_name == "universe_config.yaml":
+            return {
+                "backtest_universe_mode": {"allow_pending": True},
+                "sectors": {
+                    "active": {
+                        "status": "confirmed",
+                        "stocks": [{"ticker": "5930", "status": "active"}],
+                    },
+                    "pending": {
+                        "status": "confirmed_pending_data",
+                        "stocks": [{"ticker": "000660", "status": "pending_data"}],
+                    },
+                    "watch_only": {
+                        "status": "watch",
+                        "stocks": [{"ticker": "042700", "status": "pending_data"}],
+                    },
+                },
+            }
+        if (
+            file_name == "risk_config.yaml"
+            and key == "backtest_agent.deploy_decision_gate.final_dataset_gate"
+        ):
+            return {
+                "include_pending_data_tickers": True,
+                "allowed_stock_statuses": ["active", "pending_data"],
+                "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+            }
+        return {}
+
+    monkeypatch.setattr(replay_module, "config_load", fake_config_load)
+
+    assert ServicePolicyReplayEngine._load_active_universe() == ["000660", "005930"]
+
+
 def test_turnover_budget_hard_stop_prevents_budget_breach() -> None:
     engine = ServicePolicyReplayEngine(policy=_policy(initial_capital=1_000.0, daily_turnover_cap=0.05))
     panel = _panel([
@@ -493,6 +536,82 @@ def test_service_policy_verifier_handles_string_bools_and_malformed_stats(
 
     assert verification.status == "BLOCKED"
     assert "service_policy_naked_short_attempts" in verification.blockers
+
+
+def test_service_policy_verifier_blocks_universe_mismatch(tmp_path: Path) -> None:
+    report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260512_121000.json"
+    active_only_universe = ["005930"]
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-TEST",
+                "gate": {"status": "PASS", "blockers": []},
+                "policy_checks": {
+                    "deploy_candidate_by_service_policy": True,
+                    "no_naked_short_exposure": True,
+                    "order_caps_respected": True,
+                    "cash_guard_respected": True,
+                },
+                "order_stats": {"naked_short_attempts": 0},
+                "universe": active_only_universe,
+                "universe_count": len(active_only_universe),
+                "universe_hash": service_policy_universe_hash(active_only_universe),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    verification = verify_service_policy_evidence(
+        evidence,
+        bundle_id="BUNDLE-TEST",
+        repo_root=tmp_path,
+        expected_universe=["005930", "000660"],
+    )
+
+    assert verification.status == "BLOCKED"
+    assert "service_policy_universe_count_mismatch" in verification.blockers
+    assert "service_policy_universe_hash_mismatch" in verification.blockers
+
+
+def test_service_policy_verifier_accepts_matching_universe(tmp_path: Path) -> None:
+    report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260512_122000.json"
+    universe = ["005930", "000660"]
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-TEST",
+                "gate": {"status": "PASS", "blockers": []},
+                "policy_checks": {
+                    "deploy_candidate_by_service_policy": True,
+                    "no_naked_short_exposure": True,
+                    "order_caps_respected": True,
+                    "cash_guard_respected": True,
+                },
+                "order_stats": {"naked_short_attempts": 0},
+                "universe": list(reversed(universe)),
+                "universe_count": len(universe),
+                "universe_hash": service_policy_universe_hash(universe),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    verification = verify_service_policy_evidence(
+        evidence,
+        bundle_id="BUNDLE-TEST",
+        repo_root=tmp_path,
+        expected_universe=universe,
+    )
+
+    assert verification.status == "PASS"
 
 
 def test_backtest_diagnostics_treats_string_false_flags_as_false(tmp_path: Path) -> None:

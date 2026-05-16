@@ -43,6 +43,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory to write the replay JSON report",
     )
     parser.add_argument(
+        "--tickers",
+        default=None,
+        help=(
+            "Optional comma-separated universe override. "
+            "Omit to use the final deploy universe from SSOT config."
+        ),
+    )
+    parser.add_argument(
         "--no-write-report",
         action="store_true",
         help="Print only; do not persist a report file",
@@ -55,6 +63,12 @@ def _repo_relative(path: Path) -> str:
         return str(path.relative_to(_REPO_ROOT))
     except ValueError:
         return str(path)
+
+
+def _parse_tickers(raw: str | None) -> list[str] | None:
+    if raw is None or not str(raw).strip():
+        return None
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
 def _write_report(report: dict[str, Any], output_dir: Path) -> Path:
@@ -77,12 +91,14 @@ def run_service_policy_replay(
     output_dir: Path | None = None,
     write_report: bool = True,
     engine: ServicePolicyReplayEngine | None = None,
+    tickers: list[str] | None = None,
 ) -> dict[str, Any]:
     replay_engine = engine or ServicePolicyReplayEngine()
     report = replay_engine.run(
         bundle_id,
         start_date=start_date,
         end_date=end_date,
+        universe=tickers,
     )
     if write_report:
         _write_report(report, output_dir or _DEFAULT_REPORT_DIR)
@@ -97,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         end_date=args.end_date,
         output_dir=Path(str(args.output_dir)),
         write_report=not bool(args.no_write_report),
+        tickers=_parse_tickers(args.tickers),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("status") == "PASS" else 1

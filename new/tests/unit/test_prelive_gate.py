@@ -73,7 +73,16 @@ def _service_policy_evidence(
     bundle_id: str = "BUNDLE-TEST",
     status: str = "PASS",
     date_range: dict | None = None,
+    universe: list[str] | None = None,
 ) -> dict:
+    replay_universe = sorted(
+        set(universe or _final_dataset_metadata()["requested_tickers"])
+    )
+    universe_payload = json.dumps(
+        replay_universe,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     checks = {
         "deploy_candidate_by_service_policy": status == "PASS",
         "no_naked_short_exposure": True,
@@ -86,6 +95,10 @@ def _service_policy_evidence(
         "gate": {"status": status},
         "policy_checks": checks,
         "order_stats": {"naked_short_attempts": 0},
+        "universe": replay_universe,
+        "universe_count": len(replay_universe),
+        "universe_hash": hashlib.sha256(universe_payload).hexdigest(),
+        "universe_policy": "final_dataset_gate",
     }
     if date_range is not None:
         report["date_range"] = date_range
@@ -1010,6 +1023,49 @@ def test_backtest_gate_uses_service_policy_expected_date_range(monkeypatch, tmp_
 
     assert result["status"] == "PASS"
     assert result["report_path"].endswith(report_path.name)
+
+
+def test_backtest_gate_blocks_active_only_service_policy_universe(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    report_dir = tmp_path / "backtest"
+    report_dir.mkdir(parents=True)
+    report_path = report_dir / "backtest_BUNDLE-TEST_20260511_011700.json"
+    service_policy = _service_policy_evidence(tmp_path, universe=["005930"])
+    report_path.write_text(
+        json.dumps(
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "verdict": "pass",
+                "date_range": {"start": "20260415", "end": "20260504"},
+                "regression_risk": {"flagged": False},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_backtest_gate({
+        "status": "PASS",
+        "bundle_id": "BUNDLE-TEST",
+    })
+
+    assert result["status"] == "BLOCKED"
+    assert result["latest_report_path"].endswith(report_path.name)
+    assert result["latest_service_policy_gate_pass"] is False
+    assert result["latest_final_dataset_gate"]["status"] == "PASS"
 
 
 def test_backtest_gate_blocks_pass_report_with_zero_feature_quality(monkeypatch, tmp_path):

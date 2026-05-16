@@ -13,6 +13,10 @@ import deploy_candidate  # noqa: E402
 
 
 def _service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict[str, object]:
+    universe = sorted(_final_dataset_metadata()["requested_tickers"])
+    universe_hash = hashlib.sha256(
+        json.dumps(universe, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     report = {
         "status": "PASS",
         "bundle_id": bundle_id,
@@ -24,6 +28,10 @@ def _service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict[str, object
             "cash_guard_respected": True,
         },
         "order_stats": {"naked_short_attempts": 0},
+        "universe": universe,
+        "universe_count": len(universe),
+        "universe_hash": universe_hash,
+        "universe_policy": "final_dataset_gate",
     }
     report_path = (
         tmp_path

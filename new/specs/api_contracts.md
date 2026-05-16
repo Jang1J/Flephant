@@ -924,6 +924,10 @@ output:
       status: "PASS|BLOCKED|MISSING|UNREADABLE"
       service_policy_report_path: "string"
       service_policy_report_sha256: "string"
+      universe: "[ticker]"                 # padded, sorted final deploy universe
+      universe_count: "int"                # v1 final gate requires 30
+      universe_hash: "sha256"              # hash of canonical universe list
+      universe_policy: "final_dataset_gate|operator_override"
       gate:
         status: "PASS|BLOCKED"
         blockers: "[string]"

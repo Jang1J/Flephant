@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from src.utils.safe_cast import safe_bool, safe_int
+from src.utils.ticker_utils import pad_ticker
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -30,6 +31,7 @@ def verify_service_policy_evidence(
     bundle_id: str,
     repo_root: Path | None = None,
     expected_date_range: dict[str, Any] | None = None,
+    expected_universe: list[str] | None = None,
 ) -> ServicePolicyVerification:
     """Validate C12-embedded service-policy evidence against its report file."""
     root = repo_root or _REPO_ROOT
@@ -76,6 +78,14 @@ def verify_service_policy_evidence(
         if not _date_ranges_equal(report_range, expected_date_range):
             blockers.append("service_policy_date_range_mismatch")
 
+    if expected_universe is not None:
+        universe_blockers = _verify_universe_binding(
+            report=report,
+            evidence=evidence,
+            expected_universe=expected_universe,
+        )
+        blockers.extend(universe_blockers)
+
     status = str(evidence.get("status") or report.get("status") or "")
     gate = _merge_mapping(report.get("gate"), evidence.get("gate"))
     checks = _merge_mapping(report.get("policy_checks"), evidence.get("policy_checks"))
@@ -113,13 +123,32 @@ def service_policy_gate_pass(
     bundle_id: str,
     repo_root: Path | None = None,
     expected_date_range: dict[str, Any] | None = None,
+    expected_universe: list[str] | None = None,
 ) -> bool:
     return verify_service_policy_evidence(
         evidence,
         bundle_id=bundle_id,
         repo_root=repo_root,
         expected_date_range=expected_date_range,
+        expected_universe=expected_universe,
     ).passed
+
+
+def normalize_service_policy_universe(tickers: list[str] | None) -> list[str]:
+    """Canonical final-universe representation used by replay and gates."""
+    normalized = {
+        pad_ticker(str(ticker))
+        for ticker in (tickers or [])
+        if str(ticker).strip()
+    }
+    return sorted(normalized)
+
+
+def service_policy_universe_hash(tickers: list[str] | None) -> str:
+    """Stable SHA-256 hash for a service-policy replay universe."""
+    universe = normalize_service_policy_universe(tickers)
+    payload = json.dumps(universe, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _resolve_report_path(evidence: dict[str, Any], root: Path) -> Path | None:
@@ -156,6 +185,55 @@ def _merge_mapping(primary: Any, fallback: Any) -> dict[str, Any]:
     if isinstance(fallback, dict):
         return fallback
     return {}
+
+
+def _verify_universe_binding(
+    *,
+    report: dict[str, Any],
+    evidence: dict[str, Any],
+    expected_universe: list[str],
+) -> list[str]:
+    expected = normalize_service_policy_universe(expected_universe)
+    if not expected:
+        return ["service_policy_expected_universe_empty"]
+
+    blockers: list[str] = []
+    expected_count = len(expected)
+    expected_hash = service_policy_universe_hash(expected)
+    observed_universe = normalize_service_policy_universe(
+        _first_list(report.get("universe"), evidence.get("universe"))
+    )
+    observed_hash = str(report.get("universe_hash") or evidence.get("universe_hash") or "")
+    observed_count_raw = report.get("universe_count", evidence.get("universe_count"))
+
+    if observed_count_raw in (None, "") and not observed_universe:
+        blockers.append("service_policy_universe_count_missing")
+    else:
+        observed_count = (
+            len(observed_universe)
+            if observed_count_raw in (None, "")
+            else safe_int(observed_count_raw, default=-1, min_value=0)
+        )
+        if observed_count != expected_count:
+            blockers.append("service_policy_universe_count_mismatch")
+
+    if observed_hash:
+        if observed_hash != expected_hash:
+            blockers.append("service_policy_universe_hash_mismatch")
+    elif observed_universe:
+        if service_policy_universe_hash(observed_universe) != expected_hash:
+            blockers.append("service_policy_universe_hash_mismatch")
+    else:
+        blockers.append("service_policy_universe_hash_missing")
+
+    return blockers
+
+
+def _first_list(*values: Any) -> list[Any]:
+    for value in values:
+        if isinstance(value, list):
+            return value
+    return []
 
 
 def _date_ranges_equal(left: Any, right: Any) -> bool:

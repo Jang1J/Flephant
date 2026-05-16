@@ -753,6 +753,7 @@ def _service_policy_gate_pass(payload: dict[str, Any], bundle_id: str) -> bool:
             payload.get("service_policy_expected_date_range")
             or payload.get("date_range")
         ),
+        expected_universe=_active_tickers(_final_gate_min_tickers()),
     )
 
 
