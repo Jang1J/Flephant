@@ -34,8 +34,8 @@ class PubSubBroker:
 
     def __init__(self, pool: MessagePool | None = None) -> None:
         self._pool: MessagePool = pool or MessagePool()
-        # id(handler) → (channel, handler): unsubscribe 추적용
-        self._handler_registry: dict[int, tuple[str, Callable]] = {}
+        # id(handler) → [(channel, handler)]: unsubscribe 추적용
+        self._handler_registry: dict[int, list[tuple[str, Callable]]] = {}
 
     def publish(self, channel: str, message: dict) -> str:
         """채널에 메시지 publish. MessagePool.publish() 경유. message_id 반환."""
@@ -49,35 +49,38 @@ class PubSubBroker:
     ) -> None:
         """채널 구독 등록. MessagePool.subscribe() 경유.
 
-        동일 handler 를 여러 채널에 구독 등록 가능하나,
-        unsubscribe 는 가장 최근 (channel, handler) 쌍 기준 제거.
+        동일 handler 를 여러 채널에 구독 등록할 수 있으며,
+        unsubscribe 는 해당 handler 의 모든 등록 채널에서 제거한다.
         """
         self._pool.subscribe(channel, handler, filter_fn)
-        self._handler_registry[id(handler)] = (channel, handler)
+        self._handler_registry.setdefault(id(handler), []).append((channel, handler))
 
     def unsubscribe(self, handler: Callable) -> bool:
         """handler 구독 해제. 성공 여부 반환.
 
-        MessagePool._subscribers[channel] 에서 해당 handler 항목 제거.
+        MessagePool.remove_subscriber() 로 해당 handler 항목 제거.
         handler 가 등록된 적 없으면 False 반환 (에러 아님).
         """
-        info = self._handler_registry.pop(id(handler), None)
-        if info is None:
+        registrations = self._handler_registry.pop(id(handler), None)
+        if not registrations:
             logger.info(
                 "[pubsub] unsubscribe: handler=%s 등록 이력 없음",
                 getattr(handler, "__name__", repr(handler)),
             )
             return False
 
-        channel, h = info
-        # TODO(Sprint4): MessagePool.remove_subscriber() 공개 메서드로 리팩터
-        subs = self._pool._subscribers.get(channel, [])
-        self._pool._subscribers[channel] = [(hh, ff) for hh, ff in subs if hh is not h]
+        removed = 0
+        channels: list[str] = []
+        for channel, h in registrations:
+            removed += self._pool.remove_subscriber(channel, h)
+            channels.append(channel)
         logger.info(
-            "[pubsub] unsubscribed: channel=%s handler=%s",
-            channel, getattr(handler, "__name__", repr(handler)),
+            "[pubsub] unsubscribed: channels=%s handler=%s removed=%d",
+            sorted(set(channels)),
+            getattr(handler, "__name__", repr(handler)),
+            removed,
         )
-        return True
+        return removed > 0
 
     def pool(self) -> MessagePool:
         """underlying MessagePool 반환.

@@ -261,6 +261,21 @@ class MessagePool:
             channel, getattr(handler, "__name__", repr(handler)),
         )
 
+    def remove_subscriber(self, channel: str, handler: Callable[[dict], None]) -> int:
+        """채널에서 특정 handler 구독을 제거하고 제거 건수를 반환."""
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"INVALID_SCOPE: channel='{channel}' not registered")
+        subscribers = self._subscribers[channel]
+        kept = [(hh, ff) for hh, ff in subscribers if hh is not handler]
+        removed = len(subscribers) - len(kept)
+        self._subscribers[channel] = kept
+        if removed:
+            logger.info(
+                "[message_pool] 구독 해제: channel=%s handler=%s removed=%d",
+                channel, getattr(handler, "__name__", repr(handler)), removed,
+            )
+        return removed
+
     def ack(self, message_id: str, ack_by: str = "unknown") -> None:
         """메시지 처리 완료 확인.
 
@@ -383,10 +398,10 @@ class MessagePool:
 
     @staticmethod
     def _dependency_correlation_key(message: dict[str, Any]) -> str:
-        for field in ("event_id", "portfolio_patch_id"):
-            value = message.get(field)
+        for field_name in ("event_id", "portfolio_patch_id"):
+            value = message.get(field_name)
             if value:
-                return f"{field}:{value}"
+                return f"{field_name}:{value}"
         return f"scope:{message.get('scope', '')}"
 
     def _check_dependencies(self, just_published_channel: str) -> None:

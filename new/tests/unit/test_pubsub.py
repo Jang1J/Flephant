@@ -107,3 +107,20 @@ def test_pubsub_unsubscribe_success_returns_true() -> None:
     broker.subscribe("news_signal", handler)
     result = broker.unsubscribe(handler)
     assert result is True
+
+
+def test_pubsub_unsubscribe_removes_handler_from_all_channels() -> None:
+    broker = PubSubBroker()
+    received: list[dict] = []
+
+    def handler(m: dict) -> None:
+        received.append(m)
+
+    broker.subscribe("news_signal", handler)
+    broker.subscribe("risk_warning", handler)
+
+    assert broker.unsubscribe(handler) is True
+    broker.publish("news_signal", _valid_msg())
+    broker.publish("risk_warning", _valid_msg(action_type="alert", risk_level="medium"))
+
+    assert received == []
