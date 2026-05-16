@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -26,6 +26,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import materialize_dual_source_history as dual_source_history  # noqa: E402
 import materialize_exogenous_history as exogenous_history  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.trading_calendar import previous_kospi_trading_day  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "phase2_input_readiness"
@@ -39,6 +40,12 @@ def _candidate_raw_paths(raw_events_dir: Path, date_key: str) -> list[Path]:
         raw_events_dir / f"events_{date_key}.json",
         raw_events_dir / f"news_community_{date_key}.json",
     ]
+
+
+def _expected_raw_window_start(date_key: str) -> datetime:
+    day = datetime.strptime(str(date_key), "%Y%m%d").date()
+    prev = previous_kospi_trading_day(day)
+    return datetime.combine(prev, time(8, 30), tzinfo=_KST)
 
 
 def _raw_payload_readiness(path: Path, date_key: str) -> dict[str, Any]:
@@ -80,6 +87,48 @@ def _raw_payload_readiness(path: Path, date_key: str) -> dict[str, Any]:
         }
 
     snapshot = dual_source_history._snapshot_ts(date_key)
+    window_start = _expected_raw_window_start(date_key)
+    if not provenance.get("window_start"):
+        return {
+            "valid": False,
+            "reason": "raw_payload_missing_window_start",
+            "event_count": len(events),
+        }
+    if not provenance.get("window_end"):
+        return {
+            "valid": False,
+            "reason": "raw_payload_missing_window_end",
+            "event_count": len(events),
+        }
+    try:
+        declared_window_start = dual_source_history._required_ts(
+            provenance.get("window_start"),
+            field="provenance.window_start",
+            snapshot=snapshot,
+        )
+        declared_window_end = dual_source_history._required_ts(
+            provenance.get("window_end"),
+            field="provenance.window_end",
+            snapshot=snapshot,
+        )
+    except Exception as e:
+        return {
+            "valid": False,
+            "reason": f"raw_payload_window_invalid:{type(e).__name__}",
+            "event_count": len(events),
+        }
+    if declared_window_start != window_start:
+        return {
+            "valid": False,
+            "reason": "raw_payload_window_start_mismatch",
+            "event_count": len(events),
+        }
+    if declared_window_end != snapshot:
+        return {
+            "valid": False,
+            "reason": "raw_payload_window_end_mismatch",
+            "event_count": len(events),
+        }
     for idx, event in enumerate(events):
         if not isinstance(event, dict):
             return {
@@ -103,6 +152,12 @@ def _raw_payload_readiness(path: Path, date_key: str) -> dict[str, Any]:
             return {
                 "valid": False,
                 "reason": "raw_payload_event_after_snapshot",
+                "event_count": len(events),
+            }
+        if event_ts < window_start:
+            return {
+                "valid": False,
+                "reason": "raw_payload_event_before_window",
                 "event_count": len(events),
             }
     return {"valid": True, "reason": None, "event_count": len(events)}

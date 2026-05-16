@@ -470,6 +470,69 @@ def test_exogenous_history_accepts_normalized_investor_events(monkeypatch, tmp_p
     assert (tmp_path / "exogenous" / "20260508.json").exists()
 
 
+def test_exogenous_history_uses_latest_us_close_on_korea_only_holiday(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            assert as_of == "2026-05-06"
+            return SimpleNamespace(
+                us_sp500_change=0.01,
+                us_nasdaq_change=0.02,
+                us_vix=18.5,
+                us_soxx_change=0.03,
+                source="yfinance",
+                as_of_date="2026-05-05",
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 3.5, "usd_krw": 1350.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+        def get_investor_info(self, ticker, bgn_de, end_de):
+            assert bgn_de == "20260504"
+            assert end_de == "20260504"
+            return [{
+                "payload": {
+                    "ticker": ticker,
+                    "date": bgn_de,
+                    "foreign_net_buy": 1000,
+                    "institutional_net_buy": 0,
+                    "retail_net_buy": -1000,
+                }
+            }]
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260506"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260506",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    stats = report["per_date"][0]["source_stats"]
+    assert stats["us_market_expected_as_of_date"] == "2026-05-05"
+    assert stats["us_market_request_as_of_date"] == "2026-05-06"
+    assert (tmp_path / "exogenous" / "20260506.json").exists()
+
+
 def test_exogenous_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_path):
     mod = _load_script("materialize_exogenous_history")
 

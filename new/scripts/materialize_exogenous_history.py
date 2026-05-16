@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -66,6 +66,29 @@ def _business_dates(end_date: str, business_days: int) -> list[str]:
     end = _parse_date(end_date).date()
     start = kospi_trading_start_date(end, business_days)
     return kospi_trading_dates_between(start, end)
+
+
+def _configured_us_market_holidays(year: int) -> set[date]:
+    cfg = config_load("risk_config.yaml", "exogenous_features") or {}
+    raw_dates = cfg.get(f"us_market_holidays_{year}", []) or []
+    holidays: set[date] = set()
+    for raw in raw_dates:
+        try:
+            holidays.add(date.fromisoformat(str(raw)))
+        except ValueError:
+            continue
+    return holidays
+
+
+def _is_us_market_close_day(value: date) -> bool:
+    return value.weekday() < 5 and value not in _configured_us_market_holidays(value.year)
+
+
+def _latest_us_close_date_before_snapshot(date_key: str) -> date:
+    cur = _snapshot_ts(date_key).date() - timedelta(days=1)
+    while not _is_us_market_close_day(cur):
+        cur -= timedelta(days=1)
+    return cur
 
 
 def _active_tickers() -> list[str]:
@@ -135,7 +158,7 @@ def _collect_global_features(
     us_client: USMarketClient,
     ecos_client: ECOSRestClient,
 ) -> tuple[dict[str, float], dict[str, Any]]:
-    expected_us_date = previous_kospi_trading_day(_parse_date(date_key).date())
+    expected_us_date = _latest_us_close_date_before_snapshot(date_key)
     expected_us_as_of = expected_us_date.isoformat()
     request_as_of = (expected_us_date + timedelta(days=1)).isoformat()
     us = us_client.get_indices(as_of=request_as_of)
