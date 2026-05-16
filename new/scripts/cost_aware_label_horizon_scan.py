@@ -8,6 +8,7 @@ It does not train, deploy, call KIS, or mutate any registry.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -30,6 +31,15 @@ from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
+
+
+def _universe_hash(tickers: list[str]) -> str:
+    payload = json.dumps(
+        sorted({pad_ticker(str(ticker)) for ticker in tickers}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _active_tickers() -> list[str]:
@@ -451,6 +461,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "start_date": start_date,
             "end_date": end_date,
             "ticker_count": len(tickers),
+            "tickers": tickers,
+            "universe_hash": _universe_hash(tickers),
             "loaded_rows": int(len(panel)),
             "missing_tickers": missing_tickers,
         },

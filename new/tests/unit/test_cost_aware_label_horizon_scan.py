@@ -58,6 +58,10 @@ def test_label_horizon_scan_uses_final_gate_pending_data_universe(monkeypatch):
     monkeypatch.setattr(mod, "config_load", fake_config_load)
 
     assert mod._active_tickers() == ["005930", "105560"]
+    assert mod._universe_hash(["105560", "005930"]) == mod._universe_hash([
+        "005930",
+        "105560",
+    ])
 
 
 def test_label_horizon_scan_thresholds_loaded_from_risk_config(monkeypatch):

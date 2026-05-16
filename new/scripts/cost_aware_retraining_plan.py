@@ -8,6 +8,7 @@ cost-aware retraining experiment.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -26,6 +27,16 @@ from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "cost_aware_retraining"
+
+
+def _universe_hash(tickers: list[str]) -> str:
+    normalized = sorted({pad_ticker(str(ticker)) for ticker in tickers})
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -260,6 +271,18 @@ def _label_scan_pretraining_blockers(
         expected_ticker_count = len(final_tickers)
         if int(data.get("ticker_count") or 0) != expected_ticker_count:
             blockers.append("label_horizon_scan_ticker_mismatch")
+        reported_tickers = data.get("tickers")
+        if isinstance(reported_tickers, list):
+            normalized_reported = sorted({
+                pad_ticker(str(ticker))
+                for ticker in reported_tickers
+                if str(ticker).strip()
+            })
+            if normalized_reported != final_tickers:
+                blockers.append("label_horizon_scan_universe_mismatch")
+        reported_hash = data.get("universe_hash")
+        if reported_hash and str(reported_hash) != _universe_hash(final_tickers):
+            blockers.append("label_horizon_scan_universe_mismatch")
     missing_tickers = data.get("missing_tickers")
     if isinstance(missing_tickers, list) and any(str(t).strip() for t in missing_tickers):
         blockers.append("label_horizon_scan_missing_tickers")
