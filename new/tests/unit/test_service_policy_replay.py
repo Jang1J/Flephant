@@ -414,7 +414,7 @@ def test_trade_probability_gate_missing_classifier_fails_closed() -> None:
 
 
 def test_trade_probability_gate_uncalibrated_classifier_blocks() -> None:
-    model, reason = ServicePolicyReplayEngine._load_trade_probability_model({
+    model, reason = ServicePolicyReplayEngine._load_trade_probability_model_with_reason({
         "metadata": {
             "trade_no_trade_classifier": {
                 "status": "PASS",

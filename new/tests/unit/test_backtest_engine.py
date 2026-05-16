@@ -707,6 +707,7 @@ def test_candidate_bundle_exposes_trade_classifier_metadata(tmp_path: Path):
                 "target_col": "label_session_close_net_ret",
                 "trade_no_trade_classifier": {
                     "status": "PASS",
+                    "calibration_status": "PASS",
                     "model_path": str(classifier_path),
                 },
             },

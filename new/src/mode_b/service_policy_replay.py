@@ -232,7 +232,7 @@ class ServicePolicyReplayEngine:
             raise DataUnavailable(f"target column missing from replay panel: {target_col}")
 
         trade_probability_model, trade_probability_unavailable_reason = (
-            self._load_trade_probability_model(candidate_artifact)
+            self._load_trade_probability_model_with_reason(candidate_artifact)
         )
         result = self._simulate_panel(
             panel=panel,
@@ -422,6 +422,15 @@ class ServicePolicyReplayEngine:
 
     @staticmethod
     def _load_trade_probability_model(
+        candidate_artifact: dict[str, Any],
+    ) -> Any | None:
+        model, _ = ServicePolicyReplayEngine._load_trade_probability_model_with_reason(
+            candidate_artifact
+        )
+        return model
+
+    @staticmethod
+    def _load_trade_probability_model_with_reason(
         candidate_artifact: dict[str, Any],
     ) -> tuple[Any | None, str | None]:
         metadata = ServicePolicyReplayEngine._candidate_metadata(candidate_artifact)
