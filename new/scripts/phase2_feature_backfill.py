@@ -110,6 +110,9 @@ def _valid_bar_artifact(path: Path, *, date_key: str, ticker: str, min_rows: int
         and int(inspection.get("out_of_hours_count") or 0) == 0
         and inspection.get("session_span_ok") is True
         and inspection.get("max_gap_ok") is True
+        and int(inspection.get("missing_ohlcv_count") or 0) == 0
+        and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+        and int(inspection.get("invalid_ohlcv_count") or 0) == 0
     )
 
 
@@ -124,11 +127,21 @@ def _common_artifact_dates(
         ticker_dir = artifacts_dir / ticker
         if not ticker_dir.exists():
             continue
-        seen: set[str] = set()
+        paths_by_date: dict[str, list[Path]] = {}
         for path in ticker_dir.iterdir():
             date_key = _extract_date(path)
-            if date_key and _valid_bar_artifact(
-                path,
+            if (
+                date_key
+                and path.name.startswith("bars_1m_")
+                and path.suffix in {".parquet", ".jsonl"}
+            ):
+                paths_by_date.setdefault(date_key, []).append(path)
+        seen: set[str] = set()
+        for date_key, paths in paths_by_date.items():
+            if len(paths) != 1:
+                continue
+            if _valid_bar_artifact(
+                paths[0],
                 date_key=date_key,
                 ticker=ticker,
                 min_rows=min_rows,

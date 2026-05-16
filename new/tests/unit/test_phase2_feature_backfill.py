@@ -24,12 +24,9 @@ def _write_jsonl(
     gap_minutes: int = 0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.name.startswith("bars_1m_"):
-        date_key = path.name.removeprefix("bars_1m_").split(".", 1)[0]
-    else:
-        match = re.search(r"(20\d{6})", path.name)
-        assert match
-        date_key = match.group(1)
+    match = re.search(r"(20\d{6})", path.name)
+    assert match
+    date_key = match.group(1)
     ticker = path.parent.name
     start = datetime(
         int(date_key[:4]),
@@ -50,7 +47,7 @@ def _write_jsonl(
                 "{"
                 f'"ticker": "{ticker}", '
                 f'"ts_close": "{ts.isoformat()}", '
-                '"close": 1'
+                '"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1'
                 "}\n"
             )
         )
@@ -115,6 +112,24 @@ def test_select_dates_rejects_large_intraday_gap(tmp_path):
         gap_after=150,
         gap_minutes=20,
     )
+
+    assert mod._select_dates(
+        artifacts,
+        tickers,
+        end_date="20260515",
+        business_days=10,
+        min_rows=300,
+    ) == []
+
+
+def test_select_dates_rejects_duplicate_same_date_artifacts(tmp_path):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    tickers = ["005930", "105560"]
+
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 301)
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515_extra.jsonl", 301)
+    _write_jsonl(artifacts / "105560" / "bars_1m_20260515.jsonl", 301)
 
     assert mod._select_dates(
         artifacts,
