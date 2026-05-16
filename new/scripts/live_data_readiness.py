@@ -584,7 +584,11 @@ def _inspect_bar_file(
             non_finite_ohlcv_count += 1
             continue
         if (
-            high_price < max(open_price, close_price)
+            open_price <= 0
+            or high_price <= 0
+            or low_price <= 0
+            or high_price < low_price
+            or high_price < max(open_price, close_price)
             or low_price > min(open_price, close_price)
             or close_price <= 0
             or volume < 0

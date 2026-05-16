@@ -455,6 +455,35 @@ def test_artifact_date_quality_rejects_bad_ohlcv_values(monkeypatch, tmp_path):
     assert first["invalid_ohlcv_count"] == 1
 
 
+def test_artifact_date_quality_rejects_non_positive_ohl_prices(
+    monkeypatch,
+    tmp_path,
+):
+    """open/high/low도 양수여야 한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"open": 1.0, "high": 1.0, "low": 0.0, "close": 1.0, "volume": 1.0},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["invalid_ohlcv_count"] == 1
+
+
 def test_artifact_date_quality_rejects_non_finite_ohlcv(monkeypatch, tmp_path):
     """NaN/문자열 OHLCV는 row 수가 충분해도 readiness에서 차단한다."""
     readiness = _load_script_module()
