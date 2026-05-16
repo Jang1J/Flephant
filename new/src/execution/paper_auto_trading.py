@@ -294,7 +294,7 @@ class PaperAutoTrader:
             ticker = pad_ticker(str(pos.get("ticker", "")))
             if ticker == "000000":
                 continue
-            qty = safe_int(pos.get("qty", 0), default=0, min_value=0)
+            qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
             price = latest_prices.get(
                 ticker,
                 safe_float(pos.get("current_price", 0.0), default=0.0),
@@ -325,7 +325,7 @@ class PaperAutoTrader:
 
     def _active_model_check(self) -> dict[str, Any]:
         quant = getattr(self._hot_runner, "_quant", None)
-        has_model = bool(getattr(quant, "has_model", False))
+        has_model = safe_bool(getattr(quant, "has_model", False), default=False)
         metadata = getattr(quant, "model_metadata", None)
         bundle_id = (
             (metadata or {}).get("bundle_id")

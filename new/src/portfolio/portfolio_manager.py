@@ -19,7 +19,7 @@ from typing import Any
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_portfolio_patch_id
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_lossless_int
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("portfolio_manager")
@@ -207,7 +207,7 @@ class PortfolioManager:
             if "ticker" in p
         }
         current_qty = {
-            pad_ticker(str(p["ticker"])): safe_int(
+            pad_ticker(str(p["ticker"])): safe_lossless_int(
                 p.get("qty", 0),
                 default=0,
                 min_value=0,

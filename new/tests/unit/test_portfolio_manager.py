@@ -276,6 +276,20 @@ def test_malformed_position_qty_is_fail_safe(monkeypatch) -> None:
     assert result["errors"][0]["error"] == "SELL_QTY_UNAVAILABLE"
 
 
+def test_fractional_position_qty_is_not_truncated_for_sell(pm: PortfolioManager) -> None:
+    """외부 포지션 qty='1.9'는 1주 보유로 절삭하지 않고 sell 불가로 닫는다."""
+    result = pm.plan(
+        target_weights={},
+        current_positions=[{"ticker": "005930", "qty": "1.9", "weight": 0.1}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["errors"][0]["error"] == "SELL_QTY_UNAVAILABLE"
+    assert result["sell_caps_applied"][0]["capped_qty"] == 0
+
+
 # ====================================================================== #
 # 7. Output schema (C8)
 # ====================================================================== #

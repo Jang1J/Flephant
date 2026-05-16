@@ -1023,7 +1023,7 @@ def test_execute_paper_rejects_real_mode_kis_client(monkeypatch, tmp_path: Path)
 
 
 def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) -> None:
-    """BE/direct 입력의 approved='false'를 True로 오판하지 않는다."""
+    """BE/direct 입력의 approved='false'는 C9 bool 위반으로 reject한다."""
     fd = _final_decision(
         approved="false",
         order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
@@ -1032,7 +1032,36 @@ def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) ->
     result = gateway.execute(fd)
 
     assert result["execution_report"]["status"] == "rejected"
-    assert "veto" in result["execution_report"]["rejection_reason"]
+    assert result["execution_report"]["rejection_reason"] == "approved_must_be_bool"
+
+
+def test_execute_string_yes_approved_is_rejected_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """C10은 approved='yes' 같은 bool-like 문자열을 FDA 승인으로 승격하지 않는다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PaperKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("approved string must not submit")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PaperKISClient(),
+    )
+    fd = _final_decision(
+        approved="yes",
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert result["execution_report"]["rejection_reason"] == "approved_must_be_bool"
 
 
 def test_execute_rejects_non_list_order_deltas(gateway: ExecutionGateway) -> None:

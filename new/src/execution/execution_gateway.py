@@ -125,7 +125,16 @@ class ExecutionGateway:
         t0 = time.perf_counter()
         order_plan_id = generate_order_plan_id()
         decision_id = str(final_decision.get("decision_id", ""))
-        approved = safe_bool(final_decision.get("approved", False), default=False)
+        approved_raw = final_decision.get("approved")
+        if not isinstance(approved_raw, bool):
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "approved_must_be_bool",
+                [],
+                t0,
+            )
+        approved = approved_raw
         order_deltas, validation_errors = self._normalize_order_deltas(
             final_decision.get("order_deltas", [])
         )
