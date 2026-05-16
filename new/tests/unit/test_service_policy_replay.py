@@ -15,6 +15,7 @@ from src.mode_b.service_policy_verifier import (
     verify_service_policy_evidence,
 )
 from src.mode_b.service_policy_replay import (
+    DataUnavailable,
     ServicePolicyConfig,
     ServicePolicyReplayEngine,
 )
@@ -171,6 +172,48 @@ def test_policy_config_treats_string_false_flags_as_false(monkeypatch) -> None:
 
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is False
+
+
+@pytest.mark.parametrize(
+    "cost_cfg,match",
+    [
+        ({}, "execution_cost_model_missing"),
+        ({"components": {}}, "execution_cost_model_missing"),
+        ({"components": {"commission_bps": 0.0, "slippage_bps": 10.0}}, "execution_cost_model_non_positive"),
+        ({"components": {"commission_bps": 5.0, "slippage_bps": 0.0}}, "execution_cost_model_non_positive"),
+    ],
+)
+def test_policy_config_requires_positive_cost_model(monkeypatch, cost_cfg, match) -> None:
+    """비용 설정 누락/0bps는 service replay gate를 쉽게 만들 수 있어 차단한다."""
+    config_by_section = {
+        "backtest": {"initial_capital": 1_000_000.0},
+        "evaluation": {
+            "top_k_fraction": 0.5,
+            "annualization_factor": 252,
+            "min_daily_pnl_std": 1e-8,
+        },
+        "paper_auto_trading": {
+            "max_orders_per_cycle": 1,
+            "max_order_qty_per_order": 1,
+        },
+        "position_limits": {
+            "max_names": 10,
+            "max_single_name": 1.0,
+            "min_cash": 0.0,
+        },
+        "turnover_cap": {"daily_max": 10.0},
+        "execution_cost_model": cost_cfg,
+        "label": {"horizon_bars": 5},
+        "service_policy_replay": {},
+        "cost_aware_retraining": {"trade_probability_gate": {"enabled": False}},
+    }
+    monkeypatch.setattr(
+        "src.mode_b.service_policy_replay.config_load",
+        lambda _file, section: config_by_section.get(section, {}),
+    )
+
+    with pytest.raises(DataUnavailable, match=match):
+        ServicePolicyConfig.from_config()
 
 
 def test_no_trade_score_spread_filters_low_conviction_cycle() -> None:
@@ -333,6 +376,85 @@ def test_trade_probability_gate_filters_service_replay_candidate() -> None:
     assert result["trade_probability_gate"]["applied"] is True
     assert result["trade_probability_gate"]["candidates_rejected"] == 1
     assert result["order_stats"]["trade_probability_rejected_candidates"] == 1
+
+
+def test_trade_probability_gate_missing_classifier_fails_closed() -> None:
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        )
+    )
+    panel = _panel([
+        ("005930", "2026-05-01 09:00:00", 3.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 2.0, 0.001, 100.0),
+    ])
+
+    result = engine._simulate_panel(
+        panel=panel,
+        model_callable=_model,
+        feature_cols=["feature_score"],
+        target_col="label_5m_ret",
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        ),
+        trade_probability_model=None,
+    )
+
+    assert result["order_stats"]["buy_orders"] == 0
+    assert result["trade_probability_gate"]["reason"] == "classifier_missing"
+    assert result["trade_probability_gate"]["applied"] is True
+    assert result["trade_probability_gate"]["candidates_rejected"] == 2
+    assert result["order_stats"]["trade_probability_rejected_candidates"] == 2
+    assert result["status"] == "BLOCKED"
+    assert "trade_probability_classifier_missing" in result["gate"]["blockers"]
+
+
+def test_trade_probability_gate_uncalibrated_classifier_blocks() -> None:
+    model, reason = ServicePolicyReplayEngine._load_trade_probability_model({
+        "metadata": {
+            "trade_no_trade_classifier": {
+                "status": "PASS",
+                "model_path": "artifacts/lgbm/fake_trade_classifier.pkl",
+            },
+        },
+    })
+    assert model is None
+    assert reason == "classifier_uncalibrated"
+
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        )
+    )
+    panel = _panel([
+        ("005930", "2026-05-01 09:00:00", 3.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 2.0, 0.001, 100.0),
+    ])
+
+    result = engine._simulate_panel(
+        panel=panel,
+        model_callable=_model,
+        feature_cols=["feature_score"],
+        target_col="label_5m_ret",
+        policy=_policy(
+            max_orders_per_cycle=1,
+            trade_probability_gate_enabled=True,
+            min_trade_probability=0.5,
+        ),
+        trade_probability_model=model,
+        trade_probability_unavailable_reason=reason,
+    )
+
+    assert result["order_stats"]["buy_orders"] == 0
+    assert result["trade_probability_gate"]["reason"] == "classifier_uncalibrated"
+    assert result["status"] == "BLOCKED"
+    assert "trade_probability_classifier_uncalibrated" in result["gate"]["blockers"]
 
 
 def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:

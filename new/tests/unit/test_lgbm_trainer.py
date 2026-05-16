@@ -280,6 +280,9 @@ def test_train_accepts_cost_aware_target_override(
     if classifier["status"] == "PASS":
         assert Path(classifier["model_path"]).exists()
         assert result["trade_no_trade_classifier"]["model_path"] == classifier["model_path"]
+        assert classifier["calibration_status"] == "UNAVAILABLE"
+        assert classifier["calibration_required_for_service_gate"] is True
+        assert classifier["deploy_gate_eligible"] is False
 
 
 def test_train_blocks_production_active_write_without_explicit_approval(

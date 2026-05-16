@@ -131,9 +131,16 @@ def _default_horizons() -> list[str]:
 def _cost_bps() -> float:
     cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
     components = cost_cfg.get("components") or {}
-    return float(components.get("commission_bps", 0.0)) + float(
-        components.get("slippage_bps", 0.0)
-    )
+    if not isinstance(components, dict) or not {
+        "commission_bps",
+        "slippage_bps",
+    }.issubset(components):
+        raise ValueError("execution_cost_model_missing")
+    commission_bps = safe_float(components.get("commission_bps"), default=-1.0)
+    slippage_bps = safe_float(components.get("slippage_bps"), default=-1.0)
+    if commission_bps <= 0.0 or slippage_bps <= 0.0:
+        raise ValueError("execution_cost_model_non_positive")
+    return commission_bps + slippage_bps
 
 
 def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, Any]:

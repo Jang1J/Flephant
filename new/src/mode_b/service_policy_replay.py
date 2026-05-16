@@ -94,6 +94,15 @@ class ServicePolicyConfig:
         turnover_cfg = config_load("risk_config.yaml", "turnover_cap") or {}
         cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
         cost_components = cost_cfg.get("components", {}) or {}
+        if not isinstance(cost_components, dict) or not {
+            "commission_bps",
+            "slippage_bps",
+        }.issubset(cost_components):
+            raise DataUnavailable("execution_cost_model_missing")
+        commission_bps = safe_float(cost_components.get("commission_bps"), default=-1.0)
+        slippage_bps = safe_float(cost_components.get("slippage_bps"), default=-1.0)
+        if commission_bps <= 0.0 or slippage_bps <= 0.0:
+            raise DataUnavailable("execution_cost_model_non_positive")
         label_cfg = config_load("risk_config.yaml", "label") or {}
         replay_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
         trade_gate_cfg = (
@@ -111,8 +120,8 @@ class ServicePolicyConfig:
             max_single_name=float(position_cfg.get("max_single_name", 0.20)),
             min_cash=float(position_cfg.get("min_cash", 0.10)),
             daily_turnover_cap=float(turnover_cfg.get("daily_max", 0.30)),
-            commission_bps=float(cost_components.get("commission_bps", 0.0)),
-            slippage_bps=float(cost_components.get("slippage_bps", 0.0)),
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
             annualization_factor=int(eval_cfg.get("annualization_factor", 252)),
             min_daily_return_std=float(eval_cfg.get("min_daily_pnl_std", 1e-8)),
             decision_stride_bars=max(
@@ -222,13 +231,17 @@ class ServicePolicyReplayEngine:
         if target_col not in panel.columns:
             raise DataUnavailable(f"target column missing from replay panel: {target_col}")
 
+        trade_probability_model, trade_probability_unavailable_reason = (
+            self._load_trade_probability_model(candidate_artifact)
+        )
         result = self._simulate_panel(
             panel=panel,
             model_callable=model_callable,
             feature_cols=feature_cols,
             target_col=target_col,
             policy=self._policy,
-            trade_probability_model=self._load_trade_probability_model(candidate_artifact),
+            trade_probability_model=trade_probability_model,
+            trade_probability_unavailable_reason=trade_probability_unavailable_reason,
         )
         result.update({
             "schema_version": "1.0.0",
@@ -408,23 +421,27 @@ class ServicePolicyReplayEngine:
         return {}
 
     @staticmethod
-    def _load_trade_probability_model(candidate_artifact: dict[str, Any]) -> Any | None:
+    def _load_trade_probability_model(
+        candidate_artifact: dict[str, Any],
+    ) -> tuple[Any | None, str | None]:
         metadata = ServicePolicyReplayEngine._candidate_metadata(candidate_artifact)
         classifier = metadata.get("trade_no_trade_classifier")
         if not isinstance(classifier, dict) or classifier.get("status") != "PASS":
-            return None
+            return None, "classifier_missing"
+        if classifier.get("calibration_status") != "PASS":
+            return None, "classifier_uncalibrated"
         raw_path = str(classifier.get("model_path") or "").strip()
         if not raw_path:
-            return None
+            return None, "classifier_missing"
         path = Path(raw_path)
         if not path.is_absolute():
             path = _REPO_ROOT / path
         try:
             with path.open("rb") as fh:
-                return pickle.load(fh)
+                return pickle.load(fh), None
         except Exception as e:
             _ = e
-            return None
+            return None, "classifier_load_failed"
 
     def _simulate_panel(
         self,
@@ -436,6 +453,7 @@ class ServicePolicyReplayEngine:
         policy: ServicePolicyConfig,
         initial_holdings: dict[str, int] | None = None,
         trade_probability_model: Any | None = None,
+        trade_probability_unavailable_reason: str | None = None,
     ) -> dict[str, Any]:
         cash = float(policy.initial_capital)
         holdings: dict[str, int] = {
@@ -554,9 +572,12 @@ class ServicePolicyReplayEngine:
                 policy,
                 trade_probs_by_ticker,
                 trade_probability_model=trade_probability_model,
+                unavailable_reason=trade_probability_unavailable_reason,
             )
             if trade_gate_state.get("applied"):
                 trade_gate_stats["applied"] = True
+                if trade_gate_state.get("reason") and not trade_gate_stats.get("reason"):
+                    trade_gate_stats["reason"] = trade_gate_state.get("reason")
                 trade_gate_stats["cycles"] += 1
                 trade_gate_stats["candidates_seen"] += int(trade_gate_state.get("n_input", 0))
                 trade_gate_stats["candidates_rejected"] += int(
@@ -715,6 +736,12 @@ class ServicePolicyReplayEngine:
             max_daily_turnover=max_daily_turnover,
             policy_checks=policy_checks,
         )
+        if (
+            policy.trade_probability_gate_enabled
+            and trade_gate_stats.get("reason")
+            in {"classifier_missing", "classifier_uncalibrated", "classifier_load_failed"}
+        ):
+            blockers.append(f"trade_probability_{trade_gate_stats['reason']}")
         status = "PASS" if not blockers else "BLOCKED"
         policy_checks["deploy_candidate_by_service_policy"] = status == "PASS"
 
@@ -837,6 +864,7 @@ class ServicePolicyReplayEngine:
         trade_probs_by_ticker: dict[str, float],
         *,
         trade_probability_model: Any | None,
+        unavailable_reason: str | None = None,
     ) -> tuple[list[tuple[str, float, float, float]], dict[str, Any]]:
         state: dict[str, Any] = {
             "enabled": policy.trade_probability_gate_enabled,
@@ -847,8 +875,15 @@ class ServicePolicyReplayEngine:
             state["reason"] = "disabled"
             return bar_preds, state
         if trade_probability_model is None:
-            state["reason"] = "classifier_missing"
-            return bar_preds, state
+            state["reason"] = unavailable_reason or "classifier_missing"
+            state.update({
+                "applied": True,
+                "n_input": len(bar_preds),
+                "n_passed": 0,
+                "n_rejected": len(bar_preds),
+                "missing_probability": len(bar_preds),
+            })
+            return [], state
         filtered: list[tuple[str, float, float, float]] = []
         missing = 0
         rejected = 0

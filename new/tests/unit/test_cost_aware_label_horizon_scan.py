@@ -87,6 +87,29 @@ def test_label_horizon_scan_thresholds_loaded_from_risk_config(monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    "cost_cfg,match",
+    [
+        ({}, "execution_cost_model_missing"),
+        ({"components": {}}, "execution_cost_model_missing"),
+        ({"components": {"commission_bps": 0.0, "slippage_bps": 10.0}}, "execution_cost_model_non_positive"),
+        ({"components": {"commission_bps": 5.0, "slippage_bps": 0.0}}, "execution_cost_model_non_positive"),
+    ],
+)
+def test_label_horizon_scan_requires_positive_cost_model(monkeypatch, cost_cfg, match):
+    mod = _load_script("cost_aware_label_horizon_scan")
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "execution_cost_model":
+            return cost_cfg
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    with pytest.raises(ValueError, match=match):
+        mod._cost_bps()
+
+
 def test_default_horizons_include_service_policy_min_holding(monkeypatch):
     mod = _load_script("cost_aware_label_horizon_scan")
 
