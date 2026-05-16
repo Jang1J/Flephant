@@ -811,7 +811,7 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         }
         if latest_external_state is None:
             latest_external_state = state
-        if passed:
+        if bundle_match:
             return state
 
     if latest_external_state is not None:

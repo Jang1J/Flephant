@@ -753,6 +753,70 @@ def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
     assert evidence["report_path"].endswith("20260515_135618.json")
 
 
+def test_broker_evidence_blocks_newer_external_fail_over_older_pass_same_bundle(
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    older_pass_path = (
+        tmp_path
+        / "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_20260515_135618.json"
+    )
+    newer_fail_path = (
+        tmp_path
+        / "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_20260516_065843.json"
+    )
+    pass_payload = {
+        "status": "PASS",
+        "bundle_id": bundle_id,
+        "external_kis_api": True,
+        "evidence_level": "external_kis_virtual",
+        **_external_broker_evidence_fields(),
+        "stage_statuses": {
+            "paper_auto_cycle": "PASS",
+            "balance_reconciliation": "PASS",
+            "probe_order": "PASS",
+            "order_history_requery": "PASS",
+        },
+        "stages": {
+            "paper_auto_cycle": {
+                "status": "PASS",
+                "stages": {
+                    "active_model_guard": {"bundle_id": bundle_id},
+                    "cycles": {
+                        "items": [{
+                            "status": "PASS",
+                            "order_history_verification": {
+                                "status": "PASS",
+                                "queries": [{"matched_order_count": 1}],
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    }
+    fail_payload = {
+        **pass_payload,
+        "status": "FAIL",
+        "stage_statuses": {
+            **pass_payload["stage_statuses"],
+            "probe_order": "FAIL",
+        },
+    }
+    _write_json(older_pass_path, pass_payload)
+    _write_json(newer_fail_path, fail_payload)
+    os.utime(older_pass_path, (1000, 1000))
+    os.utime(newer_fail_path, (2000, 2000))
+
+    evidence = service_readiness_status._broker_evidence_state(tmp_path, bundle_id)
+
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["external_kis_api"] is True
+    assert evidence["bundle_match"] is True
+    assert evidence["stage_statuses"]["probe_order"] == "FAIL"
+    assert evidence["report_path"].endswith("20260516_065843.json")
+
+
 def test_broker_evidence_blocks_stale_external_report(
     tmp_path: Path,
 ) -> None:
