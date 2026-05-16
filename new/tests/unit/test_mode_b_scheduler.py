@@ -5,6 +5,7 @@ config_load: monkeypatch로 실제 yaml 경유 없이 고정값 주입.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -150,6 +151,29 @@ def _install_fast_candidate_stages(
         scheduler._backtest_agent = _FastBacktestAgent()
 
 
+def _valid_service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict:
+    report = {
+        "bundle_id": bundle_id,
+        "status": "PASS",
+        "gate": {"status": "PASS"},
+        "policy_checks": {
+            "deploy_candidate_by_service_policy": True,
+            "no_naked_short_exposure": True,
+            "order_caps_respected": True,
+            "cash_guard_respected": True,
+        },
+        "order_stats": {"naked_short_attempts": 0},
+    }
+    path = tmp_path / f"{bundle_id}_service_policy_replay.json"
+    raw = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+    path.write_bytes(raw)
+    return {
+        **report,
+        "service_policy_report_path": str(path),
+        "service_policy_report_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 1. FORBIDDEN_PERMISSIONS 상수 검증
 # --------------------------------------------------------------------------- #
@@ -257,6 +281,28 @@ def test_run_pipeline_blocks_before_backtest_on_stage_timeout(scheduler, monkeyp
     assert result["deploy_status"] == "skipped"
     assert result["blocked_stage"] == "stage_1"
     assert [stage["stage"] for stage in result["stages"]] == ["stage_0", "stage_1"]
+
+
+def test_run_pipeline_skips_on_non_trading_day(scheduler, mock_state_machine, monkeypatch):
+    """주말/공휴일 DQR skip은 stage_1~7을 실행하지 않고 terminal skip 처리한다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    def _stage_1_should_not_run():
+        raise AssertionError("stage_1 must not run on non-trading day")
+
+    scheduler.stage_1_performance_analysis = _stage_1_should_not_run
+
+    result = scheduler.run_pipeline(date="2026-04-25")
+
+    assert result["verdict"] == "skipped_non_trading_day"
+    assert result["pipeline_status"] == "skipped"
+    assert result["deploy_status"] == "skipped"
+    assert result["deploy_result"] == "skipped_non_trading_day"
+    assert [stage["stage"] for stage in result["stages"]] == ["stage_0"]
+
+    from src.ops.state_machine import PipelineState
+
+    mock_state_machine.transition.assert_any_call(PipelineState.MODE_B_IDLE)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,7 +415,7 @@ def test_verdict_pass_triggers_deploy(scheduler, monkeypatch):
     assert s7.get("error") == "deployer_not_configured"
 
 
-def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch):
+def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch, tmp_path):
     """stage_6의 feature/service-policy evidence가 stage_7 deployer 호출로 전달된다."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
@@ -379,19 +425,7 @@ def test_stage_7_passes_c12_deploy_evidence_to_deployer(scheduler, monkeypatch):
         "exogenous_rows": 100,
         "exogenous_non_neutral_rows": 90,
     }
-    service_policy_replay = {
-        "status": "PASS",
-        "service_policy_report_path": "artifacts/reports/service_policy_replay/test.json",
-        "service_policy_report_sha256": "a" * 64,
-        "gate": {"status": "PASS"},
-        "policy_checks": {
-            "deploy_candidate_by_service_policy": True,
-            "no_naked_short_exposure": True,
-            "order_caps_respected": True,
-            "cash_guard_respected": True,
-        },
-        "order_stats": {"naked_short_attempts": 0},
-    }
+    service_policy_replay = _valid_service_policy_evidence(tmp_path, "BUNDLE-TEST")
 
     class _MockBacktestAgent:
         def run(self, bundle_id):
@@ -485,7 +519,37 @@ def test_stage_7_blocks_when_c12_deploy_evidence_missing(scheduler, monkeypatch)
     assert result["missing_evidence"] == ["feature_quality", "service_policy_replay"]
 
 
-def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypatch):
+def test_stage_7_blocks_invalid_service_policy_evidence_before_deployer(scheduler, monkeypatch):
+    """service-policy evidence가 C12 PASS 형태가 아니면 deployer 호출 전 차단한다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    class _MockDeployer:
+        def deploy(self, **kwargs):
+            _ = kwargs
+            raise AssertionError("deploy should not be called with invalid service-policy evidence")
+
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._current_verdict = "pass"
+    scheduler._current_sanity_check_result = "ok"
+    scheduler._current_regression_risk = {"flagged": False, "severity": "low", "evidence": []}
+    scheduler._current_feature_quality = {
+        "dual_source_rows": 100,
+        "dual_source_non_neutral_rows": 90,
+        "exogenous_rows": 100,
+        "exogenous_non_neutral_rows": 90,
+    }
+    scheduler._current_service_policy_evidence = {"status": "PASS"}
+    scheduler._deployer = _MockDeployer()
+
+    result = scheduler.stage_7_deploy()
+
+    assert result["deploy_status"] == "blocked"
+    assert result["deploy_result"] == "service_policy_gate_failed"
+    assert result["error"] == "service_policy_gate_failed"
+    assert "service_policy_report_path_missing" in result["service_policy_blockers"]
+
+
+def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypatch, tmp_path):
     """deployer 주입 후 NotImplementedError는 not_configured와 구분한다."""
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
 
@@ -504,7 +568,10 @@ def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypa
         "exogenous_rows": 100,
         "exogenous_non_neutral_rows": 90,
     }
-    scheduler._current_service_policy_evidence = {"status": "PASS"}
+    scheduler._current_service_policy_evidence = _valid_service_policy_evidence(
+        tmp_path,
+        "BUNDLE-TEST",
+    )
     scheduler._deployer = _MockDeployer()
 
     result = scheduler.stage_7_deploy()
@@ -513,6 +580,69 @@ def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypa
     assert result["deploy_result"] == "deployer_not_implemented"
     assert result["error"] == "deployer_not_implemented"
     assert result["error_detail"] == "deploy pending"
+
+
+def test_stage_7_reports_deploy_blocked_reason(scheduler, monkeypatch, tmp_path):
+    """ModeBDeployer DeployBlocked 예외는 generic failure 대신 blocked reason으로 노출한다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    from src.mode_b.deployer import DeployBlocked
+
+    class _MockDeployer:
+        def deploy(self, **kwargs):
+            _ = kwargs
+            raise DeployBlocked("feature_quality_gate_failed", "dual source coverage low")
+
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._current_verdict = "pass"
+    scheduler._current_sanity_check_result = "ok"
+    scheduler._current_regression_risk = {"flagged": False, "severity": "low", "evidence": []}
+    scheduler._current_feature_quality = {
+        "dual_source_rows": 100,
+        "dual_source_non_neutral_rows": 90,
+        "exogenous_rows": 100,
+        "exogenous_non_neutral_rows": 90,
+    }
+    scheduler._current_service_policy_evidence = _valid_service_policy_evidence(
+        tmp_path,
+        "BUNDLE-TEST",
+    )
+    scheduler._deployer = _MockDeployer()
+
+    result = scheduler.stage_7_deploy()
+
+    assert result["deploy_status"] == "blocked"
+    assert result["deploy_result"] == "feature_quality_gate_failed"
+    assert result["error"] == "feature_quality_gate_failed"
+    assert "dual source coverage low" in result["error_detail"]
+
+
+def test_fail_verdict_transitions_back_to_idle(scheduler, mock_state_machine, monkeypatch):
+    """verdict=fail 경로도 MODE_B_BLOCKED 이후 MODE_B_IDLE로 닫는다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    _install_fast_candidate_stages(scheduler, factor_candidates=["f1"])
+
+    def _fail_s6():
+        return {
+            "status": "ok",
+            "verdict": "fail",
+            "regression_severity": "high",
+            "critical_alert": True,
+        }
+
+    scheduler.stage_6_backtest_validation = _fail_s6
+
+    result = scheduler.run_pipeline(date="2026-04-27")
+
+    assert result["verdict"] == "fail"
+    assert result["pipeline_status"] == "blocked"
+    assert result["deploy_status"] == "skipped"
+
+    from src.ops.state_machine import PipelineState
+
+    calls = [call.args[0] for call in mock_state_machine.transition.call_args_list]
+    assert PipelineState.MODE_B_BLOCKED in calls
+    assert calls[-1] == PipelineState.MODE_B_IDLE
 
 
 # --------------------------------------------------------------------------- #

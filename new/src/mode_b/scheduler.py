@@ -16,6 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.ops.state_machine import PipelineState, StateMachine
+from src.mode_b.service_policy_verifier import verify_service_policy_evidence
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_bundle_id
 from src.utils.logger import get_logger
@@ -140,6 +141,25 @@ class ModeBScheduler:
                 "verdict": "blocked_dqr_critical",
                 "dqr_alerts": s0.get("alerts", []),
             }
+        if (
+            s0.get("status") == "skipped"
+            and s0.get("reason") in {"weekend", "holiday"}
+        ):
+            logger.info(
+                "[mode_b_scheduler] 비거래일 DQR skip 감지. Mode B 후속 stage 생략: %s",
+                s0.get("reason"),
+            )
+            self._transition(PipelineState.MODE_B_IDLE)
+            return {
+                "bundle_id": self._bundle_id,
+                "date": date_str,
+                "stages": [s0],
+                "verdict": "skipped_non_trading_day",
+                "pipeline_status": "skipped",
+                "deploy_status": "skipped",
+                "deploy_result": "skipped_non_trading_day",
+                "skip_reason": s0.get("reason"),
+            }
 
         # Stage 1~5 (EVOLVING phase)
         s1 = self._run_stage(
@@ -254,8 +274,8 @@ class ModeBScheduler:
         deploy_status = self._classify_deploy_status(s7)
         pipeline_status = self._classify_pipeline_status(verdict, s6, s7, deploy_status)
 
-        # → IDLE
-        if verdict in ("pass", "blocked"):
+        # → IDLE. warn은 operator review 상태로 남기고, pass/fail/blocked는 닫는다.
+        if pipeline_status != "awaiting_operator_approval":
             self._transition(PipelineState.MODE_B_IDLE)
 
         result = {
@@ -790,9 +810,24 @@ class ModeBScheduler:
                     "error": "c12_deploy_evidence_missing",
                 }
             try:
-                from src.mode_b.deployer import RegressionRisk
+                from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
                 risk = self._current_regression_risk or {}
+                policy_verification = verify_service_policy_evidence(
+                    self._current_service_policy_evidence,
+                    bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
+                )
+                if not policy_verification.passed:
+                    return {
+                        "status": "blocked",
+                        "deploy_status": "blocked",
+                        "deploy_result": "service_policy_gate_failed",
+                        "bundle_id": self._bundle_id,
+                        "service_policy_blockers": policy_verification.blockers,
+                        "sanity_check_result": self._current_sanity_check_result,
+                        "regression_risk": self._current_regression_risk or {},
+                        "error": "service_policy_gate_failed",
+                    }
                 return self._deployer.deploy(
                     bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
                     backtest_verdict=self._current_verdict or "fail",
@@ -814,6 +849,17 @@ class ModeBScheduler:
                     "sanity_check_result": self._current_sanity_check_result,
                     "regression_risk": self._current_regression_risk or {},
                     "error": "deployer_not_implemented",
+                    "error_detail": str(e),
+                }
+            except DeployBlocked as e:
+                return {
+                    "status": "blocked",
+                    "deploy_status": "blocked",
+                    "deploy_result": e.reason,
+                    "bundle_id": self._bundle_id,
+                    "sanity_check_result": self._current_sanity_check_result,
+                    "regression_risk": self._current_regression_risk or {},
+                    "error": e.reason,
                     "error_detail": str(e),
                 }
         return {
@@ -852,6 +898,8 @@ class ModeBScheduler:
         deploy_status: str,
     ) -> str:
         """C12 verdict와 C14 deploy 결과를 분리해 top-level 실행 상태를 반환."""
+        if deploy_status == "blocked":
+            return "blocked"
         if stage_6.get("error") or stage_7.get("error"):
             return "failed"
         if verdict == "warn" or deploy_status == "awaiting_operator_approval":
