@@ -189,6 +189,16 @@ def test_join_exogenous_features_reads_daily_artifact(
     exog_dir.mkdir()
     payload = {
         "batch_date": "2026-05-08",
+        "snapshot_ts": "2026-05-08T08:30:00+09:00",
+        "source_stats": {
+            "input_mode": "real",
+            "provider_availability": {
+                "us_market_real": True,
+                "ecos_real": True,
+                "kis_investor_real": True,
+            },
+            "us_market_source": "yfinance",
+        },
         "features": {
             "us_sp500_change": 0.012,
             "us_vix": 18.5,
@@ -264,6 +274,41 @@ def test_join_exogenous_features_rejects_rehearsal_artifact(
     ).set_index(["ticker", "ts_close"])
 
     with pytest.raises(DatasetBuildError, match="exogenous_neutral_rehearsal_artifact"):
+        builder._join_exogenous_features(frame)
+
+
+def test_join_exogenous_features_rejects_missing_provenance(
+    builder: DatasetBuilder,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """exogenous artifact가 source_stats 없이 있으면 학습 join을 중단한다."""
+    exog_dir = tmp_path / "exogenous"
+    exog_dir.mkdir()
+    payload = {
+        "batch_date": "2026-05-08",
+        "snapshot_ts": "2026-05-08T08:30:00+09:00",
+        "features": {"us_sp500_change": 0.012},
+    }
+    (exog_dir / "20260508.json").write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dataset_builder_module,
+        "DEFAULT_EXOGENOUS_ARTIFACT_DIR",
+        exog_dir,
+    )
+
+    frame = pd.DataFrame(
+        {
+            "ticker": ["005930"],
+            "ts_close": pd.to_datetime(["2026-05-08T09:00:00+09:00"]),
+            "close": [70000.0],
+        }
+    ).set_index(["ticker", "ts_close"])
+
+    with pytest.raises(DatasetBuildError, match="exogenous_provenance_missing"):
         builder._join_exogenous_features(frame)
 
 
@@ -828,6 +873,8 @@ def test_dual_source_join_vectorized_result(tmp_path: Path) -> None:
     mock_scores = [
         {
             "ticker": "005930",
+            "snapshot_ts": "2026-04-20T08:30:00+09:00",
+            "source_stats": {"input_mode": "archived_raw_events"},
             "news_score_t": 0.5,
             "comm_score_t_1": 0.3,
             "comm_score_t_2": 0.1,
@@ -872,7 +919,7 @@ def test_dual_source_join_rejects_future_snapshot(tmp_path: Path) -> None:
     mock_scores = [{
         "ticker": "005930",
         "snapshot_ts": "2026-04-20T10:00:00+09:00",
-        "source_stats": {"input_mode": "real"},
+        "source_stats": {"input_mode": "archived_raw_events"},
         "news_score_t": 0.5,
         "comm_score_t_1": 0.3,
         "comm_score_t_2": 0.1,
@@ -937,6 +984,8 @@ def test_dual_source_join_missing_rows_use_multiplier_neutral(tmp_path: Path) ->
 
     mock_scores = [{
         "ticker": "005930",
+        "snapshot_ts": "2026-04-20T08:30:00+09:00",
+        "source_stats": {"input_mode": "archived_raw_events"},
         "news_score_t": 0.0,
         "comm_score_t_1": 0.0,
         "comm_score_t_2": 0.0,
@@ -950,3 +999,39 @@ def test_dual_source_join_missing_rows_use_multiplier_neutral(tmp_path: Path) ->
     missing_rows = result.loc["000660"]
     assert (missing_rows["community_noise_multiplier"] == 1.0).all()
     assert result.attrs["dual_source_join_stats"]["rows_non_neutral"] == 0
+
+
+def test_dual_source_join_rejects_missing_provenance(tmp_path: Path) -> None:
+    """Dual-Source score가 provenance 없이 들어오면 학습 join을 중단한다."""
+    from unittest.mock import patch
+
+    b = DatasetBuilder(artifacts_dir=tmp_path)
+    b._ds_enabled_for_lgbm = True
+    ts = pd.date_range("2026-04-20 09:00:00+09:00", periods=1, freq="1min")
+    idx = pd.MultiIndex.from_tuples([("005930", ts[0])], names=["ticker", "ts_close"])
+    panel = pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.0],
+            "volume": [1000.0],
+            "label_5m_ret": [0.01],
+            "cs_rank": [0.5],
+            "relevance": [1.0],
+        },
+        index=idx,
+    )
+    mock_scores = [{
+        "ticker": "005930",
+        "snapshot_ts": "2026-04-20T08:30:00+09:00",
+        "news_score_t": 0.0,
+        "comm_score_t_1": 0.0,
+        "comm_score_t_2": 0.0,
+        "news_comm_divergence": 0.0,
+        "community_noise_multiplier": 1.0,
+    }]
+
+    with patch("src.data.dataset_builder.load_latest_scores", return_value=mock_scores):
+        with pytest.raises(DatasetBuildError, match="dual_source_provenance_missing"):
+            b._join_dual_source_features(panel, "20260420", "20260420")

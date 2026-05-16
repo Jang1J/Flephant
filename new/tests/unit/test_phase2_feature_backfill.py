@@ -411,3 +411,84 @@ def test_phase2_blocks_mock_dual_source_artifact_even_with_full_coverage(
     assert report["per_date"][0]["dual_source_artifact_blockers"] == [
         "dual_source_non_real_input_mode"
     ]
+
+
+def test_dual_source_blockers_accept_archived_raw_events():
+    mod = _load_script("phase2_feature_backfill")
+    blockers = mod._dual_source_artifact_blockers({
+        "source_stats": {
+            "input_mode": "archived_raw_events",
+            "neutral_rehearsal_file": False,
+        }
+    })
+
+    assert blockers == []
+
+
+def test_phase2_blocks_exogenous_artifact_missing_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    tickers = ["005930"]
+
+    _write_jsonl(artifacts / "005930" / "bars_1m_20260515.jsonl", 301)
+
+    monkeypatch.setattr(mod, "_active_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        mod,
+        "_expected_artifact_dates",
+        lambda *, end_date, business_days: ["20260515"],
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "phase2_feature_backfill":
+            return {
+                "min_rows_per_day": 300,
+                "min_dual_source_non_neutral_date_coverage": 0.0,
+                "min_exogenous_non_neutral_date_coverage": 0.0,
+            }
+        if key == "live_data_readiness":
+            return {"train_min_rows_per_day": 300}
+        if key == "exogenous_features":
+            return {"neutral_defaults": {}}
+        return {}
+
+    exog_feature = mod.EXOGENOUS_FEATURES[0]
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(
+        mod,
+        "load_latest_scores",
+        lambda date_key: [{
+            "ticker": "005930",
+            "news_score_t": 0.1,
+            "source_stats": {"input_mode": "archived_raw_events"},
+        }],
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_exogenous_scores",
+        lambda date_key, feature_cols, defaults: (
+            {"005930": {exog_feature: 1.0}},
+            {
+                "status": "found",
+                "record_count": 1,
+                "source_stats": {},
+            },
+        ),
+    )
+
+    report = mod.run_phase2_feature_backfill(
+        end_date="20260515",
+        business_days=1,
+        write_neutral_placeholders=False,
+        artifacts_dir=artifacts,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "exogenous_provenance_missing" in report["blockers"]
+    assert report["per_date"][0]["exogenous_artifact_blockers"] == [
+        "exogenous_provenance_missing"
+    ]

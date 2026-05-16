@@ -81,6 +81,7 @@ EXOGENOUS_FEATURES: tuple[str, ...] = (
 logger = get_logger("dataset_builder")
 
 _KST = ZoneInfo("Asia/Seoul")
+_ALLOWED_DUAL_SOURCE_INPUT_MODES = {"real", "archived_raw_events"}
 
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts" / "data"
 
@@ -415,9 +416,11 @@ class DatasetBuilder:
         market_open = self._market_open_ts(date_key)
         for item in scores_list:
             source_stats = item.get("source_stats")
-            if isinstance(source_stats, dict):
+            if not isinstance(source_stats, dict) or not source_stats:
+                blockers.add("dual_source_provenance_missing")
+            else:
                 input_mode = str(source_stats.get("input_mode", "")).strip().lower()
-                if input_mode and input_mode != "real":
+                if input_mode not in _ALLOWED_DUAL_SOURCE_INPUT_MODES:
                     blockers.add("dual_source_non_real_input_mode")
                 if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
                     blockers.add("dual_source_neutral_rehearsal_artifact")
@@ -431,7 +434,9 @@ class DatasetBuilder:
     def _exogenous_artifact_blockers(self, date_key: str, stats: dict[str, Any]) -> list[str]:
         blockers: set[str] = set()
         source_stats = stats.get("source_stats")
-        if isinstance(source_stats, dict):
+        if not isinstance(source_stats, dict) or not source_stats:
+            blockers.add("exogenous_provenance_missing")
+        else:
             input_mode = str(source_stats.get("input_mode", "")).strip().lower()
             if input_mode and input_mode != "real":
                 blockers.add("exogenous_non_real_input_mode")

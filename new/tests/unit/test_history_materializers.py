@@ -71,6 +71,67 @@ def test_agent_memory_dual_source_export_is_rehearsal_only(tmp_path):
     assert materialize_report["per_date"][0]["status"] == "NON_DEPLOY_QUALITY_RAW_EVENTS"
 
 
+def test_dual_source_history_blocks_missing_deploy_quality_provenance(tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "20260508.json").write_text(
+        json.dumps({
+            "events": [{
+                "ticker": "005930",
+                "event_ts": "2026-05-08T08:00:00+09:00",
+                "source": "news",
+                "title": "실적 호조",
+            }],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=raw_dir,
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["files_written"] == []
+    assert "non_deploy_quality_raw_events" in report["blockers"]
+    assert report["per_date"][0]["status"] == "NON_DEPLOY_QUALITY_RAW_EVENTS"
+
+
+def test_dual_source_history_blocks_missing_event_timestamp(monkeypatch, tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "20260508.json").write_text(
+        json.dumps({
+            "provenance": {"deploy_quality": True},
+            "events": [{
+                "ticker": "005930",
+                "source": "news",
+                "title": "실적 호조",
+            }],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "_load_active_universe", lambda: [{"ticker": "005930"}])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=raw_dir,
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["files_written"] == []
+    assert report["per_date"][0]["status"] == "ERROR"
+    assert "missing required timestamp" in report["per_date"][0]["error"]
+
+
 def test_dual_source_history_uses_sector_and_market_fallback(monkeypatch, tmp_path):
     mod = _load_script("materialize_dual_source_history")
     raw_dir = tmp_path / "raw"
@@ -469,3 +530,47 @@ def test_exogenous_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_
     assert report["coverage"]["exogenous_non_neutral_date_coverage"] == 0.5
     assert report["coverage"]["min_exogenous_non_neutral_date_coverage"] == 0.4
     assert report["coverage"]["written_date_count"] == 1
+
+
+def test_exogenous_history_blocks_future_us_market_asof(monkeypatch, tmp_path):
+    mod = _load_script("materialize_exogenous_history")
+
+    class DummyUS:
+        _is_mock = False
+
+        def get_indices(self, as_of):
+            return SimpleNamespace(
+                us_sp500_change=0.01,
+                us_nasdaq_change=0.0,
+                us_vix=18.5,
+                us_soxx_change=0.0,
+                source="yfinance",
+                as_of_date="2026-05-08",
+            )
+
+    class DummyECOS:
+        _is_mock = False
+
+        def get_macro_pack(self, date_key):
+            return {"interest_rate": 3.5, "usd_krw": 1350.0}
+
+    class DummyKRX:
+        def _has_kis_investor_provider(self):
+            return True
+
+    monkeypatch.setattr(mod, "USMarketClient", lambda: DummyUS())
+    monkeypatch.setattr(mod, "ECOSRestClient", lambda: DummyECOS())
+    monkeypatch.setattr(mod, "KRXRestClient", lambda: DummyKRX())
+    monkeypatch.setattr(mod, "_active_tickers", lambda: ["005930"])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+
+    report = mod.materialize_exogenous_history(
+        end_date="20260508",
+        business_days=1,
+        artifact_dir=tmp_path / "exogenous",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "us_market_as_of_after_expected_close" in report["blockers"]
+    assert not (tmp_path / "exogenous" / "20260508.json").exists()

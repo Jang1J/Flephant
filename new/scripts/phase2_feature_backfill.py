@@ -42,6 +42,7 @@ _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
 _DUAL_SOURCE_DIR = SRC / "artifacts" / "dual_source"
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "phase2_feature_backfill"
+_ALLOWED_DUAL_SOURCE_INPUT_MODES = {"real", "archived_raw_events"}
 
 
 def _active_tickers() -> list[str]:
@@ -292,12 +293,38 @@ def _dual_source_artifact_blockers(payload: dict[str, Any]) -> list[str]:
 
     blockers: list[str] = []
     input_mode = str(source_stats.get("input_mode", "")).strip().lower()
-    if input_mode and input_mode != "real":
+    if input_mode not in _ALLOWED_DUAL_SOURCE_INPUT_MODES:
         blockers.append("dual_source_non_real_input_mode")
     if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
         blockers.append("dual_source_neutral_rehearsal_artifact")
     if safe_bool(source_stats.get("payload_read_error"), default=False):
         blockers.append("dual_source_payload_read_error")
+    return blockers
+
+
+def _exogenous_artifact_blockers(stats: dict[str, Any]) -> list[str]:
+    if stats.get("status") != "found":
+        return []
+    if "source_stats" not in stats:
+        return []
+    source_stats = stats.get("source_stats")
+    if not isinstance(source_stats, dict) or not source_stats:
+        return ["exogenous_provenance_missing"]
+
+    blockers: list[str] = []
+    input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+    if input_mode and input_mode != "real":
+        blockers.append("exogenous_non_real_input_mode")
+    if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+        blockers.append("exogenous_neutral_rehearsal_artifact")
+    provider_availability = source_stats.get("provider_availability")
+    if isinstance(provider_availability, dict) and any(
+        not bool(value) for value in provider_availability.values()
+    ):
+        blockers.append("exogenous_provider_unavailable")
+    us_source = source_stats.get("us_market_source")
+    if us_source and str(us_source) != "yfinance":
+        blockers.append("exogenous_us_market_source_not_yfinance")
     return blockers
 
 
@@ -398,6 +425,7 @@ def run_phase2_feature_backfill(
             defaults=defaults,
         )
         exog_found = exog_stats["status"] == "found"
+        exog_artifact_blockers = _exogenous_artifact_blockers(exog_stats)
         exog_non_neutral = any(is_non_neutral(values, defaults) for values in exog_scores.values())
         exog_tickers = _exogenous_tickers(exog_scores) & expected_ticker_set
         exog_non_neutral_tickers = (
@@ -417,9 +445,13 @@ def run_phase2_feature_backfill(
                 feature_cols=list(EXOGENOUS_FEATURES),
                 defaults=defaults,
             )
+            exog_artifact_blockers = _exogenous_artifact_blockers(exog_stats)
             exog_found = True
             exog_non_neutral = False
             exog_tickers = _exogenous_tickers(exog_scores) & expected_ticker_set
+            exog_non_neutral_tickers = set()
+        if exog_artifact_blockers:
+            exog_non_neutral = False
             exog_non_neutral_tickers = set()
         exogenous_found += int(exog_found)
         exogenous_non_neutral += int(exog_non_neutral)
@@ -440,6 +472,7 @@ def run_phase2_feature_backfill(
             "dual_source_non_neutral_ticker_count": len(ds_non_neutral_tickers),
             "exogenous_found": exog_found,
             "exogenous_non_neutral": exog_non_neutral,
+            "exogenous_artifact_blockers": exog_artifact_blockers,
             "exogenous_record_count": int(exog_stats.get("record_count", 0)),
             "exogenous_ticker_count": len(exog_tickers),
             "exogenous_missing_tickers_sample": sorted(
@@ -479,6 +512,12 @@ def run_phase2_feature_backfill(
         for blocker in item.get("dual_source_artifact_blockers", [])
     })
     blockers.extend(dual_source_artifact_blockers)
+    exogenous_artifact_blockers = sorted({
+        blocker
+        for item in per_date
+        for blocker in item.get("exogenous_artifact_blockers", [])
+    })
+    blockers.extend(exogenous_artifact_blockers)
     if missing_artifact_dates:
         blockers.append("kis_1m_artifact_date_coverage_below_threshold")
     if dual_source_ticker_coverage < 1.0:

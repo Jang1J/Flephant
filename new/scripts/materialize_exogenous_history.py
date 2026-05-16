@@ -135,7 +135,8 @@ def _collect_global_features(
     us_client: USMarketClient,
     ecos_client: ECOSRestClient,
 ) -> tuple[dict[str, float], dict[str, Any]]:
-    as_of_dash = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+    expected_us_date = previous_kospi_trading_day(_parse_date(date_key).date())
+    as_of_dash = expected_us_date.isoformat()
     us = us_client.get_indices(as_of=as_of_dash)
     macro = ecos_client.get_macro_pack(date_key)
     features = {
@@ -149,6 +150,7 @@ def _collect_global_features(
     return features, {
         "us_market_source": us.source,
         "us_market_as_of_date": us.as_of_date,
+        "us_market_expected_as_of_date": as_of_dash,
         "ecos_macro_pack_date": date_key,
     }
 
@@ -317,6 +319,23 @@ def materialize_exogenous_history(
                 )
                 if str(global_stats.get("us_market_source")) != "yfinance":
                     blocker = "us_market_source_not_yfinance"
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                    per_date.append({
+                        "date": date_key,
+                        "status": "BLOCKED",
+                        "reason": blocker,
+                        "artifact_written": False,
+                        "non_neutral": False,
+                        "source_stats": global_stats,
+                    })
+                    continue
+                actual_us_date = _normalize_date_key(global_stats.get("us_market_as_of_date"))
+                expected_us_date = _normalize_date_key(
+                    global_stats.get("us_market_expected_as_of_date")
+                )
+                if actual_us_date and expected_us_date and actual_us_date > expected_us_date:
+                    blocker = "us_market_as_of_after_expected_close"
                     if blocker not in blockers:
                         blockers.append(blocker)
                     per_date.append({
