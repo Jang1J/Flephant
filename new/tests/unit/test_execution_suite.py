@@ -148,8 +148,30 @@ def _final_decision(approved: bool, order_deltas: list[dict] | None = None) -> d
     }
 
 
+def _execution_universe_config() -> dict:
+    return {
+        "sectors": {
+            "반도체": {
+                "status": "confirmed",
+                "stocks": [
+                    {"ticker": "005930", "status": "active"},
+                    {"ticker": "000660", "status": "active"},
+                ],
+            },
+            "금융": {
+                "status": "confirmed_pending_data",
+                "stocks": [
+                    {"ticker": "105560", "status": "pending_data"},
+                ],
+            },
+        },
+    }
+
+
 def _patch_execution_config(monkeypatch, mode: str, live_enabled: bool = False) -> None:
     def fake_config_load(file_name: str, section: str):
+        if file_name == "universe_config.yaml":
+            return _execution_universe_config()
         if section == "execution":
             return {"mode": mode, "live_enabled": live_enabled}
         if section == "execution_cost_model":
@@ -290,6 +312,42 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     assert report["execution_mode"] == "paper"
     assert report["fills"][0]["broker_order_id"] == "OD-001"
     assert client.calls == [("005930", "buy", 10, 70000.0)]
+
+
+def test_execute_paper_rejects_pending_universe_ticker_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """paper 주문은 pending_data 종목을 broker submit 전에 차단한다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("pending_data ticker must not be submitted")
+
+    client = FakeKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "105560", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "order_ticker_not_active_universe: 105560" in report["rejection_reason"]
+    assert client.called is False
 
 
 def test_execute_paper_rejects_kis_error_without_status(
@@ -672,6 +730,45 @@ def test_execute_live_with_complete_approval_proof_submits(
     assert report["execution_mode"] == "live"
     assert report["fills"][0]["broker_order_id"] == "OD-LIVE"
     assert client.calls == [("005930", "buy", 1, 70000.0)]
+
+
+def test_execute_live_rejects_unknown_universe_ticker_before_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """live 주문도 active universe 밖 종목은 approval proof가 있어도 broker 호출 금지."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("unknown ticker must not be submitted")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "999999", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "order_ticker_not_active_universe: 999999" in report["rejection_reason"]
+    assert client.called is False
 
 
 def test_execute_live_rejects_missing_kill_switch_even_with_complete_proof(

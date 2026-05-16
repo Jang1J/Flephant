@@ -92,6 +92,7 @@ class ExecutionGateway:
         self._audit_logger = audit_logger
         self._kis_client = kis_client
         self._live_approval_proof: dict[str, Any] = dict(live_approval_proof or {})
+        self._active_trade_universe: set[str] | None = None
 
         logger.info(
             "[execution_gateway] 초기화: mode=%s, live_enabled=%s, "
@@ -159,6 +160,16 @@ class ExecutionGateway:
                 order_plan_id,
                 decision_id,
                 "no_order_deltas",
+                order_deltas,
+                t0,
+            )
+
+        active_universe_rejection = self._active_universe_rejection(order_deltas)
+        if active_universe_rejection:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                active_universe_rejection,
                 order_deltas,
                 t0,
             )
@@ -417,6 +428,60 @@ class ExecutionGateway:
         if missing:
             return "live_approval_missing: " + ",".join(missing)
         return None
+
+    def _active_universe_rejection(self, order_deltas: list[dict[str, Any]]) -> str | None:
+        """paper/live broker 주문은 active trade universe 안에서만 허용한다."""
+        if self._mode not in {"paper", "live"}:
+            return None
+        active_universe = self._get_active_trade_universe()
+        if not active_universe:
+            return "active_trade_universe_empty. paper/live 주문 차단."
+        blocked_tickers = sorted({
+            str(order_delta.get("ticker", "")).strip()
+            for order_delta in order_deltas
+            if str(order_delta.get("ticker", "")).strip() not in active_universe
+        })
+        if blocked_tickers:
+            return (
+                "order_ticker_not_active_universe: "
+                + ",".join(blocked_tickers)
+            )
+        return None
+
+    def _get_active_trade_universe(self) -> set[str]:
+        if self._active_trade_universe is None:
+            self._active_trade_universe = self._load_active_trade_universe()
+        return self._active_trade_universe
+
+    @staticmethod
+    def _load_active_trade_universe() -> set[str]:
+        """Load active-only order universe from universe_config.yaml."""
+        try:
+            universe_cfg = config_load("universe_config.yaml", None) or {}
+        except TypeError:
+            universe_cfg = config_load("universe_config.yaml") or {}
+        except Exception as e:
+            logger.warning("[execution_gateway] active universe 로드 실패: %s", e)
+            return set()
+
+        active: set[str] = set()
+        sectors = universe_cfg.get("sectors") or {}
+        if not isinstance(sectors, dict):
+            return active
+        for sector in sectors.values():
+            if not isinstance(sector, dict):
+                continue
+            if str(sector.get("status", "")).strip() != "confirmed":
+                continue
+            for stock in sector.get("stocks") or []:
+                if not isinstance(stock, dict):
+                    continue
+                if str(stock.get("status", "")).strip() != "active":
+                    continue
+                ticker = pad_ticker(str(stock.get("ticker", "")))
+                if ticker != "000000" and is_valid_ticker(ticker):
+                    active.add(ticker)
+        return active
 
     def _execute_broker(
         self,
