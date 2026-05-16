@@ -32,6 +32,7 @@ from src.data.exogenous_feature_store import (  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
+from scripts.live_data_readiness import _inspect_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
@@ -89,27 +90,21 @@ def _extract_date(path: Path) -> str | None:
     return match.group(1)
 
 
-def _artifact_row_count(path: Path) -> int | None:
-    try:
-        if path.suffix == ".parquet":
-            import pandas as pd  # type: ignore[import]
-
-            return int(len(pd.read_parquet(path)))
-        if path.suffix == ".jsonl":
-            with path.open("r", encoding="utf-8") as fh:
-                return sum(1 for line in fh if line.strip())
-    except Exception:
-        return None
-    return None
-
-
-def _valid_bar_artifact(path: Path, min_rows: int) -> bool:
+def _valid_bar_artifact(path: Path, *, date_key: str, ticker: str, min_rows: int) -> bool:
     if not path.name.startswith("bars_1m_"):
         return False
     if path.suffix not in {".parquet", ".jsonl"}:
         return False
-    row_count = _artifact_row_count(path)
-    return row_count is not None and row_count >= min_rows
+    inspection = _inspect_bar_file(path, date_key, pad_ticker(ticker))
+    rows = inspection.get("rows")
+    return (
+        rows is not None
+        and int(rows) >= min_rows
+        and inspection.get("timestamp_dates_match") is True
+        and inspection.get("ticker_matches") is True
+        and int(inspection.get("duplicate_ts_count") or 0) == 0
+        and int(inspection.get("out_of_hours_count") or 0) == 0
+    )
 
 
 def _common_artifact_dates(
@@ -126,7 +121,12 @@ def _common_artifact_dates(
         seen: set[str] = set()
         for path in ticker_dir.iterdir():
             date_key = _extract_date(path)
-            if date_key and _valid_bar_artifact(path, min_rows):
+            if date_key and _valid_bar_artifact(
+                path,
+                date_key=date_key,
+                ticker=ticker,
+                min_rows=min_rows,
+            ):
                 seen.add(date_key)
         for date_key in seen:
             counts[date_key] = counts.get(date_key, 0) + 1

@@ -36,7 +36,7 @@ from src.connectors.naver_rest import NaverNewsClient  # noqa: E402
 from src.connectors.us_market import USMarketClient  # noqa: E402
 from src.data.backfill import Backfill  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -715,10 +715,17 @@ def run_backfill(
         cfg = _readiness_cfg()
         min_rows = _readiness_min_rows("min_rows_per_day")
         require_all = safe_bool(cfg.get("require_all_tickers_for_backfill", True), default=True)
+        max_failed_dates = safe_int(
+            cfg.get("max_consecutive_backfill_failed_dates", 3),
+            default=3,
+            min_value=1,
+        )
         backfill = Backfill()
         counts = {pad_ticker(ticker): 0 for ticker in tickers}
         fetch_counts_by_date: dict[str, dict[str, int]] = {}
         skipped_existing_dates: list[str] = []
+        consecutive_failed_dates = 0
+        circuit_breaker: dict[str, Any] = {"triggered": False}
         start = datetime.strptime(start_date, "%Y%m%d").date()
         end = datetime.strptime(end_date, "%Y%m%d").date()
         business_dates = _business_dates_between(start, end)
@@ -756,6 +763,21 @@ def run_backfill(
             }
             for ticker, count in day_counts.items():
                 counts[pad_ticker(ticker)] = counts.get(pad_ticker(ticker), 0) + count
+            failed_today = (
+                all(int(fetch_counts_by_date[day].get(pad_ticker(ticker), 0)) < min_rows for ticker in tickers)
+                if require_all
+                else all(int(count) <= 0 for count in fetch_counts_by_date[day].values())
+            )
+            consecutive_failed_dates = consecutive_failed_dates + 1 if failed_today else 0
+            if consecutive_failed_dates >= max_failed_dates:
+                circuit_breaker = {
+                    "triggered": True,
+                    "date": day,
+                    "consecutive_failed_dates": consecutive_failed_dates,
+                    "max_consecutive_backfill_failed_dates": max_failed_dates,
+                    "min_rows_per_day": min_rows,
+                }
+                break
         files = _saved_file_summary(tickers, start_date, end_date, min_rows)
         artifact_missing_or_empty: list[str] = []
         current_fetch_missing_or_short: list[dict[str, Any]] = []
@@ -784,6 +806,7 @@ def run_backfill(
                 "files": files,
                 "missing_or_empty_tickers": artifact_missing_or_empty,
                 "current_fetch_missing_or_short": current_fetch_missing_or_short,
+                "backfill_circuit_breaker": circuit_breaker,
             },
         )
     except Exception as e:

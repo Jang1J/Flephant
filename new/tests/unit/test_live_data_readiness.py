@@ -263,6 +263,54 @@ def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_pat
     assert first["duplicate_ts_count"] == 300
 
 
+def test_run_backfill_trips_circuit_breaker_after_repeated_empty_fetches(
+    monkeypatch,
+    tmp_path,
+):
+    """KIS 반복 실패가 모든 날짜를 끝까지 소모하지 않고 backfill stage를 멈춘다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness,
+        "_business_dates_between",
+        lambda start, end: ["20260511", "20260512", "20260513", "20260514"],
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    class FakeBackfill:
+        def backfill_universe(self, tickers, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {ticker: 0 for ticker in tickers}
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "min_rows_per_day": 300,
+                "require_all_tickers_for_backfill": True,
+                "max_consecutive_backfill_failed_dates": 2,
+            }
+        if section == "walk_forward":
+            return {"trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "Backfill", lambda: FakeBackfill())
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_backfill(
+        ["005930", "000660"],
+        "20260511",
+        "20260514",
+    )
+
+    assert result["status"] == "FAIL"
+    assert calls == [("20260511", "20260511"), ("20260512", "20260512")]
+    breaker = result["backfill_circuit_breaker"]
+    assert breaker["triggered"] is True
+    assert breaker["date"] == "20260512"
+    assert breaker["consecutive_failed_dates"] == 2
+
+
 def test_artifact_date_quality_rejects_duplicate_date_artifacts(monkeypatch, tmp_path):
     """같은 ticker/date에 jsonl과 parquet가 같이 있으면 중복 artifact로 막는다."""
     readiness = _load_script_module()

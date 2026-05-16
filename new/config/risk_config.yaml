@@ -804,6 +804,7 @@ live_data_readiness:
   train_min_rows_per_day: 300       # LightGBM real artifact 날짜 인정 최소 row 수
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
+  max_consecutive_backfill_failed_dates: 3
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"

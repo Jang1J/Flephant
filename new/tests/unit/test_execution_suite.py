@@ -11,10 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from src.execution.execution_gateway import (
-    ExecutionDependencyError,
-    ExecutionGateway,
-)
+from src.execution.execution_gateway import ExecutionGateway
 from src.execution.kill_switch import (
     InvalidOperatorTokenError,
     KillSwitch,
@@ -156,7 +153,7 @@ def _patch_execution_config(monkeypatch, mode: str, live_enabled: bool = False) 
         if section == "execution":
             return {"mode": mode, "live_enabled": live_enabled}
         if section == "execution_cost_model":
-            return {"slippage_bps": 10}
+            return {"components": {"slippage_bps": 10}}
         return {}
 
     monkeypatch.setattr(
@@ -308,8 +305,56 @@ def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
         order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
     )
 
-    with pytest.raises(ExecutionDependencyError):
-        gw.execute(fd)
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "broker_dependency_missing" in report["rejection_reason"]
+    assert report["execution_mode"] == "paper"
+
+
+def test_execute_paper_rejects_client_without_submit_order(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class NoSubmitKISClient:
+        mode = "virtual"
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=NoSubmitKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "broker_dependency_missing" in report["rejection_reason"]
+
+
+def test_execution_gateway_reads_nested_slippage_bps(monkeypatch) -> None:
+    def fake_config_load(file_name: str, section: str):
+        if section == "execution":
+            return {"mode": "mock", "live_enabled": False}
+        if section == "execution_cost_model":
+            return {"components": {"slippage_bps": 25}}
+        return {}
+
+    monkeypatch.setattr(
+        "src.execution.execution_gateway.config_load",
+        fake_config_load,
+    )
+
+    gw = ExecutionGateway()
+
+    assert gw._slippage_bps == 25
 
 
 def test_execute_paper_rejects_malformed_numeric_fields(

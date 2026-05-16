@@ -66,7 +66,16 @@ class ExecutionGateway:
             else safe_bool(live_enabled_override, default=False)
         )
         exec_cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
-        self._slippage_bps: float = float(exec_cost_cfg.get("slippage_bps", 10))
+        exec_cost_components = exec_cost_cfg.get("components")
+        if not isinstance(exec_cost_components, dict):
+            raise ValueError("execution_cost_model.components 설정 누락")
+        self._slippage_bps = safe_float(
+            exec_cost_components.get("slippage_bps"),
+            default=-1.0,
+            min_value=0.0,
+        )
+        if self._slippage_bps < 0:
+            raise ValueError("execution_cost_model.components.slippage_bps 설정 누락")
 
         self._kill_switch = kill_switch
         self._audit_logger = audit_logger
@@ -307,7 +316,8 @@ class ExecutionGateway:
     def _broker_mode_rejection(self, expected_mode: str) -> str | None:
         """Fail closed when paper/live execution is wired to the wrong KIS mode."""
         if self._kis_client is None:
-            raise ExecutionDependencyError(
+            return (
+                "broker_dependency_missing: "
                 f"execution_mode={self._mode} requires kis_client.submit_order"
             )
         client_mode = self._broker_client_mode()
@@ -366,12 +376,20 @@ class ExecutionGateway:
         C10 계약에 맞춰 제출 성공/실패를 execution_report로 정규화한다.
         """
         if self._kis_client is None:
-            raise ExecutionDependencyError(
-                f"execution_mode={self._mode} requires kis_client.submit_order"
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                f"broker_dependency_missing: execution_mode={self._mode} requires kis_client.submit_order",
+                order_deltas,
+                t0,
             )
         if not hasattr(self._kis_client, "submit_order"):
-            raise ExecutionDependencyError(
-                "kis_client must expose submit_order(ticker, side, qty)"
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "broker_dependency_missing: kis_client must expose submit_order(ticker, side, qty)",
+                order_deltas,
+                t0,
             )
 
         now = datetime.now(tz=timezone.utc).isoformat()
