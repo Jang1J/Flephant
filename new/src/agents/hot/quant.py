@@ -216,23 +216,25 @@ class QuantAgent(AgentBase):
             for col in self._exogenous_feature_cols
             if col in features and features[col] is not None
         }
-        meta: dict[str, Any] = {}
-        if received_at is not None:
-            meta["received_at"] = self._parse_snapshot_dt(received_at)
-            meta["max_age_sec"] = (
+        meta: dict[str, Any] = {
+            "received_at": (
+                self._parse_snapshot_dt(received_at)
+                if received_at is not None
+                else datetime.now(_KST)
+            ),
+            "max_age_sec": (
                 float(max_age_sec)
                 if max_age_sec is not None
                 else float(self._investor_flow_stale_sec)
-            )
+            ),
+        }
         if ticker:
             ticker_padded = pad_ticker(str(ticker))
             self._exogenous_snapshot[ticker_padded] = clean
-            if meta:
-                self._exogenous_snapshot_meta[ticker_padded] = meta
+            self._exogenous_snapshot_meta[ticker_padded] = meta
         else:
             self._market_exogenous_snapshot.update(clean)
-            if meta:
-                self._market_exogenous_snapshot_meta = meta
+            self._market_exogenous_snapshot_meta = meta
 
     def get_investor_flow_snapshot(
         self,
@@ -724,14 +726,14 @@ class QuantAgent(AgentBase):
         return values
 
     def _exogenous_meta_usable(self, meta: dict[str, Any], asof: str | None) -> bool:
-        """Optional freshness guard for generic exogenous snapshots.
+        """Freshness guard for generic exogenous snapshots.
 
-        Legacy snapshots without `received_at` remain usable. Snapshots with explicit
-        metadata are blocked if they are from the future or older than max_age_sec.
+        Exogenous values without `received_at` provenance are blocked and fall back
+        to neutral defaults. Explicit metadata is blocked if it is future/stale.
         """
         received_at = meta.get("received_at") if isinstance(meta, dict) else None
         if received_at is None:
-            return True
+            return False
         asof_dt = self._parse_snapshot_dt(asof) if asof else datetime.now(_KST)
         raw_age_sec = (asof_dt - received_at).total_seconds()
         if raw_age_sec < 0:
