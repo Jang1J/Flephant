@@ -223,6 +223,15 @@ class HotRunner:
                 asof_dt = _parse_hot_ts(asof)
             except (TypeError, ValueError):
                 asof_dt = None
+        if bars_batch and asof_dt is None:
+            return {
+                "pipeline_state": self._sm.state.value,
+                "skipped": True,
+                "reason": "asof_required_for_bar_batch",
+                "asof": asof,
+                "n_bars_consumed": 0,
+                "bar_errors": ["asof_required_for_bar_batch"],
+            }
 
         # 1. on_bar 호출 (BarBuffer 저장, 경량)
         n_bars_consumed = 0
@@ -252,12 +261,39 @@ class HotRunner:
 
         # 3. PPOAllocator (S4-4 stage timer)
         t_ppo = self._profiler.start_stage("ppo")
-        allocation = self._ppo.allocate(
-            quant_output=quant_output,
-            current_positions=current_positions,
-            market_state=market_state,
+        ppo_guard_warnings: list[dict[str, Any]] = []
+        try:
+            allocation = self._ppo.allocate(
+                quant_output=quant_output,
+                current_positions=current_positions,
+                market_state=market_state,
+            )
+        except Exception as e:
+            allocation = {
+                "allocation_plan": {"target_weights": {}},
+                "status": "BLOCKED",
+                "error": str(e),
+            }
+            ppo_guard_warnings.append({
+                "agent": "PPOAllocator",
+                "severity": "high",
+                "reason_code": "PPO_ALLOCATOR_ERROR",
+                "message": str(e),
+            })
+        allocation_plan = allocation.get("allocation_plan") if isinstance(allocation, dict) else {}
+        target_weights = (
+            allocation_plan.get("target_weights")
+            if isinstance(allocation_plan, dict)
+            else None
         )
-        target_weights = allocation["allocation_plan"]["target_weights"]
+        if not isinstance(target_weights, dict):
+            ppo_guard_warnings.append({
+                "agent": "PPOAllocator",
+                "severity": "high",
+                "reason_code": "PPO_ALLOCATION_PLAN_INVALID",
+                "message": "allocation_plan.target_weights missing",
+            })
+            target_weights = {}
         ppo_ms = self._profiler.end_stage("ppo", t_ppo)
 
         # 4. PortfolioManager (anomaly tickers = cold_path_exits, S4-4 stage timer)
@@ -304,6 +340,7 @@ class HotRunner:
 
         # 6. FDA Hot Path (risk_fast_eval 전달, S4-4 stage timer)
         combined_risk_warnings = list(risk_warnings or [])
+        combined_risk_warnings.extend(ppo_guard_warnings)
         combined_risk_warnings.extend(pm_guard_warnings)
         t_fda = self._profiler.start_stage("fda")
         fda_result = self._fda.decide(
@@ -353,6 +390,7 @@ class HotRunner:
             "anomalies": anomalies,
             "allocation": allocation,
             "pm_result": pm_result,
+            "ppo_guard_warnings": ppo_guard_warnings,
             "pm_guard_warnings": pm_guard_warnings,
             "risk_eval": risk_eval,
             "fda_result": fda_result,

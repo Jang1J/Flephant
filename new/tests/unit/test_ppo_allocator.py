@@ -87,6 +87,12 @@ def test_normalize_scores_pads_ticker() -> None:
     assert "005930" in out
 
 
+def test_normalize_scores_skips_malformed_and_nonfinite_scores() -> None:
+    qo = _quant_output({"005930": "N/A", "000660": float("inf"), "035420": 0.7})  # type: ignore[arg-type]
+    out = PPOAllocator._normalize_scores(qo)
+    assert out == {"035420": 0.7}
+
+
 # ====================================================================== #
 # 3. allocate (Happy path)
 # ====================================================================== #

@@ -445,6 +445,71 @@ def test_score_cross_section_blocks_future_dual_source_scores(
     assert result["scores"] == {}
 
 
+def test_dual_source_cache_rechecks_asof_on_each_lookup(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """늦은 asof에서 채운 cache를 이른 asof가 재사용해도 PIT guard를 다시 적용한다."""
+    loader_calls: list[str | None] = []
+
+    def loader(date_str: str | None) -> list[dict[str, Any]]:
+        loader_calls.append(date_str)
+        return [{
+            "ticker": "005930",
+            "generated_at": "2026-04-20T10:30:00+09:00",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    later = agent.score_cross_section(["005930"], asof="2026-04-20T10:31:00+09:00")
+    earlier = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert later["mode"] == "active"
+    assert earlier["mode"] == "warmup"
+    assert earlier["scores"] == {}
+    assert loader_calls == ["20260420"]
+
+
+def test_score_cross_section_blocks_invalid_model_predictions(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """NaN/short model output은 Hot Path 예외 대신 fail-closed warmup으로 닫는다."""
+    def loader(_date_str: str | None) -> list[dict[str, Any]]:
+        return [{
+            "ticker": "005930",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    agent._booster = MockBooster(scores=[np.nan])  # type: ignore[assignment]
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+    assert result["error"] == "model_prediction_invalid"
+
+
 def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None:
     """수급 side-channel 피처가 LightGBM 추론 feature vector에 반영된다."""
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_flow")

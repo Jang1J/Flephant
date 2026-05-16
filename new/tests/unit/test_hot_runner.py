@@ -259,9 +259,45 @@ def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
         {"ticker": "000660"},   # 필수 필드 누락
         _make_bar("005930", 50100.0, 1),
     ]
-    result = runner.run_once(tickers=["005930"], bars_batch=bars)
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,
+        asof="2026-04-20T10:00:00+09:00",
+    )
     assert result["n_bars_consumed"] == 2
     assert len(result["bar_errors"]) == 1
+
+
+def test_run_once_requires_asof_for_bar_batch(runner: HotRunner) -> None:
+    """bar batch는 asof 없이 buffer에 넣지 않는다."""
+    runner.start()
+    bar = _make_bar("005930", 50000.0, 0)
+
+    result = runner.run_once(tickers=["005930"], bars_batch=[bar])
+
+    assert result["skipped"] is True
+    assert result["reason"] == "asof_required_for_bar_batch"
+    assert result["n_bars_consumed"] == 0
+    assert runner._quant._bar_buffer.get_latest("005930") == []
+
+
+def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
+    """PPO가 malformed allocation을 반환해도 Hot Path는 구조화된 veto로 닫는다."""
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers, n=65)
+
+    runner._ppo.allocate = lambda **_: {}  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_ALLOCATION_PLAN_INVALID"
+    assert result["final_decision"]["approved"] is False
 
 
 def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:

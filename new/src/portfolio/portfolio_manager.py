@@ -125,6 +125,25 @@ class PortfolioManager:
         # Codex 권고 8 (2026-05-09): PM boundary 정책. respect_ppo_weights=True 면 PPO weights
         # 변경 안 함 + violation 만 errors 에 보고. False (default backward-compat) 면 clip/drop/renorm.
         ppo_violations: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        negative_weight_tickers = [
+            {"ticker": ticker, "weight": weight}
+            for ticker, weight in target_weights_norm.items()
+            if weight < 0.0
+        ]
+        if negative_weight_tickers:
+            ppo_violations.extend([
+                {"type": "negative_target_weight", **row}
+                for row in negative_weight_tickers
+            ])
+            for row in negative_weight_tickers:
+                errors.append({
+                    "ticker": row["ticker"],
+                    "error": "NEGATIVE_TARGET_WEIGHT",
+                    "weight": row["weight"],
+                })
+                target_weights_norm[row["ticker"]] = 0.0
 
         # max_names 초과 시 하위 종목 제거
         if len(target_weights_norm) > self._max_names:
@@ -216,7 +235,6 @@ class PortfolioManager:
             set(current_weights.keys()) | set(target_weights_norm.keys())
         )
         order_deltas: list[dict[str, Any]] = []
-        errors: list[dict[str, Any]] = []
         sell_caps_applied: list[dict[str, Any]] = []
 
         for ticker in all_tickers:
@@ -251,8 +269,8 @@ class PortfolioManager:
 
             side = "buy" if delta_w > 0 else "sell"
             if side == "sell":
-                held_qty = current_qty.get(ticker)
-                if held_qty is not None and qty > held_qty:
+                held_qty = current_qty.get(ticker, 0)
+                if qty > held_qty:
                     sell_caps_applied.append({
                         "ticker": ticker,
                         "requested_qty": qty,

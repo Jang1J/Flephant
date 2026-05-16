@@ -184,8 +184,12 @@ class PPOAllocator:
                 if not isinstance(item, dict) or "ticker" not in item:
                     continue
                 t = pad_ticker(str(item["ticker"]))
-                s = float(item.get("score", 0.0))
-                scores[t] = s
+                try:
+                    s = float(item.get("score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(s):
+                    scores[t] = s
             return scores
 
         if isinstance(quant_output, dict):
@@ -195,7 +199,12 @@ class PPOAllocator:
                 for t, s in raw_scores.items():
                     if s is None:
                         continue
-                    scores[pad_ticker(str(t))] = float(s)
+                    try:
+                        score = float(s)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(score):
+                        scores[pad_ticker(str(t))] = score
                 return scores
             # 또는 직접 {ticker: score} 형태
             for t, s in quant_output.items():

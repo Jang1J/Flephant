@@ -232,6 +232,21 @@ def test_sell_qty_is_capped_to_current_position_qty(pm: PortfolioManager) -> Non
     }]
 
 
+def test_negative_target_weight_does_not_create_unheld_sell(pm: PortfolioManager) -> None:
+    """malformed PPO 음수 weight는 미보유 종목 sell 주문으로 변환하지 않는다."""
+    result = pm.plan(
+        target_weights={"005930": -0.10},
+        current_positions=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["portfolio_patch"]["target_weights"]["005930"] == 0.0
+    assert result["errors"][0]["error"] == "NEGATIVE_TARGET_WEIGHT"
+    assert result["ppo_violations"][0]["type"] == "negative_target_weight"
+
+
 def test_malformed_position_qty_is_fail_safe(monkeypatch) -> None:
     """외부/BE 포지션 qty가 깨져도 예외 대신 sell 불가 오류로 닫는다."""
     monkeypatch.setattr(

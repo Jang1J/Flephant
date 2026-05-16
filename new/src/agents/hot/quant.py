@@ -116,7 +116,7 @@ class QuantAgent(AgentBase):
                 self._feature_cols.append(col)
         self._inference_feature_cols: list[str] = list(self._feature_cols)
         self._dual_source_loader = dual_source_loader
-        self._dual_source_cache: dict[str, dict[str, dict[str, float]]] = {}
+        self._dual_source_cache: dict[str, list[dict[str, Any]]] = {}
         self._investor_flow_snapshot: dict[str, dict[str, Any]] = {}
         self._exogenous_snapshot: dict[str, dict[str, float]] = {}
         self._exogenous_snapshot_meta: dict[str, dict[str, Any]] = {}
@@ -351,7 +351,29 @@ class QuantAgent(AgentBase):
             }
 
         X = np.asarray(feature_matrix, dtype=float)
-        preds = self._booster.predict(X)
+        try:
+            preds = np.asarray(self._booster.predict(X), dtype=float)
+        except Exception as e:
+            logger.warning("[quant_agent] model predict 실패: %s", e)
+            preds = np.asarray([], dtype=float)
+        if len(preds) != len(valid_tickers) or not np.all(np.isfinite(preds)):
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._latency_records.append(elapsed_ms)
+            logger.warning(
+                "[quant_agent] model predict invalid: expected=%d actual=%d finite=%s",
+                len(valid_tickers),
+                len(preds),
+                bool(np.all(np.isfinite(preds))) if len(preds) else False,
+            )
+            return {
+                "tickers": [],
+                "scores": {},
+                "ts": asof_str,
+                "mode": "warmup",
+                "latency_ms": elapsed_ms,
+                "n_tickers": 0,
+                "error": "model_prediction_invalid",
+            }
         scores = {t: float(s) for t, s in zip(valid_tickers, preds)}
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -675,23 +697,26 @@ class QuantAgent(AgentBase):
                     e,
                 )
                 records = []
-            ticker_map: dict[str, dict[str, float]] = {}
-            for item in records:
-                if not self._dual_source_record_usable(item, asof):
-                    continue
-                padded = pad_ticker(str(item.get("ticker", "")))
-                if not padded or padded == "000000":
-                    continue
-                values: dict[str, float] = {}
-                for col in self._dual_source_feature_cols:
-                    value = self._float_or_none(item.get(col))
-                    if value is not None:
-                        values[col] = value
-                if values:
-                    ticker_map[padded] = values
-            self._dual_source_cache[date_key] = ticker_map
+            self._dual_source_cache[date_key] = [
+                item for item in records if isinstance(item, dict)
+            ]
 
-        return self._dual_source_cache.get(date_key, {}).get(pad_ticker(ticker), {})
+        ticker_map: dict[str, dict[str, float]] = {}
+        for item in self._dual_source_cache.get(date_key, []):
+            if not self._dual_source_record_usable(item, asof):
+                continue
+            padded = pad_ticker(str(item.get("ticker", "")))
+            if not padded or padded == "000000":
+                continue
+            values: dict[str, float] = {}
+            for col in self._dual_source_feature_cols:
+                value = self._float_or_none(item.get(col))
+                if value is not None:
+                    values[col] = value
+            if values:
+                ticker_map[padded] = values
+
+        return ticker_map.get(pad_ticker(ticker), {})
 
     def _dual_source_record_usable(self, item: dict[str, Any], asof: str) -> bool:
         """Dual-Source score metadata must not be newer than Hot Path asof."""

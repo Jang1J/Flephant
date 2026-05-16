@@ -163,6 +163,17 @@ def test_veto_dependency_timeout(fda: FDAAgent) -> None:
     assert len(fd["risk_overrides"]) == 1
 
 
+def test_veto_dependency_timeout_normalizes_status(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        dependency_status={"news": " TIMEOUT ", "risk": "done", "quant": "done"},
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert "news" in fd["veto_reason"]
+
+
 def test_veto_risk_high_severity(fda: FDAAgent) -> None:
     result = fda.decide(
         portfolio_patch_ref="PP-001",

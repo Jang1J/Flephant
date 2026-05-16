@@ -251,7 +251,7 @@ class FDAAgent(AgentBase):
         # (risk_fast_eval은 step 3에서 처리)
         timeout_deps = [
             name for name, status in dependency_status.items()
-            if status == "timeout"
+            if str(status).strip().lower() == "timeout"
         ]
         if timeout_deps:
             return self._build_veto_decision(
