@@ -238,6 +238,15 @@ class FakeNoBundleHotRunner(FakeHotRunner):
         )
 
 
+class FakeOtherBundleHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            has_model=True,
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-OTHER"},
+        )
+
+
 class FakeStringFalseModelHotRunner(FakeHotRunner):
     def __init__(self) -> None:
         super().__init__(qty=1)
@@ -354,6 +363,31 @@ def test_paper_auto_active_model_guard_requires_bundle_id(tmp_path: Path) -> Non
     assert report["status"] == "FAIL"
     assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
     assert report["stages"]["active_model_guard"]["bundle_id"] is None
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_requested_bundle(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeOtherBundleHotRunner(),
+        report_dir=tmp_path,
+        required_bundle_id="BUNDLE-TEST",
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    guard = report["stages"]["active_model_guard"]
+    assert guard["error_code"] == "ACTIVE_MODEL_BUNDLE_MISMATCH"
+    assert guard["bundle_id"] == "BUNDLE-OTHER"
+    assert guard["required_bundle_id"] == "BUNDLE-TEST"
     assert client.orders == []
 
 
@@ -648,3 +682,61 @@ def test_paper_auto_cli_rejects_paper_rehearsal_scope(capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "BLOCKED"
     assert out["reason"] == "paper_rehearsal_scope_not_allowed_for_auto_trade"
+
+
+def test_paper_auto_cli_requires_bundle_id_for_strict(capsys) -> None:
+    script = _load_paper_auto_trade_script()
+
+    rc = script.main(["--tickers", "005930", "--no-write-report"])
+
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "BLOCKED"
+    assert out["reason"] == "bundle_id_required_for_strict_paper_auto_trade"
+
+
+def test_paper_auto_cli_passes_bundle_to_prelive_and_trader(monkeypatch, capsys) -> None:
+    script = _load_paper_auto_trade_script()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        script,
+        "config_load",
+        lambda _file_name, _section=None: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 0,
+            "max_tickers": 1,
+            "require_prelive_pass": True,
+        },
+    )
+
+    def fake_build_report(**kwargs: Any) -> dict[str, Any]:
+        calls["prelive"] = kwargs
+        return {"status": "PASS", "blockers": []}
+
+    class FakeTrader:
+        def __init__(self, *, required_bundle_id: str | None = None) -> None:
+            calls["required_bundle_id"] = required_bundle_id
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            calls["run"] = kwargs
+            return {"status": "PASS", "stages": {}}
+
+    monkeypatch.setattr(script.prelive_gate, "build_report", fake_build_report)
+    monkeypatch.setattr(script, "PaperAutoTrader", FakeTrader)
+
+    rc = script.main([
+        "--tickers",
+        "005930",
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--confirm-phrase",
+        "PAPER_AUTO_OK",
+        "--no-write-report",
+    ])
+
+    assert rc == 0
+    assert calls["prelive"]["bundle_id"] == "BUNDLE-TEST"
+    assert calls["required_bundle_id"] == "BUNDLE-TEST"
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "PASS"

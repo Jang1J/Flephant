@@ -586,8 +586,15 @@ def test_bundle_paper_auto_evidence_satisfies_paper_stages(monkeypatch, tmp_path
             {
                 "status": "PASS",
                 "bundle_id": bundle_id,
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
                 "external_kis_api": True,
                 "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "broker_evidence": {
+                    "balance_reconciliation": {"status": "PASS"},
+                    "probe_order": {"status": "PASS"},
+                    "order_history_requery": {"status": "PASS"},
+                },
                 "stage_statuses": {
                     "paper_auto_cycle": "PASS",
                     "balance_reconciliation": "PASS",
@@ -626,6 +633,111 @@ def test_bundle_paper_auto_evidence_satisfies_paper_stages(monkeypatch, tmp_path
     assert reconciliation["status"] == "PASS"
     assert probe["status"] == "PASS"
     assert probe["paper_auto_cycle_history_matched"] is True
+
+
+def test_bundle_paper_auto_evidence_blocks_stale_report(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "generated_at": "2000-01-01T00:00:00+09:00",
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "broker_evidence": {
+                    "balance_reconciliation": {"status": "PASS"},
+                    "probe_order": {"status": "PASS"},
+                    "order_history_requery": {"status": "PASS"},
+                },
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order(bundle_id)
+
+    assert result["status"] == "BLOCKED"
+    assert result["freshness"]["reason"] == "generated_at_stale_or_future"
+
+
+def test_bundle_paper_auto_evidence_requires_nested_broker_evidence(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order(bundle_id)
+
+    assert result["status"] == "BLOCKED"
+    assert result["broker_evidence_nested"]["reason"] == "broker_evidence_missing"
 
 
 def test_bundle_paper_auto_evidence_blocks_wrong_bundle(monkeypatch, tmp_path):

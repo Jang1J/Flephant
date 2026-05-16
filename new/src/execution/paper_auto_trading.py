@@ -40,6 +40,7 @@ class PaperAutoTrader:
         hot_runner: HotRunner | None = None,
         report_dir: Path | str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        required_bundle_id: str | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -54,6 +55,7 @@ class PaperAutoTrader:
             log_path=self._report_dir / "paper_auto_execution_audit.jsonl"
         )
         self._sleep = sleep_fn or time.sleep
+        self._required_bundle_id = str(required_bundle_id or "").strip() or None
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
         self._require_virtual_mode = safe_bool(
@@ -340,11 +342,21 @@ class PaperAutoTrader:
                 "has_model": has_model,
                 "bundle_id": bundle_id,
             }
+        if self._required_bundle_id and bundle_id != self._required_bundle_id:
+            return {
+                "status": "FAIL",
+                "error_code": "ACTIVE_MODEL_BUNDLE_MISMATCH",
+                "message": "QuantAgent active model bundle_id가 요청 bundle_id와 다르다.",
+                "has_model": has_model,
+                "bundle_id": bundle_id,
+                "required_bundle_id": self._required_bundle_id,
+            }
         return {
             "status": "PASS",
             "has_model": has_model,
             "model_version": (metadata or {}).get("version") if isinstance(metadata, dict) else None,
             "bundle_id": bundle_id,
+            "required_bundle_id": self._required_bundle_id,
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
@@ -560,6 +572,7 @@ class PaperAutoTrader:
                 "tickers": [pad_ticker(str(t)) for t in tickers],
                 "cycles": int(cycles),
                 "interval_sec": float(interval_sec),
+                "required_bundle_id": self._required_bundle_id,
             },
             "stages": {},
             "failures": [],
