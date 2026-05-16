@@ -123,6 +123,48 @@ def test_final_demo_accepts_explicit_bundle_id(monkeypatch) -> None:
     assert args.bundle_id == "BUNDLE-TEST"
 
 
+def test_final_demo_accepts_no_write_summary(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_final_demo.py", "--demo", "hot", "--no-write-summary"],
+    )
+
+    args = _parse_args()
+
+    assert args.demo == "hot"
+    assert args.no_write_summary is True
+
+
+def test_mode_b_demo_no_write_summary_skips_artifact(monkeypatch) -> None:
+    def fake_status(*, bundle_id: str):
+        return {
+            "status": "PASS",
+            "deploy_quality": "PASS",
+            "broker_evidence": "PASS",
+            "registry_mutated": False,
+            "live_trading_allowed": False,
+            "c12_backtest": {"verdict": "pass", "deployable": True},
+            "production_registry": {"active_version": None},
+            "paper_registry": {"active_version": "paper_model"},
+        }
+
+    monkeypatch.setattr("src.jobs.run_final_demo.build_service_status", fake_status)
+
+    def fail_save(*_args, **_kwargs):
+        raise AssertionError("_save_summary should not be called")
+
+    monkeypatch.setattr("src.jobs.run_final_demo._save_summary", fail_save)
+
+    summary = run_demo_mode_b(
+        "week1_basic.yaml",
+        bundle_id="BUNDLE-TEST",
+        write_summary=False,
+    )
+
+    assert summary["status"] == "PASS"
+
+
 def test_mode_b_stage_blocking_treats_string_true_critical_alert_as_blocking() -> None:
     assert E2EScenarioRunner._is_mode_b_stage_blocking(
         {"status": "PASS", "critical_alert": "true"}

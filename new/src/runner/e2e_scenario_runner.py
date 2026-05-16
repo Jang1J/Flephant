@@ -181,6 +181,7 @@ class E2EScenarioRunner:
         scenario_file: scenarios/*.yaml 파일명 (예: "week1_basic.yaml").
         short_mode: True이면 hot_path_ticks_short tick만 실행 (CI 빠른 모드).
         skip_mode_b: True이면 Mode B 건너뜀. unit test용.
+        write_audit: False이면 artifacts/audit JSONL/summary 파일을 쓰지 않음.
     """
 
     def __init__(
@@ -189,6 +190,7 @@ class E2EScenarioRunner:
         short_mode: bool = True,
         skip_mode_b: bool = False,
         quant_registry_dir: str | Path | None = "artifacts/lgbm_paper",
+        write_audit: bool = True,
     ) -> None:
         scenario_path = _SCENARIOS_DIR / scenario_file
         with scenario_path.open("r", encoding="utf-8") as f:
@@ -197,6 +199,7 @@ class E2EScenarioRunner:
         self._short_mode = short_mode
         self._skip_mode_b = skip_mode_b
         self._quant_registry_dir = self._resolve_repo_path(quant_registry_dir)
+        self._write_audit = bool(write_audit)
         self._scenario_name: str = self._scenario.get("scenario_name", "unknown")
         self._tickers: list[str] = [
             pad_ticker(t) for t in self._scenario.get("universe_tickers", [])
@@ -752,6 +755,9 @@ class E2EScenarioRunner:
         records: list[dict[str, Any]],
         path: Path,
     ) -> None:
+        if not self._write_audit:
+            logger.debug("[e2e_scenario_runner] JSONL flush skipped: %s", path)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
             for rec in records:
@@ -759,6 +765,9 @@ class E2EScenarioRunner:
         logger.debug("[e2e_scenario_runner] JSONL flush: %d 건 → %s", len(records), path)
 
     def _flush_summary(self, summary: dict[str, Any]) -> None:
+        if not self._write_audit:
+            logger.info("[e2e_scenario_runner] summary save skipped (--no-write-summary)")
+            return
         summary_path = _AUDIT_DIR / f"scenario_{self._scenario_name}_summary.json"
         with summary_path.open("w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)

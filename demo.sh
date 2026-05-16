@@ -14,6 +14,7 @@
 #   PYTHON      Python 인터프리터 경로 (기본: python3)
 #   ELEPHANT_MODE  Mode B 시뮬에서 자동 mode_b 설정
 #   BUNDLE_ID   Mode B read-only evidence bundle id (all/mode_b/full 필수)
+#   DEMO_NO_WRITE  true/1이면 demo summary와 E2E audit JSONL/summary를 쓰지 않음
 
 set -e
 set -u
@@ -22,11 +23,16 @@ PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
 DEMO_TYPE="${1:-all}"
 SCENARIO="${SCENARIO:-week1_basic.yaml}"
 BUNDLE_ID="${BUNDLE_ID:-}"
+DEMO_NO_WRITE="${DEMO_NO_WRITE:-false}"
+NO_WRITE_FLAG=""
+if [ "$DEMO_NO_WRITE" = "1" ] || [ "$DEMO_NO_WRITE" = "true" ] || [ "$DEMO_NO_WRITE" = "TRUE" ]; then
+  NO_WRITE_FLAG="--no-write-summary"
+fi
 
 cd "$(dirname "$0")"
 
 echo "[demo] Elephant Lab v3 학기말 발표 데모 시작..."
-echo "[demo] scenario=$SCENARIO demo=$DEMO_TYPE python=$PYTHON bundle_id=${BUNDLE_ID:-<required-for-mode-b>}"
+echo "[demo] scenario=$SCENARIO demo=$DEMO_TYPE python=$PYTHON bundle_id=${BUNDLE_ID:-<required-for-mode-b>} no_write=${DEMO_NO_WRITE}"
 echo ""
 
 require_bundle_id() {
@@ -44,39 +50,39 @@ case "$DEMO_TYPE" in
   hot|cold)
     # Mode A 정상 환경 (env -u 로 부모 shell ELEPHANT_MODE 명시적 제거)
     env -u ELEPHANT_MODE PYTHONPATH=new $PYTHON -m src.jobs.run_final_demo \
-        --demo "$DEMO_TYPE" --scenario "$SCENARIO"
+        --demo "$DEMO_TYPE" --scenario "$SCENARIO" $NO_WRITE_FLAG
     ;;
   mode_b)
     # Mode B 단독: ELEPHANT_MODE=mode_b 필수
     require_bundle_id
     PYTHONPATH=new ELEPHANT_MODE=mode_b $PYTHON -m src.jobs.run_final_demo \
-        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID"
+        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID" $NO_WRITE_FLAG
     ;;
   all)
     require_bundle_id
     # 2026-05-09 Codex 권고 4 fix: Hot+Cold (Mode A 격리) → 후 Mode B (mode_b 환경) 분리 실행.
     echo "[demo] all 단계 1/2: Hot Path (Mode A 격리, env -u ELEPHANT_MODE)"
     env -u ELEPHANT_MODE PYTHONPATH=new $PYTHON -m src.jobs.run_final_demo \
-        --demo hot --scenario "$SCENARIO"
+        --demo hot --scenario "$SCENARIO" $NO_WRITE_FLAG
     echo "[demo] all 단계 2/2: Cold Path (Mode A 격리)"
     env -u ELEPHANT_MODE PYTHONPATH=new $PYTHON -m src.jobs.run_final_demo \
-        --demo cold --scenario "$SCENARIO"
+        --demo cold --scenario "$SCENARIO" $NO_WRITE_FLAG
     echo "[demo] all 단계 3/3: Mode B (ELEPHANT_MODE=mode_b)"
     PYTHONPATH=new ELEPHANT_MODE=mode_b $PYTHON -m src.jobs.run_final_demo \
-        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID"
+        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID" $NO_WRITE_FLAG
     ;;
   full)
     require_bundle_id
     # 2026-05-09 Codex 권고 4 fix: all 과 동일 분리, Hot Path 만 --full-ticks (390 tick).
     echo "[demo] full 단계 1/3: Hot Path 전체 390 tick (Mode A 격리)"
     env -u ELEPHANT_MODE PYTHONPATH=new $PYTHON -m src.jobs.run_final_demo \
-        --demo hot --scenario "$SCENARIO" --full-ticks
+        --demo hot --scenario "$SCENARIO" --full-ticks $NO_WRITE_FLAG
     echo "[demo] full 단계 2/3: Cold Path (Mode A 격리)"
     env -u ELEPHANT_MODE PYTHONPATH=new $PYTHON -m src.jobs.run_final_demo \
-        --demo cold --scenario "$SCENARIO"
+        --demo cold --scenario "$SCENARIO" $NO_WRITE_FLAG
     echo "[demo] full 단계 3/3: Mode B (mode_b)"
     PYTHONPATH=new ELEPHANT_MODE=mode_b $PYTHON -m src.jobs.run_final_demo \
-        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID"
+        --demo mode_b --scenario "$SCENARIO" --bundle-id "$BUNDLE_ID" $NO_WRITE_FLAG
     ;;
   *)
     echo "[demo] 사용법: bash demo.sh [all|hot|cold|mode_b|full]"

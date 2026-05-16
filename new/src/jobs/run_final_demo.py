@@ -28,6 +28,7 @@ CLI 에서는 시나리오 파일만 선택 (실행 단축이 필요하면 별�
 
 출력:
     콘솔 요약 + artifacts/audit/demo_{a|b|c}_{timestamp}.json
+    검증 모드에서는 --no-write-summary 로 demo summary와 E2E audit 파일 생성을 건너뜀.
 """
 from __future__ import annotations
 
@@ -79,6 +80,11 @@ def _parse_args() -> argparse.Namespace:
         "--bundle-id",
         default=None,
         help="Mode B read-only evidence demo에 사용할 bundle id. --demo all/mode_b에서는 필수.",
+    )
+    parser.add_argument(
+        "--no-write-summary",
+        action="store_true",
+        help="검증용 dry run. demo summary와 E2E audit JSONL/summary를 쓰지 않음.",
     )
     args = parser.parse_args()
     if args.demo in {"all", "mode_b"} and not args.bundle_id:
@@ -154,7 +160,20 @@ def _positive_count(value: object) -> bool:
     return safe_int(value, default=default, min_value=0) > 0
 
 
-def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
+def _emit_summary_path(demo_id: str, summary: dict[str, Any], *, write_summary: bool) -> None:
+    if not write_summary:
+        print("  → 산출: skipped (--no-write-summary)")
+        return
+    out = _save_summary(demo_id, summary)
+    print(f"  → 산출: {out}")
+
+
+def run_demo_hot(
+    scenario: str,
+    short_mode: bool,
+    *,
+    write_summary: bool = True,
+) -> dict[str, Any]:
     """Demo A: Hot Path. tick 5회 실행 + latency p95 + final_decision."""
     _print_banner("Demo A: Hot Path (Quant -> PPO/PM -> FDA non-LLM)")
 
@@ -162,6 +181,7 @@ def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
         scenario_file=scenario,
         short_mode=short_mode,
         skip_mode_b=True,
+        write_audit=write_summary,
     )
     result = runner.run()
     summary = result.summary()
@@ -188,12 +208,16 @@ def run_demo_hot(scenario: str, short_mode: bool) -> dict[str, Any]:
     print(f"  FDA reason_code 누락 : {summary.get('fda_missing_reason_code', 0)}")
     print(f"  에러 합계          : {summary.get('total_errors', 0)}")
 
-    out = _save_summary("a_hot", summary)
-    print(f"  → 산출: {out}")
+    _emit_summary_path("a_hot", summary, write_summary=write_summary)
     return summary
 
 
-def run_demo_cold(scenario: str, short_mode: bool) -> dict[str, Any]:
+def run_demo_cold(
+    scenario: str,
+    short_mode: bool,
+    *,
+    write_summary: bool = True,
+) -> dict[str, Any]:
     """Demo B: Cold Path. event_injector 4종 inject -> reason_code."""
     _print_banner("Demo B: Cold Path (Event -> News/Risk Slow -> FDA veto)")
 
@@ -201,6 +225,7 @@ def run_demo_cold(scenario: str, short_mode: bool) -> dict[str, Any]:
         scenario_file=scenario,
         short_mode=short_mode,
         skip_mode_b=True,
+        write_audit=write_summary,
     )
     result = runner.run()
     summary = result.summary()
@@ -222,12 +247,16 @@ def run_demo_cold(scenario: str, short_mode: bool) -> dict[str, Any]:
     print(f"  에러 합계          : {summary.get('total_errors', 0)}")
     print("  (Cold Path event_injector 4종 inject 결과는 audit_log JSONL 에서 확인)")
 
-    out = _save_summary("b_cold", summary)
-    print(f"  → 산출: {out}")
+    _emit_summary_path("b_cold", summary, write_summary=write_summary)
     return summary
 
 
-def run_demo_mode_b(scenario: str, bundle_id: str) -> dict[str, Any]:
+def run_demo_mode_b(
+    scenario: str,
+    bundle_id: str,
+    *,
+    write_summary: bool = True,
+) -> dict[str, Any]:
     """Demo C: read-only Mode B evidence without violating 18:00 KST PIT gate."""
     _print_banner("Demo C: Mode B Evidence (C12 -> C14 dry-run -> Service Readiness)")
 
@@ -289,8 +318,7 @@ def run_demo_mode_b(scenario: str, bundle_id: str) -> dict[str, Any]:
     print(f"  registry_mutated   : {summary.get('registry_mutated')}")
     print(f"  live_trading_allowed: {summary.get('live_trading_allowed')}")
 
-    out = _save_summary("c_mode_b", summary)
-    print(f"  → 산출: {out}")
+    _emit_summary_path("c_mode_b", summary, write_summary=write_summary)
     return summary
 
 
@@ -311,7 +339,11 @@ def main() -> int:
     # Demo A 실패 시에도 B/C 진행 가능 (발표 당일 부분 실패 격리).
     if args.demo in ("all", "hot"):
         try:
-            results["hot"] = run_demo_hot(args.scenario, short_mode)
+            results["hot"] = run_demo_hot(
+                args.scenario,
+                short_mode,
+                write_summary=not args.no_write_summary,
+            )
             if results["hot"].get("status") == "FAIL":
                 failed.append("hot")
         except Exception as e:
@@ -320,7 +352,11 @@ def main() -> int:
 
     if args.demo in ("all", "cold"):
         try:
-            results["cold"] = run_demo_cold(args.scenario, short_mode)
+            results["cold"] = run_demo_cold(
+                args.scenario,
+                short_mode,
+                write_summary=not args.no_write_summary,
+            )
             if results["cold"].get("status") == "FAIL":
                 failed.append("cold")
         except Exception as e:
@@ -329,7 +365,11 @@ def main() -> int:
 
     if args.demo in ("all", "mode_b"):
         try:
-            results["mode_b"] = run_demo_mode_b(args.scenario, bundle_id=str(args.bundle_id))
+            results["mode_b"] = run_demo_mode_b(
+                args.scenario,
+                bundle_id=str(args.bundle_id),
+                write_summary=not args.no_write_summary,
+            )
             if results["mode_b"].get("status") == "FAIL":
                 failed.append("mode_b")
         except Exception as e:
