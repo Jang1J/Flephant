@@ -806,6 +806,7 @@ live_data_readiness:
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
   max_consecutive_backfill_failed_dates: 3
+  backfill_failed_ticker_ratio_threshold: 0.8
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"

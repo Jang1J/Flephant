@@ -246,6 +246,8 @@ def _saved_file_summary(
         valid_dates: dict[str, bool] = {}
         timestamp_dates_match: dict[str, bool | None] = {}
         ticker_matches: dict[str, bool | None] = {}
+        missing_timestamp_counts: dict[str, int | None] = {}
+        ticker_mismatch_counts: dict[str, int | None] = {}
         duplicate_ts_counts: dict[str, int | None] = {}
         out_of_hours_counts: dict[str, int | None] = {}
         duplicate_date_artifacts: dict[str, list[str]] = {}
@@ -272,6 +274,8 @@ def _saved_file_summary(
                 row_counts[date_part] = rows
                 timestamp_dates_match[date_part] = inspection.get("timestamp_dates_match")
                 ticker_matches[date_part] = inspection.get("ticker_matches")
+                missing_timestamp_counts[date_part] = inspection.get("missing_timestamp_count")
+                ticker_mismatch_counts[date_part] = inspection.get("ticker_mismatch_count")
                 duplicate_ts_counts[date_part] = inspection.get("duplicate_ts_count")
                 out_of_hours_counts[date_part] = inspection.get("out_of_hours_count")
                 file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
@@ -291,6 +295,8 @@ def _saved_file_summary(
             "valid_dates": valid_dates,
             "timestamp_dates_match": timestamp_dates_match,
             "ticker_matches": ticker_matches,
+            "missing_timestamp_counts": missing_timestamp_counts,
+            "ticker_mismatch_counts": ticker_mismatch_counts,
             "duplicate_ts_counts": duplicate_ts_counts,
             "out_of_hours_counts": out_of_hours_counts,
             "duplicate_date_artifacts": duplicate_date_artifacts,
@@ -321,6 +327,8 @@ def _artifact_date_quality(
             valid_dates = info.get("valid_dates", {})
             timestamp_dates_match = info.get("timestamp_dates_match", {})
             ticker_matches = info.get("ticker_matches", {})
+            missing_timestamp_counts = info.get("missing_timestamp_counts", {})
+            ticker_mismatch_counts = info.get("ticker_mismatch_counts", {})
             duplicate_ts_counts = info.get("duplicate_ts_counts", {})
             out_of_hours_counts = info.get("out_of_hours_counts", {})
             duplicate_date_artifacts = info.get("duplicate_date_artifacts", {})
@@ -333,6 +341,8 @@ def _artifact_date_quality(
                     "rows": rows,
                     "timestamp_dates_match": timestamp_dates_match.get(day),
                     "ticker_matches": ticker_matches.get(day),
+                    "missing_timestamp_count": missing_timestamp_counts.get(day),
+                    "ticker_mismatch_count": ticker_mismatch_counts.get(day),
                     "duplicate_ts_count": duplicate_ts_counts.get(day),
                     "out_of_hours_count": out_of_hours_counts.get(day),
                     "duplicate_date_artifacts": duplicate_date_artifacts.get(day, []),
@@ -413,6 +423,8 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
             "rows": None,
             "timestamp_dates_match": None,
             "ticker_matches": None,
+            "missing_timestamp_count": None,
+            "ticker_mismatch_count": None,
             "duplicate_ts_count": None,
             "out_of_hours_count": None,
         }
@@ -421,6 +433,8 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
             "rows": None,
             "timestamp_dates_match": None,
             "ticker_matches": None,
+            "missing_timestamp_count": None,
+            "ticker_mismatch_count": None,
             "duplicate_ts_count": None,
             "out_of_hours_count": None,
         }
@@ -428,14 +442,22 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
     timestamps = [_parse_bar_timestamp(row) for row in rows]
     present_timestamps = [ts for ts in timestamps if ts is not None]
     timestamp_dates = {ts.date() for ts in present_timestamps}
-    timestamp_dates_match = bool(present_timestamps) and timestamp_dates == {expected_date}
+    missing_timestamp_count = len(rows) - len(present_timestamps)
+    timestamp_dates_match = (
+        bool(rows)
+        and missing_timestamp_count == 0
+        and timestamp_dates == {expected_date}
+    )
 
-    row_tickers = {
+    expected_ticker = pad_ticker(ticker)
+    row_tickers = [
         pad_ticker(str(row.get("ticker")))
-        for row in rows
         if row.get("ticker") is not None
-    }
-    ticker_matches = bool(row_tickers) and row_tickers == {pad_ticker(ticker)}
+        else None
+        for row in rows
+    ]
+    ticker_mismatch_count = sum(1 for row_ticker in row_tickers if row_ticker != expected_ticker)
+    ticker_matches = bool(rows) and ticker_mismatch_count == 0
 
     iso_timestamps = [ts.isoformat() for ts in present_timestamps]
     duplicate_ts_count = len(iso_timestamps) - len(set(iso_timestamps))
@@ -450,6 +472,8 @@ def _inspect_bar_file(file_path: Path, yyyymmdd: str, ticker: str) -> dict[str, 
         "rows": len(rows),
         "timestamp_dates_match": timestamp_dates_match,
         "ticker_matches": ticker_matches,
+        "missing_timestamp_count": missing_timestamp_count,
+        "ticker_mismatch_count": ticker_mismatch_count,
         "duplicate_ts_count": duplicate_ts_count,
         "out_of_hours_count": out_of_hours_count,
     }
@@ -720,6 +744,10 @@ def run_backfill(
             default=3,
             min_value=1,
         )
+        failed_ticker_ratio_threshold = float(
+            cfg.get("backfill_failed_ticker_ratio_threshold", 1.0)
+        )
+        failed_ticker_ratio_threshold = min(max(failed_ticker_ratio_threshold, 0.0), 1.0)
         backfill = Backfill()
         counts = {pad_ticker(ticker): 0 for ticker in tickers}
         fetch_counts_by_date: dict[str, dict[str, int]] = {}
@@ -763,8 +791,14 @@ def run_backfill(
             }
             for ticker, count in day_counts.items():
                 counts[pad_ticker(ticker)] = counts.get(pad_ticker(ticker), 0) + count
+            short_fetch_count = sum(
+                1
+                for ticker in tickers
+                if int(fetch_counts_by_date[day].get(pad_ticker(ticker), 0)) < min_rows
+            )
+            short_fetch_ratio = short_fetch_count / max(len(tickers), 1)
             failed_today = (
-                all(int(fetch_counts_by_date[day].get(pad_ticker(ticker), 0)) < min_rows for ticker in tickers)
+                short_fetch_ratio >= failed_ticker_ratio_threshold
                 if require_all
                 else all(int(count) <= 0 for count in fetch_counts_by_date[day].values())
             )
@@ -776,6 +810,10 @@ def run_backfill(
                     "consecutive_failed_dates": consecutive_failed_dates,
                     "max_consecutive_backfill_failed_dates": max_failed_dates,
                     "min_rows_per_day": min_rows,
+                    "short_fetch_count": short_fetch_count,
+                    "expected_ticker_count": len(tickers),
+                    "short_fetch_ratio": short_fetch_ratio,
+                    "failed_ticker_ratio_threshold": failed_ticker_ratio_threshold,
                 }
                 break
         files = _saved_file_summary(tickers, start_date, end_date, min_rows)

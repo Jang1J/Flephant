@@ -113,3 +113,65 @@ def test_active_tickers_uses_final_gate_pending_data_universe(monkeypatch):
     monkeypatch.setattr(mod, "config_load", fake_config_load)
 
     assert mod._active_tickers() == ["005930", "105560"]
+
+
+def test_phase2_blocks_when_requested_artifact_dates_are_missing(
+    tmp_path,
+    monkeypatch,
+):
+    mod = _load_script("phase2_feature_backfill")
+    artifacts = tmp_path / "data"
+    tickers = ["005930", "105560"]
+
+    for ticker in tickers:
+        _write_jsonl(artifacts / ticker / "bars_1m_20260515.jsonl", 3)
+
+    monkeypatch.setattr(mod, "_active_tickers", lambda: tickers)
+    monkeypatch.setattr(
+        mod,
+        "_expected_artifact_dates",
+        lambda *, end_date, business_days: ["20260514", "20260515"],
+    )
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if key == "phase2_feature_backfill":
+            return {
+                "min_rows_per_day": 3,
+                "min_dual_source_non_neutral_date_coverage": 0.0,
+                "min_exogenous_non_neutral_date_coverage": 0.0,
+            }
+        if key == "live_data_readiness":
+            return {"train_min_rows_per_day": 3}
+        if key == "exogenous_features":
+            return {"neutral_defaults": {}}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(
+        mod,
+        "load_latest_scores",
+        lambda date_key: [{"ticker": "005930", "news_score_t": 0.1}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_exogenous_scores",
+        lambda date_key, feature_cols, defaults: (
+            {"005930": {"macro": 1.0}},
+            {"status": "found", "record_count": 1},
+        ),
+    )
+
+    report = mod.run_phase2_feature_backfill(
+        end_date="20260515",
+        business_days=2,
+        write_neutral_placeholders=False,
+        artifacts_dir=artifacts,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "kis_1m_artifact_date_coverage_below_threshold" in report["blockers"]
+    assert report["date_count"] == 1
+    assert report["artifact_date_coverage"]["expected_date_count"] == 2
+    assert report["artifact_date_coverage"]["missing_date_count"] == 1
+    assert report["artifact_date_coverage"]["missing_dates_sample"] == ["20260514"]

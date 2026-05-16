@@ -32,6 +32,10 @@ from src.data.exogenous_feature_store import (  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
+from src.utils.trading_calendar import (  # noqa: E402
+    kospi_trading_dates_between,
+    kospi_trading_start_date,
+)
 from scripts.live_data_readiness import _inspect_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -142,12 +146,15 @@ def _select_dates(
     business_days: int,
     min_rows: int,
 ) -> list[str]:
-    dates = [
-        date_key
-        for date_key in _common_artifact_dates(artifacts_dir, tickers, min_rows=min_rows)
-        if date_key <= end_date
-    ]
-    return dates[-business_days:]
+    expected = _expected_artifact_dates(end_date=end_date, business_days=business_days)
+    common = set(_common_artifact_dates(artifacts_dir, tickers, min_rows=min_rows))
+    return [date_key for date_key in expected if date_key in common]
+
+
+def _expected_artifact_dates(*, end_date: str, business_days: int) -> list[str]:
+    end_dt = datetime.strptime(end_date, "%Y%m%d").date()
+    start_dt = kospi_trading_start_date(end_dt, business_days)
+    return kospi_trading_dates_between(start_dt, end_dt)
 
 
 def _dual_source_non_neutral(scores: list[dict[str, Any]]) -> bool:
@@ -221,8 +228,10 @@ def run_phase2_feature_backfill(
         business_days=business_days,
         min_rows=min_artifact_rows,
     )
-    if not selected_dates:
-        raise RuntimeError("no common 1m artifact dates found for active tickers")
+    expected_dates = _expected_artifact_dates(end_date=end_date, business_days=business_days)
+    missing_artifact_dates = [
+        date_key for date_key in expected_dates if date_key not in set(selected_dates)
+    ]
 
     exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
     defaults = {
@@ -294,6 +303,8 @@ def run_phase2_feature_backfill(
     dual_source_non_neutral_coverage = dual_source_non_neutral / max(date_count, 1)
     exogenous_non_neutral_coverage = exogenous_non_neutral / max(date_count, 1)
     blockers: list[str] = []
+    if missing_artifact_dates:
+        blockers.append("kis_1m_artifact_date_coverage_below_threshold")
     if dual_source_non_neutral_coverage < min_ds_cov:
         blockers.append("dual_source_non_neutral_coverage_below_threshold")
     if exogenous_non_neutral_coverage < min_exog_cov:
@@ -305,7 +316,17 @@ def run_phase2_feature_backfill(
         "end_date": end_date,
         "business_days_requested": business_days,
         "date_count": date_count,
-        "date_range": {"start": selected_dates[0], "end": selected_dates[-1]},
+        "date_range": (
+            {"start": selected_dates[0], "end": selected_dates[-1]}
+            if selected_dates
+            else {"start": None, "end": None}
+        ),
+        "artifact_date_coverage": {
+            "expected_date_count": len(expected_dates),
+            "selected_date_count": date_count,
+            "missing_date_count": len(missing_artifact_dates),
+            "missing_dates_sample": missing_artifact_dates[:20],
+        },
         "ticker_count": len(tickers),
         "min_artifact_rows_per_day": min_artifact_rows,
         "thresholds": {
@@ -326,7 +347,10 @@ def run_phase2_feature_backfill(
     ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
     path = output_dir / f"phase2_feature_backfill_{ts}.json"
     report["report_path"] = str(path)
-    report["report_path_relative"] = str(path.relative_to(ROOT))
+    try:
+        report["report_path_relative"] = str(path.relative_to(ROOT))
+    except ValueError:
+        report["report_path_relative"] = str(path)
     _write_json(path, report)
     return report
 

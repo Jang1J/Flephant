@@ -396,8 +396,8 @@ def test_fda_cold_llm_string_false_vetoes() -> None:
     assert fd["reason_code"] == "NEWS_DIVERGENCE"
 
 
-def test_fda_cold_llm_json_array_falls_back_without_crash() -> None:
-    """JSON array 응답은 crash 없이 heuristic fallback으로 처리된다."""
+def test_fda_cold_llm_json_array_fails_closed_without_crash() -> None:
+    """JSON array 응답은 crash 없이 NEWS_DIVERGENCE veto로 닫힌다."""
     fda = FDAAgent(llm_router=_make_router("[]"))
     result = fda.decide(
         portfolio_patch_ref="PP-20260426-006",
@@ -408,7 +408,8 @@ def test_fda_cold_llm_json_array_falls_back_without_crash() -> None:
         debate_result={"conflict_detected": False},
     )
     fd = _fd(result)
-    assert fd["approved"] is True
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
 
 
 def test_fda_cold_can_change_weight_still_false() -> None:

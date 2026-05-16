@@ -242,6 +242,64 @@ def test_artifact_date_quality_rejects_wrong_ticker(monkeypatch, tmp_path):
     assert first["ticker_matches"] is False
 
 
+def test_artifact_date_quality_rejects_partial_missing_timestamp(monkeypatch, tmp_path):
+    """일부 row의 timestamp가 비어 있으면 row 수가 충분해도 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines()]
+    rows[0].pop("ts_close")
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["timestamp_dates_match"] is False
+    assert first["missing_timestamp_count"] == 1
+
+
+def test_artifact_date_quality_rejects_partial_missing_ticker(monkeypatch, tmp_path):
+    """일부 row의 ticker가 비어 있으면 row 수가 충분해도 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines()]
+    rows[0].pop("ticker")
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["ticker_matches"] is False
+    assert first["ticker_mismatch_count"] == 1
+
+
 def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
     """row 수만 맞춘 중복 timestamp artifact는 학습 가능 날짜가 아니다."""
     readiness = _load_script_module()
@@ -309,6 +367,57 @@ def test_run_backfill_trips_circuit_breaker_after_repeated_empty_fetches(
     assert breaker["triggered"] is True
     assert breaker["date"] == "20260512"
     assert breaker["consecutive_failed_dates"] == 2
+
+
+def test_run_backfill_trips_circuit_breaker_when_most_tickers_short(
+    monkeypatch,
+    tmp_path,
+):
+    """대부분 종목이 반복 short fetch면 일부 성공 종목이 있어도 breaker가 열린다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness,
+        "_business_dates_between",
+        lambda start, end: ["20260511", "20260512", "20260513"],
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    class MostlyShortBackfill:
+        def backfill_universe(self, tickers, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {"005930": 0, "000660": 0, "105560": 381}
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "min_rows_per_day": 300,
+                "require_all_tickers_for_backfill": True,
+                "max_consecutive_backfill_failed_dates": 2,
+                "backfill_failed_ticker_ratio_threshold": 0.5,
+            }
+        if section == "walk_forward":
+            return {"trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "Backfill", lambda: MostlyShortBackfill())
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_backfill(
+        ["005930", "000660", "105560"],
+        "20260511",
+        "20260513",
+    )
+
+    assert result["status"] == "FAIL"
+    assert calls == [("20260511", "20260511"), ("20260512", "20260512")]
+    breaker = result["backfill_circuit_breaker"]
+    assert breaker["triggered"] is True
+    assert breaker["short_fetch_count"] == 2
+    assert breaker["expected_ticker_count"] == 3
+    assert breaker["short_fetch_ratio"] == 2 / 3
+    assert breaker["failed_ticker_ratio_threshold"] == 0.5
 
 
 def test_artifact_date_quality_rejects_duplicate_date_artifacts(monkeypatch, tmp_path):
