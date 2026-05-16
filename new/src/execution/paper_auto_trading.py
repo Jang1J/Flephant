@@ -74,6 +74,7 @@ class PaperAutoTrader:
             self._cfg.get("allow_market_order", False),
             default=False,
         )
+        self._run_guard_passed = False
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -121,20 +122,24 @@ class PaperAutoTrader:
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
-        try:
-            if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
-                self._hot_runner.start()
-        except AttributeError:
-            self._hot_runner.start()
-
         cycle_reports: list[dict[str, Any]] = []
-        for idx in range(cycles_int):
-            cycle = self.run_once(tickers=tickers, cycle_index=idx)
-            cycle_reports.append(cycle)
-            if cycle.get("status") == "FAIL":
-                break
-            if idx < cycles_int - 1:
-                self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        self._run_guard_passed = True
+        try:
+            try:
+                if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
+                    self._hot_runner.start()
+            except AttributeError:
+                self._hot_runner.start()
+
+            for idx in range(cycles_int):
+                cycle = self.run_once(tickers=tickers, cycle_index=idx)
+                cycle_reports.append(cycle)
+                if cycle.get("status") == "FAIL":
+                    break
+                if idx < cycles_int - 1:
+                    self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        finally:
+            self._run_guard_passed = False
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
@@ -144,8 +149,15 @@ class PaperAutoTrader:
         return self._finish_report(report, write_report)
 
     def run_once(self, *, tickers: list[str], cycle_index: int = 0) -> dict[str, Any]:
-        padded = [pad_ticker(str(t)) for t in tickers]
         started_at = datetime.now(_KST).isoformat()
+        if not self._run_guard_passed:
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "run_once_requires_start_guard",
+            }
+        padded = [pad_ticker(str(t)) for t in tickers]
         balance = self._kis_client.get_balance()
         bars_by_ticker = self._fetch_recent_bars(padded)
         latest_prices = self._latest_prices(bars_by_ticker)
@@ -308,19 +320,26 @@ class PaperAutoTrader:
 
     def _active_model_check(self) -> dict[str, Any]:
         quant = getattr(self._hot_runner, "_quant", None)
-        has_model = bool(getattr(quant, "has_model", True))
+        has_model = bool(getattr(quant, "has_model", False))
         metadata = getattr(quant, "model_metadata", None)
-        if self._require_active_model and not has_model:
+        bundle_id = (
+            (metadata or {}).get("bundle_id")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if self._require_active_model and (not has_model or not bundle_id):
             return {
                 "status": "FAIL",
                 "error_code": "ACTIVE_MODEL_REQUIRED",
                 "message": "QuantAgent active model이 없어 paper auto trading을 시작할 수 없다.",
+                "has_model": has_model,
+                "bundle_id": bundle_id,
             }
         return {
             "status": "PASS",
             "has_model": has_model,
             "model_version": (metadata or {}).get("version") if isinstance(metadata, dict) else None,
-            "bundle_id": (metadata or {}).get("bundle_id") if isinstance(metadata, dict) else None,
+            "bundle_id": bundle_id,
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:

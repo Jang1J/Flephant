@@ -360,6 +360,92 @@ def _broker_stage_statuses(data: dict[str, Any]) -> dict[str, Any]:
     return stage_statuses
 
 
+def _parse_report_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed.astimezone(_KST)
+
+
+def _fresh_generated_at_state(
+    value: Any,
+    *,
+    max_age_sec: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    generated_at = _parse_report_ts(value)
+    if generated_at is None:
+        return {
+            "status": "BLOCKED",
+            "reason": "generated_at_missing_or_invalid",
+            "generated_at": value,
+            "max_age_sec": max_age_sec,
+        }
+    ref_now = now or datetime.now(_KST)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=_KST)
+    age_sec = (ref_now.astimezone(_KST) - generated_at).total_seconds()
+    fresh = 0 <= age_sec <= max_age_sec
+    return {
+        "status": "PASS" if fresh else "BLOCKED",
+        "reason": None if fresh else "generated_at_stale_or_future",
+        "generated_at": generated_at.isoformat(),
+        "age_sec": round(age_sec, 3),
+        "max_age_sec": max_age_sec,
+    }
+
+
+def _paper_auto_evidence_guard(data: dict[str, Any]) -> dict[str, Any]:
+    guard = data.get("evidence_guard")
+    if isinstance(guard, dict):
+        return guard
+    preflight = (data.get("stages") or {}).get("preflight")
+    if not isinstance(preflight, dict):
+        return {}
+    paper_evidence = (preflight.get("stages") or {}).get("paper_evidence")
+    if not isinstance(paper_evidence, dict):
+        return {}
+    nested_guard = paper_evidence.get("evidence_guard")
+    return nested_guard if isinstance(nested_guard, dict) else {}
+
+
+def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, Any]:
+    broker_evidence = data.get("broker_evidence")
+    if not isinstance(broker_evidence, dict):
+        return {
+            "status": "BLOCKED",
+            "reason": "broker_evidence_missing",
+            "stage_statuses": {},
+        }
+    required = (
+        "balance_reconciliation",
+        "probe_order",
+        "order_history_requery",
+    )
+    statuses: dict[str, str] = {}
+    for name in required:
+        stage = broker_evidence.get(name)
+        statuses[name] = (
+            str(stage.get("status", "MISSING")).upper()
+            if isinstance(stage, dict)
+            else "MISSING"
+        )
+    passed = all(status == "PASS" for status in statuses.values())
+    return {
+        "status": "PASS" if passed else "BLOCKED",
+        "reason": None if passed else "broker_evidence_stage_not_pass",
+        "stage_statuses": statuses,
+    }
+
+
 def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
     if not isinstance(report_or_stage, dict):
         return 0
@@ -558,6 +644,12 @@ def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
 
 def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     paper_trading = _paper_trading_evidence_state(root)
+    paper_cfg = config_load("risk_config.yaml", "paper_trading") or {}
+    max_age_sec = safe_int(
+        paper_cfg.get("evidence_max_age_sec", 86400),
+        default=86400,
+        min_value=1,
+    )
     reports = _json_candidates(
         root,
         "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_*.json",
@@ -582,12 +674,22 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         bundle_ids = _paper_auto_bundle_ids(data)
         bundle_match = bundle_id in bundle_ids
         cycle_history_matched = _paper_auto_cycle_history_matched(data)
+        freshness = _fresh_generated_at_state(
+            data.get("generated_at"),
+            max_age_sec=max_age_sec,
+        )
+        nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+        evidence_guard = _paper_auto_evidence_guard(data)
+        evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
         passed = (
             data.get("status") == "PASS"
             and stage_statuses.get("paper_auto_cycle") == "PASS"
             and stage_statuses.get("balance_reconciliation") == "PASS"
             and stage_statuses.get("probe_order") == "PASS"
             and stage_statuses.get("order_history_requery") == "PASS"
+            and freshness.get("status") == "PASS"
+            and nested_evidence.get("status") == "PASS"
+            and evidence_guard_pass
             and cycle_history_matched
             and bundle_match
         )
@@ -597,6 +699,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
             "evidence_level": data.get("evidence_level"),
             "report_path": _repo_relative(path, root),
             "stage_statuses": stage_statuses,
+            "freshness": freshness,
+            "broker_evidence_nested": nested_evidence,
+            "evidence_guard": evidence_guard,
             "bundle_match": bundle_match,
             "bundle_ids": sorted(bundle_ids),
             "paper_auto_cycle_history_matched": cycle_history_matched,
@@ -619,6 +724,13 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     bundle_ids = _paper_auto_bundle_ids(data)
     bundle_match = bundle_id in bundle_ids
     cycle_history_matched = _paper_auto_cycle_history_matched(data)
+    freshness = _fresh_generated_at_state(
+        data.get("generated_at"),
+        max_age_sec=max_age_sec,
+    )
+    nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+    evidence_guard = _paper_auto_evidence_guard(data)
+    evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
     passed = (
         data.get("status") == "PASS"
         and external
@@ -626,6 +738,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         and stage_statuses.get("balance_reconciliation") == "PASS"
         and stage_statuses.get("probe_order") == "PASS"
         and stage_statuses.get("order_history_requery") == "PASS"
+        and freshness.get("status") == "PASS"
+        and nested_evidence.get("status") == "PASS"
+        and evidence_guard_pass
         and cycle_history_matched
         and bundle_match
     )
@@ -635,6 +750,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         "evidence_level": data.get("evidence_level"),
         "report_path": _repo_relative(path, root),
         "stage_statuses": stage_statuses,
+        "freshness": freshness,
+        "broker_evidence_nested": nested_evidence,
+        "evidence_guard": evidence_guard,
         "bundle_match": bundle_match,
         "bundle_ids": sorted(bundle_ids),
         "paper_auto_cycle_history_matched": cycle_history_matched,

@@ -183,6 +183,23 @@ class FakeMarketHotRunner(FakeHotRunner):
         return result
 
 
+class FakeNoModelFlagHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-TEST"},
+        )
+
+
+class FakeNoBundleHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            has_model=True,
+            model_metadata={"version": "active_v1"},
+        )
+
+
 def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
@@ -232,6 +249,65 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
     assert cycle["order_history_verification"]["status"] == "PASS"
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
+
+
+def test_paper_auto_run_once_requires_start_guard(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+    )
+
+    result = trader.run_once(tickers=["005930"], cycle_index=0)
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "run_once_requires_start_guard"
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_has_model_flag(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeNoModelFlagHotRunner(),
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
+    assert report["stages"]["active_model_guard"]["has_model"] is False
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_bundle_id(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeNoBundleHotRunner(),
+        report_dir=tmp_path,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
+    assert report["stages"]["active_model_guard"]["bundle_id"] is None
+    assert client.orders == []
 
 
 def test_paper_auto_rejects_zero_cycles_before_starting_hot_runner(tmp_path: Path) -> None:

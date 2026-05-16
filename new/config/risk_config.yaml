@@ -112,6 +112,7 @@ alpha_decay:
 execution:
   mode: "mock"                 # mock | paper | live
   live_enabled: false          # true면 실계좌 주문 가능
+  allowed_order_types: ["00"]  # KIS ORD_DVSN whitelist. 기본 지정가만 허용
 
 paper_trading:
   report_dir: "artifacts/reports/paper_trading"

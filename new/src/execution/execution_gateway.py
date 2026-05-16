@@ -77,6 +77,17 @@ class ExecutionGateway:
         if self._slippage_bps < 0:
             raise ValueError("execution_cost_model.components.slippage_bps 설정 누락")
 
+        allowed_order_types = exec_cfg.get("allowed_order_types", ["00"])
+        if isinstance(allowed_order_types, (list, tuple, set)):
+            order_type_values = allowed_order_types
+        else:
+            order_type_values = [allowed_order_types]
+        self._allowed_order_types: set[str] = {
+            str(value).strip().zfill(2)
+            for value in order_type_values
+            if str(value).strip()
+        } or {"00"}
+
         self._kill_switch = kill_switch
         self._audit_logger = audit_logger
         self._kis_client = kis_client
@@ -149,6 +160,14 @@ class ExecutionGateway:
             reason = f"kill_switch_active: {status.get('reason', 'unknown')}"
             return self._rejected(
                 order_plan_id, decision_id, reason, order_deltas, t0,
+            )
+        if self._mode == "live" and self._kill_switch is None:
+            return self._rejected(
+                order_plan_id,
+                decision_id,
+                "kill_switch_missing. 실계좌 주문 차단.",
+                order_deltas,
+                t0,
             )
 
         # 3. Mode 분기
@@ -381,8 +400,6 @@ class ExecutionGateway:
         if isinstance(registry, dict):
             active_version = str(registry.get("active_version") or "").strip()
         if not active_version:
-            active_version = str(proof.get("active_version") or "").strip()
-        if not active_version:
             missing.append("production_registry.active_version")
 
         if not safe_bool(proof.get("live_trading_allowed", False), default=False):
@@ -433,7 +450,14 @@ class ExecutionGateway:
             price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
 
-            if not self._valid_order_delta(ticker, side, qty, price, order_type):
+            if not self._valid_order_delta(
+                ticker,
+                side,
+                qty,
+                price,
+                order_type,
+                self._allowed_order_types,
+            ):
                 rejections.append({
                     "ticker": ticker,
                     "side": side,
@@ -534,8 +558,10 @@ class ExecutionGateway:
             "n_fills": len(fills),
         }
 
-    @staticmethod
-    def _normalize_order_deltas(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _normalize_order_deltas(
+        self,
+        raw: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Validate and normalize C10 order_deltas before any execution mode."""
         if raw is None:
             return [], []
@@ -557,7 +583,14 @@ class ExecutionGateway:
             qty = safe_lossless_int(od.get("qty", 0), default=0)
             price = safe_float(od.get("price", 0.0), default=0.0)
             order_type = str(od.get("order_type", "00") or "00")
-            if not ExecutionGateway._valid_order_delta(ticker, side, qty, price, order_type):
+            if not self._valid_order_delta(
+                ticker,
+                side,
+                qty,
+                price,
+                order_type,
+                self._allowed_order_types,
+            ):
                 errors.append({
                     "index": idx,
                     "ticker": ticker,
@@ -586,12 +619,16 @@ class ExecutionGateway:
         qty: int,
         price: float,
         order_type: str,
+        allowed_order_types: set[str] | None = None,
     ) -> bool:
+        allowed = allowed_order_types or {"00"}
         if ticker == "000000" or not is_valid_ticker(ticker):
             return False
         if side not in {"buy", "sell"}:
             return False
         if qty <= 0:
+            return False
+        if order_type not in allowed:
             return False
         if order_type != "01" and price <= 0:
             return False

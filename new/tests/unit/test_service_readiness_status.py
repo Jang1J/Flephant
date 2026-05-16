@@ -2,14 +2,34 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.ops import service_readiness_status
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _fresh_report_ts() -> str:
+    return datetime.now(_KST).isoformat()
+
+
+def _external_broker_evidence_fields(generated_at: str | None = None) -> dict:
+    return {
+        "generated_at": generated_at or _fresh_report_ts(),
+        "evidence_guard": {"status": "PASS"},
+        "broker_evidence": {
+            "balance_reconciliation": {"status": "PASS"},
+            "probe_order": {"status": "PASS"},
+            "order_history_requery": {"status": "PASS"},
+        },
+    }
 
 
 def _final_dataset_metadata() -> dict:
@@ -109,6 +129,7 @@ def test_service_status_passes_with_external_broker_evidence(
             "bundle_id": bundle_id,
             "external_kis_api": True,
             "evidence_level": "external_kis_virtual",
+            **_external_broker_evidence_fields(),
             "stage_statuses": {
                 "preflight": "PASS",
                 "paper_auto_cycle": "PASS",
@@ -408,6 +429,7 @@ def test_service_status_prefers_deployable_evidence_over_newer_failed_experiment
             "bundle_id": bundle_id,
             "external_kis_api": True,
             "evidence_level": "external_kis_virtual",
+            **_external_broker_evidence_fields(),
             "stage_statuses": {
                 "preflight": "PASS",
                 "paper_auto_cycle": "PASS",
@@ -584,6 +606,7 @@ def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
         "bundle_id": bundle_id,
         "external_kis_api": True,
         "evidence_level": "external_kis_virtual",
+        **_external_broker_evidence_fields(),
         "stage_statuses": {
             "paper_auto_cycle": "PASS",
             "balance_reconciliation": "PASS",
@@ -628,6 +651,100 @@ def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
     assert evidence["external_kis_api"] is True
     assert evidence["evidence_level"] == "external_kis_virtual"
     assert evidence["report_path"].endswith("20260515_135618.json")
+
+
+def test_broker_evidence_blocks_stale_external_report(
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    payload = {
+        "status": "PASS",
+        "bundle_id": bundle_id,
+        "external_kis_api": True,
+        "evidence_level": "external_kis_virtual",
+        **_external_broker_evidence_fields(generated_at="2020-01-01T09:00:00+09:00"),
+        "stage_statuses": {
+            "paper_auto_cycle": "PASS",
+            "balance_reconciliation": "PASS",
+            "probe_order": "PASS",
+            "order_history_requery": "PASS",
+        },
+        "stages": {
+            "paper_auto_cycle": {
+                "status": "PASS",
+                "stages": {
+                    "active_model_guard": {"bundle_id": bundle_id},
+                    "cycles": {
+                        "items": [{
+                            "status": "PASS",
+                            "order_history_verification": {
+                                "status": "PASS",
+                                "queries": [{"matched_order_count": 1}],
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    }
+    _write_json(
+        tmp_path
+        / "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_20260515.json",
+        payload,
+    )
+
+    evidence = service_readiness_status._broker_evidence_state(tmp_path, bundle_id)
+
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["freshness"]["status"] == "BLOCKED"
+    assert evidence["freshness"]["reason"] == "generated_at_stale_or_future"
+
+
+def test_broker_evidence_blocks_missing_nested_guard(
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    payload = {
+        "status": "PASS",
+        "generated_at": _fresh_report_ts(),
+        "bundle_id": bundle_id,
+        "external_kis_api": True,
+        "evidence_level": "external_kis_virtual",
+        "stage_statuses": {
+            "paper_auto_cycle": "PASS",
+            "balance_reconciliation": "PASS",
+            "probe_order": "PASS",
+            "order_history_requery": "PASS",
+        },
+        "stages": {
+            "paper_auto_cycle": {
+                "status": "PASS",
+                "stages": {
+                    "active_model_guard": {"bundle_id": bundle_id},
+                    "cycles": {
+                        "items": [{
+                            "status": "PASS",
+                            "order_history_verification": {
+                                "status": "PASS",
+                                "queries": [{"matched_order_count": 1}],
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    }
+    _write_json(
+        tmp_path
+        / "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_20260515.json",
+        payload,
+    )
+
+    evidence = service_readiness_status._broker_evidence_state(tmp_path, bundle_id)
+
+    assert evidence["status"] == "BLOCKED"
+    assert evidence["broker_evidence_nested"]["status"] == "BLOCKED"
+    assert evidence["evidence_guard"] == {}
 
 
 def test_probe_blocker_classifies_non_business_day_as_market_closed() -> None:
