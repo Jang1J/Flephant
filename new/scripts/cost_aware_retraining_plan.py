@@ -21,7 +21,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
+from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "cost_aware_retraining"
@@ -65,6 +66,93 @@ def _is_newer(candidate: Path | None, reference: Path | None) -> bool:
         return False
 
 
+def _dataset_date_arg(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        raw = raw[:10]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    gate_cfg = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
+def _final_dataset_window() -> dict[str, str | None]:
+    gate_cfg = _final_dataset_gate_cfg()
+    return {
+        "start_date": _dataset_date_arg(gate_cfg.get("expected_start_date")),
+        "end_date": _dataset_date_arg(gate_cfg.get("expected_end_date")),
+    }
+
+
+def _final_training_tickers() -> list[str]:
+    cfg = config_load("universe_config.yaml") or {}
+    gate_cfg = _final_dataset_gate_cfg()
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
+        for row in sector.get("stocks", []) or []:
+            if str(row.get("status")) in stock_statuses:
+                tickers.append(pad_ticker(str(row.get("ticker", ""))))
+    if not tickers:
+        fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
+        tickers.extend(pad_ticker(str(ticker)) for ticker in fallback)
+    max_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+    deduped = sorted({ticker for ticker in tickers if ticker != "000000"})
+    return deduped[:max_tickers] if max_tickers else deduped
+
+
+def _label_scan_command(
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+) -> str:
+    parts = [
+        "PYTHONPATH=new python new/scripts/cost_aware_label_horizon_scan.py",
+        "--artifacts-dir artifacts/data",
+    ]
+    if start_date:
+        parts.append(f"--start-date {start_date}")
+    if end_date:
+        parts.append(f"--end-date {end_date}")
+    if tickers:
+        parts.append(f"--tickers {','.join(tickers)}")
+    return " ".join(parts)
+
+
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
     if not isinstance(label_scan, dict):
         return {}
@@ -91,6 +179,8 @@ def build_retraining_plan(
         f"artifacts/reports/service_policy_replay/service_policy_replay_{bundle_id}_*.json"
     )
     label_scan_path, label_scan = _latest("artifacts/reports/label_horizon_scan/*.json")
+    final_window = _final_dataset_window()
+    final_tickers = _final_training_tickers()
 
     blockers: list[str] = []
     phase2_pass = (phase2 or {}).get("status") == "PASS"
@@ -127,6 +217,15 @@ def build_retraining_plan(
         "bundle_id": bundle_id,
         "read_only": True,
         "registry_mutated": False,
+        "training_window": {
+            "source": "final_dataset_gate",
+            **final_window,
+        },
+        "training_universe": {
+            "source": "final_dataset_gate",
+            "ticker_count": len(final_tickers),
+            "tickers": final_tickers,
+        },
         "active_label": {
             "horizon_bars": active_horizon,
             "target_col": label_cfg.get("target_col"),
@@ -197,7 +296,11 @@ def build_retraining_plan(
         },
         "blockers": sorted(set(blockers)),
         "next_commands": [
-            "PYTHONPATH=new python new/scripts/cost_aware_label_horizon_scan.py --artifacts-dir artifacts/data --end-date 20260508",
+            _label_scan_command(
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+            ),
             f"PYTHONPATH=new python new/scripts/service_policy_replay.py --bundle-id {bundle_id}",
         ],
     }

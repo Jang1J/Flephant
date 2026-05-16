@@ -1,6 +1,6 @@
 """Post-backfill pre-live orchestrator.
 
-Run this after the 80-business-day ``live_data_readiness --all --require-train``
+Run this after the final dataset ``live_data_readiness --all --require-train``
 job finishes. The script does not read .env files. It uses the already sourced
 process environment, keeps live trading disabled, and advances only through
 safe pre-live gates.
@@ -42,6 +42,14 @@ def _previous_business_day(today: date | None = None) -> date:
 
 def _business_start_date(end: date, business_days: int) -> date:
     return kospi_trading_start_date(end, business_days)
+
+
+def _final_gate_default_end_date() -> str:
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    expected = prelive_gate._parse_dataset_date(gate_cfg.get("expected_end_date"))
+    if expected is not None:
+        return expected.strftime("%Y%m%d")
+    return _previous_business_day().strftime("%Y%m%d")
 
 
 def _stage(status: str, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -354,13 +362,13 @@ def run_pipeline(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_end = _previous_business_day().strftime("%Y%m%d")
+    default_end = _final_gate_default_end_date()
     parser = argparse.ArgumentParser(
         description="Run post-backfill gates up to the pre-live boundary",
     )
     parser.add_argument("--end-date", default=default_end, help="YYYYMMDD")
-    parser.add_argument("--business-days", type=int, default=80)
-    parser.add_argument("--max-tickers", type=int, default=30)
+    parser.add_argument("--business-days", type=int, default=prelive_gate._final_gate_min_business_days())
+    parser.add_argument("--max-tickers", type=int, default=prelive_gate._final_gate_min_tickers())
     parser.add_argument("--bundle-id", default="")
     parser.add_argument("--run-paper-balance", action="store_true")
     parser.add_argument("--system-positions-json", default="")

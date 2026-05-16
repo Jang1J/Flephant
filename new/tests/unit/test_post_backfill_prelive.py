@@ -76,6 +76,25 @@ def test_business_start_date_uses_krx_calendar():
     assert mod._business_start_date(date(2026, 5, 8), 80).strftime("%Y%m%d") == "20260109"
 
 
+def test_parse_args_defaults_follow_final_dataset_gate(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_final_dataset_gate_cfg",
+        lambda: {
+            "expected_end_date": "20260515",
+            "min_business_days": 249,
+            "min_tickers": 30,
+        },
+    )
+
+    args = mod._parse_args([])
+
+    assert args.end_date == "20260515"
+    assert args.business_days == 249
+    assert args.max_tickers == 30
+
+
 def test_pipeline_stops_before_training_when_80d_gate_blocked(monkeypatch):
     mod = _load_script_module()
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")

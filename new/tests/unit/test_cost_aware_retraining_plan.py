@@ -124,6 +124,71 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
         == "label_session_close_net_ret"
     )
     assert plan["recommended_experiment"]["active_horizon_mean_net_bps"] == -14.0
+    assert "20260508" not in plan["next_commands"][0]
+
+
+def test_cost_aware_next_command_uses_final_gate_window_and_universe(monkeypatch, tmp_path):
+    mod = _load_script("cost_aware_retraining_plan")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    def fake_config_load(file: str = "risk_config.yaml", key: str | None = None):
+        if file == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "semis": {
+                        "status": "confirmed",
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                        ],
+                    },
+                    "banks": {
+                        "status": "confirmed_pending_data",
+                        "stocks": [
+                            {"ticker": "105560", "status": "pending_data"},
+                        ],
+                    },
+                    "ignored": {
+                        "status": "candidate",
+                        "stocks": [
+                            {"ticker": "000001", "status": "pending_data"},
+                        ],
+                    },
+                },
+            }
+        if key == "backtest_agent":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "expected_start_date": "20250509",
+                        "expected_end_date": "20260515",
+                        "min_tickers": 30,
+                        "include_pending_data_tickers": True,
+                        "allowed_stock_statuses": ["active", "pending_data"],
+                        "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+                    },
+                },
+            }
+        if key == "cost_aware_retraining":
+            return {"horizon_candidates": ["5"], "objective": {}}
+        if key == "label":
+            return {"horizon_bars": 5, "target_col": "label_5m_ret"}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+
+    plan = mod.build_retraining_plan(bundle_id="BUNDLE-TEST", write_report=False)
+    command = plan["next_commands"][0]
+
+    assert plan["training_window"] == {
+        "source": "final_dataset_gate",
+        "start_date": "20250509",
+        "end_date": "20260515",
+    }
+    assert plan["training_universe"]["tickers"] == ["005930", "105560"]
+    assert "--start-date 20250509" in command
+    assert "--end-date 20260515" in command
+    assert "--tickers 005930,105560" in command
+    assert "20260508" not in command
 
 
 def test_cost_aware_objective_string_false(monkeypatch, tmp_path):
