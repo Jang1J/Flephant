@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -163,6 +165,29 @@ def test_mode_b_demo_no_write_summary_skips_artifact(monkeypatch) -> None:
     )
 
     assert summary["status"] == "PASS"
+
+
+def test_e2e_no_write_redirects_dead_letter_to_devnull(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeAdmission:
+        def __init__(self, *args, dead_letter_path=None, **kwargs):
+            captured["dead_letter_path"] = dead_letter_path
+
+    class FakeGateway:
+        def __init__(self, admission=None):
+            self.admission = admission
+            captured["admission"] = admission
+
+    monkeypatch.setattr("src.runner.e2e_scenario_runner.EventAdmission", FakeAdmission)
+    monkeypatch.setattr("src.runner.e2e_scenario_runner.EventGateway", FakeGateway)
+
+    runner = E2EScenarioRunner(write_audit=False)
+    gateway = runner._event_gateway_for_run()
+
+    assert gateway.admission is captured["admission"]
+    assert captured["dead_letter_path"] == Path(os.devnull)
+    assert runner._event_injector_audit_path() == Path(os.devnull)
 
 
 def test_mode_b_stage_blocking_treats_string_true_critical_alert_as_blocking() -> None:

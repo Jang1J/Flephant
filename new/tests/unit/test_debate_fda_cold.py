@@ -14,6 +14,14 @@ from src.utils.pit_guard import PITViolationError
 # fixtures
 # ------------------------------------------------------------------ #
 
+@pytest.fixture(autouse=True)
+def _isolate_default_memory_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.cold.debate._DEFAULT_MEMORY_ROOT",
+        tmp_path / "agent_memory",
+    )
+
+
 _DEFAULT_DEBATE_BATCH = (
     '{"results":['
     '{"pair":["005930","000660"],"winner":"005930","confidence":0.8,"reasoning":"삼성전자 우위"},'

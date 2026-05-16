@@ -47,6 +47,7 @@ from src.models.registry import ModelRegistry
 from src.models.ppo_allocator import PPOAllocator
 from src.ops.profiler import HotPathProfiler
 from src.ops.state_machine import PipelineState, StateMachine
+from src.data.event_admission import EventAdmission
 from src.orchestration.event_gateway import EventGateway
 from src.orchestration.hot_runner import HotRunner
 from src.portfolio.portfolio_manager import PortfolioManager
@@ -64,7 +65,6 @@ _KST = ZoneInfo("Asia/Seoul")
 _SCENARIOS_DIR = Path(__file__).resolve().parents[2] / "config" / "scenarios"
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _AUDIT_DIR = _PROJECT_ROOT / "artifacts" / "audit"
-_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -181,7 +181,8 @@ class E2EScenarioRunner:
         scenario_file: scenarios/*.yaml 파일명 (예: "week1_basic.yaml").
         short_mode: True이면 hot_path_ticks_short tick만 실행 (CI 빠른 모드).
         skip_mode_b: True이면 Mode B 건너뜀. unit test용.
-        write_audit: False이면 artifacts/audit JSONL/summary 파일을 쓰지 않음.
+        write_audit: False이면 artifacts/audit JSONL/summary 파일을 쓰지 않고,
+            Cold Path dead-letter도 persistent artifact 대신 os.devnull로 보냄.
     """
 
     def __init__(
@@ -254,6 +255,18 @@ class E2EScenarioRunner:
             return None
         resolved = Path(path)
         return resolved if resolved.is_absolute() else _PROJECT_ROOT / resolved
+
+    def _event_gateway_for_run(self) -> EventGateway:
+        """Build EventGateway with a persistent dead-letter sink only for audit runs."""
+        if self._write_audit:
+            return EventGateway()
+        admission = EventAdmission(dead_letter_path=Path(os.devnull))
+        return EventGateway(admission=admission)
+
+    def _event_injector_audit_path(self) -> Path:
+        if not self._write_audit:
+            return Path(os.devnull)
+        return _AUDIT_DIR / "injected_events.jsonl"
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -329,10 +342,10 @@ class E2EScenarioRunner:
             risk_fast=RiskFastAgent(),
             profiler=profiler,
         )
-        gateway = EventGateway()
+        gateway = self._event_gateway_for_run()
         injector = EventInjector(
             gateway=gateway,
-            audit_log_path=_AUDIT_DIR / "injected_events.jsonl",
+            audit_log_path=self._event_injector_audit_path(),
         )
 
         # 2. BOOTSTRAP → HOT_RUNNING
@@ -769,6 +782,7 @@ class E2EScenarioRunner:
             logger.info("[e2e_scenario_runner] summary save skipped (--no-write-summary)")
             return
         summary_path = _AUDIT_DIR / f"scenario_{self._scenario_name}_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
         with summary_path.open("w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         logger.info("[e2e_scenario_runner] summary saved → %s", summary_path)

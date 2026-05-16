@@ -343,6 +343,30 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _label_target_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
+    """Deployable C12 evidence must match the current label target SSOT."""
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    required_target_col = str(label_cfg.get("target_col") or "").strip()
+    metadata = _extract_model_metadata(backtest)
+    observed_target_col = str(metadata.get("target_col") or "").strip()
+    blockers: list[str] = []
+    if not required_target_col:
+        blockers.append("label_target_config_missing")
+    if not metadata:
+        blockers.append("model_metadata_missing")
+    elif not observed_target_col:
+        blockers.append("model_target_col_missing")
+    elif required_target_col and observed_target_col != required_target_col:
+        blockers.append("model_target_col_mismatch")
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "required": True,
+        "blockers": blockers,
+        "required_target_col": required_target_col or None,
+        "observed_target_col": observed_target_col or None,
+    }
+
+
 def _backtest_state_from_report(
     root: Path,
     bundle_id: str,
@@ -355,6 +379,8 @@ def _backtest_state_from_report(
     service_pass = _service_policy_gate_pass(data, bundle_id, repo_root=root)
     final_dataset_gate = _final_dataset_gate_state(data)
     final_dataset_pass = final_dataset_gate.get("status") == "PASS"
+    label_target_gate = _label_target_gate_state(data)
+    label_target_pass = label_target_gate.get("status") == "PASS"
     schema_current = "feature_quality" in data and "service_policy_replay" in data
     deployable = (
         data.get("verdict") == "pass"
@@ -363,6 +389,7 @@ def _backtest_state_from_report(
         and feature_pass
         and service_pass
         and final_dataset_pass
+        and label_target_pass
     )
     return {
         "status": "PASS" if deployable else "BLOCKED",
@@ -377,6 +404,8 @@ def _backtest_state_from_report(
         "service_policy_gate_pass": service_pass,
         "final_dataset_gate_pass": final_dataset_pass,
         "final_dataset_gate": final_dataset_gate,
+        "label_target_gate_pass": label_target_pass,
+        "label_target_gate": label_target_gate,
         "metrics": data.get("metrics", {}),
     }
 

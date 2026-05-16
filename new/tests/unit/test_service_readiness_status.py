@@ -46,6 +46,7 @@ def _final_dataset_metadata() -> dict:
         "train_end": "2026-05-15",
         "data_source": "artifact_bars",
         "synthetic_fallback": False,
+        "target_col": "label_5m_ret",
         "requested_tickers": tickers,
         "loaded_tickers": tickers,
         "missing_tickers": [],
@@ -180,6 +181,48 @@ def test_service_status_is_read_only_and_blocks_without_broker(tmp_path: Path) -
     assert payload["live_trading_allowed"] is False
     assert payload["be_contract"]["safe_to_enable_order_actions"] is False
     assert payload["production_registry"]["active_version"] is None
+
+
+def test_backtest_state_blocks_label_target_mismatch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    monkeypatch.setattr(
+        service_readiness_status,
+        "_service_policy_gate_pass",
+        lambda backtest, bundle_id, **kwargs: True,
+    )
+    metadata = _final_dataset_metadata()
+    metadata["target_col"] = "label_30m_net_ret"
+    backtest = {
+        "bundle_id": bundle_id,
+        "verdict": "pass",
+        "regression_risk": {"flagged": False, "severity": "low"},
+        "minute_bar_leakage_check": {"verdict": "pass"},
+        "feature_quality": {
+            "dual_source_rows": 10,
+            "dual_source_non_neutral_rows": 10,
+            "exogenous_rows": 10,
+            "exogenous_non_neutral_rows": 10,
+        },
+        "service_policy_replay": {"status": "PASS"},
+        "candidate_model_metadata": metadata,
+    }
+
+    state = service_readiness_status._backtest_state_from_report(
+        tmp_path,
+        bundle_id,
+        tmp_path / "artifacts/reports/backtest/backtest_BUNDLE-TEST.json",
+        backtest,
+    )
+
+    assert state["status"] == "BLOCKED"
+    assert state["deployable"] is False
+    assert state["label_target_gate_pass"] is False
+    assert state["label_target_gate"]["required_target_col"] == "label_5m_ret"
+    assert state["label_target_gate"]["observed_target_col"] == "label_30m_net_ret"
+    assert "model_target_col_mismatch" in state["label_target_gate"]["blockers"]
 
 
 def test_service_status_passes_with_external_broker_evidence(

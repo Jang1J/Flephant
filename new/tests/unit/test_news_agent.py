@@ -13,6 +13,14 @@ from src.utils.pit_guard import PITViolationError
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _isolate_default_memory_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.cold.news._DEFAULT_MEMORY_ROOT",
+        tmp_path / "agent_memory",
+    )
+
+
 def _make_llm(success=True, content="삼성전자 buy 매수 추천"):
     """LLMRouter mock 생성. LLMCallResult 유사 객체 반환."""
     llm = MagicMock()

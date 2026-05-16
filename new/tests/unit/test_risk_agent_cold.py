@@ -15,6 +15,14 @@ from src.utils.pit_guard import PITViolationError
 # fixtures
 # ------------------------------------------------------------------ #
 
+@pytest.fixture(autouse=True)
+def _isolate_default_memory_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.cold.risk_slow._DEFAULT_MEMORY_ROOT",
+        tmp_path / "agent_memory",
+    )
+
+
 def _make_fast() -> RiskAgentFast:
     return RiskAgentFast(pubsub=None)
 
