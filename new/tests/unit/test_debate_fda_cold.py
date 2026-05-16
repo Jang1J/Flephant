@@ -429,6 +429,33 @@ def test_fda_cold_llm_approve() -> None:
     assert fd["confidence"] == pytest.approx(0.85)
 
 
+def test_fda_cold_uses_uncertainty_signal_score_for_news_divergence_veto() -> None:
+    """RiskFast uncertainty_signal이 cold FDA uncertainty_score로 연결된다."""
+    fda = _make_fda(with_router=False)
+    result = fda.decide(
+        portfolio_patch_ref="PP-20260426-UNC",
+        target_weights={"005930": 0.05},
+        mode="cold",
+        risk_warnings=[],
+        agent_signals=[
+            {
+                "channel": "uncertainty_signal",
+                "payload": {
+                    "uncertainty_score": 0.8,
+                    "event_id": "EVT-UNC",
+                    "scope": "ticker:005930",
+                },
+            }
+        ],
+        debate_result={"conflict_detected": False},
+    )
+
+    fd = _fd(result)
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+    assert "uncertainty_score=0.800" in fd["veto_reason"]
+
+
 def test_fda_cold_llm_string_false_vetoes() -> None:
     """LLM approved='false' 문자열은 Python truthy가 아니라 False로 해석한다."""
     router = _make_router(

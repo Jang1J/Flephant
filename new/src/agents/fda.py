@@ -219,16 +219,27 @@ class FDAAgent(AgentBase):
         t0 = time.perf_counter()
 
         if mode == "cold":
+            cold_signals = agent_signals or []
+            resolved_uncertainty_score = safe_float(
+                uncertainty_score,
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            if resolved_uncertainty_score == 0.0:
+                resolved_uncertainty_score = self._uncertainty_score_from_signals(
+                    cold_signals
+                )
             result = self._decide_cold(
                 portfolio_patch_ref=portfolio_patch_ref,
                 target_weights=target_weights or {},
                 order_deltas=order_deltas or [],
                 risk_warnings=risk_warnings or [],
                 debate_result=debate_result,
-                agent_signals=agent_signals or [],
+                agent_signals=cold_signals,
                 active_reports=active_reports or [],
                 t0=t0,
-                uncertainty_score=float(uncertainty_score),
+                uncertainty_score=resolved_uncertainty_score,
             )
             result["mode"] = "cold"  # Cold Path임을 C9 mode 필드에 명시
             return result
@@ -616,6 +627,27 @@ class FDAAgent(AgentBase):
             active_reports=active_reports,
             confidence=confidence,
         )
+
+    @staticmethod
+    def _uncertainty_score_from_signals(agent_signals: list[dict[str, Any]]) -> float:
+        """Extract the strongest RiskFast uncertainty_signal score for cold FDA."""
+        best = 0.0
+        for signal in agent_signals:
+            if not isinstance(signal, dict):
+                continue
+            payload = signal.get("payload")
+            payload = payload if isinstance(payload, dict) else signal
+            channel = str(signal.get("channel") or payload.get("channel") or "")
+            if channel != "uncertainty_signal":
+                continue
+            score = safe_float(
+                payload.get("uncertainty_score", payload.get("confidence", 0.0)),
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            best = max(best, score)
+        return best
 
     def _build_cold_prompt(
         self,

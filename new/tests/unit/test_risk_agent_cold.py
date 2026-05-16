@@ -166,6 +166,30 @@ def test_fast_news_comm_divergence_trigger() -> None:
     })
     assert "news_comm_divergence_strong" in result["triggered_rules"]
     assert result["stance"] == "risk_reduce"
+    assert result["uncertainty_score"] == pytest.approx(0.7)
+
+
+def test_fast_uncertainty_signal_payload_has_score_and_trace() -> None:
+    """uncertainty_signal은 FDA가 읽을 score + correlation trace를 포함한다."""
+    pubsub = MagicMock()
+    pubsub.publish.return_value = "MSG-UNC-1"
+    fast = RiskAgentFast(pubsub=pubsub)
+    event = _make_event()
+    event["scope"] = "ticker:005930"
+    event["asof"] = "2026-04-18T10:01:00+09:00"
+
+    fast.evaluate(event, context={"news_comm_divergence": -0.8})
+
+    pubsub.publish.assert_called()
+    channel, message = pubsub.publish.call_args.args
+    payload = message["payload"]
+    assert channel == "uncertainty_signal"
+    assert payload["uncertainty_score"] == pytest.approx(0.8)
+    assert payload["confidence"] == pytest.approx(0.8)
+    assert payload["scope"] == "ticker:005930"
+    assert payload["event_id"] == "EVT-TEST-001"
+    assert payload["occurred_at"] == "2026-04-18T10:00:00+09:00"
+    assert payload["asof"] == "2026-04-18T10:01:00+09:00"
 
 
 # ------------------------------------------------------------------ #

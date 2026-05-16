@@ -143,6 +143,7 @@ class RiskAgentFast(AgentBase):
         t0 = time.perf_counter()
         ctx = context or {}
         triggered: list[dict[str, Any]] = []
+        uncertainty_score: float | None = None
 
         event_type = event.get("event_type", "")
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -201,13 +202,18 @@ class RiskAgentFast(AgentBase):
 
         # 규칙 6: 뉴스-커뮤니티 방향 불일치
         divergence = ctx.get("news_comm_divergence", 0.0)
-        if abs(divergence) > self._thresholds["news_comm_divergence"]:
+        try:
+            divergence_value = float(divergence)
+        except (TypeError, ValueError):
+            divergence_value = 0.0
+        if abs(divergence_value) > self._thresholds["news_comm_divergence"]:
+            uncertainty_score = max(0.0, min(1.0, abs(divergence_value)))
             triggered.append(
                 {"rule_id": "news_comm_divergence_strong", "matched_at": now_iso}
             )
             logger.info(
                 "[risk_fast_cold] rule_news_comm_divergence_strong 발동: div=%.2f",
-                divergence,
+                divergence_value,
             )
             # uncertainty_signal publish (Dual-Source divergence → FDA 연계)
             self._publish_to_bus(
@@ -215,6 +221,15 @@ class RiskAgentFast(AgentBase):
                 {
                     "source": "risk_fast_cold",
                     "trigger": "news_comm_divergence_strong",
+                    "uncertainty_score": uncertainty_score,
+                    "confidence": uncertainty_score,
+                    "scope": event.get("scope") or (
+                        f"ticker:{event.get('ticker')}" if event.get("ticker") else "market"
+                    ),
+                    "event_id": event.get("event_id"),
+                    "ticker": event.get("ticker"),
+                    "occurred_at": event.get("occurred_at"),
+                    "asof": event.get("asof"),
                     "ts": datetime.now(_KST).isoformat(),
                     "reasoning": "뉴스-커뮤니티 방향 불일치로 불확실성 신호 발행",
                 },
@@ -248,7 +263,7 @@ class RiskAgentFast(AgentBase):
                 "[risk_fast_cold] SLA 초과: %.2fms > %.0fms", latency_ms, self._sla_ms
             )
 
-        return {
+        result = {
             "risk_level": risk_level,
             "stance": stance,
             "fast_rule_match": triggered if triggered else None,
@@ -258,6 +273,9 @@ class RiskAgentFast(AgentBase):
             # consumer 가 len(triggered_rules) 로 동등 계산 가능.
             "latency_ms": round(latency_ms, 2),
         }
+        if uncertainty_score is not None:
+            result["uncertainty_score"] = uncertainty_score
+        return result
 
     def report(self, report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """C5 risk_warning 리포트 생성."""
