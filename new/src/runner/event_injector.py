@@ -32,7 +32,6 @@ logger = get_logger("event_injector")
 _KST = ZoneInfo("Asia/Seoul")
 
 _AUDIT_DIR = Path(__file__).resolve().parents[3] / "artifacts" / "audit"
-_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class EventInjector:
@@ -52,7 +51,6 @@ class EventInjector:
         self._log_path: Path = audit_log_path or (
             _AUDIT_DIR / "injected_events.jsonl"
         )
-        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._injected: list[dict[str, Any]] = []
         logger.info("[event_injector] 초기화 완료. audit=%s", self._log_path)
 
@@ -89,7 +87,7 @@ class EventInjector:
             "source": source,
             "category": "single_company",
         }
-        return self._ingest(raw, source="naver_news", event_type="news")
+        return self._ingest(raw, source="naver_news", event_type="news", asof=ts)
 
     def inject_dart(
         self,
@@ -121,7 +119,7 @@ class EventInjector:
             "title": title if title else disclosure_type,
             "source": "dart",
         }
-        return self._ingest(raw, source="dart", event_type="dart")
+        return self._ingest(raw, source="dart", event_type="dart", asof=ts)
 
     def inject_community(
         self,
@@ -150,7 +148,7 @@ class EventInjector:
             "score": float(score),
             "source": "community",
         }
-        return self._ingest(raw, source="community", event_type="community")
+        return self._ingest(raw, source="community", event_type="community", asof=ts)
 
     def inject_macro(
         self,
@@ -175,7 +173,7 @@ class EventInjector:
             "value": float(value),
             "source": "ecos",
         }
-        return self._ingest(raw, source="ecos", event_type="macro")
+        return self._ingest(raw, source="ecos", event_type="macro", asof=ts)
 
     def injected_count(self) -> int:
         """지금까지 주입한 이벤트 수."""
@@ -187,6 +185,7 @@ class EventInjector:
 
     def flush_audit_log(self) -> Path:
         """주입된 이벤트 전체를 JSONL로 기록. 경로 반환."""
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_path.open("w", encoding="utf-8") as f:
             for entry in self._injected:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -206,9 +205,10 @@ class EventInjector:
         raw: dict[str, Any],
         source: str,
         event_type: str,
+        asof: datetime | None = None,
     ) -> dict[str, Any]:
         """EventGateway.ingest() 호출 + audit 기록."""
-        result = self._gateway.ingest(raw, source=source)
+        result = self._gateway.ingest(raw, source=source, asof=asof)
         record = {
             "event_type": event_type,
             "raw": raw,

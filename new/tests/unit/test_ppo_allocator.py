@@ -87,6 +87,12 @@ def test_normalize_scores_pads_ticker() -> None:
     assert "005930" in out
 
 
+def test_normalize_scores_skips_malformed_and_nonfinite_scores() -> None:
+    qo = _quant_output({"005930": "N/A", "000660": float("inf"), "035420": 0.7})  # type: ignore[arg-type]
+    out = PPOAllocator._normalize_scores(qo)
+    assert out == {"035420": 0.7}
+
+
 # ====================================================================== #
 # 3. allocate (Happy path)
 # ====================================================================== #
@@ -135,6 +141,58 @@ def test_allocate_all_below_min_confidence(allocator: PPOAllocator) -> None:
     assert result["metadata"]["reason"] == "all_below_min_confidence"
 
 
+def test_trade_probability_gate_filters_low_probability(allocator: PPOAllocator) -> None:
+    allocator._trade_probability_gate_enabled = True
+    allocator._min_trade_probability = 0.6
+    qo = _quant_output({
+        "005930": 10.0,
+        "000660": 9.0,
+        "035420": 8.0,
+    })
+    qo["trade_probs"] = {
+        "005930": 0.2,
+        "000660": 0.9,
+        "035420": 0.1,
+    }
+
+    result = allocator.allocate(qo)
+    weights = result["allocation_plan"]["target_weights"]
+    rejected = result["metadata"]["rejected"]
+
+    assert set(weights) == {"000660"}
+    assert result["metadata"]["trade_probability_gate"]["applied"] is True
+    assert result["metadata"]["trade_probability_gate"]["n_rejected"] == 2
+    assert {
+        (item["ticker"], item["reason"])
+        for item in rejected
+        if item["reason"] == "below_min_trade_probability"
+    } == {
+        ("005930", "below_min_trade_probability"),
+        ("035420", "below_min_trade_probability"),
+    }
+
+
+def test_trade_probability_gate_keeps_existing_flow_when_probs_missing(
+    allocator: PPOAllocator,
+) -> None:
+    allocator._trade_probability_gate_enabled = True
+    allocator._min_trade_probability = 0.6
+    scores = {
+        "005930": 10.0,
+        "000660": 10.0,
+    }
+
+    result = allocator.allocate(_quant_output(scores))
+
+    assert result["allocation_plan"]["target_weights"]
+    assert result["metadata"]["trade_probability_gate"] == {
+        "enabled": True,
+        "applied": False,
+        "min_probability": 0.6,
+        "reason": "trade_probs_missing",
+    }
+
+
 def test_allocate_few_dominant_scores(allocator: PPOAllocator) -> None:
     # 2 종목 극단적으로 높음 → softmax에서 0.5 이상 독점
     scores = {
@@ -169,6 +227,27 @@ def test_max_single_name_cap_enforced(allocator: PPOAllocator) -> None:
     plan = result["allocation_plan"]
     for w in plan["target_weights"].values():
         assert w <= allocator._max_single_name + 1e-9
+
+
+def test_max_sector_cap_enforced(allocator: PPOAllocator) -> None:
+    scores = {
+        "005930": 10.0,
+        "000660": 10.0,
+        "042700": 10.0,
+        "403870": 10.0,
+        "058470": 10.0,
+    }
+
+    result = allocator.allocate(_quant_output(scores))
+    weights = result["allocation_plan"]["target_weights"]
+    semiconductor_weight = sum(weights.values())
+
+    assert set(weights) == set(scores)
+    assert semiconductor_weight == pytest.approx(allocator._max_sector, abs=1e-9)
+    assert result["allocation_plan"]["cash_weight"] == pytest.approx(
+        1.0 - allocator._max_sector,
+        abs=1e-9,
+    )
 
 
 def test_min_cash_ratio(allocator: PPOAllocator) -> None:

@@ -11,10 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from src.execution.execution_gateway import (
-    ExecutionDependencyError,
-    ExecutionGateway,
-)
+from src.execution.execution_gateway import ExecutionGateway
 from src.execution.kill_switch import (
     InvalidOperatorTokenError,
     KillSwitch,
@@ -141,22 +138,53 @@ def gateway(tmp_path: Path) -> ExecutionGateway:
 
 
 def _final_decision(approved: bool, order_deltas: list[dict] | None = None) -> dict:
+    if order_deltas is None or not isinstance(order_deltas, list):
+        contract_order_deltas = order_deltas or []
+    else:
+        contract_order_deltas = []
+        for od in order_deltas:
+            if isinstance(od, dict):
+                contract_order_deltas.append({"reason": "rebalance", **od})
+            else:
+                contract_order_deltas.append(od)
     return {
         "decision_id": "DEC-20260420-001",
         "approved": approved,
         "target_weights": {"005930": 0.1} if approved else {},
-        "order_deltas": order_deltas or [],
+        "order_deltas": contract_order_deltas,
         "veto_reason": None if approved else "some reason",
         "reason_code": "NORMAL_APPROVE" if approved else "RISK_FAST_TRIGGER",
     }
 
 
+def _execution_universe_config() -> dict:
+    return {
+        "sectors": {
+            "반도체": {
+                "status": "confirmed",
+                "stocks": [
+                    {"ticker": "005930", "status": "active"},
+                    {"ticker": "000660", "status": "active"},
+                ],
+            },
+            "금융": {
+                "status": "confirmed_pending_data",
+                "stocks": [
+                    {"ticker": "105560", "status": "pending_data"},
+                ],
+            },
+        },
+    }
+
+
 def _patch_execution_config(monkeypatch, mode: str, live_enabled: bool = False) -> None:
     def fake_config_load(file_name: str, section: str):
+        if file_name == "universe_config.yaml":
+            return _execution_universe_config()
         if section == "execution":
             return {"mode": mode, "live_enabled": live_enabled}
         if section == "execution_cost_model":
-            return {"slippage_bps": 10}
+            return {"components": {"slippage_bps": 10}}
         return {}
 
     monkeypatch.setattr(
@@ -262,6 +290,8 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     _patch_execution_config(monkeypatch, mode="paper")
 
     class FakeKISClient:
+        mode = "virtual"
+
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, int, float]] = []
 
@@ -293,6 +323,135 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     assert client.calls == [("005930", "buy", 10, 70000.0)]
 
 
+def test_execute_paper_rejects_pending_universe_ticker_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """paper 주문은 pending_data 종목을 broker submit 전에 차단한다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("pending_data ticker must not be submitted")
+
+    client = FakeKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "105560", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "order_ticker_not_active_universe: 105560" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_paper_rejects_kis_error_without_status(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            return {"rt_cd": "1", "msg_cd": "EGW00001", "msg1": "주문거부"}
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=FakeKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert report["fills"] == []
+    assert report["rejections"][0]["reason"] == "broker_rt_cd_1"
+
+
+def test_execute_paper_accepts_kis_success_code_with_order_id(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            return {"rt_cd": "0", "odno": "OD-RTCD", "price": price}
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=FakeKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "submitted"
+    assert report["fills"][0]["broker_order_id"] == "OD-RTCD"
+
+
+def test_execute_paper_requires_audit_logger_before_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class FakeKISClient:
+        mode = "virtual"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("broker submit must require audit sink")
+
+    client = FakeKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=None,
+        kis_client=client,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "audit_logger_missing" in result["execution_report"]["rejection_reason"]
+    assert client.called is False
+
+
 def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
     """paper/live는 명시적인 broker client 없이 조용히 mock으로 흐르지 않는다."""
     _patch_execution_config(monkeypatch, mode="paper")
@@ -306,8 +465,56 @@ def test_execute_paper_requires_kis_client(monkeypatch, tmp_path: Path) -> None:
         order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
     )
 
-    with pytest.raises(ExecutionDependencyError):
-        gw.execute(fd)
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "broker_dependency_missing" in report["rejection_reason"]
+    assert report["execution_mode"] == "paper"
+
+
+def test_execute_paper_rejects_client_without_submit_order(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class NoSubmitKISClient:
+        mode = "virtual"
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=NoSubmitKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 10, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "broker_dependency_missing" in report["rejection_reason"]
+
+
+def test_execution_gateway_reads_nested_slippage_bps(monkeypatch) -> None:
+    def fake_config_load(file_name: str, section: str):
+        if section == "execution":
+            return {"mode": "mock", "live_enabled": False}
+        if section == "execution_cost_model":
+            return {"components": {"slippage_bps": 25}}
+        return {}
+
+    monkeypatch.setattr(
+        "src.execution.execution_gateway.config_load",
+        fake_config_load,
+    )
+
+    gw = ExecutionGateway()
+
+    assert gw._slippage_bps == 25
 
 
 def test_execute_paper_rejects_malformed_numeric_fields(
@@ -318,6 +525,8 @@ def test_execute_paper_rejects_malformed_numeric_fields(
     _patch_execution_config(monkeypatch, mode="paper")
 
     class FakeKISClient:
+        mode = "virtual"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             raise AssertionError("invalid broker order must not be submitted")
 
@@ -369,6 +578,8 @@ def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_
     _patch_execution_config(monkeypatch, mode="live", live_enabled=False)
 
     class BrokerClient:
+        mode = "real"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             raise AssertionError("live broker must not be called")
 
@@ -391,11 +602,458 @@ def test_execute_live_treats_string_false_override_as_disabled(monkeypatch, tmp_
     assert "live_enabled=false" in report["rejection_reason"]
 
 
+def _live_approval_proof(**overrides) -> dict:
+    proof = {
+        "prelive_gate": {"status": "PASS", "blockers": []},
+        "deploy_quality": {
+            "status": "PASS",
+            "service_policy_gate_pass": True,
+            "registry_mutated": False,
+        },
+        "sanitized_release": {
+            "status": "PASS",
+            "forbidden_entries": [],
+            "secret_sources_in_zip": [],
+        },
+        "broker_evidence": {
+            "status": "PASS",
+            "external_kis_api": True,
+            "bundle_match": True,
+            "paper_auto_cycle_history_matched": True,
+            "stage_statuses": {
+                "paper_auto_cycle": "PASS",
+                "balance_reconciliation": "PASS",
+                "probe_order": "PASS",
+                "order_history_requery": "PASS",
+            },
+        },
+        "production_registry": {"active_version": "MODEL-LIVE-1"},
+        "live_trading_allowed": True,
+    }
+    proof.update(overrides)
+    return proof
+
+
+def test_execute_live_enabled_real_broker_requires_live_approval_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """live_enabled=True만으로는 실계좌 broker 호출까지 갈 수 없다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("live broker must require approval proof")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "live_approval_missing" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_rejects_incomplete_live_approval_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("live broker must not be called")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(live_trading_allowed=False),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "live_trading_allowed" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_with_complete_approval_proof_submits(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """완전한 proof가 있을 때만 live broker까지 도달한다."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int, float]] = []
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.calls.append((ticker, side, qty, price))
+            return {"status": "submitted", "order_id": "OD-LIVE", "price": price}
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "submitted"
+    assert report["execution_mode"] == "live"
+    assert report["fills"][0]["broker_order_id"] == "OD-LIVE"
+    assert client.calls == [("005930", "buy", 1, 70000.0)]
+
+
+def test_execute_live_rejects_registry_mutated_deploy_quality(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("registry_mutated proof must not submit")
+
+    proof = _live_approval_proof(
+        deploy_quality={
+            "status": "PASS",
+            "service_policy_gate_pass": True,
+            "registry_mutated": True,
+        }
+    )
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=proof,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "deploy_quality.registry_mutated" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_live_rejects_unknown_universe_ticker_before_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """live 주문도 active universe 밖 종목은 approval proof가 있어도 broker 호출 금지."""
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("unknown ticker must not be submitted")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "999999", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "order_ticker_not_active_universe: 999999" in report["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_rejects_missing_kill_switch_even_with_complete_proof(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("live broker must require kill switch")
+
+    gw = ExecutionGateway(
+        kill_switch=None,
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "kill_switch_missing" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_live_rejects_top_level_active_version_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("top-level active_version must not authorize live")
+
+    proof = _live_approval_proof(
+        production_registry={"active_version": None},
+        active_version="MODEL-LIVE-1",
+    )
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=proof,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "production_registry.active_version" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_live_rejects_bare_string_broker_evidence_pass(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("bare string broker_evidence must not submit")
+
+    client = RealBrokerClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=_live_approval_proof(broker_evidence="PASS"),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "broker_evidence" in result["execution_report"]["rejection_reason"]
+    assert client.called is False
+
+
+def test_execute_live_rejects_unmatched_broker_evidence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="live", live_enabled=True)
+
+    class RealBrokerClient:
+        mode = "real"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("unmatched broker_evidence must not submit")
+
+    proof = _live_approval_proof()
+    proof["broker_evidence"] = {
+        **proof["broker_evidence"],
+        "bundle_match": False,
+    }
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=RealBrokerClient(),
+        mode_override="live",
+        live_enabled_override=True,
+        live_approval_proof=proof,
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "broker_evidence" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_rejects_fractional_qty_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PaperKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("fractional qty must not be truncated and submitted")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PaperKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": "1.9", "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_deltas" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_rejects_non_whitelisted_order_type_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PaperKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("non-whitelisted order_type must not submit")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PaperKISClient(),
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "buy",
+                "qty": 1,
+                "price": 70000.0,
+                "order_type": "02",
+            }
+        ],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_deltas" in result["execution_report"]["rejection_reason"]
+
+
+def test_rejected_execution_does_not_emit_success_audit(tmp_path: Path) -> None:
+    audit = AuditLogger(log_path=tmp_path / "exec.jsonl")
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=audit,
+    )
+    fd = _final_decision(
+        approved=False,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    gw.execute(fd)
+
+    records = audit.read_recent(n=10)
+    assert [record["event_type"] for record in records] == ["execution_rejected"]
+
+
 def test_execute_broker_partial_fill_reports_rejections(monkeypatch, tmp_path: Path) -> None:
     """broker 제출 일부 실패는 C10 partial_filled와 rejections로 남긴다."""
     _patch_execution_config(monkeypatch, mode="paper")
 
     class PartialKISClient:
+        mode = "virtual"
+
         def submit_order(self, ticker: str, side: str, qty: int) -> dict:
             if ticker == "000660":
                 return {"status": "rejected", "message": "insufficient cash"}
@@ -431,6 +1089,8 @@ def test_execute_mode_override_routes_to_paper_and_passes_order_type(
     _patch_execution_config(monkeypatch, mode="mock")
 
     class PaperKISClient:
+        mode = "virtual"
+
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
@@ -481,8 +1141,42 @@ def test_execute_mode_override_routes_to_paper_and_passes_order_type(
     }]
 
 
+def test_execute_paper_rejects_real_mode_kis_client(monkeypatch, tmp_path: Path) -> None:
+    """paper 경로는 real KIS client를 주입받아도 broker submit 전에 차단한다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class RealKISClient:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.called = False
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            self.called = True
+            raise AssertionError("real broker must not be called from paper mode")
+
+    client = RealKISClient()
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=client,
+        mode_override="paper",
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+    report = result["execution_report"]
+
+    assert report["status"] == "rejected"
+    assert "paper_mode_requires_virtual_kis_client" in report["rejection_reason"]
+    assert client.called is False
+
+
 def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) -> None:
-    """BE/direct 입력의 approved='false'를 True로 오판하지 않는다."""
+    """BE/direct 입력의 approved='false'는 C9 bool 위반으로 reject한다."""
     fd = _final_decision(
         approved="false",
         order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
@@ -491,7 +1185,36 @@ def test_execute_string_false_approved_is_rejected(gateway: ExecutionGateway) ->
     result = gateway.execute(fd)
 
     assert result["execution_report"]["status"] == "rejected"
-    assert "veto" in result["execution_report"]["rejection_reason"]
+    assert result["execution_report"]["rejection_reason"] == "approved_must_be_bool"
+
+
+def test_execute_string_yes_approved_is_rejected_without_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """C10은 approved='yes' 같은 bool-like 문자열을 FDA 승인으로 승격하지 않는다."""
+    _patch_execution_config(monkeypatch, mode="paper")
+
+    class PaperKISClient:
+        mode = "virtual"
+
+        def submit_order(self, ticker: str, side: str, qty: int, price: float) -> dict:
+            raise AssertionError("approved string must not submit")
+
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        kis_client=PaperKISClient(),
+    )
+    fd = _final_decision(
+        approved="yes",
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert result["execution_report"]["rejection_reason"] == "approved_must_be_bool"
 
 
 def test_execute_rejects_non_list_order_deltas(gateway: ExecutionGateway) -> None:
@@ -501,6 +1224,50 @@ def test_execute_rejects_non_list_order_deltas(gateway: ExecutionGateway) -> Non
 
     assert result["execution_report"]["status"] == "rejected"
     assert "order_deltas_must_be_list" in result["execution_report"]["rejection_reason"]
+
+
+def test_execute_rejects_invalid_mode_without_raise(tmp_path: Path) -> None:
+    gw = ExecutionGateway(
+        kill_switch=KillSwitch(),
+        audit_logger=AuditLogger(log_path=tmp_path / "exec.jsonl"),
+        mode_override="invalid_mode",
+    )
+    fd = _final_decision(
+        approved=True,
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "buy",
+                "qty": 1,
+                "price": 70000.0,
+                "reason": "rebalance",
+            }
+        ],
+    )
+
+    result = gw.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert result["execution_report"]["rejection_reason"] == "invalid execution_mode=invalid_mode"
+
+
+def test_execute_rejects_missing_order_delta_reason(gateway: ExecutionGateway) -> None:
+    """C10 order_deltas[].reason은 Portfolio Manager trace 필수 필드다."""
+    fd = {
+        "decision_id": "DEC-20260420-001",
+        "approved": True,
+        "target_weights": {"005930": 0.1},
+        "order_deltas": [
+            {"ticker": "005930", "side": "buy", "qty": 1, "price": 70000.0}
+        ],
+        "veto_reason": None,
+        "reason_code": "NORMAL_APPROVE",
+    }
+
+    result = gateway.execute(fd)
+
+    assert result["execution_report"]["status"] == "rejected"
+    assert "invalid_order_delta_reason" in result["execution_report"]["rejection_reason"]
 
 
 def test_execute_mock_rejects_invalid_order_delta(gateway: ExecutionGateway) -> None:

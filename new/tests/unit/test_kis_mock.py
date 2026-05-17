@@ -366,6 +366,103 @@ def test_kis_rest_get_preserves_kis_json_error_on_http_500(monkeypatch):
     assert body["msg_cd"] == "OPSQ2000"
 
 
+def test_kis_rest_get_preserves_retry_after_on_kis_json_error(monkeypatch):
+    """HTTP 429 JSON body의 Retry-After를 상위 retry wait까지 보존한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    import requests
+
+    from src.connectors.kis_rest import KISRestClient
+
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "2.5"}
+
+        def json(self):
+            return {
+                "rt_cd": "1",
+                "msg_cd": "EGW00201",
+                "msg1": "초당 거래건수를 초과하였습니다.",
+            }
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError("429 Too Many Requests")
+
+    monkeypatch.setattr(requests, "get", lambda *_, **__: FakeResponse())
+
+    body = KISRestClient()._http_get_json("https://example.invalid", {}, {})  # noqa: SLF001
+
+    assert body["msg_cd"] == "EGW00201"
+    assert body["_retry_after_sec"] == pytest.approx(2.5)
+
+
+def test_kis_rest_call_get_uses_retry_after_wait(monkeypatch):
+    """KIS retry loop는 Retry-After가 있으면 fixed backoff보다 긴 대기를 사용한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    from src.connectors.kis_rest import KISRestClient
+
+    client = KISRestClient()
+    client._max_retries = 2  # noqa: SLF001
+    monkeypatch.setattr(client.auth, "get_kis_base_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(client, "_kis_headers", lambda tr_id: {})
+    monkeypatch.setattr(client.rate_limiter, "wait_and_acquire", lambda: None)
+
+    calls = {"n": 0}
+
+    def fake_http_get_json(url, params, headers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "rt_cd": "1",
+                "msg_cd": "EGW00201",
+                "msg1": "초당 거래건수를 초과하였습니다.",
+                "_retry_after_sec": 2.5,
+            }
+        return {"rt_cd": "0", "output": {"ok": True}}
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(client, "_http_get_json", fake_http_get_json)
+    monkeypatch.setattr("src.connectors.kis_rest.time.sleep", lambda sec: sleeps.append(sec))
+
+    body = client._call_kis_get("/uapi/test", "TRTEST", {})  # noqa: SLF001
+
+    assert body["rt_cd"] == "0"
+    assert calls["n"] == 2
+    assert sleeps == [pytest.approx(2.5)]
+
+
+def test_kis_rest_get_opens_circuit_after_retry_exhaustion(monkeypatch):
+    """retry 소진 call이 연속 실패하면 다음 KIS call은 broker 호출 전 차단된다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    from src.connectors.kis_rest import KISAPIError, KISRestClient
+
+    client = KISRestClient()
+    client._max_retries = 1  # noqa: SLF001
+    client._circuit_enabled = True  # noqa: SLF001
+    client._circuit_failure_threshold = 2  # noqa: SLF001
+    client._circuit_open_duration_sec = 60.0  # noqa: SLF001
+    monkeypatch.setattr(client.auth, "get_kis_base_url", lambda: "https://example.invalid")
+    monkeypatch.setattr(client, "_kis_headers", lambda tr_id: {})
+    monkeypatch.setattr(client.rate_limiter, "wait_and_acquire", lambda: None)
+
+    calls = {"n": 0}
+
+    def always_timeout(url, params, headers):
+        calls["n"] += 1
+        raise TimeoutError("socket timeout")
+
+    monkeypatch.setattr(client, "_http_get_json", always_timeout)
+
+    for _ in range(2):
+        with pytest.raises(ConnectionError, match="재시도 실패"):
+            client._call_kis_get("/uapi/test", "TRTEST", {})  # noqa: SLF001
+
+    with pytest.raises(KISAPIError, match="circuit breaker OPEN") as exc_info:
+        client._call_kis_get("/uapi/test", "TRTEST", {})  # noqa: SLF001
+
+    assert calls["n"] == 2
+    assert exc_info.value.retry_after_sec is not None
+
+
 def test_kis_rest_headers_match_official_sample_shape(monkeypatch):
     """KIS 공식 샘플 kis_auth.py의 공통 계좌조회 헤더 형태를 유지한다."""
     monkeypatch.setenv("KIS_MODE", "virtual")

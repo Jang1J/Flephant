@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,23 @@ class MockBooster:
         if callable(self._scores):
             return self._scores(X)
         return np.asarray(self._scores[:n], dtype=float)
+
+
+class MockTradeClassifier:
+    """Trade/no-trade classifier sidecar 대체."""
+
+    def __init__(self, probs=None):
+        self._probs = probs
+        self.predict_calls = 0
+        self.last_X = None
+
+    def predict(self, X):
+        self.predict_calls += 1
+        self.last_X = np.asarray(X, dtype=float)
+        n = len(X)
+        if self._probs is None:
+            return np.full(n, 0.5, dtype=float)
+        return np.asarray(self._probs[:n], dtype=float)
 
 
 def _make_bars(
@@ -99,6 +117,7 @@ def populated_registry(tmp_path: Path) -> ModelRegistry:
             "feat_60m_trend",
         ],
         "label_horizon_bars": 5,
+        "target_col": "label_5m_ret",
         "label_generation_version": "session_local_v2",
         "label_session_scope": "ticker_trading_day",
         "metrics": {"ic": 0.01, "icir": 0.5, "rank_ic": 0.012,
@@ -132,6 +151,7 @@ def populated_dual_source_registry(tmp_path: Path) -> ModelRegistry:
         "train_end": "20260419",
         "feature_cols": feature_cols,
         "label_horizon_bars": 5,
+        "target_col": "label_5m_ret",
         "label_generation_version": "session_local_v2",
         "label_session_scope": "ticker_trading_day",
         "metrics": {"ic": 0.01, "icir": 0.5, "rank_ic": 0.012,
@@ -310,13 +330,60 @@ def test_score_cross_section_happy_path(agent_active: QuantAgent) -> None:
     for t in tickers:
         for bar in _make_bars(t, n=65, start_price=50000 + int(t) % 1000, seed=int(t[-1])):
             agent_active.on_bar(bar)
-    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
     assert result["mode"] == "active"
     assert result["n_tickers"] == 4
     assert set(result["scores"].keys()) == set(tickers)
     for s in result["scores"].values():
         assert isinstance(s, float)
     assert result["latency_ms"] > 0
+
+
+def test_score_cross_section_adds_trade_probs_from_classifier(tmp_path: Path) -> None:
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_trade")
+    classifier_path = reg.base_dir / "baseline_trade_classifier.pkl"
+    with classifier_path.open("wb") as fh:
+        pickle.dump(MockTradeClassifier(probs=[0.2, 0.8]), fh)
+    reg.save(
+        MockBooster(scores=[0.1, 0.9]),
+        {
+            "version": "baseline",
+            "bundle_id": None,
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-19",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+            "trade_no_trade_classifier": {
+                "status": "PASS",
+                "model_path": str(classifier_path),
+                "tradeable_col": "label_5m_tradeable",
+            },
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    tickers = ["005930", "000660"]
+    for ticker in tickers:
+        for bar in _make_bars(ticker, n=65):
+            agent.on_bar(bar)
+
+    result = agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "active"
+    assert result["trade_probs"] == {
+        "005930": pytest.approx(0.2),
+        "000660": pytest.approx(0.8),
+    }
 
 
 def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
@@ -326,11 +393,67 @@ def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
     for bar in _make_bars("000660", n=30):   # 부족
         agent_active.on_bar(bar)
     result = agent_active.score_cross_section(
-        ["005930", "000660"], asof="2026-04-20T10:00:00+09:00"
+        ["005930", "000660"], asof="2026-04-20T10:04:00+09:00"
     )
     assert result["n_tickers"] == 1
     assert "005930" in result["scores"]
     assert "000660" not in result["scores"]
+
+
+def test_score_cross_section_excludes_future_buffered_bars(
+    populated_registry: ModelRegistry,
+) -> None:
+    """이미 buffer에 들어간 미래 bar도 asof 이후면 추론 feature에서 제외한다."""
+    agent_active = QuantAgent(
+        registry=populated_registry,
+        bar_buffer=BarBuffer(max_bars=120),
+    )
+    bars = _make_bars("005930", n=65, seed=11)
+    for bar in bars:
+        agent_active.on_bar(bar)
+    future_bar = dict(bars[-1])
+    future_bar["ts_close"] = "2026-04-20T10:05:00+09:00"
+    future_bar["close"] = future_bar["close"] * 10.0
+    agent_active.on_bar(future_bar)
+
+    result = agent_active.score_cross_section(
+        ["005930"],
+        asof="2026-04-20T10:04:00+09:00",
+    )
+    expected = agent_active._compute_features(bars)
+
+    assert result["mode"] == "active"
+    assert expected is not None
+    assert agent_active._booster.last_X is not None
+    assert agent_active._booster.last_X[0, 0] == pytest.approx(
+        expected["feat_1m_close_robust_z"]
+    )
+    assert agent_active._booster.last_X[0, 0] < agent_active._outlier_cap_z
+
+
+def test_score_cross_section_empty_asof_does_not_use_latest_buffer(
+    agent_active: QuantAgent,
+) -> None:
+    """asof가 비어 있으면 buffer의 최신 bar를 암묵적으로 쓰지 않는다."""
+    for bar in _make_bars("005930", n=65):
+        agent_active.on_bar(bar)
+
+    result = agent_active.score_cross_section(["005930"], asof="")
+
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "asof_required"
+    assert result["scores"] == {}
+    assert agent_active._booster.predict_calls == 0
+
+
+def test_detect_anomalies_empty_asof_does_not_use_latest_buffer(
+    agent_active: QuantAgent,
+) -> None:
+    """anomaly sidecar도 empty asof에서 최신 buffer fallback을 쓰지 않는다."""
+    for bar in _make_bars("005930", n=65):
+        agent_active.on_bar(bar)
+
+    assert agent_active.detect_anomalies(["005930"], asof="") == []
 
 
 def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> None:
@@ -343,7 +466,7 @@ def test_score_cross_section_latency_under_100ms(agent_active: QuantAgent) -> No
     for t in tickers:
         for bar in _make_bars(t, n=65, seed=int(t[-1])):
             agent_active.on_bar(bar)
-    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
     # Mock inference + feature 계산은 50ms 이내 (실측 ~5ms)
     assert result["latency_ms"] < 50.0, f"latency={result['latency_ms']}ms"
 
@@ -373,13 +496,108 @@ def test_score_cross_section_uses_dual_source_scores(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert loader_calls == ["20260420"]
     assert agent._booster.last_X is not None
     ds_values = agent._booster.last_X[0, 4:9].tolist()
     assert ds_values == pytest.approx([0.7, 0.3, 0.1, 0.4, 0.8])
+
+
+def test_score_cross_section_blocks_future_dual_source_scores(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """asof 이후 생성된 Dual-Source score는 Hot Path 추론에 섞지 않는다."""
+    def loader(_date_str: str | None) -> list[dict[str, Any]]:
+        return [{
+            "ticker": "005930",
+            "snapshot_ts": "2026-04-20T10:30:00+09:00",
+            "generated_at": "2026-04-20T10:31:00+09:00",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+
+
+def test_dual_source_cache_rechecks_asof_on_each_lookup(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """늦은 asof에서 채운 cache를 이른 asof가 재사용해도 PIT guard를 다시 적용한다."""
+    loader_calls: list[str | None] = []
+
+    def loader(date_str: str | None) -> list[dict[str, Any]]:
+        loader_calls.append(date_str)
+        return [{
+            "ticker": "005930",
+            "generated_at": "2026-04-20T10:30:00+09:00",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    later = agent.score_cross_section(["005930"], asof="2026-04-20T10:31:00+09:00")
+    earlier = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert later["mode"] == "active"
+    assert earlier["mode"] == "warmup"
+    assert earlier["scores"] == {}
+    assert loader_calls == ["20260420"]
+
+
+def test_score_cross_section_blocks_invalid_model_predictions(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    """NaN/short model output은 Hot Path 예외 대신 fail-closed warmup으로 닫는다."""
+    def loader(_date_str: str | None) -> list[dict[str, Any]]:
+        return [{
+            "ticker": "005930",
+            "news_score_t": 0.7,
+            "comm_score_t_1": 0.3,
+            "comm_score_t_2": 0.1,
+            "news_comm_divergence": 0.4,
+            "community_noise_multiplier": 0.8,
+        }]
+
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=loader,
+    )
+    agent._booster = MockBooster(scores=[np.nan])  # type: ignore[assignment]
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+    assert result["error"] == "model_prediction_invalid"
 
 
 def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None:
@@ -403,8 +621,9 @@ def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None
             "train_start": "20260101",
             "train_end": "20260419",
             "feature_cols": feature_cols,
-            "label_horizon_bars": 5,
-            "label_generation_version": "session_local_v2",
+                "label_horizon_bars": 5,
+                "target_col": "label_5m_ret",
+                "label_generation_version": "session_local_v2",
             "label_session_scope": "ticker_trading_day",
             "metrics": {},
             "data_version": "v1",
@@ -424,7 +643,7 @@ def test_score_cross_section_uses_investor_flow_features(tmp_path: Path) -> None
         received_at="2026-04-20T10:00:00+09:00",
     )
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert agent._booster.last_X is not None
@@ -451,8 +670,9 @@ def test_score_cross_section_ignores_future_investor_flow(tmp_path: Path) -> Non
             "train_start": "20260101",
             "train_end": "20260419",
             "feature_cols": feature_cols,
-            "label_horizon_bars": 5,
-            "label_generation_version": "session_local_v2",
+                "label_horizon_bars": 5,
+                "target_col": "label_5m_ret",
+                "label_generation_version": "session_local_v2",
             "label_session_scope": "ticker_trading_day",
             "metrics": {},
             "data_version": "v1",
@@ -465,15 +685,15 @@ def test_score_cross_section_ignores_future_investor_flow(tmp_path: Path) -> Non
     agent.update_investor_flow_snapshot(
         "005930",
         {"foreign_net_buy": 999999},
-        received_at="2026-04-20T10:01:00+09:00",
+        received_at="2026-04-20T10:05:00+09:00",
     )
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "active"
     assert agent.get_investor_flow_snapshot(
         "005930",
-        asof="2026-04-20T10:00:00+09:00",
+        asof="2026-04-20T10:04:00+09:00",
     )["is_future"] is True
     assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
 
@@ -497,8 +717,9 @@ def test_score_cross_section_ignores_stale_exogenous_snapshot(tmp_path: Path) ->
             "train_start": "20260101",
             "train_end": "20260419",
             "feature_cols": feature_cols,
-            "label_horizon_bars": 5,
-            "label_generation_version": "session_local_v2",
+                "label_horizon_bars": 5,
+                "target_col": "label_5m_ret",
+                "label_generation_version": "session_local_v2",
             "label_session_scope": "ticker_trading_day",
             "metrics": {},
             "data_version": "v1",
@@ -520,6 +741,47 @@ def test_score_cross_section_ignores_stale_exogenous_snapshot(tmp_path: Path) ->
     assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
 
 
+def test_score_cross_section_ignores_exogenous_snapshot_without_provenance(
+    tmp_path: Path,
+) -> None:
+    """received_at 메타 없는 generic exogenous snapshot은 neutral default로 대체한다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_missing_exog_meta")
+    mock = MockBooster(scores=None)
+    feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_5m_ret",
+        "feat_30m_vol",
+        "feat_60m_trend",
+        "us_sp500_change",
+    ]
+    reg.save(
+        mock,
+        {
+            "version": "missing-exog-meta-v1",
+            "bundle_id": None,
+            "train_start": "20260101",
+            "train_end": "20260419",
+            "feature_cols": feature_cols,
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+    agent._market_exogenous_snapshot["us_sp500_change"] = 0.99
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "active"
+    assert agent._booster.last_X[0, 4] == pytest.approx(0.0)
+
+
 def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     populated_dual_source_registry: ModelRegistry,
 ) -> None:
@@ -532,11 +794,41 @@ def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
     assert result["n_tickers"] == 0
+
+
+def test_score_cross_section_default_does_not_load_dual_source_from_disk(
+    populated_dual_source_registry: ModelRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hot Path 기본값은 Dual-Source artifact 파일을 직접 읽지 않는다."""
+    calls: list[str | None] = []
+
+    def fake_load_latest_scores(date_key: str | None = None) -> list[dict[str, Any]]:
+        calls.append(date_key)
+        return [{"ticker": "005930"}]
+
+    monkeypatch.setattr(
+        "src.data.dual_source_runner.load_latest_scores",
+        fake_load_latest_scores,
+    )
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=None,
+    )
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "warmup"
+    assert result["scores"] == {}
+    assert calls == []
 
 
 def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
@@ -554,7 +846,7 @@ def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
@@ -582,7 +874,7 @@ def test_score_cross_section_blocks_dual_source_model_when_values_invalid(
     for bar in _make_bars("005930", n=65):
         agent.on_bar(bar)
 
-    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:00:00+09:00")
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert result["mode"] == "warmup"
     assert result["scores"] == {}
@@ -695,6 +987,30 @@ def test_detect_anomalies_noisy_history_detects_drop(agent_active: QuantAgent) -
     assert anomalies[0]["z_score"] < -3.0
 
 
+def test_detect_anomalies_excludes_future_buffered_bars(
+    populated_registry: ModelRegistry,
+) -> None:
+    """asof 이후 미래 급락 bar는 anomaly 판단에 쓰지 않는다."""
+    agent_active = QuantAgent(
+        registry=populated_registry,
+        bar_buffer=BarBuffer(max_bars=120),
+    )
+    bars = _make_bars("005930", n=65, seed=7)
+    for bar in bars:
+        agent_active.on_bar(bar)
+    future_drop = dict(bars[-1])
+    future_drop["ts_close"] = "2026-04-20T10:05:00+09:00"
+    future_drop["close"] = future_drop["close"] * 0.1
+    agent_active.on_bar(future_drop)
+
+    anomalies = agent_active.detect_anomalies(
+        ["005930"],
+        asof="2026-04-20T10:04:00+09:00",
+    )
+
+    assert anomalies == []
+
+
 def test_detect_anomalies_warmup_insufficient(agent_active: QuantAgent) -> None:
     for bar in _make_bars("005930", n=30):
         agent_active.on_bar(bar)
@@ -720,7 +1036,7 @@ def test_latency_percentiles_records(agent_active: QuantAgent) -> None:
             agent_active.on_bar(bar)
     # score 여러번 호출 → 레이턴시 기록
     for _ in range(5):
-        agent_active.score_cross_section(tickers, asof="2026-04-20T10:00:00+09:00")
+        agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
 
     p = agent_active.latency_percentiles()
     assert p["n"] == 5

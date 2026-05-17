@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from src.data.dataset_builder import DatasetBuilder
+from src.models import lgbm_trainer as trainer_module
 from src.models.lgbm_trainer import LGBMTrainer
 from src.models.registry import ModelRegistry, VersionNotFoundError
 from src.models.splitter import WalkForwardSplitter
@@ -147,6 +148,16 @@ def test_compute_data_version_string_format() -> None:
     assert "20260419" in v
 
 
+def test_tradeable_col_for_target_mapping() -> None:
+    assert LGBMTrainer._tradeable_col_for_target("label_5m_ret") == "label_5m_tradeable"
+    assert LGBMTrainer._tradeable_col_for_target("label_5m_net_ret") == "label_5m_tradeable"
+    assert (
+        LGBMTrainer._tradeable_col_for_target("label_session_close_net_ret")
+        == "label_session_close_tradeable"
+    )
+    assert LGBMTrainer._tradeable_col_for_target("cs_rank") is None
+
+
 def test_normalize_yyyymmdd_accepts_hyphen() -> None:
     assert LGBMTrainer._normalize_yyyymmdd("2026-01-07") == "20260107"
     assert LGBMTrainer._normalize_yyyymmdd("20260107") == "20260107"
@@ -185,8 +196,16 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     assert metadata["version"] == "baseline"
     assert metadata["train_start"] == "2026-01-01"
     assert metadata["train_end"] == "2026-01-07"
+    assert metadata["final_model_scope"] == "full_requested_window"
+    assert metadata["final_model_train_start"] == "2026-01-01"
+    assert metadata["final_model_train_end"] == "2026-01-07"
+    assert metadata["n_final_train_rows"] == result["n_train_rows"]
+    assert metadata["n_final_train_rows"] > metadata["n_cv_last_train_rows"]
     assert metadata["label_generation_version"] == trainer_small.builder.label_generation_version
     assert metadata["label_session_scope"] == trainer_small.builder.label_session_scope
+    assert metadata["target_col"] == "label_5m_ret"
+    assert metadata["target_horizon_bars"] == 5
+    assert metadata["target_horizon_kind"] == "minute"
     assert metadata["data_source"] == "artifact_bars"
     assert metadata["synthetic_fallback"] is False
     # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
@@ -248,8 +267,102 @@ def test_train_accepts_cost_aware_target_override(
     )
 
     assert result["target_col"] == "label_session_close_net_ret"
+    assert result["target_horizon_bars"] == 0
+    assert result["target_horizon_kind"] == "session_close"
     _, metadata = trainer_small.registry.load_latest()
     assert metadata["target_col"] == "label_session_close_net_ret"
+    assert metadata["label_horizon_bars"] == trainer_small.builder.horizon_bars
+    assert metadata["target_horizon_bars"] == 0
+    assert metadata["target_horizon_kind"] == "session_close"
+    classifier = metadata["trade_no_trade_classifier"]
+    assert classifier["enabled"] is True
+    assert classifier["tradeable_col"] == "label_session_close_tradeable"
+    if classifier["status"] == "PASS":
+        assert Path(classifier["model_path"]).exists()
+        assert result["trade_no_trade_classifier"]["model_path"] == classifier["model_path"]
+        assert classifier["calibration_status"] == "UNAVAILABLE"
+        assert classifier["calibration_required_for_service_gate"] is True
+        assert classifier["deploy_gate_eligible"] is False
+
+
+def test_train_blocks_production_active_write_without_explicit_approval(
+    trainer_small: LGBMTrainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """production registry active/latest 저장은 direct API에서도 명시 승인 없이는 차단한다."""
+    monkeypatch.setattr(
+        trainer_module,
+        "_PRODUCTION_LGBM_DIR",
+        trainer_small.registry.base_dir,
+    )
+
+    with pytest.raises(RuntimeError, match="production registry active/latest"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="baseline",
+        )
+
+
+def test_train_blocks_target_override_bundle_candidate_on_production_registry(
+    trainer_small: LGBMTrainer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target_col_override + bundle_id 후보도 production registry direct write를 막는다."""
+    monkeypatch.setattr(
+        trainer_module,
+        "_PRODUCTION_LGBM_DIR",
+        trainer_small.registry.base_dir,
+    )
+
+    with pytest.raises(RuntimeError, match="target_col_override candidate write"):
+        trainer_small.train(
+            tickers=["000001", "000002", "000003", "000004"],
+            start_date="20260101",
+            end_date="20260107",
+            version="cost-aware",
+            bundle_id="BUNDLE-COST",
+            target_col_override="label_session_close_net_ret",
+        )
+
+
+def test_cli_blocks_target_override_on_production_registry() -> None:
+    """cost-aware 실험 label은 명시 research registry 없이 CLI에서 production에 저장하지 않는다."""
+    result = trainer_module.main(
+        [
+            "--tickers",
+            "005930",
+            "--start",
+            "20260101",
+            "--end",
+            "20260107",
+            "--version",
+            "cost-aware",
+            "--target-col-override",
+            "label_session_close_net_ret",
+        ]
+    )
+
+    assert result == 1
+
+
+def test_cli_blocks_production_active_write_without_bundle() -> None:
+    """CLI production 기본 registry에는 bundle_id 없는 active/latest 저장을 차단한다."""
+    result = trainer_module.main(
+        [
+            "--tickers",
+            "005930",
+            "--start",
+            "20260101",
+            "--end",
+            "20260107",
+            "--version",
+            "baseline",
+        ]
+    )
+
+    assert result == 1
 
 
 def test_train_blocks_missing_feature_manifest(trainer_small: LGBMTrainer) -> None:

@@ -3,12 +3,17 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.execution import paper_auto_trading as paper_auto_module
+from src.execution.kill_switch import KillSwitch
 from src.execution.paper_auto_trading import PaperAutoTrader
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _load_paper_auto_trade_script():
@@ -21,6 +26,22 @@ def _load_paper_auto_trade_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _paper_session_now() -> datetime:
+    return datetime(2026, 5, 12, 10, 0, tzinfo=_KST)
+
+
+def _paper_preopen_now() -> datetime:
+    return datetime(2026, 5, 12, 8, 30, tzinfo=_KST)
+
+
+def _paper_weekend_now() -> datetime:
+    return datetime(2026, 5, 16, 10, 0, tzinfo=_KST)
+
+
+def _paper_close_now() -> datetime:
+    return datetime(2026, 5, 12, 15, 31, tzinfo=_KST)
 
 
 class FakePaperKIS:
@@ -142,6 +163,44 @@ class FakePaperKISNoBrokerOrderId(FakePaperKIS):
         }
 
 
+class FakePaperKISNoHistoryMethod:
+    mode = "virtual"
+
+    def __init__(self) -> None:
+        self.orders: list[dict[str, Any]] = []
+
+    def get_balance(self) -> dict[str, Any]:
+        return {
+            "balance": {"cash": 1_000_000.0, "net_asset": 1_000_000.0},
+            "positions": [],
+            "_mode": self.mode,
+        }
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        return FakePaperKIS().inquire_minute_bar(ticker, n_bars)
+
+    def submit_order(
+        self,
+        ticker: str,
+        side: str,
+        qty: int,
+        price: float,
+        order_type: str = "00",
+    ) -> dict[str, Any]:
+        self.orders.append({
+            "ticker": ticker,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "order_type": order_type,
+        })
+        return {
+            "status": "submitted",
+            "order_id": "PAPER-AUTO-NO-HISTORY",
+            "price": price,
+        }
+
+
 class FakeHotRunner:
     def __init__(self, qty: int = 1, approved: bool = True) -> None:
         self.state = SimpleNamespace(value="BOOTSTRAP")
@@ -151,11 +210,13 @@ class FakeHotRunner:
         )
         self.qty = qty
         self.approved = approved
+        self.calls: list[dict[str, Any]] = []
 
     def start(self) -> None:
         self.state = SimpleNamespace(value="HOT_RUNNING")
 
-    def run_once(self, **_: Any) -> dict[str, Any]:
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
         return {
             "final_decision": {
                 "decision_id": "FDA-TEST",
@@ -168,6 +229,7 @@ class FakeHotRunner:
                         "qty": self.qty,
                         "price": 70000.0,
                         "order_type": "00",
+                        "reason": "rebalance",
                     }
                 ] if self.approved else [],
             },
@@ -183,12 +245,48 @@ class FakeMarketHotRunner(FakeHotRunner):
         return result
 
 
+class FakeNoModelFlagHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-TEST"},
+        )
+
+
+class FakeNoBundleHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            has_model=True,
+            model_metadata={"version": "active_v1"},
+        )
+
+
+class FakeOtherBundleHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            has_model=True,
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-OTHER"},
+        )
+
+
+class FakeStringFalseModelHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self._quant = SimpleNamespace(
+            has_model="false",
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-TEST"},
+        )
+
+
 def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
         kis_client=client,
         hot_runner=FakeHotRunner(),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -206,10 +304,12 @@ def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
 
 def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
     trader = PaperAutoTrader(
         kis_client=client,
-        hot_runner=FakeHotRunner(qty=1),
+        hot_runner=hot_runner,
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -232,6 +332,258 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
     assert cycle["order_history_verification"]["status"] == "PASS"
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
+    assert hot_runner.calls[0]["dependency_status"] == {
+        "news": "skipped",
+        "risk": "done",
+        "quant": "done",
+        "debate": "skipped",
+    }
+
+
+def test_paper_auto_respects_active_kill_switch(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    kill_switch = KillSwitch()
+    kill_switch.trigger("overnight_test")
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+        kill_switch=kill_switch,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "rejected"
+    assert "kill_switch_active" in cycle["execution"]["execution_report"]["rejection_reason"]
+    assert client.orders == []
+
+
+def test_paper_auto_checks_market_session_each_cycle(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    times = iter([
+        datetime(2026, 5, 12, 15, 29, tzinfo=_KST),
+        datetime(2026, 5, 12, 15, 29, tzinfo=_KST),
+        _paper_close_now(),
+    ])
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=lambda: next(times),
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=2,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycles = report["stages"]["cycles"]["items"]
+    assert len(cycles) == 2
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
+    assert cycles[1]["market_session_guard"]["reason"] == "outside_market_session"
+    assert cycles[1]["execution"] is None
+
+
+def test_paper_auto_skips_before_market_open(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_preopen_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "SKIP"
+    assert report["stages"]["market_session_guard"]["reason"] == "outside_market_session"
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
+
+
+def test_paper_auto_skips_non_trading_day(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_weekend_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "SKIP"
+    assert report["stages"]["market_session_guard"]["reason"] == "not_kospi_trading_day"
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
+
+
+def test_paper_auto_run_once_requires_start_guard(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    result = trader.run_once(tickers=["005930"], cycle_index=0)
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "run_once_requires_start_guard"
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_has_model_flag(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeNoModelFlagHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
+    assert report["stages"]["active_model_guard"]["has_model"] is False
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_bundle_id(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeNoBundleHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
+    assert report["stages"]["active_model_guard"]["bundle_id"] is None
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_requires_requested_bundle(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeOtherBundleHotRunner(),
+        report_dir=tmp_path,
+        required_bundle_id="BUNDLE-TEST",
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    guard = report["stages"]["active_model_guard"]
+    assert guard["error_code"] == "ACTIVE_MODEL_BUNDLE_MISMATCH"
+    assert guard["bundle_id"] == "BUNDLE-OTHER"
+    assert guard["required_bundle_id"] == "BUNDLE-TEST"
+    assert client.orders == []
+
+
+def test_paper_auto_active_model_guard_treats_string_false_as_false(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeStringFalseModelHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["active_model_guard"]["error_code"] == "ACTIVE_MODEL_REQUIRED"
+    assert report["stages"]["active_model_guard"]["has_model"] is False
+    assert client.orders == []
+
+
+def test_paper_auto_rejects_zero_cycles_before_starting_hot_runner(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=0,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["cycles"]["reason"] == "cycles_must_be_positive"
+    assert report["stages"]["cycles"]["items"] == []
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert client.orders == []
 
 
 def test_paper_auto_broker_rejection_fails_cycle(tmp_path: Path) -> None:
@@ -239,6 +591,7 @@ def test_paper_auto_broker_rejection_fails_cycle(tmp_path: Path) -> None:
         kis_client=FakePaperKISRejects(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -261,6 +614,7 @@ def test_paper_auto_fails_when_broker_order_id_not_in_history(tmp_path: Path) ->
         kis_client=FakePaperKISNoHistoryMatch(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -284,6 +638,7 @@ def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
         kis_client=FakePaperKISNoBrokerOrderId(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -296,18 +651,18 @@ def test_paper_auto_fails_when_broker_order_id_missing(tmp_path: Path) -> None:
 
     cycle = report["stages"]["cycles"]["items"][0]
     assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "rejected"
+    assert cycle["broker_blockers"][0]["reason"] == "broker_order_id_missing"
     assert cycle["order_history_verification"]["status"] == "FAIL"
-    assert cycle["order_history_verification"]["failures"][0]["error_code"] == (
-        "BROKER_ORDER_ID_MISSING"
-    )
+    assert cycle["order_history_verification"]["reason"] == "no_broker_fills"
 
 
-def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:
-    client = FakePaperKIS()
+def test_paper_auto_fails_when_order_history_method_missing(tmp_path: Path) -> None:
     trader = PaperAutoTrader(
-        kis_client=client,
-        hot_runner=FakeHotRunner(qty=2),
+        kis_client=FakePaperKISNoHistoryMethod(),
+        hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -318,13 +673,38 @@ def test_paper_auto_clips_qty_over_limit_downward(tmp_path: Path) -> None:
         write_report=False,
     )
 
-    assert report["status"] == "PASS"
-    assert client.orders[0]["qty"] == 1
     cycle = report["stages"]["cycles"]["items"][0]
-    clipping = cycle["order_guard"]["qty_clipping"]["items"][0]
-    assert clipping["original_qty"] == 2
-    assert clipping["clipped_qty"] == 1
-    assert clipping["direction"] == "decrease_only"
+    assert report["status"] == "FAIL"
+    assert cycle["execution"]["execution_report"]["status"] == "submitted"
+    assert cycle["order_history_verification"]["status"] == "FAIL"
+    assert cycle["order_history_verification"]["reason"] == "kis_client_no_get_order_history"
+
+
+def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=2),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    assert client.orders == []
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["order_guard"]["reason"] == "order_guard_violations"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
+    assert cycle["order_guard"]["violations"][0]["qty"] == 2
+    assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["qty"] == 2
+    assert cycle["execution"] is None
 
 
 def test_paper_auto_treats_string_false_market_order_as_disabled(
@@ -355,6 +735,7 @@ def test_paper_auto_treats_string_false_market_order_as_disabled(
         kis_client=client,
         hot_runner=FakeMarketHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -378,6 +759,7 @@ def test_paper_auto_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
         kis_client=client,
         hot_runner=FakeHotRunner(qty="abc"),  # type: ignore[arg-type]
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -395,11 +777,46 @@ def test_paper_auto_rejects_malformed_qty_without_crash(tmp_path: Path) -> None:
     assert client.orders == []
 
 
+def test_paper_auto_rejects_fractional_qty_without_truncation(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty="1.9"),  # type: ignore[arg-type]
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["order_guard"]["status"] == "FAIL"
+    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
+    assert client.orders == []
+
+
+def test_paper_auto_current_positions_do_not_truncate_fractional_qty() -> None:
+    positions = PaperAutoTrader._current_positions(
+        [{"ticker": "005930", "qty": "1.9", "current_price": 70000.0}],
+        latest_prices={"005930": 70000.0},
+        portfolio_value=1_000_000.0,
+    )
+
+    assert positions == [{"ticker": "005930", "qty": 0, "weight": 0.0}]
+
+
 def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:
     trader = PaperAutoTrader(
         kis_client=FakeRealKIS(),
         hot_runner=FakeHotRunner(qty=1),
         report_dir=tmp_path,
+        now_fn=_paper_session_now,
     )
 
     report = trader.run(
@@ -423,3 +840,61 @@ def test_paper_auto_cli_rejects_paper_rehearsal_scope(capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "BLOCKED"
     assert out["reason"] == "paper_rehearsal_scope_not_allowed_for_auto_trade"
+
+
+def test_paper_auto_cli_requires_bundle_id_for_strict(capsys) -> None:
+    script = _load_paper_auto_trade_script()
+
+    rc = script.main(["--tickers", "005930", "--no-write-report"])
+
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "BLOCKED"
+    assert out["reason"] == "bundle_id_required_for_strict_paper_auto_trade"
+
+
+def test_paper_auto_cli_passes_bundle_to_prelive_and_trader(monkeypatch, capsys) -> None:
+    script = _load_paper_auto_trade_script()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        script,
+        "config_load",
+        lambda _file_name, _section=None: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 0,
+            "max_tickers": 1,
+            "require_prelive_pass": True,
+        },
+    )
+
+    def fake_build_report(**kwargs: Any) -> dict[str, Any]:
+        calls["prelive"] = kwargs
+        return {"status": "PASS", "blockers": []}
+
+    class FakeTrader:
+        def __init__(self, *, required_bundle_id: str | None = None) -> None:
+            calls["required_bundle_id"] = required_bundle_id
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            calls["run"] = kwargs
+            return {"status": "PASS", "stages": {}}
+
+    monkeypatch.setattr(script.prelive_gate, "build_report", fake_build_report)
+    monkeypatch.setattr(script, "PaperAutoTrader", FakeTrader)
+
+    rc = script.main([
+        "--tickers",
+        "005930",
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--confirm-phrase",
+        "PAPER_AUTO_OK",
+        "--no-write-report",
+    ])
+
+    assert rc == 0
+    assert calls["prelive"]["bundle_id"] == "BUNDLE-TEST"
+    assert calls["required_bundle_id"] == "BUNDLE-TEST"
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "PASS"

@@ -1,6 +1,6 @@
 """Post-backfill pre-live orchestrator.
 
-Run this after the 80-business-day ``live_data_readiness --all --require-train``
+Run this after the final dataset ``live_data_readiness --all --require-train``
 job finishes. The script does not read .env files. It uses the already sourced
 process environment, keeps live trading disabled, and advances only through
 safe pre-live gates.
@@ -22,6 +22,7 @@ if str(NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(NEW_ROOT))
 
 from scripts import prelive_gate  # noqa: E402
+from scripts.phase2_feature_backfill import run_phase2_feature_backfill  # noqa: E402
 from scripts.service_policy_replay import run_service_policy_replay  # noqa: E402
 from src.execution.paper_trading import PaperTradingRunner  # noqa: E402
 from src.jobs.run_backtest import run_backtest  # noqa: E402
@@ -42,6 +43,14 @@ def _previous_business_day(today: date | None = None) -> date:
 
 def _business_start_date(end: date, business_days: int) -> date:
     return kospi_trading_start_date(end, business_days)
+
+
+def _final_gate_default_end_date() -> str:
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    expected = prelive_gate._parse_dataset_date(gate_cfg.get("expected_end_date"))
+    if expected is not None:
+        return expected.strftime("%Y%m%d")
+    return _previous_business_day().strftime("%Y%m%d")
 
 
 def _stage(status: str, message: str, detail: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -106,6 +115,49 @@ def _latest_readiness_status(end_date: str, business_days: int, max_tickers: int
     }
 
 
+def _final_training_tickers(max_tickers: int) -> list[str]:
+    """Resolve the final deploy training universe, including pending_data names."""
+    return prelive_gate._active_tickers(
+        max_tickers=max_tickers,
+        include_pending_data=True,
+    )
+
+
+def _final_feature_coverage_status(end_date: str, business_days: int) -> dict[str, Any]:
+    """Fail closed unless final-window Dual-Source/exogenous coverage is deployable."""
+    try:
+        coverage = run_phase2_feature_backfill(
+            end_date=end_date,
+            business_days=business_days,
+            write_neutral_placeholders=False,
+            artifacts_dir=REPO_ROOT / "artifacts" / "data",
+            output_dir=REPO_ROOT / "artifacts" / "reports" / "phase2_feature_backfill",
+        )
+    except Exception as e:
+        return _stage(
+            "FAIL",
+            "Final-window feature coverage audit failed before training.",
+            {"error": str(e), "error_type": type(e).__name__},
+        )
+
+    return _stage(
+        "PASS" if coverage.get("status") == "PASS" else "BLOCKED",
+        "Final-window Dual-Source/exogenous feature coverage checked before training.",
+        {
+            "result": {
+                "status": coverage.get("status"),
+                "date_range": coverage.get("date_range"),
+                "artifact_date_coverage": coverage.get("artifact_date_coverage"),
+                "coverage": coverage.get("coverage", {}),
+                "blockers": coverage.get("blockers", []),
+                "report_path": coverage.get("report_path"),
+                "report_path_relative": coverage.get("report_path_relative"),
+            },
+            "blockers": coverage.get("blockers", []),
+        },
+    )
+
+
 def run_pipeline(
     *,
     end_date: str,
@@ -121,6 +173,9 @@ def run_pipeline(
     price: float | None,
     confirm_phrase: str | None,
     order_type: str,
+    target_col_override: str | None = None,
+    registry_dir: str | None = None,
+    allow_production_candidate_write: bool = False,
 ) -> dict[str, Any]:
     end_dt = datetime.strptime(end_date, "%Y%m%d").date()
     start_date = _business_start_date(end_dt, business_days).strftime("%Y%m%d")
@@ -134,6 +189,8 @@ def run_pipeline(
         "end_date": end_date,
         "business_days": business_days,
         "bundle_id": resolved_bundle_id,
+        "target_col_override": target_col_override,
+        "registry_dir": registry_dir,
         "runtime": {
             "elephant_mode": os.environ.get("ELEPHANT_MODE"),
             "kis_mode": os.environ.get("KIS_MODE"),
@@ -164,11 +221,43 @@ def run_pipeline(
         report["blockers"] = ["01_prelive_gate_before"]
         return report
 
+    training_tickers = _final_training_tickers(max_tickers)
+    report["training_tickers"] = training_tickers
+    report["training_ticker_count"] = len(training_tickers)
+    if not training_tickers:
+        stages["02_lgbm_bundle"] = _stage(
+            "BLOCKED",
+            "Final training universe resolved to zero tickers.",
+            {"max_tickers": max_tickers},
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["02_lgbm_bundle"]
+        return report
+
+    stages["02_feature_coverage"] = _final_feature_coverage_status(
+        end_date,
+        business_days,
+    )
+    if stages["02_feature_coverage"]["status"] != "PASS":
+        stages["02_lgbm_bundle"] = _stage(
+            "SKIP",
+            "Final-window feature coverage gate is not PASS yet.",
+            {"upstream_blockers": stages["02_feature_coverage"].get("blockers", [])},
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["02_feature_coverage"]
+        return report
+
     try:
-        lgbm_result = NightlyLGBMRetrainer().retrain(
+        lgbm_result = NightlyLGBMRetrainer(
+            registry_dir=registry_dir,
+            allow_production_candidate_write=allow_production_candidate_write,
+        ).retrain(
             bundle_id=resolved_bundle_id,
+            tickers=training_tickers,
             start_date=start_date,
             end_date=end_date,
+            target_col_override=target_col_override,
         )
         stages["02_lgbm_bundle"] = _stage(
             "PASS" if lgbm_result.get("candidate_bundle_staged") else "BLOCKED",
@@ -332,13 +421,13 @@ def run_pipeline(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    default_end = _previous_business_day().strftime("%Y%m%d")
+    default_end = _final_gate_default_end_date()
     parser = argparse.ArgumentParser(
         description="Run post-backfill gates up to the pre-live boundary",
     )
     parser.add_argument("--end-date", default=default_end, help="YYYYMMDD")
-    parser.add_argument("--business-days", type=int, default=80)
-    parser.add_argument("--max-tickers", type=int, default=20)
+    parser.add_argument("--business-days", type=int, default=prelive_gate._final_gate_min_business_days())
+    parser.add_argument("--max-tickers", type=int, default=prelive_gate._final_gate_min_tickers())
     parser.add_argument("--bundle-id", default="")
     parser.add_argument("--run-paper-balance", action="store_true")
     parser.add_argument("--system-positions-json", default="")
@@ -349,6 +438,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--price", type=float, default=None)
     parser.add_argument("--order-type", default="00")
     parser.add_argument("--confirm-phrase", default="")
+    parser.add_argument("--target-col-override", default="")
+    parser.add_argument("--registry-dir", default="")
+    parser.add_argument("--allow-production-candidate-write", action="store_true")
     parser.add_argument("--no-write-report", action="store_true")
     return parser.parse_args(argv)
 
@@ -369,6 +461,9 @@ def main(argv: list[str] | None = None) -> int:
         price=args.price,
         confirm_phrase=str(args.confirm_phrase).strip() or None,
         order_type=str(args.order_type or "00"),
+        target_col_override=str(args.target_col_override).strip() or None,
+        registry_dir=str(args.registry_dir).strip() or None,
+        allow_production_candidate_write=bool(args.allow_production_candidate_write),
     )
     if not bool(args.no_write_report):
         _write_report(report)

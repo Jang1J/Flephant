@@ -295,6 +295,18 @@ class TestScoreIntegration:
         missing = required_fields - set(result.keys())
         assert not missing, f"C3A 필수 필드 누락: {missing}"
 
+    def test_score_asof_uses_snapshot_ts(self, scorer: DualSourceScorer) -> None:
+        """historical materialize 시 C3A asof는 현재 시각이 아니라 snapshot_ts."""
+        snapshot = datetime(2026, 5, 4, 8, 30, 0, tzinfo=_KST)
+        result = scorer.score(
+            ticker="005930",
+            news_texts=["삼성전자 실적 호조"],
+            comm_texts_t1=["매수 좋아"],
+            data_ts=snapshot,
+            snapshot_ts=snapshot,
+        )
+        assert result["asof"] == snapshot.isoformat()
+
     def test_ticker_zero_padded(self, scorer: DualSourceScorer) -> None:
         """ticker '5930' → '005930' 자동 변환."""
         result = scorer.score(
@@ -362,6 +374,7 @@ class TestScoreIntegration:
         tickers = {r["ticker"] for r in results}
         assert "005930" in tickers
         assert "000660" in tickers
+        assert all(r["asof"] == _SAFE_SNAPSHOT.isoformat() for r in results)
 
 
 # =========================================================

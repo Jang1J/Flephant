@@ -4,8 +4,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import hashlib
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 def _load_script_module():
@@ -27,13 +28,61 @@ def _required_label_session_scope(gate) -> str:
     return str(cfg["label"]["session_scope"])
 
 
+def _required_target_col(gate) -> str:
+    cfg = gate._load_yaml(gate.NEW_ROOT / "config" / "risk_config.yaml")
+    return str(cfg["label"]["target_col"])
+
+
+def _write_staged_lgbm_bundle(
+    root: Path,
+    gate,
+    bundle_id: str,
+    *,
+    metadata: dict | None = None,
+    model_bytes: bytes = b"staged-model",
+) -> dict:
+    bundle_dir = root / "artifacts" / "bundles" / bundle_id / "lgbm"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "latest_model.pkl").write_bytes(model_bytes)
+    payload = {
+        "version": "staged",
+        "status": "candidate",
+        "bundle_id": bundle_id,
+        "model_path": f"artifacts/bundles/{bundle_id}/lgbm/latest_model.pkl",
+        "created_at": "2026-05-12T09:00:00+09:00",
+        "synthetic_fallback": False,
+        "data_source": "artifact_bars",
+        "n_train_rows": 1000,
+        "label_generation_version": _required_label_generation_version(gate),
+        "label_session_scope": _required_label_session_scope(gate),
+        "target_col": _required_target_col(gate),
+        **_final_dataset_metadata(),
+    }
+    if metadata:
+        payload.update(metadata)
+    (bundle_dir / "latest_model_metadata.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
 def _service_policy_evidence(
     root: Path,
     *,
     bundle_id: str = "BUNDLE-TEST",
     status: str = "PASS",
     date_range: dict | None = None,
+    universe: list[str] | None = None,
 ) -> dict:
+    replay_universe = sorted(
+        set(universe or _final_dataset_metadata()["requested_tickers"])
+    )
+    universe_payload = json.dumps(
+        replay_universe,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     checks = {
         "deploy_candidate_by_service_policy": status == "PASS",
         "no_naked_short_exposure": True,
@@ -46,6 +95,10 @@ def _service_policy_evidence(
         "gate": {"status": status},
         "policy_checks": checks,
         "order_stats": {"naked_short_attempts": 0},
+        "universe": replay_universe,
+        "universe_count": len(replay_universe),
+        "universe_hash": hashlib.sha256(universe_payload).hexdigest(),
+        "universe_policy": "final_dataset_gate",
     }
     if date_range is not None:
         report["date_range"] = date_range
@@ -78,7 +131,54 @@ def _final_dataset_metadata() -> dict:
         "loaded_tickers": tickers,
         "missing_tickers": [],
         "n_tickers": len(tickers),
+        "label_generation_version": "session_local_v2",
+        "label_session_scope": "ticker_trading_day",
+        "target_col": "label_5m_ret",
     }
+
+
+def _write_parquet_day(
+    root: Path,
+    ticker: str,
+    yyyymmdd: str,
+    *,
+    rows: int = 301,
+    row_ticker: str | None = None,
+    ts_yyyymmdd: str | None = None,
+    gap_after: int | None = None,
+    gap_minutes: int = 0,
+) -> None:
+    import pandas as pd
+
+    data_dir = root / ticker
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ts_day = ts_yyyymmdd or yyyymmdd
+    start = datetime(
+        int(ts_day[:4]),
+        int(ts_day[4:6]),
+        int(ts_day[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    records = []
+    for i in range(rows):
+        offset = i
+        if gap_after is not None and i > gap_after:
+            offset += gap_minutes
+        records.append({
+            "ticker": row_ticker or ticker,
+            "ts_close": (start + timedelta(minutes=offset)).isoformat(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        })
+    pd.DataFrame.from_records(records).to_parquet(
+        data_dir / f"bars_1m_{yyyymmdd}.parquet",
+        index=False,
+    )
 
 
 def test_configured_train_min_rows_requires_config_value():
@@ -102,6 +202,183 @@ def test_business_start_date_counts_krx_trading_days():
         "20260213",
         "20260219",
     ]
+
+
+def test_80_day_artifact_gate_rejects_internal_date_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", ts_yyyymmdd="20260507")
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["rows"] == 301
+    assert first["timestamp_dates_match"] is False
+    assert first["valid_artifact"] is False
+
+
+def test_80_day_artifact_gate_rejects_ticker_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", row_ticker="000660")
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["ticker_matches"] is False
+
+
+def test_80_day_artifact_gate_rejects_morning_only_session_span(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508", rows=300)
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["session_span_ok"] is False
+    assert first["session_span_minutes"] == 299.0
+
+
+def test_80_day_artifact_gate_rejects_large_intraday_gap(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=301,
+        gap_after=150,
+        gap_minutes=20,
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["max_gap_ok"] is False
+    assert first["max_gap_minutes"] == 21.0
+
+
+def test_80_day_artifact_gate_allows_closing_auction_gap(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=381,
+        gap_after=379,
+        gap_minutes=10,
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "PASS"
+
+
+def test_80_day_artifact_gate_allows_known_market_halt_gap(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(
+        tmp_path,
+        "005930",
+        "20260304",
+        rows=332,
+        gap_after=139,
+        gap_minutes=29,
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260304",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "PASS"
+
+
+def test_80_day_artifact_gate_rejects_invalid_ohlcv(monkeypatch, tmp_path):
+    import pandas as pd
+
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508")
+    path = tmp_path / "005930" / "bars_1m_20260508.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[0, "close"] = 0.0
+    frame.to_parquet(path, index=False)
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["valid_artifact"] is False
+    assert first["invalid_ohlcv_count"] == 1
+
+
+def test_80_day_artifact_gate_rejects_duplicate_same_date_files(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)
+    _write_parquet_day(tmp_path, "005930", "20260508")
+    duplicate = tmp_path / "005930" / "bars_1m_20260508_shadow.jsonl"
+    duplicate.write_text(
+        (
+            '{"ticker": "005930", '
+            '"ts_close": "2026-05-08T09:00:00+09:00", '
+            '"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    result = gate._check_80_day_artifacts(
+        tickers=["005930"],
+        end_yyyymmdd="20260508",
+        business_days=1,
+        min_rows_per_day=300,
+    )
+
+    assert result["status"] == "BLOCKED"
+    first = result["sample_missing_or_short"]["20260508"][0]
+    assert first["reason"] == "duplicate_date_artifacts"
+    assert len(first["duplicate_date_artifacts"]) == 2
 
 
 def test_latest_matching_report_skips_non_matching_and_bad_json(tmp_path):
@@ -137,6 +414,7 @@ def test_real_readiness_treats_allow_mock_string_false_as_real(monkeypatch, tmp_
                 "stages": {
                     "smoke": {"naver": {"status": "PASS"}},
                     "backfill": {"status": "PASS", "counts": {"005930": 30400}},
+                    "train": {"status": "PASS", "data_source": "artifact_bars"},
                 },
             },
             ensure_ascii=False,
@@ -149,6 +427,35 @@ def test_real_readiness_treats_allow_mock_string_false_as_real(monkeypatch, tmp_
 
     assert result["status"] == "PASS"
     assert result["backfill_min_rows"] == 30400
+    assert result["train_status"] == "PASS"
+
+
+def test_real_readiness_requires_train_pass(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "data_readiness"
+    report_dir.mkdir(parents=True)
+    report = report_dir / "data_readiness_20260516_000000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "end_date": "20260515",
+                "allow_mock": False,
+                "stages": {
+                    "smoke": {"naver": {"status": "PASS"}},
+                    "backfill": {"status": "PASS", "counts": {"005930": 30400}},
+                    "train": {"status": "SKIP"},
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_real_readiness("20260515")
+
+    assert result["status"] == "BLOCKED"
 
 
 def test_deployable_backtest_treats_regression_string_false_as_false(monkeypatch):
@@ -168,6 +475,32 @@ def test_deployable_backtest_treats_regression_string_false_as_false(monkeypatch
                 "exogenous_non_neutral_rows": 10,
             },
             "candidate_model_metadata": _final_dataset_metadata(),
+        },
+        "BUNDLE-TEST",
+    )
+
+
+def test_deployable_backtest_blocks_target_col_override(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_service_policy_gate_pass", lambda *_args, **_kwargs: True)
+    metadata = {
+        **_final_dataset_metadata(),
+        "target_col": "label_session_close_net_ret",
+    }
+
+    assert not gate._is_deployable_backtest_report(
+        {
+            "bundle_id": "BUNDLE-TEST",
+            "verdict": "pass",
+            "regression_risk": {"flagged": False},
+            "minute_bar_leakage_check": {"verdict": "pass"},
+            "feature_quality": {
+                "dual_source_rows": 10,
+                "dual_source_non_neutral_rows": 10,
+                "exogenous_rows": 10,
+                "exogenous_non_neutral_rows": 10,
+            },
+            "candidate_model_metadata": metadata,
         },
         "BUNDLE-TEST",
     )
@@ -243,10 +576,199 @@ def test_probe_order_passes_with_order_history_match(monkeypatch, tmp_path):
     assert result["matched_order_count"] == 1
 
 
+def test_bundle_paper_auto_evidence_satisfies_paper_stages(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "broker_evidence": {
+                    "balance_reconciliation": {"status": "PASS"},
+                    "probe_order": {"status": "PASS"},
+                    "order_history_requery": {"status": "PASS"},
+                },
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    balance = gate._check_paper_balance(bundle_id)
+    reconciliation = gate._check_paper_reconciliation(bundle_id)
+    probe = gate._check_probe_order(bundle_id)
+
+    assert balance["status"] == "PASS"
+    assert reconciliation["status"] == "PASS"
+    assert probe["status"] == "PASS"
+    assert probe["paper_auto_cycle_history_matched"] is True
+
+
+def test_bundle_paper_auto_evidence_blocks_stale_report(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "generated_at": "2000-01-01T00:00:00+09:00",
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "broker_evidence": {
+                    "balance_reconciliation": {"status": "PASS"},
+                    "probe_order": {"status": "PASS"},
+                    "order_history_requery": {"status": "PASS"},
+                },
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order(bundle_id)
+
+    assert result["status"] == "BLOCKED"
+    assert result["freshness"]["reason"] == "generated_at_stale_or_future"
+
+
+def test_bundle_paper_auto_evidence_requires_nested_broker_evidence(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "external_kis_api": True,
+                "evidence_level": "external_kis_virtual",
+                "evidence_guard": {"status": "PASS"},
+                "stage_statuses": {
+                    "paper_auto_cycle": "PASS",
+                    "balance_reconciliation": "PASS",
+                    "probe_order": "PASS",
+                    "order_history_requery": "PASS",
+                },
+                "stages": {
+                    "paper_auto_cycle": {
+                        "status": "PASS",
+                        "stages": {
+                            "active_model_guard": {"bundle_id": bundle_id},
+                            "cycles": {
+                                "items": [{
+                                    "status": "PASS",
+                                    "order_history_verification": {
+                                        "status": "PASS",
+                                        "queries": [{"matched_order_count": 1}],
+                                    },
+                                }],
+                            },
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order(bundle_id)
+
+    assert result["status"] == "BLOCKED"
+    assert result["broker_evidence_nested"]["reason"] == "broker_evidence_missing"
+
+
+def test_bundle_paper_auto_evidence_blocks_wrong_bundle(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-OTHER",
+                "external_kis_api": True,
+                "stage_statuses": {"probe_order": "PASS"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_probe_order("BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["blocker"] == "paper_auto_bundle_evidence_missing"
+
+
 def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -275,6 +797,8 @@ def test_lgbm_real_train_prefers_candidate_bundle(monkeypatch, tmp_path):
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -298,6 +822,7 @@ def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -318,6 +843,8 @@ def test_lgbm_real_train_treats_synthetic_fallback_string_false_as_real(
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -337,6 +864,7 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -368,6 +896,8 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
                         "n_train_rows": 454639,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -388,30 +918,21 @@ def test_lgbm_real_train_prefers_latest_candidate_even_without_bundle(monkeypatc
 
 def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
     gate = _load_script_module()
-    label_version = _required_label_generation_version(gate)
-    label_scope = _required_label_session_scope(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
-    (lgbm_dir / "requested.pkl").write_bytes(b"requested")
     (lgbm_dir / "newer.pkl").write_bytes(b"newer")
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"version": "requested"},
+    )
     (lgbm_dir / "registry.json").write_text(
         json.dumps(
             {
                 "active_version": None,
                 "versions": [
-                    {
-                        "version": "requested",
-                        "status": "candidate",
-                        "bundle_id": "BUNDLE-REQUESTED",
-                        "model_path": "artifacts/lgbm/requested.pkl",
-                        "created_at": "2026-05-12T09:00:00+09:00",
-                        "synthetic_fallback": False,
-                        "data_source": "artifact_bars",
-                        "n_train_rows": 1000,
-                        "label_generation_version": label_version,
-                        "label_session_scope": label_scope,
-                    },
                     {
                         "version": "newer",
                         "status": "candidate",
@@ -421,8 +942,9 @@ def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
                         "synthetic_fallback": False,
                         "data_source": "artifact_bars",
                         "n_train_rows": 1000,
-                        "label_generation_version": label_version,
-                        "label_session_scope": label_scope,
+                        "label_generation_version": _required_label_generation_version(gate),
+                        "label_session_scope": _required_label_session_scope(gate),
+                        "target_col": _required_target_col(gate),
                     },
                 ],
             },
@@ -439,6 +961,8 @@ def test_lgbm_real_train_uses_requested_bundle_metadata(monkeypatch, tmp_path):
     assert result["requested_bundle_id"] == "BUNDLE-REQUESTED"
     assert result["candidate_bundle_id"] == "BUNDLE-REQUESTED"
     assert result["bundle_id_matches_request"] is True
+    assert result["metadata_source"] == "staged_bundle"
+    assert result["model_path"] == "artifacts/bundles/BUNDLE-REQUESTED/lgbm/latest_model.pkl"
 
 
 def test_lgbm_real_train_blocks_unknown_requested_bundle(monkeypatch, tmp_path):
@@ -459,10 +983,107 @@ def test_lgbm_real_train_blocks_unknown_requested_bundle(monkeypatch, tmp_path):
     assert "requested bundle id" in result["message"]
 
 
+def test_lgbm_real_train_blocks_staged_bundle_id_mismatch(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"bundle_id": "BUNDLE-OTHER"},
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["metadata_source"] == "staged_bundle"
+    assert result["bundle_id_matches_request"] is False
+
+
+def test_lgbm_real_train_blocks_target_col_override_candidate(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"target_col": "label_session_close_net_ret"},
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["target_col"] == "label_session_close_net_ret"
+    assert result["required_target_col"] == _required_target_col(gate)
+
+
+def test_lgbm_real_train_enforces_final_dataset_gate(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={
+            "train_start": None,
+            "train_end": None,
+            "requested_tickers": [],
+            "loaded_tickers": [],
+            "n_tickers": 0,
+        },
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "BLOCKED"
+    assert result["final_dataset_gate"]["status"] == "BLOCKED"
+    assert "train_start_missing_or_invalid" in result["final_dataset_gate"]["blockers"]
+
+
+def test_final_dataset_gate_blocks_wrong_ticker_set():
+    gate = _load_script_module()
+    metadata = _final_dataset_metadata()
+    wrong_tickers = list(metadata["requested_tickers"])
+    wrong_tickers[-1] = "999999"
+    metadata["requested_tickers"] = wrong_tickers
+    metadata["loaded_tickers"] = wrong_tickers
+    metadata["n_tickers"] = len(wrong_tickers)
+
+    result = gate._final_dataset_gate_result({"model_metadata": metadata})
+
+    assert result["status"] == "BLOCKED"
+    assert "requested_tickers_final_universe_mismatch" in result["blockers"]
+    assert "loaded_tickers_final_universe_mismatch" in result["blockers"]
+    assert result["expected_ticker_count"] == 30
+    assert result["expected_universe_hash"]
+
+
+def test_final_dataset_gate_blocks_missing_expected_universe(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(gate, "_active_tickers", lambda max_tickers: [])
+
+    metadata = _final_dataset_metadata()
+    arbitrary_tickers = [f"{i:06d}" for i in range(100000, 100030)]
+    metadata["requested_tickers"] = arbitrary_tickers
+    metadata["loaded_tickers"] = arbitrary_tickers
+    metadata["n_tickers"] = len(arbitrary_tickers)
+
+    result = gate._final_dataset_gate_result({"model_metadata": metadata})
+
+    assert result["status"] == "BLOCKED"
+    assert "final_dataset_expected_universe_missing" in result["blockers"]
+    assert result["expected_ticker_count"] == 0
+    assert result["expected_universe_hash"] is None
+
+
 def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -483,6 +1104,8 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "data_source": "artifact_bars",
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                     {
                         "version": "utc_time",
@@ -494,6 +1117,8 @@ def test_lgbm_real_train_sorts_created_at_by_instant(monkeypatch, tmp_path):
                         "data_source": "artifact_bars",
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
+                        **_final_dataset_metadata(),
                     },
                 ],
             },
@@ -550,6 +1175,7 @@ def test_lgbm_real_train_blocks_missing_real_data_source(monkeypatch, tmp_path):
     gate = _load_script_module()
     label_version = _required_label_generation_version(gate)
     label_scope = _required_label_session_scope(gate)
+    target_col = _required_target_col(gate)
     repo_root = tmp_path
     lgbm_dir = repo_root / "artifacts" / "lgbm"
     lgbm_dir.mkdir(parents=True)
@@ -569,6 +1195,7 @@ def test_lgbm_real_train_blocks_missing_real_data_source(monkeypatch, tmp_path):
                         "n_train_rows": 1000,
                         "label_generation_version": label_version,
                         "label_session_scope": label_scope,
+                        "target_col": target_col,
                     },
                 ],
             },
@@ -748,6 +1375,49 @@ def test_backtest_gate_uses_service_policy_expected_date_range(monkeypatch, tmp_
 
     assert result["status"] == "PASS"
     assert result["report_path"].endswith(report_path.name)
+
+
+def test_backtest_gate_blocks_active_only_service_policy_universe(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    report_dir = tmp_path / "backtest"
+    report_dir.mkdir(parents=True)
+    report_path = report_dir / "backtest_BUNDLE-TEST_20260511_011700.json"
+    service_policy = _service_policy_evidence(tmp_path, universe=["005930"])
+    report_path.write_text(
+        json.dumps(
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "verdict": "pass",
+                "date_range": {"start": "20260415", "end": "20260504"},
+                "regression_risk": {"flagged": False},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_backtest_gate({
+        "status": "PASS",
+        "bundle_id": "BUNDLE-TEST",
+    })
+
+    assert result["status"] == "BLOCKED"
+    assert result["latest_report_path"].endswith(report_path.name)
+    assert result["latest_service_policy_gate_pass"] is False
+    assert result["latest_final_dataset_gate"]["status"] == "PASS"
 
 
 def test_backtest_gate_blocks_pass_report_with_zero_feature_quality(monkeypatch, tmp_path):
@@ -1002,9 +1672,13 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
 
     monkeypatch.setattr(gate, "_check_lgbm_real_train", fake_lgbm)
     monkeypatch.setattr(gate, "_check_backtest_gate", fake_backtest)
-    monkeypatch.setattr(gate, "_check_paper_balance", lambda: {"status": "PASS"})
-    monkeypatch.setattr(gate, "_check_paper_reconciliation", lambda: {"status": "PASS"})
-    monkeypatch.setattr(gate, "_check_probe_order", lambda: {"status": "PASS"})
+    monkeypatch.setattr(gate, "_check_paper_balance", lambda bundle_id=None: {"status": "PASS"})
+    monkeypatch.setattr(
+        gate,
+        "_check_paper_reconciliation",
+        lambda bundle_id=None: {"status": "PASS"},
+    )
+    monkeypatch.setattr(gate, "_check_probe_order", lambda bundle_id=None: {"status": "PASS"})
     monkeypatch.setattr(gate, "_check_ops_risk", lambda: {"status": "PASS"})
 
     report = gate.build_report(
@@ -1021,3 +1695,15 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
         "status": "PASS",
         "candidate_bundle_id": "BUNDLE-REQUESTED",
     }
+
+
+def test_next_commands_keep_deploy_candidate_in_dry_run() -> None:
+    gate = _load_script_module()
+
+    commands = gate._next_commands(
+        end_date="20260515",
+        business_days=80,
+        max_tickers=30,
+    )
+
+    assert "--dry-run" in commands["deploy_candidate_after_backtest_pass"]

@@ -9,12 +9,16 @@ ticker: 6자리 zero-padded (pad_ticker 경유).
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("bar_buffer")
+_KST = ZoneInfo("Asia/Seoul")
 
 # C1 MinuteBarContract 필수 필드
 _REQUIRED_FIELDS = frozenset(
@@ -60,6 +64,10 @@ class BarBuffer:
         필수 필드 검증: ticker, ts_close, open, high, low, close, volume.
         누락 시 ValueError.
         """
+        if not isinstance(bar, dict):
+            raise ValueError(
+                f"BarBuffer.push: bar must be dict. got={type(bar).__name__}"
+            )
         missing = _REQUIRED_FIELDS - bar.keys()
         if missing:
             raise ValueError(
@@ -104,6 +112,39 @@ class BarBuffer:
             return items
         return items[-n:]
 
+    def get_latest_asof(
+        self,
+        ticker: str,
+        n: int = 60,
+        asof: datetime | str | None = None,
+    ) -> list[dict]:
+        """ticker의 asof 이하 최근 n개 bar 반환."""
+        if asof in (None, ""):
+            return []
+
+        ticker = pad_ticker(str(ticker))
+        buf = self._buffers.get(ticker)
+        if buf is None:
+            return []
+        asof_dt = _parse_bar_ts(asof)
+        filtered: list[dict[str, Any]] = []
+        for item in list(buf):
+            try:
+                bar_dt = _parse_bar_ts(item.get("ts_close"))
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "[bar_buffer] malformed ts_close skipped: ticker=%s ts_close=%s error=%s",
+                    ticker,
+                    item.get("ts_close"),
+                    e,
+                )
+                continue
+            if bar_dt <= asof_dt:
+                filtered.append(item)
+        if n >= len(filtered):
+            return filtered
+        return filtered[-n:]
+
     def get_batch(
         self, tickers: list[str], n_bars: int = 60
     ) -> dict[str, list[dict]]:
@@ -112,6 +153,18 @@ class BarBuffer:
         Cross-sectional 처리 전제. 없는 ticker는 빈 리스트로 포함.
         """
         return {pad_ticker(str(t)): self.get_latest(t, n_bars) for t in tickers}
+
+    def get_batch_asof(
+        self,
+        tickers: list[str],
+        n_bars: int = 60,
+        asof: datetime | str | None = None,
+    ) -> dict[str, list[dict]]:
+        """여러 ticker의 asof 이하 최근 n_bars 반환."""
+        return {
+            pad_ticker(str(t)): self.get_latest_asof(t, n_bars, asof)
+            for t in tickers
+        }
 
     def missing_check(
         self, tickers: list[str], expected_n: int = 60
@@ -149,3 +202,13 @@ class BarBuffer:
     def tickers(self) -> list[str]:
         """현재 buffer에 있는 ticker 리스트 (오름차순)."""
         return sorted(self._buffers.keys())
+
+
+def _parse_bar_ts(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt.astimezone(timezone.utc)

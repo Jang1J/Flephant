@@ -8,6 +8,7 @@ cost-aware retraining experiment.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -21,10 +22,21 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
+from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "cost_aware_retraining"
+
+
+def _universe_hash(tickers: list[str]) -> str:
+    normalized = sorted({pad_ticker(str(ticker)) for ticker in tickers})
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -65,6 +77,164 @@ def _is_newer(candidate: Path | None, reference: Path | None) -> bool:
         return False
 
 
+def _dataset_date_arg(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        raw = raw[:10]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").strftime("%Y%m%d")
+    except ValueError:
+        return None
+
+
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    gate_cfg = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
+def _final_dataset_window() -> dict[str, str | None]:
+    gate_cfg = _final_dataset_gate_cfg()
+    return {
+        "start_date": _dataset_date_arg(gate_cfg.get("expected_start_date")),
+        "end_date": _dataset_date_arg(gate_cfg.get("expected_end_date")),
+    }
+
+
+def _final_dataset_business_days() -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(gate_cfg.get("min_business_days"), default=0, min_value=0)
+
+
+def _final_dataset_min_tickers() -> int:
+    gate_cfg = _final_dataset_gate_cfg()
+    return safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+
+
+def _final_training_tickers() -> list[str]:
+    cfg = config_load("universe_config.yaml") or {}
+    gate_cfg = _final_dataset_gate_cfg()
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
+        for row in sector.get("stocks", []) or []:
+            if str(row.get("status")) in stock_statuses:
+                tickers.append(pad_ticker(str(row.get("ticker", ""))))
+    if not tickers:
+        fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
+        tickers.extend(pad_ticker(str(ticker)) for ticker in fallback)
+    max_tickers = _final_dataset_min_tickers()
+    deduped = sorted({ticker for ticker in tickers if ticker != "000000"})
+    return deduped[:max_tickers] if max_tickers else deduped
+
+
+def _label_scan_command(
+    *,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+) -> str:
+    parts = [
+        "PYTHONPATH=new python new/scripts/cost_aware_label_horizon_scan.py",
+        "--artifacts-dir artifacts/data",
+    ]
+    if start_date:
+        parts.append(f"--start-date {start_date}")
+    if end_date:
+        parts.append(f"--end-date {end_date}")
+    if tickers:
+        parts.append(f"--tickers {','.join(tickers)}")
+    return " ".join(parts)
+
+
+def _research_registry_dir(bundle_id: str) -> str:
+    safe_bundle = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in bundle_id)
+    safe_bundle = safe_bundle or "cost_aware"
+    return f"artifacts/lgbm_research/{safe_bundle}"
+
+
+def _staged_retrain_gate_command(
+    *,
+    bundle_id: str,
+    end_date: str | None,
+    tickers: list[str],
+    target_col_override: str | None,
+) -> str:
+    registry_dir = _research_registry_dir(bundle_id)
+    business_days = _final_dataset_business_days()
+    max_tickers = _final_dataset_min_tickers() or len(tickers)
+    parts = [
+        "ELEPHANT_MODE=mode_b PYTHONPATH=new python new/scripts/post_backfill_prelive.py",
+        f"--bundle-id {bundle_id}",
+        f"--registry-dir {registry_dir}",
+        "--run-paper-balance",
+    ]
+    if end_date:
+        parts.append(f"--end-date {end_date}")
+    if business_days:
+        parts.append(f"--business-days {business_days}")
+    if max_tickers:
+        parts.append(f"--max-tickers {max_tickers}")
+    if target_col_override:
+        parts.append(f"--target-col-override {target_col_override}")
+    return " ".join(parts)
+
+
+def _research_training_command(
+    *,
+    bundle_id: str,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+    target_col_override: str | None,
+) -> str:
+    registry_dir = _research_registry_dir(bundle_id)
+    version = "cost-aware-research"
+    if target_col_override:
+        version = target_col_override.replace("label_", "cost-aware-").replace("_net_ret", "")
+    parts = [
+        "ELEPHANT_MODE=mode_b PYTHONPATH=new python -m src.models.lgbm_trainer",
+        f"--tickers {','.join(tickers)}",
+        f"--version {version}",
+        f"--bundle-id {bundle_id}",
+        f"--registry-dir {registry_dir}",
+    ]
+    if start_date:
+        parts.append(f"--start {start_date}")
+    if end_date:
+        parts.append(f"--end {end_date}")
+    if target_col_override:
+        parts.append(f"--target-col-override {target_col_override}")
+    return " ".join(parts)
+
+
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
     if not isinstance(label_scan, dict):
         return {}
@@ -73,6 +243,146 @@ def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[
         if isinstance(row, dict) and str(row.get("horizon")) == target:
             return row
     return {}
+
+
+def _target_col_for_horizon(horizon: Any) -> str | None:
+    if horizon is None:
+        return None
+    if str(horizon) == "session_close":
+        return "label_session_close_net_ret"
+    return f"label_{horizon}m_net_ret"
+
+
+def _target_changes_rank(
+    *,
+    best_horizon: Any,
+    active_horizon: Any,
+    best_horizon_report: dict[str, Any],
+) -> bool:
+    if best_horizon is None:
+        return False
+    if str(best_horizon) == str(active_horizon):
+        return False
+    impact = best_horizon_report.get("selection_impact")
+    if not isinstance(impact, dict):
+        return True
+    if safe_bool(impact.get("rank_equivalent_to_active_horizon"), default=False):
+        return False
+    selection_changes = impact.get("selection_changes")
+    if selection_changes is None:
+        return True
+    return safe_int(selection_changes, default=0, min_value=0) > 0
+
+
+def _label_scan_pretraining_blockers(
+    *,
+    label_scan: dict[str, Any] | None,
+    final_window: dict[str, str | None],
+    final_tickers: list[str],
+) -> list[str]:
+    if not isinstance(label_scan, dict):
+        return ["label_horizon_scan_missing"]
+
+    data = label_scan.get("data") if isinstance(label_scan.get("data"), dict) else {}
+    blockers: list[str] = []
+    research_trainable = safe_bool(
+        label_scan.get("research_trainable_label_recommendation"),
+        default=False,
+    )
+    deployable_label = safe_bool(
+        label_scan.get("deployable_label_recommendation"),
+        default=False,
+    )
+    if label_scan.get("status") != "PASS" and not research_trainable:
+        blockers.append("label_horizon_scan_not_pass")
+    if not (deployable_label or research_trainable):
+        blockers.append("label_horizon_scan_not_deployable")
+    expected_start = final_window.get("start_date")
+    expected_end = final_window.get("end_date")
+    if expected_start and data.get("start_date") != expected_start:
+        blockers.append("label_horizon_scan_window_mismatch")
+    if expected_end and data.get("end_date") != expected_end:
+        blockers.append("label_horizon_scan_window_mismatch")
+    if final_tickers:
+        expected_ticker_count = len(final_tickers)
+        if int(data.get("ticker_count") or 0) != expected_ticker_count:
+            blockers.append("label_horizon_scan_ticker_mismatch")
+        reported_tickers = data.get("tickers")
+        if isinstance(reported_tickers, list):
+            normalized_reported = sorted({
+                pad_ticker(str(ticker))
+                for ticker in reported_tickers
+                if str(ticker).strip()
+            })
+            if normalized_reported != final_tickers:
+                blockers.append("label_horizon_scan_universe_mismatch")
+        reported_hash = data.get("universe_hash")
+        if reported_hash and str(reported_hash) != _universe_hash(final_tickers):
+            blockers.append("label_horizon_scan_universe_mismatch")
+    missing_tickers = data.get("missing_tickers")
+    if isinstance(missing_tickers, list) and any(str(t).strip() for t in missing_tickers):
+        blockers.append("label_horizon_scan_missing_tickers")
+    return sorted(set(blockers))
+
+
+def _phase2_price_backfill_ready(
+    phase2: dict[str, Any] | None,
+    *,
+    final_tickers: list[str],
+    final_window: dict[str, str | None],
+) -> bool:
+    """Return True when KIS bar coverage is complete enough for research training.
+
+    Phase 2 feature backfill can be BLOCKED because Dual-Source/exogenous
+    non-neutral artifacts are unavailable. DatasetBuilder can still train a
+    research model with neutral DS/exog defaults if the KIS price panel itself
+    is complete. Prelive deploy remains blocked until the full Phase 2 report
+    is PASS.
+    """
+    if not isinstance(phase2, dict):
+        return False
+    artifact_coverage = phase2.get("artifact_date_coverage")
+    if not isinstance(artifact_coverage, dict):
+        return False
+    expected_tickers = phase2.get("expected_tickers")
+    if not isinstance(expected_tickers, list):
+        return False
+    observed_tickers = sorted({
+        pad_ticker(str(ticker))
+        for ticker in expected_tickers
+        if str(ticker).strip()
+    })
+    if observed_tickers != sorted(final_tickers):
+        return False
+    date_range = phase2.get("date_range")
+    if not isinstance(date_range, dict):
+        return False
+    if final_window.get("start_date") and str(date_range.get("start")) != str(final_window["start_date"]):
+        return False
+    if final_window.get("end_date") and str(date_range.get("end")) != str(final_window["end_date"]):
+        return False
+    expected_dates = safe_int(
+        artifact_coverage.get("expected_date_count"),
+        default=0,
+        min_value=0,
+    )
+    selected_dates = safe_int(
+        artifact_coverage.get("selected_date_count"),
+        default=0,
+        min_value=0,
+    )
+    missing_dates = safe_int(
+        artifact_coverage.get("missing_date_count"),
+        default=0,
+        min_value=0,
+    )
+    ticker_count = safe_int(phase2.get("ticker_count"), default=0, min_value=0)
+    return (
+        expected_dates > 0
+        and selected_dates >= expected_dates
+        and missing_dates == 0
+        and ticker_count >= len(final_tickers)
+    )
 
 
 def build_retraining_plan(
@@ -91,11 +401,22 @@ def build_retraining_plan(
         f"artifacts/reports/service_policy_replay/service_policy_replay_{bundle_id}_*.json"
     )
     label_scan_path, label_scan = _latest("artifacts/reports/label_horizon_scan/*.json")
+    final_window = _final_dataset_window()
+    final_tickers = _final_training_tickers()
 
-    blockers: list[str] = []
+    pretraining_blockers: list[str] = []
+    predeploy_blockers: list[str] = []
     phase2_pass = (phase2 or {}).get("status") == "PASS"
+    phase2_price_backfill_ready = _phase2_price_backfill_ready(
+        phase2,
+        final_tickers=final_tickers,
+        final_window=final_window,
+    )
     if not phase2_pass:
-        blockers.append("phase2_feature_backfill_not_pass")
+        if phase2_price_backfill_ready:
+            predeploy_blockers.append("phase2_feature_backfill_not_pass")
+        else:
+            pretraining_blockers.append("phase2_feature_backfill_not_pass")
 
     phase2_input_blocking = bool(phase2_input and phase2_input.get("status") != "PASS")
     phase2_input_superseded = bool(
@@ -104,29 +425,75 @@ def build_retraining_plan(
         and _is_newer(phase2_path, input_path)
     )
     if phase2_input_blocking and not phase2_input_superseded:
-        blockers.append("phase2_input_readiness_not_pass")
+        pretraining_blockers.append("phase2_input_readiness_not_pass")
     if (service or {}).get("status") != "PASS":
-        blockers.append("service_policy_replay_not_pass")
-    if not label_scan:
-        blockers.append("label_horizon_scan_missing")
+        predeploy_blockers.append("service_policy_replay_not_pass")
+    if (
+        isinstance(label_scan, dict)
+        and not safe_bool(label_scan.get("deployable_label_recommendation"), default=False)
+    ):
+        predeploy_blockers.append("label_horizon_scan_not_deployable_for_prelive")
+    pretraining_blockers.extend(
+        _label_scan_pretraining_blockers(
+            label_scan=label_scan,
+            final_window=final_window,
+            final_tickers=final_tickers,
+        )
+    )
 
     objective_cfg = cfg.get("objective", {}) or {}
     active_horizon = label_cfg.get("horizon_bars")
+    active_target_col = label_cfg.get("target_col")
     active_horizon_report = _horizon_report(label_scan, active_horizon)
     best_horizon = (label_scan or {}).get("best_horizon")
     best_horizon_report = _horizon_report(label_scan, best_horizon)
-    if best_horizon is None:
-        target_col_override = None
-    elif str(best_horizon) == "session_close":
-        target_col_override = "label_session_close_net_ret"
-    else:
-        target_col_override = f"label_{best_horizon}m_net_ret"
+    target_col_candidate = _target_col_for_horizon(best_horizon)
+    rank_changing_target = _target_changes_rank(
+        best_horizon=best_horizon,
+        active_horizon=active_horizon,
+        best_horizon_report=best_horizon_report,
+    )
+    target_col_override = target_col_candidate if rank_changing_target else None
+    if target_col_candidate and not rank_changing_target:
+        pretraining_blockers.append("cost_aware_target_no_rank_change")
+    requires_label_ssot_update = bool(
+        target_col_override and str(target_col_override) != str(active_target_col)
+    )
+    if requires_label_ssot_update:
+        predeploy_blockers.append("label_ssot_update_required_before_prelive")
+    pretraining_status = "READY" if not pretraining_blockers else "BLOCKED"
+    predeploy_status = "READY" if not predeploy_blockers else "BLOCKED"
+    deployment_status = (
+        "READY"
+        if pretraining_status == "READY" and predeploy_status == "READY"
+        else "BLOCKED"
+    )
     plan = {
-        "status": "READY" if not blockers else "BLOCKED",
+        "status": pretraining_status,
+        "status_scope": "pretraining",
+        "pretraining_status": pretraining_status,
+        "predeploy_status": predeploy_status,
+        "deployment_status": deployment_status,
+        "safe_to_auto_deploy": False,
         "generated_at": datetime.now(_KST).isoformat(),
         "bundle_id": bundle_id,
         "read_only": True,
         "registry_mutated": False,
+        "training_window": {
+            "source": "final_dataset_gate",
+            **final_window,
+        },
+        "training_universe": {
+            "source": "final_dataset_gate",
+            "ticker_count": len(final_tickers),
+            "tickers": final_tickers,
+        },
+        "research_registry": {
+            "registry_dir": _research_registry_dir(bundle_id),
+            "production_registry_mutated": False,
+            "staging_script": "new/scripts/post_backfill_prelive.py",
+            "allow_production_candidate_write": False,
+        },
         "active_label": {
             "horizon_bars": active_horizon,
             "target_col": label_cfg.get("target_col"),
@@ -146,26 +513,47 @@ def build_retraining_plan(
             "min_expected_net_alpha_bps": float(
                 service_policy_cfg.get("min_expected_net_alpha_bps", 0.0)
             ),
+            "expected_net_alpha_source": str(
+                service_policy_cfg.get("expected_net_alpha_source", "rank_score")
+            ),
             "min_holding_bars": int(service_policy_cfg.get("min_holding_bars", 0)),
             "rebalance_cooldown_bars": int(service_policy_cfg.get("rebalance_cooldown_bars", 0)),
         },
         "recommended_experiment": {
             "target_horizon": best_horizon,
+            "target_col_candidate": target_col_candidate,
             "target_col_override": target_col_override,
+            "rank_changing_target": rank_changing_target,
+            "blocked_reason": (
+                "cost_aware_target_no_rank_change"
+                if target_col_candidate and not rank_changing_target
+                else None
+            ),
             "active_horizon_mean_net_bps": active_horizon_report.get("mean_net_bps"),
             "active_horizon_positive_net_rate": active_horizon_report.get("positive_net_rate"),
             "best_horizon_mean_net_bps": best_horizon_report.get("mean_net_bps"),
             "best_horizon_positive_net_rate": best_horizon_report.get("positive_net_rate"),
+            "best_horizon_selection_impact": best_horizon_report.get("selection_impact"),
             "train_target": "net_of_cost_return",
             "selection_gate": "trade_no_trade_or_expected_net_bps",
             "deploy_policy": "manual_review_then_c12_service_policy_replay",
             "do_not_auto_deploy": True,
+            "requires_label_ssot_update_before_prelive": requires_label_ssot_update,
+            "prelive_gate_expected": (
+                "BLOCKED_UNTIL_LABEL_SSOT_APPROVED"
+                if requires_label_ssot_update
+                else "NORMAL_GATE"
+            ),
         },
         "evidence": {
             "phase2_feature_backfill": {
                 "status": (phase2 or {}).get("status"),
                 "report_path": _repo_relative(phase2_path),
                 "coverage": (phase2 or {}).get("coverage", {}),
+                "artifact_date_coverage": (phase2 or {}).get("artifact_date_coverage", {}),
+                "price_backfill_ready_for_research": phase2_price_backfill_ready,
+                "blocking": not phase2_price_backfill_ready,
+                "predeploy_blocking": not phase2_pass,
                 "blockers": (phase2 or {}).get("blockers", []),
             },
             "phase2_input_readiness": {
@@ -188,14 +576,36 @@ def build_retraining_plan(
                 "deployable_label_recommendation": (
                     (label_scan or {}).get("deployable_label_recommendation")
                 ),
+                "research_trainable_label_recommendation": (
+                    (label_scan or {}).get("research_trainable_label_recommendation")
+                ),
+                "data": (label_scan or {}).get("data", {}),
                 "active_horizon": active_horizon_report,
                 "best_horizon_report": best_horizon_report,
             },
         },
-        "blockers": sorted(set(blockers)),
+        "blockers": sorted(set(pretraining_blockers)),
+        "pretraining_blockers": sorted(set(pretraining_blockers)),
+        "predeploy_blockers": sorted(set(predeploy_blockers)),
         "next_commands": [
-            "PYTHONPATH=new python new/scripts/cost_aware_label_horizon_scan.py --artifacts-dir artifacts/data --end-date 20260508",
-            f"PYTHONPATH=new python new/scripts/service_policy_replay.py --bundle-id {bundle_id}",
+            _label_scan_command(
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+            ),
+            _research_training_command(
+                bundle_id=bundle_id,
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+                target_col_override=target_col_override,
+            ),
+            _staged_retrain_gate_command(
+                bundle_id=bundle_id,
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+                target_col_override=target_col_override,
+            ),
         ],
     }
     if write_report:

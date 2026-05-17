@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.mode_b.service_policy_verifier import service_policy_gate_pass
+from src.mode_b.service_policy_verifier import (
+    normalize_service_policy_universe,
+    service_policy_gate_pass,
+    service_policy_universe_hash,
+)
 from src.utils.config_loader import load as config_load
 from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.ticker_utils import pad_ticker
@@ -84,9 +88,18 @@ def _feature_quality_gate_pass(backtest: dict[str, Any]) -> bool:
     gate_cfg = (
         config_load("risk_config.yaml", "backtest_agent.deploy_decision_gate")
         or {}
-    ).get("feature_quality_gate", {}) or {}
-    min_dual = float(gate_cfg.get("min_dual_source_non_neutral_row_coverage", 0.8))
-    min_exog = float(gate_cfg.get("min_exogenous_non_neutral_row_coverage", 0.8))
+    ).get("feature_quality_gate")
+    if not isinstance(gate_cfg, dict):
+        return False
+    min_dual_raw = gate_cfg.get("min_dual_source_non_neutral_row_coverage")
+    min_exog_raw = gate_cfg.get("min_exogenous_non_neutral_row_coverage")
+    if min_dual_raw is None or min_exog_raw is None:
+        return False
+    try:
+        min_dual = float(min_dual_raw)
+        min_exog = float(min_exog_raw)
+    except (TypeError, ValueError):
+        return False
     feature_quality = backtest.get("feature_quality") or {}
     dual_rows = int(feature_quality.get("dual_source_rows", 0) or 0)
     dual_non_neutral = int(feature_quality.get("dual_source_non_neutral_rows", 0) or 0)
@@ -114,6 +127,7 @@ def _service_policy_gate_pass(
             backtest.get("service_policy_expected_date_range")
             or backtest.get("date_range")
         ),
+        expected_universe=_final_dataset_tickers(),
     )
 
 
@@ -165,6 +179,62 @@ def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
             if tickers:
                 return len(tickers), tickers
     return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
+
+
+def _metadata_ticker_sets(metadata: dict[str, Any]) -> dict[str, list[str]]:
+    sets: dict[str, list[str]] = {}
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = normalize_service_policy_universe([
+                str(ticker)
+                for ticker in raw
+                if str(ticker).strip()
+            ])
+            if tickers:
+                sets[key] = tickers
+    return sets
+
+
+def _final_dataset_tickers() -> list[str]:
+    gate_cfg = (
+        config_load(
+            "risk_config.yaml",
+            "backtest_agent.deploy_decision_gate.final_dataset_gate",
+        )
+        or {}
+    )
+    universe_cfg = config_load("universe_config.yaml") or {}
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (universe_cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict) or str(sector.get("status")) not in sector_statuses:
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if str(stock.get("status")) in stock_statuses:
+                tickers.append(str(stock.get("ticker", "")))
+    if not tickers:
+        tickers.extend((universe_cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", []))
+    min_tickers = safe_int(gate_cfg.get("min_tickers"), default=0, min_value=0)
+    selected = tickers[:min_tickers] if min_tickers else tickers
+    return normalize_service_policy_universe(selected)
 
 
 def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +292,28 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
     ticker_count, tickers = _metadata_ticker_count(metadata)
     if ticker_count < min_tickers:
         blockers.append("ticker_count_below_final_dataset_min")
+    expected_tickers = _final_dataset_tickers()
+    if min_tickers > 0:
+        if not expected_tickers:
+            blockers.append("final_dataset_expected_universe_missing")
+        elif len(expected_tickers) != min_tickers:
+            blockers.append("final_dataset_expected_universe_incomplete")
+    expected_universe_hash = (
+        service_policy_universe_hash(expected_tickers) if expected_tickers else None
+    )
+    observed_sets = _metadata_ticker_sets(metadata)
+    observed_hashes = {
+        key: service_policy_universe_hash(value)
+        for key, value in observed_sets.items()
+    }
+    if expected_tickers:
+        if ticker_count != len(expected_tickers):
+            blockers.append("ticker_count_final_universe_mismatch")
+        if not observed_sets:
+            blockers.append("ticker_set_missing_for_final_dataset")
+        for key, observed_tickers in observed_sets.items():
+            if observed_tickers != expected_tickers:
+                blockers.append(f"{key}_final_universe_mismatch")
     if required_data_source and data_source != required_data_source:
         blockers.append("model_data_source_not_allowed_for_final_dataset")
     if safe_bool(metadata.get("synthetic_fallback"), default=False):
@@ -243,8 +335,35 @@ def _final_dataset_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
         "ticker_count": ticker_count,
         "min_tickers": min_tickers,
         "sample_tickers": tickers[:5],
+        "expected_ticker_count": len(expected_tickers),
+        "expected_universe_hash": expected_universe_hash,
+        "observed_universe_hashes": observed_hashes,
         "data_source": data_source or None,
         "required_data_source": required_data_source or None,
+    }
+
+
+def _label_target_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
+    """Deployable C12 evidence must match the current label target SSOT."""
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    required_target_col = str(label_cfg.get("target_col") or "").strip()
+    metadata = _extract_model_metadata(backtest)
+    observed_target_col = str(metadata.get("target_col") or "").strip()
+    blockers: list[str] = []
+    if not required_target_col:
+        blockers.append("label_target_config_missing")
+    if not metadata:
+        blockers.append("model_metadata_missing")
+    elif not observed_target_col:
+        blockers.append("model_target_col_missing")
+    elif required_target_col and observed_target_col != required_target_col:
+        blockers.append("model_target_col_mismatch")
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "required": True,
+        "blockers": blockers,
+        "required_target_col": required_target_col or None,
+        "observed_target_col": observed_target_col or None,
     }
 
 
@@ -260,6 +379,8 @@ def _backtest_state_from_report(
     service_pass = _service_policy_gate_pass(data, bundle_id, repo_root=root)
     final_dataset_gate = _final_dataset_gate_state(data)
     final_dataset_pass = final_dataset_gate.get("status") == "PASS"
+    label_target_gate = _label_target_gate_state(data)
+    label_target_pass = label_target_gate.get("status") == "PASS"
     schema_current = "feature_quality" in data and "service_policy_replay" in data
     deployable = (
         data.get("verdict") == "pass"
@@ -268,6 +389,7 @@ def _backtest_state_from_report(
         and feature_pass
         and service_pass
         and final_dataset_pass
+        and label_target_pass
     )
     return {
         "status": "PASS" if deployable else "BLOCKED",
@@ -282,6 +404,8 @@ def _backtest_state_from_report(
         "service_policy_gate_pass": service_pass,
         "final_dataset_gate_pass": final_dataset_pass,
         "final_dataset_gate": final_dataset_gate,
+        "label_target_gate_pass": label_target_pass,
+        "label_target_gate": label_target_gate,
         "metrics": data.get("metrics", {}),
     }
 
@@ -302,14 +426,21 @@ def _backtest_state(root: Path, bundle_id: str) -> dict[str, Any]:
         _backtest_state_from_report(root, bundle_id, path, data)
         for path, data in reports
     ]
-    for idx, state in enumerate(states):
-        if safe_bool(state.get("deployable"), default=False):
-            state["selection"] = "latest_deployable"
-            state["ignored_newer_non_deployable_reports"] = idx
-            return state
-    states[0]["selection"] = "latest_non_deployable"
+    latest = states[0]
+    latest["selection"] = (
+        "latest_report"
+        if safe_bool(latest.get("deployable"), default=False)
+        else "latest_non_deployable"
+    )
     states[0]["ignored_newer_non_deployable_reports"] = 0
-    return states[0]
+    older_deployable = [
+        state for state in states[1:]
+        if safe_bool(state.get("deployable"), default=False)
+    ]
+    if older_deployable:
+        latest["older_deployable_report_path"] = older_deployable[0].get("report_path")
+        latest["older_deployable_ignored"] = True
+    return latest
 
 
 def _report_status(data: dict[str, Any]) -> str:
@@ -358,6 +489,92 @@ def _broker_stage_statuses(data: dict[str, Any]) -> dict[str, Any]:
         if status_key not in stage_statuses and isinstance(stage, dict):
             stage_statuses[status_key] = stage.get("status")
     return stage_statuses
+
+
+def _parse_report_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed.astimezone(_KST)
+
+
+def _fresh_generated_at_state(
+    value: Any,
+    *,
+    max_age_sec: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    generated_at = _parse_report_ts(value)
+    if generated_at is None:
+        return {
+            "status": "BLOCKED",
+            "reason": "generated_at_missing_or_invalid",
+            "generated_at": value,
+            "max_age_sec": max_age_sec,
+        }
+    ref_now = now or datetime.now(_KST)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=_KST)
+    age_sec = (ref_now.astimezone(_KST) - generated_at).total_seconds()
+    fresh = 0 <= age_sec <= max_age_sec
+    return {
+        "status": "PASS" if fresh else "BLOCKED",
+        "reason": None if fresh else "generated_at_stale_or_future",
+        "generated_at": generated_at.isoformat(),
+        "age_sec": round(age_sec, 3),
+        "max_age_sec": max_age_sec,
+    }
+
+
+def _paper_auto_evidence_guard(data: dict[str, Any]) -> dict[str, Any]:
+    guard = data.get("evidence_guard")
+    if isinstance(guard, dict):
+        return guard
+    preflight = (data.get("stages") or {}).get("preflight")
+    if not isinstance(preflight, dict):
+        return {}
+    paper_evidence = (preflight.get("stages") or {}).get("paper_evidence")
+    if not isinstance(paper_evidence, dict):
+        return {}
+    nested_guard = paper_evidence.get("evidence_guard")
+    return nested_guard if isinstance(nested_guard, dict) else {}
+
+
+def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, Any]:
+    broker_evidence = data.get("broker_evidence")
+    if not isinstance(broker_evidence, dict):
+        return {
+            "status": "BLOCKED",
+            "reason": "broker_evidence_missing",
+            "stage_statuses": {},
+        }
+    required = (
+        "balance_reconciliation",
+        "probe_order",
+        "order_history_requery",
+    )
+    statuses: dict[str, str] = {}
+    for name in required:
+        stage = broker_evidence.get(name)
+        statuses[name] = (
+            str(stage.get("status", "MISSING")).upper()
+            if isinstance(stage, dict)
+            else "MISSING"
+        )
+    passed = all(status == "PASS" for status in statuses.values())
+    return {
+        "status": "PASS" if passed else "BLOCKED",
+        "reason": None if passed else "broker_evidence_stage_not_pass",
+        "stage_statuses": statuses,
+    }
 
 
 def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
@@ -558,12 +775,25 @@ def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
 
 def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     paper_trading = _paper_trading_evidence_state(root)
+    paper_cfg = config_load("risk_config.yaml", "paper_trading") or {}
+    max_age_sec = safe_int(
+        paper_cfg.get("evidence_max_age_sec", 86400),
+        default=86400,
+        min_value=1,
+    )
     reports = _json_candidates(
         root,
         "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_*.json",
     )
     if not reports:
-        return paper_trading
+        state = dict(paper_trading)
+        if state.get("status") == "PASS":
+            state["status"] = "BLOCKED"
+        state["blocker"] = "paper_auto_bundle_evidence_missing"
+        state["bundle_match"] = False
+        state["bundle_ids"] = []
+        state["paper_auto_cycle_history_matched"] = False
+        return state
 
     latest_external_state: dict[str, Any] | None = None
     for path, data in reports:
@@ -575,12 +805,22 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         bundle_ids = _paper_auto_bundle_ids(data)
         bundle_match = bundle_id in bundle_ids
         cycle_history_matched = _paper_auto_cycle_history_matched(data)
+        freshness = _fresh_generated_at_state(
+            data.get("generated_at"),
+            max_age_sec=max_age_sec,
+        )
+        nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+        evidence_guard = _paper_auto_evidence_guard(data)
+        evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
         passed = (
             data.get("status") == "PASS"
             and stage_statuses.get("paper_auto_cycle") == "PASS"
             and stage_statuses.get("balance_reconciliation") == "PASS"
             and stage_statuses.get("probe_order") == "PASS"
             and stage_statuses.get("order_history_requery") == "PASS"
+            and freshness.get("status") == "PASS"
+            and nested_evidence.get("status") == "PASS"
+            and evidence_guard_pass
             and cycle_history_matched
             and bundle_match
         )
@@ -590,6 +830,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
             "evidence_level": data.get("evidence_level"),
             "report_path": _repo_relative(path, root),
             "stage_statuses": stage_statuses,
+            "freshness": freshness,
+            "broker_evidence_nested": nested_evidence,
+            "evidence_guard": evidence_guard,
             "bundle_match": bundle_match,
             "bundle_ids": sorted(bundle_ids),
             "paper_auto_cycle_history_matched": cycle_history_matched,
@@ -597,23 +840,28 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         }
         if latest_external_state is None:
             latest_external_state = state
-        if passed:
+        if bundle_match:
             return state
 
     if latest_external_state is not None:
         return latest_external_state
 
-    # Internal fake rehearsals are useful smoke artifacts, but they must not mask
-    # older external KIS paper evidence or downgrade broker readiness by recency.
-    if paper_trading.get("status") == "PASS":
-        return paper_trading
-
+    # Internal fake rehearsals and manual paper probes are useful smoke artifacts,
+    # but final broker readiness requires external paper-auto evidence for this
+    # bundle plus matched order-history proof.
     path, data = reports[0]
     external = safe_bool(data.get("external_kis_api"), default=False)
     stage_statuses = _broker_stage_statuses(data)
     bundle_ids = _paper_auto_bundle_ids(data)
     bundle_match = bundle_id in bundle_ids
     cycle_history_matched = _paper_auto_cycle_history_matched(data)
+    freshness = _fresh_generated_at_state(
+        data.get("generated_at"),
+        max_age_sec=max_age_sec,
+    )
+    nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+    evidence_guard = _paper_auto_evidence_guard(data)
+    evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
     passed = (
         data.get("status") == "PASS"
         and external
@@ -621,6 +869,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         and stage_statuses.get("balance_reconciliation") == "PASS"
         and stage_statuses.get("probe_order") == "PASS"
         and stage_statuses.get("order_history_requery") == "PASS"
+        and freshness.get("status") == "PASS"
+        and nested_evidence.get("status") == "PASS"
+        and evidence_guard_pass
         and cycle_history_matched
         and bundle_match
     )
@@ -630,6 +881,9 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
         "evidence_level": data.get("evidence_level"),
         "report_path": _repo_relative(path, root),
         "stage_statuses": stage_statuses,
+        "freshness": freshness,
+        "broker_evidence_nested": nested_evidence,
+        "evidence_guard": evidence_guard,
         "bundle_match": bundle_match,
         "bundle_ids": sorted(bundle_ids),
         "paper_auto_cycle_history_matched": cycle_history_matched,

@@ -23,10 +23,12 @@ Investor Flow side-channel:
 """
 from __future__ import annotations
 
+import pickle
 import time
 from collections import deque
 from datetime import datetime
 import math
+from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -46,6 +48,7 @@ from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("quant_agent")
 _KST = ZoneInfo("Asia/Seoul")
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class QuantAgent(AgentBase):
@@ -116,7 +119,7 @@ class QuantAgent(AgentBase):
                 self._feature_cols.append(col)
         self._inference_feature_cols: list[str] = list(self._feature_cols)
         self._dual_source_loader = dual_source_loader
-        self._dual_source_cache: dict[str, dict[str, dict[str, float]]] = {}
+        self._dual_source_cache: dict[str, list[dict[str, Any]]] = {}
         self._investor_flow_snapshot: dict[str, dict[str, Any]] = {}
         self._exogenous_snapshot: dict[str, dict[str, float]] = {}
         self._exogenous_snapshot_meta: dict[str, dict[str, Any]] = {}
@@ -129,6 +132,7 @@ class QuantAgent(AgentBase):
 
         # --- 모델 로드 (실패 시 passive mode) ---
         self._booster: Any = None
+        self._trade_classifier: Any = None
         self._model_metadata: dict[str, Any] | None = None
         self._try_load_model()
 
@@ -212,23 +216,25 @@ class QuantAgent(AgentBase):
             for col in self._exogenous_feature_cols
             if col in features and features[col] is not None
         }
-        meta: dict[str, Any] = {}
-        if received_at is not None:
-            meta["received_at"] = self._parse_snapshot_dt(received_at)
-            meta["max_age_sec"] = (
+        meta: dict[str, Any] = {
+            "received_at": (
+                self._parse_snapshot_dt(received_at)
+                if received_at is not None
+                else datetime.now(_KST)
+            ),
+            "max_age_sec": (
                 float(max_age_sec)
                 if max_age_sec is not None
                 else float(self._investor_flow_stale_sec)
-            )
+            ),
+        }
         if ticker:
             ticker_padded = pad_ticker(str(ticker))
             self._exogenous_snapshot[ticker_padded] = clean
-            if meta:
-                self._exogenous_snapshot_meta[ticker_padded] = meta
+            self._exogenous_snapshot_meta[ticker_padded] = meta
         else:
             self._market_exogenous_snapshot.update(clean)
-            if meta:
-                self._market_exogenous_snapshot_meta = meta
+            self._market_exogenous_snapshot_meta = meta
 
     def get_investor_flow_snapshot(
         self,
@@ -287,7 +293,19 @@ class QuantAgent(AgentBase):
         """
         t0 = time.perf_counter()
         padded_all = [pad_ticker(str(t)) for t in tickers]
-        asof_str = str(asof)
+        asof_str = str(asof or "").strip()
+        if not asof_str:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._latency_records.append(elapsed_ms)
+            return {
+                "tickers": [],
+                "scores": {},
+                "ts": "",
+                "mode": "blocked",
+                "blocker": "asof_required",
+                "latency_ms": elapsed_ms,
+                "n_tickers": 0,
+            }
 
         if not self.has_model:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -301,9 +319,13 @@ class QuantAgent(AgentBase):
                 "n_tickers": 0,
             }
 
-        # BarBuffer batch load
+        # BarBuffer batch load. asof 이후 bar가 buffer에 선적재되어도 추론에서 제외한다.
         max_window = int(self._multi_scale_windows[-1])
-        bars_batch = self._bar_buffer.get_batch(padded_all, max_window)
+        bars_batch = self._bar_buffer.get_batch_asof(
+            padded_all,
+            max_window,
+            asof=asof_str,
+        )
 
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
@@ -347,8 +369,31 @@ class QuantAgent(AgentBase):
             }
 
         X = np.asarray(feature_matrix, dtype=float)
-        preds = self._booster.predict(X)
+        try:
+            preds = np.asarray(self._booster.predict(X), dtype=float)
+        except Exception as e:
+            logger.warning("[quant_agent] model predict 실패: %s", e)
+            preds = np.asarray([], dtype=float)
+        if len(preds) != len(valid_tickers) or not np.all(np.isfinite(preds)):
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._latency_records.append(elapsed_ms)
+            logger.warning(
+                "[quant_agent] model predict invalid: expected=%d actual=%d finite=%s",
+                len(valid_tickers),
+                len(preds),
+                bool(np.all(np.isfinite(preds))) if len(preds) else False,
+            )
+            return {
+                "tickers": [],
+                "scores": {},
+                "ts": asof_str,
+                "mode": "warmup",
+                "latency_ms": elapsed_ms,
+                "n_tickers": 0,
+                "error": "model_prediction_invalid",
+            }
         scores = {t: float(s) for t, s in zip(valid_tickers, preds)}
+        trade_probs, trade_classifier_error = self._predict_trade_probs(X, valid_tickers)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self._latency_records.append(elapsed_ms)
@@ -360,7 +405,7 @@ class QuantAgent(AgentBase):
                 elapsed_ms, self._latency_p95_target_ms, len(valid_tickers),
             )
 
-        return {
+        out = {
             "tickers": valid_tickers,
             "scores": scores,
             "ts": asof_str,
@@ -368,6 +413,11 @@ class QuantAgent(AgentBase):
             "latency_ms": elapsed_ms,
             "n_tickers": len(valid_tickers),
         }
+        if trade_probs:
+            out["trade_probs"] = trade_probs
+        if trade_classifier_error:
+            out["trade_classifier_error"] = trade_classifier_error
+        return out
 
     def detect_anomalies(
         self,
@@ -381,12 +431,14 @@ class QuantAgent(AgentBase):
 
         Returns: list of {ticker, anomaly_type, z_score, ts}
         """
+        if not str(asof or "").strip():
+            return []
         padded_all = [pad_ticker(str(t)) for t in tickers]
         max_window = int(self._multi_scale_windows[-1])
         out: list[dict[str, Any]] = []
 
         for ticker in padded_all:
-            bars = self._bar_buffer.get_latest(ticker, max_window)
+            bars = self._bar_buffer.get_latest_asof(ticker, max_window, asof=asof)
             if len(bars) < self._warmup_bars:
                 continue
             is_anom, z = self._is_intraday_drop_anomaly(bars)
@@ -448,6 +500,7 @@ class QuantAgent(AgentBase):
                 "[quant_agent] 모델 로드 실패 (%s). passive mode로 전환.", e
             )
             self._booster = None
+            self._trade_classifier = None
             self._model_metadata = None
             self._inference_feature_cols = list(self._feature_cols)
             return False
@@ -471,6 +524,7 @@ class QuantAgent(AgentBase):
             # train 에 있지만 serve 에 없는 feature 존재 시 추론 불가 → passive
             if missing_in_serve:
                 self._booster = None
+                self._trade_classifier = None
                 self._model_metadata = None
                 self._inference_feature_cols = list(self._feature_cols)
                 return False
@@ -481,12 +535,57 @@ class QuantAgent(AgentBase):
         self._inference_feature_cols = (
             list(metadata.get("feature_cols") or self._feature_cols)
         )
+        self._trade_classifier = self._load_trade_classifier(metadata)
         logger.info(
             "[quant_agent] 모델 로드: version=%s, train_end=%s, feature_cols=%d (train↔serve 정합 OK)",
             metadata.get("version"), metadata.get("train_end"),
             len(metadata.get("feature_cols", [])),
         )
         return True
+
+    def _load_trade_classifier(self, metadata: dict[str, Any]) -> Any | None:
+        classifier = metadata.get("trade_no_trade_classifier")
+        if not isinstance(classifier, dict) or classifier.get("status") != "PASS":
+            return None
+        raw_path = str(classifier.get("model_path") or "").strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        try:
+            with path.open("rb") as fh:
+                return pickle.load(fh)
+        except Exception as e:
+            logger.warning("[quant_agent] trade classifier load 실패: %s", e)
+            return None
+
+    def _predict_trade_probs(
+        self,
+        X: np.ndarray,
+        tickers: list[str],
+    ) -> tuple[dict[str, float], str | None]:
+        if self._trade_classifier is None:
+            return {}, None
+        try:
+            raw = np.asarray(self._trade_classifier.predict(X), dtype=float)
+        except Exception as e:
+            logger.warning("[quant_agent] trade classifier predict 실패: %s", e)
+            return {}, "trade_classifier_predict_failed"
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if len(raw) != len(tickers) or not np.all(np.isfinite(raw)):
+            logger.warning(
+                "[quant_agent] trade classifier output invalid: expected=%d actual=%d",
+                len(tickers),
+                len(raw),
+            )
+            return {}, "trade_classifier_prediction_invalid"
+        return {
+            ticker: float(np.clip(prob, 0.0, 1.0))
+            for ticker, prob in zip(tickers, raw)
+        }, None
 
     # ================================================================== #
     # Internal: Feature 계산 (DatasetBuilder rolling feature 동일 규약)
@@ -627,14 +726,14 @@ class QuantAgent(AgentBase):
         return values
 
     def _exogenous_meta_usable(self, meta: dict[str, Any], asof: str | None) -> bool:
-        """Optional freshness guard for generic exogenous snapshots.
+        """Freshness guard for generic exogenous snapshots.
 
-        Legacy snapshots without `received_at` remain usable. Snapshots with explicit
-        metadata are blocked if they are from the future or older than max_age_sec.
+        Exogenous values without `received_at` provenance are blocked and fall back
+        to neutral defaults. Explicit metadata is blocked if it is future/stale.
         """
         received_at = meta.get("received_at") if isinstance(meta, dict) else None
         if received_at is None:
-            return True
+            return False
         asof_dt = self._parse_snapshot_dt(asof) if asof else datetime.now(_KST)
         raw_age_sec = (asof_dt - received_at).total_seconds()
         if raw_age_sec < 0:
@@ -659,33 +758,63 @@ class QuantAgent(AgentBase):
         if date_key not in self._dual_source_cache:
             loader = self._dual_source_loader
             if loader is None:
-                from src.data.dual_source_runner import load_latest_scores
+                records = []
+            else:
+                try:
+                    records = loader(date_key)
+                except Exception as e:
+                    logger.warning(
+                        "[quant_agent] Dual-Source score load 실패 date=%s: %s",
+                        date_key,
+                        e,
+                    )
+                    records = []
+            self._dual_source_cache[date_key] = [
+                item for item in records if isinstance(item, dict)
+            ]
 
-                loader = load_latest_scores
+        ticker_map: dict[str, dict[str, float]] = {}
+        for item in self._dual_source_cache.get(date_key, []):
+            if not self._dual_source_record_usable(item, asof):
+                continue
+            padded = pad_ticker(str(item.get("ticker", "")))
+            if not padded or padded == "000000":
+                continue
+            values: dict[str, float] = {}
+            for col in self._dual_source_feature_cols:
+                value = self._float_or_none(item.get(col))
+                if value is not None:
+                    values[col] = value
+            if values:
+                ticker_map[padded] = values
+
+        return ticker_map.get(pad_ticker(ticker), {})
+
+    def _dual_source_record_usable(self, item: dict[str, Any], asof: str) -> bool:
+        """Dual-Source score metadata must not be newer than Hot Path asof."""
+        asof_dt = self._parse_snapshot_dt(asof)
+        for key in ("snapshot_ts", "generated_at"):
+            raw = item.get(key)
+            if raw in (None, ""):
+                continue
             try:
-                records = loader(date_key)
-            except Exception as e:
+                ts = self._parse_snapshot_dt(raw)
+            except (TypeError, ValueError) as e:
                 logger.warning(
-                    "[quant_agent] Dual-Source score load 실패 date=%s: %s",
-                    date_key,
+                    "[quant_agent] Dual-Source %s 파싱 실패: %s. record skip",
+                    key,
                     e,
                 )
-                records = []
-            ticker_map: dict[str, dict[str, float]] = {}
-            for item in records:
-                padded = pad_ticker(str(item.get("ticker", "")))
-                if not padded or padded == "000000":
-                    continue
-                values: dict[str, float] = {}
-                for col in self._dual_source_feature_cols:
-                    value = self._float_or_none(item.get(col))
-                    if value is not None:
-                        values[col] = value
-                if values:
-                    ticker_map[padded] = values
-            self._dual_source_cache[date_key] = ticker_map
-
-        return self._dual_source_cache.get(date_key, {}).get(pad_ticker(ticker), {})
+                return False
+            if ts > asof_dt:
+                logger.warning(
+                    "[quant_agent] Dual-Source future %s=%s > asof=%s. record skip",
+                    key,
+                    ts.isoformat(),
+                    asof_dt.isoformat(),
+                )
+                return False
+        return True
 
     @staticmethod
     def _asof_to_yyyymmdd(asof: str) -> str:

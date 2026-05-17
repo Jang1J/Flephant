@@ -70,10 +70,51 @@ def _service_policy_pass(bundle_id: str, write_report: bool = True) -> dict:
     }
 
 
+def _feature_coverage(status: str = "PASS") -> dict:
+    blockers = [] if status == "PASS" else ["dual_source_non_neutral_coverage_below_threshold"]
+    return {
+        "status": status,
+        "date_range": {"start": "20250509", "end": "20260515"},
+        "artifact_date_coverage": {
+            "expected_date_count": 249,
+            "selected_date_count": 249,
+            "missing_date_count": 0,
+        },
+        "coverage": {
+            "dual_source_file_coverage": 1.0,
+            "dual_source_non_neutral_date_coverage": 1.0 if status == "PASS" else 80 / 249,
+            "exogenous_file_coverage": 1.0,
+            "exogenous_non_neutral_date_coverage": 1.0,
+        },
+        "blockers": blockers,
+        "report_path": "artifacts/reports/phase2_feature_backfill/test.json",
+        "report_path_relative": "artifacts/reports/phase2_feature_backfill/test.json",
+    }
+
+
 def test_business_start_date_uses_krx_calendar():
     mod = _load_script_module()
 
     assert mod._business_start_date(date(2026, 5, 8), 80).strftime("%Y%m%d") == "20260109"
+
+
+def test_parse_args_defaults_follow_final_dataset_gate(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_final_dataset_gate_cfg",
+        lambda: {
+            "expected_end_date": "20260515",
+            "min_business_days": 249,
+            "min_tickers": 30,
+        },
+    )
+
+    args = mod._parse_args([])
+
+    assert args.end_date == "20260515"
+    assert args.business_days == 249
+    assert args.max_tickers == 30
 
 
 def test_pipeline_stops_before_training_when_80d_gate_blocked(monkeypatch):
@@ -95,6 +136,8 @@ def test_pipeline_stops_before_training_when_80d_gate_blocked(monkeypatch):
         price=None,
         confirm_phrase=None,
         order_type="00",
+        target_col_override=None,
+        registry_dir=None,
     )
 
     assert report["status"] == "BLOCKED"
@@ -106,15 +149,23 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     mod = _load_script_module()
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
     gate_calls = []
+    retrainer_init_kwargs = {}
+    retrain_kwargs = {}
 
     def fake_build_report(**kwargs):
         gate_calls.append(kwargs)
         return _gate("PASS")
 
     monkeypatch.setattr(mod.prelive_gate, "build_report", fake_build_report)
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: ["005930", "105560"],
+    )
 
     class FakeLGBM:
         def retrain(self, **kwargs):
+            retrain_kwargs.update(kwargs)
             return {
                 "candidate_bundle_staged": True,
                 "bundle_id": kwargs["bundle_id"],
@@ -128,7 +179,12 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         def submit_probe_order(self, **kwargs):
             return {"status": "PASS", "stages": {"execution": {"status": "PASS"}}}
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    def fake_retrainer_factory(**kwargs):
+        retrainer_init_kwargs.update(kwargs)
+        return FakeLGBM()
+
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", fake_retrainer_factory)
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(
         mod,
@@ -156,9 +212,12 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         price=1.0,
         confirm_phrase="PAPER_ORDER_OK",
         order_type="00",
+        target_col_override="label_session_close_net_ret",
+        registry_dir="artifacts/lgbm_research/BUNDLE-TEST",
     )
 
     assert report["status"] == "PASS"
+    assert report["stages"]["02_feature_coverage"]["status"] == "PASS"
     assert report["stages"]["02_lgbm_bundle"]["status"] == "PASS"
     assert report["stages"]["03_service_policy_replay"]["status"] == "PASS"
     assert report["stages"]["04_backtest"]["status"] == "PASS"
@@ -166,6 +225,91 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     assert report["stages"]["06_paper_probe_order"]["status"] == "PASS"
     assert gate_calls[0].get("bundle_id") is None
     assert gate_calls[-1]["bundle_id"] == "BUNDLE-TEST"
+    assert report["training_tickers"] == ["005930", "105560"]
+    assert retrainer_init_kwargs["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
+    assert retrainer_init_kwargs["allow_production_candidate_write"] is False
+    assert retrain_kwargs["tickers"] == ["005930", "105560"]
+    assert retrain_kwargs["target_col_override"] == "label_session_close_net_ret"
+    assert report["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
+
+
+def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(mod.prelive_gate, "build_report", lambda **kwargs: _gate("PASS"))
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: [],
+    )
+
+    report = mod.run_pipeline(
+        end_date="20260508",
+        business_days=80,
+        max_tickers=30,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=1.0,
+        confirm_phrase=None,
+        order_type="00",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["02_lgbm_bundle"]
+    assert report["stages"]["02_lgbm_bundle"]["status"] == "BLOCKED"
+    assert report["training_ticker_count"] == 0
+
+
+def test_pipeline_blocks_before_training_when_feature_coverage_blocked(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(mod.prelive_gate, "build_report", lambda **kwargs: _gate("PASS"))
+    monkeypatch.setattr(
+        mod.prelive_gate,
+        "_active_tickers",
+        lambda max_tickers, include_pending_data=None: ["005930", "105560"],
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_phase2_feature_backfill",
+        lambda **kwargs: _feature_coverage("BLOCKED"),
+    )
+
+    class FakeLGBM:
+        def retrain(self, **kwargs):
+            _ = kwargs
+            raise AssertionError("training must not start when final feature coverage blocks")
+
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+
+    report = mod.run_pipeline(
+        end_date="20260515",
+        business_days=249,
+        max_tickers=30,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=1.0,
+        confirm_phrase=None,
+        order_type="00",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["02_feature_coverage"]
+    assert report["stages"]["02_feature_coverage"]["status"] == "BLOCKED"
+    assert report["stages"]["02_lgbm_bundle"]["status"] == "SKIP"
+    assert "dual_source_non_neutral_coverage_below_threshold" in (
+        report["stages"]["02_lgbm_bundle"]["upstream_blockers"]
+    )
 
 
 def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
@@ -181,7 +325,8 @@ def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",
@@ -225,7 +370,8 @@ def test_pipeline_stops_when_service_policy_replay_blocks(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(
         mod,
         "run_service_policy_replay",
@@ -269,7 +415,8 @@ def test_pipeline_blocks_backtest_pass_with_regression_flag(monkeypatch):
                 "synthetic_fallback": False,
             }
 
-    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda: FakeLGBM())
+    monkeypatch.setattr(mod, "NightlyLGBMRetrainer", lambda **kwargs: FakeLGBM())
+    monkeypatch.setattr(mod, "run_phase2_feature_backfill", lambda **kwargs: _feature_coverage("PASS"))
     monkeypatch.setattr(mod, "run_service_policy_replay", _service_policy_pass)
     monkeypatch.setattr(mod, "run_backtest", lambda bundle_id, write_report=True: {
         "status": "PASS",

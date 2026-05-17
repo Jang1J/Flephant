@@ -122,12 +122,19 @@ class EventNormalizer:
         mh = config_load("risk_config.yaml", "market_hours")
         return str(mh["close"])
 
-    def normalize(self, raw_event: dict[str, Any], source: str) -> dict[str, Any]:
+    def normalize(
+        self,
+        raw_event: dict[str, Any],
+        source: str,
+        *,
+        asof: datetime | str | None = None,
+    ) -> dict[str, Any]:
         """raw_event를 C2 스키마로 정규화.
 
         Args:
             raw_event: 커넥터가 반환한 원본 dict.
             source: 소스 이름 (SUPPORTED_SOURCES 중 하나).
+            asof: 장중 Cold Path 판단 시점. 주입되면 occurred_at <= asof 만 허용.
 
         Returns:
             C2 EventNormalizeContract output 스키마 dict.
@@ -162,11 +169,12 @@ class EventNormalizer:
         occurred_at = partial["occurred_at"]
         expires_at = _compute_expires_at(occurred_at, ttl)
 
-        pit_safe_result = is_pit_safe(occurred_at)
+        snapshot_ts = _parse_ts_to_kst_str(asof, "asof", "event_normalizer") if asof else None
+        pit_safe_result = is_pit_safe(occurred_at, snapshot_ts=snapshot_ts)
         if not pit_safe_result:
             raise PITViolationError(
                 f"[event_normalizer] PIT-Safety 위반: source={source}, "
-                f"occurred_at={occurred_at} 가 snapshot(18:00 KST) 이후입니다. "
+                f"occurred_at={occurred_at} 가 snapshot/asof={snapshot_ts or '18:00 KST'} 이후입니다. "
                 "불변 원칙 1 위반. 이 이벤트는 처리 불가."
             )
 
@@ -187,6 +195,8 @@ class EventNormalizer:
             "pit_safe": pit_safe_result,
             "payload": partial.get("payload", {}),
         }
+        if snapshot_ts:
+            result["asof"] = snapshot_ts
         payload_ticker = result["payload"].get("ticker")
         scope = str(result["scope"])
         if payload_ticker:

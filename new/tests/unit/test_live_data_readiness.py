@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -22,11 +22,20 @@ def _write_jsonl_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> N
     ticker_dir = base_dir / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
     out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
     with out.open("w", encoding="utf-8") as fh:
         for i in range(rows):
+            ts = start + timedelta(minutes=i)
             rec = {
                 "ticker": ticker,
-                "ts_close": f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}T09:{i % 60:02d}:00+09:00",
+                "ts_close": ts.isoformat(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -46,11 +55,20 @@ def _write_jsonl_named_day_with_ts_date(
     ticker_dir = base_dir / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
     out = ticker_dir / f"bars_1m_{filename_yyyymmdd}.jsonl"
+    start = datetime(
+        int(ts_yyyymmdd[:4]),
+        int(ts_yyyymmdd[4:6]),
+        int(ts_yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
     with out.open("w", encoding="utf-8") as fh:
         for i in range(rows):
+            ts = start + timedelta(minutes=i)
             rec = {
                 "ticker": ticker,
-                "ts_close": f"{ts_yyyymmdd[:4]}-{ts_yyyymmdd[4:6]}-{ts_yyyymmdd[6:]}T09:{i % 60:02d}:00+09:00",
+                "ts_close": ts.isoformat(),
                 "open": 1.0,
                 "high": 1.0,
                 "low": 1.0,
@@ -58,6 +76,150 @@ def _write_jsonl_named_day_with_ts_date(
                 "volume": 1.0,
             }
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _write_jsonl_constant_ts(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    rows: int,
+) -> None:
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    ts = f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}T09:00:00+09:00"
+    with out.open("w", encoding="utf-8") as fh:
+        for _ in range(rows):
+            rec = {
+                "ticker": ticker,
+                "ts_close": ts,
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _write_jsonl_day_with_gap(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    rows: int,
+    gap_after: int,
+    gap_minutes: int,
+) -> None:
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    out = ticker_dir / f"bars_1m_{yyyymmdd}.jsonl"
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    with out.open("w", encoding="utf-8") as fh:
+        for i in range(rows):
+            extra_gap = gap_minutes if i > gap_after else 0
+            ts = start + timedelta(minutes=i + extra_gap)
+            rec = {
+                "ticker": ticker,
+                "ts_close": ts.isoformat(),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _mutate_first_jsonl_row(
+    base_dir: Path,
+    ticker: str,
+    yyyymmdd: str,
+    patch: dict,
+) -> None:
+    file_path = base_dir / ticker / f"bars_1m_{yyyymmdd}.jsonl"
+    rows = [
+        json.loads(line)
+        for line in file_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rows[0].update(patch)
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_parquet_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) -> None:
+    import pandas as pd
+
+    ticker_dir = base_dir / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+    start = datetime(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+        9,
+        0,
+        tzinfo=ZoneInfo("Asia/Seoul"),
+    )
+    records = []
+    for i in range(rows):
+        records.append({
+            "ticker": ticker,
+            "ts_close": (start + timedelta(minutes=i)).isoformat(),
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        })
+    pd.DataFrame.from_records(records).to_parquet(
+        ticker_dir / f"bars_1m_{yyyymmdd}.parquet",
+        index=False,
+    )
+
+
+def test_load_active_tickers_includes_pending_for_final_dataset(monkeypatch, tmp_path):
+    """final_dataset_gate가 켜져 있으면 active 20 + pending_data 종목을 함께 로드한다."""
+    readiness = _load_script_module()
+    universe_path = tmp_path / "universe_config.yaml"
+    universe_path.write_text(
+        "\n".join([
+            "sectors:",
+            "  반도체:",
+            "    status: confirmed",
+            "    stocks:",
+            "      - {ticker: '005930', status: active}",
+            "  금융:",
+            "    status: confirmed_pending_data",
+            "    stocks:",
+            "      - {ticker: '105560', status: pending_data}",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(readiness, "_UNIVERSE_PATH", universe_path)
+    monkeypatch.setattr(
+        readiness,
+        "config_load",
+        lambda file_name, section: {
+            "deploy_decision_gate": {
+                "final_dataset_gate": {
+                    "include_pending_data_tickers": True,
+                    "allowed_stock_statuses": ["active", "pending_data"],
+                    "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+                }
+            }
+        } if section == "backtest_agent" else {},
+    )
+
+    assert readiness._load_active_tickers(None) == ["005930", "105560"]
 
 
 def test_artifact_date_quality_rejects_short_stale_files(monkeypatch, tmp_path):
@@ -104,6 +266,429 @@ def test_artifact_date_quality_rejects_timestamp_date_mismatch(monkeypatch, tmp_
     assert first["valid_date"] is False
 
 
+def test_artifact_date_quality_rejects_wrong_ticker(monkeypatch, tmp_path):
+    """폴더 ticker와 파일 내부 ticker가 다르면 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [
+        {**json.loads(line), "ticker": "000660"}
+        for line in file_path.read_text(encoding="utf-8").splitlines()
+    ]
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["ticker_matches"] is False
+
+
+def test_artifact_date_quality_rejects_partial_missing_timestamp(monkeypatch, tmp_path):
+    """일부 row의 timestamp가 비어 있으면 row 수가 충분해도 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines()]
+    rows[0].pop("ts_close")
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["timestamp_dates_match"] is False
+    assert first["missing_timestamp_count"] == 1
+
+
+def test_artifact_date_quality_rejects_partial_missing_ticker(monkeypatch, tmp_path):
+    """일부 row의 ticker가 비어 있으면 row 수가 충분해도 readiness FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    file_path = tmp_path / "005930" / "bars_1m_20260508.jsonl"
+    rows = [json.loads(line) for line in file_path.read_text(encoding="utf-8").splitlines()]
+    rows[0].pop("ticker")
+    file_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["ticker_matches"] is False
+    assert first["ticker_mismatch_count"] == 1
+
+
+def test_artifact_date_quality_rejects_morning_only_session_span(monkeypatch, tmp_path):
+    """row 수만 맞춘 오전장 일부 artifact는 session span 부족으로 FAIL."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 300)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["session_span_ok"] is False
+    assert first["session_span_minutes"] == 299.0
+    assert first["max_gap_ok"] is True
+
+
+def test_artifact_date_quality_rejects_large_intraday_gap(monkeypatch, tmp_path):
+    """row/date/ticker가 맞아도 중간 timestamp gap이 크면 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=301,
+        gap_after=150,
+        gap_minutes=20,
+    )
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["session_span_ok"] is True
+    assert first["max_gap_ok"] is False
+    assert first["max_gap_minutes"] == 21.0
+
+
+def test_artifact_date_quality_allows_closing_auction_gap(monkeypatch, tmp_path):
+    """KIS 1분봉의 15:19→15:30 closing auction gap은 정상 artifact로 인정한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260508",
+        rows=381,
+        gap_after=379,
+        gap_minutes=10,
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is True
+    summary = readiness._saved_file_summary(["005930"], "20260508", "20260508", 300)
+    assert summary["005930"]["valid_dates"]["20260508"] is True
+    assert summary["005930"]["max_gap_minutes"]["20260508"] == 11.0
+    assert summary["005930"]["unexpected_max_gap_minutes"]["20260508"] == 0.0
+    assert summary["005930"]["allowed_closing_auction_gap_counts"]["20260508"] == 1
+
+
+def test_artifact_date_quality_allows_known_market_halt_gap(monkeypatch, tmp_path):
+    """문서화된 KRX circuit breaker 구간의 market-wide gap은 artifact 결함으로 보지 않는다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day_with_gap(
+        tmp_path,
+        "005930",
+        "20260304",
+        rows=332,
+        gap_after=139,
+        gap_minutes=29,
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930"],
+        "20260304",
+        "20260304",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260304"]["is_valid"] is True
+    summary = readiness._saved_file_summary(["005930"], "20260304", "20260304", 300)
+    assert summary["005930"]["valid_dates"]["20260304"] is True
+    assert summary["005930"]["max_gap_minutes"]["20260304"] == 30.0
+    assert summary["005930"]["unexpected_max_gap_minutes"]["20260304"] == 0.0
+    assert summary["005930"]["allowed_market_halt_gap_counts"]["20260304"] == 1
+
+
+def test_artifact_date_quality_rejects_duplicate_timestamps(monkeypatch, tmp_path):
+    """row 수만 맞춘 중복 timestamp artifact는 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_constant_ts(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["duplicate_ts_count"] == 300
+
+
+def test_artifact_date_quality_rejects_bad_ohlcv_values(monkeypatch, tmp_path):
+    """timestamp가 맞아도 OHLCV 값이 말이 안 되면 학습 가능 날짜가 아니다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"close": 0.0, "high": 0.5, "low": 2.0, "volume": -1.0},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert first["invalid_ohlcv_count"] == 1
+
+
+def test_artifact_date_quality_rejects_non_positive_ohl_prices(
+    monkeypatch,
+    tmp_path,
+):
+    """open/high/low도 양수여야 한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"open": 1.0, "high": 1.0, "low": 0.0, "close": 1.0, "volume": 1.0},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["invalid_ohlcv_count"] == 1
+
+
+def test_artifact_date_quality_rejects_non_finite_ohlcv(monkeypatch, tmp_path):
+    """NaN/문자열 OHLCV는 row 수가 충분해도 readiness에서 차단한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+    _mutate_first_jsonl_row(
+        tmp_path,
+        "005930",
+        "20260508",
+        {"close": "NaN"},
+    )
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["non_finite_ohlcv_count"] == 1
+
+
+def test_run_backfill_trips_circuit_breaker_after_repeated_empty_fetches(
+    monkeypatch,
+    tmp_path,
+):
+    """KIS 반복 실패가 모든 날짜를 끝까지 소모하지 않고 backfill stage를 멈춘다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness,
+        "_business_dates_between",
+        lambda start, end: ["20260511", "20260512", "20260513", "20260514"],
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    class FakeBackfill:
+        def backfill_universe(self, tickers, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {ticker: 0 for ticker in tickers}
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "min_rows_per_day": 300,
+                "require_all_tickers_for_backfill": True,
+                "max_consecutive_backfill_failed_dates": 2,
+            }
+        if section == "walk_forward":
+            return {"trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "Backfill", lambda: FakeBackfill())
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_backfill(
+        ["005930", "000660"],
+        "20260511",
+        "20260514",
+    )
+
+    assert result["status"] == "FAIL"
+    assert calls == [("20260511", "20260511"), ("20260512", "20260512")]
+    breaker = result["backfill_circuit_breaker"]
+    assert breaker["triggered"] is True
+    assert breaker["date"] == "20260512"
+    assert breaker["consecutive_failed_dates"] == 2
+
+
+def test_run_backfill_trips_circuit_breaker_when_most_tickers_short(
+    monkeypatch,
+    tmp_path,
+):
+    """대부분 종목이 반복 short fetch면 일부 성공 종목이 있어도 breaker가 열린다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        readiness,
+        "_business_dates_between",
+        lambda start, end: ["20260511", "20260512", "20260513"],
+    )
+
+    calls: list[tuple[str, str]] = []
+
+    class MostlyShortBackfill:
+        def backfill_universe(self, tickers, start_date, end_date):
+            calls.append((start_date, end_date))
+            return {"005930": 0, "000660": 0, "105560": 381}
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "min_rows_per_day": 300,
+                "require_all_tickers_for_backfill": True,
+                "max_consecutive_backfill_failed_dates": 2,
+                "backfill_failed_ticker_ratio_threshold": 0.5,
+            }
+        if section == "walk_forward":
+            return {"trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "Backfill", lambda: MostlyShortBackfill())
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_backfill(
+        ["005930", "000660", "105560"],
+        "20260511",
+        "20260513",
+    )
+
+    assert result["status"] == "FAIL"
+    assert calls == [("20260511", "20260511"), ("20260512", "20260512")]
+    breaker = result["backfill_circuit_breaker"]
+    assert breaker["triggered"] is True
+    assert breaker["short_fetch_count"] == 2
+    assert breaker["expected_ticker_count"] == 3
+    assert breaker["short_fetch_ratio"] == 2 / 3
+    assert breaker["failed_ticker_ratio_threshold"] == 0.5
+
+
+def test_artifact_date_quality_rejects_duplicate_date_artifacts(monkeypatch, tmp_path):
+    """같은 ticker/date에 jsonl과 parquet가 같이 있으면 중복 artifact로 막는다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    _write_jsonl_day(tmp_path, "005930", "20260508", 301)
+    _write_parquet_day(tmp_path, "005930", "20260508", 301)
+    _write_jsonl_day(tmp_path, "000660", "20260508", 301)
+
+    quality = readiness._artifact_date_quality(
+        ["005930", "000660"],
+        "20260508",
+        "20260508",
+        min_rows_per_day=300,
+    )
+
+    assert quality["20260508"]["is_valid"] is False
+    first = quality["20260508"]["missing_or_short_tickers"][0]
+    assert first["ticker"] == "005930"
+    assert len(first["duplicate_date_artifacts"]) == 2
+
+
 def test_artifact_date_quality_skips_krx_holidays(monkeypatch, tmp_path):
     """설 연휴처럼 평일 휴장일은 80일 gate 요구 날짜에서 제외한다."""
     readiness = _load_script_module()
@@ -144,6 +729,91 @@ def test_train_gate_reports_only_valid_artifact_dates(monkeypatch, tmp_path):
     assert result["available_dates"] == 1
     assert result["first_date"] == "20260508"
     assert result["date_quality_sample"]["20260507"]["is_valid"] is False
+
+
+def test_train_gate_requires_all_requested_dates_when_require_train(monkeypatch, tmp_path):
+    """require_train=True면 요청한 전체 거래일이 유효해야 학습에 진입한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {"train_window_days": 1, "test_window_days": 1, "trading_minutes_per_day": 390}
+        return {}
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260508",
+        require_train=True,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "invalid_requested_artifact_dates"
+    assert result["available_dates"] == 1
+    assert result["required_dates"] == 2
+    assert result["invalid_requested_dates_sample"] == ["20260507"]
+
+
+def test_train_gate_blocks_partial_requested_dates_without_require_train(
+    monkeypatch,
+    tmp_path,
+):
+    """require_train=False도 요청 249일 중 일부 누락이면 학습 호출 없이 SKIP한다."""
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260507", 9)
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+        _write_jsonl_day(tmp_path, ticker, "20260511", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {
+                "train_window_days": 1,
+                "test_window_days": 1,
+                "trading_minutes_per_day": 390,
+            }
+        return {}
+
+    class FailIfCalledTrainer:
+        def train(self, **_kwargs):
+            raise AssertionError("partial final dataset must not train")
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "src.models.lgbm_trainer",
+        type("FakeModule", (), {"LGBMTrainer": FailIfCalledTrainer}),
+    )
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260511",
+        require_train=False,
+    )
+
+    assert result["status"] == "SKIP"
+    assert result["reason"] == "invalid_requested_artifact_dates"
+    assert result["available_dates"] == 2
+    assert result["required_dates"] == 3
 
 
 def test_run_backfill_skips_existing_valid_artifacts(monkeypatch, tmp_path):

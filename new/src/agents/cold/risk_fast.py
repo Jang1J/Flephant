@@ -19,6 +19,9 @@ from zoneinfo import ZoneInfo
 from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.safe_cast import safe_float
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_fast_cold")
 
@@ -118,6 +121,28 @@ class RiskAgentFast(AgentBase):
             result[key] = float(cold_cfg[key])
         return result
 
+    @staticmethod
+    def _event_trace(event: dict[str, Any]) -> dict[str, str]:
+        """Cold event trace를 PIT-safe publish payload용으로 정규화한다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        ticker = normalize_ticker(event.get("ticker") or payload.get("ticker"))
+        raw_scope = str(event.get("scope") or "").strip()
+        if raw_scope.startswith("ticker:"):
+            scoped_ticker = normalize_ticker(raw_scope.split(":", 1)[1])
+            scope = f"ticker:{scoped_ticker}" if scoped_ticker else "market"
+        elif raw_scope:
+            scope = raw_scope
+        elif ticker:
+            scope = f"ticker:{ticker}"
+        else:
+            scope = "market"
+        return {"ticker": ticker, "scope": scope}
+
+    @staticmethod
+    def _ctx_float(ctx: dict[str, Any], key: str) -> float:
+        """외부 context 숫자를 fail-closed finite float로 정규화한다."""
+        return safe_float(ctx.get(key, 0.0), default=0.0)
+
     def evaluate(
         self,
         event: dict,
@@ -143,8 +168,16 @@ class RiskAgentFast(AgentBase):
         t0 = time.perf_counter()
         ctx = context or {}
         triggered: list[dict[str, Any]] = []
+        uncertainty_score: float | None = None
 
         event_type = event.get("event_type", "")
+        occurred_at = event.get("occurred_at")
+        asof = event.get("asof")
+        if occurred_at and not asof:
+            raise PITViolationError("[risk_fast_cold] asof_required: occurred_at 이벤트는 asof가 필요합니다.")
+        if occurred_at:
+            assert_pit_safe(occurred_at, snapshot_ts=asof)
+        trace = self._event_trace(event)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # admit_candidate action rule 은 AdmissionEngine 담당. risk_fast 는 skip.
@@ -153,7 +186,7 @@ class RiskAgentFast(AgentBase):
         # action=admit_candidate 인 rule 은 이 evaluate loop 에 진입하지 않음.
 
         # 규칙 1: 커뮤니티 게시글 급증
-        comm_z = ctx.get("comm_volume_zscore", 0.0)
+        comm_z = self._ctx_float(ctx, "comm_volume_zscore")
         if comm_z > self._thresholds["comm_volume_zscore"]:
             triggered.append({"rule_id": "comm_volume_spike", "matched_at": now_iso})
             logger.info(
@@ -161,7 +194,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 2: 커뮤니티 감성 급변
-        sent_delta = ctx.get("comm_sentiment_delta", 0.0)
+        sent_delta = self._ctx_float(ctx, "comm_sentiment_delta")
         if abs(sent_delta) > self._thresholds["comm_sentiment_delta"]:
             triggered.append({"rule_id": "comm_sentiment_delta", "matched_at": now_iso})
             logger.info(
@@ -169,7 +202,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 3: 분봉 급락 이상치
-        ret_z = ctx.get("intraday_return_zscore", 0.0)
+        ret_z = self._ctx_float(ctx, "intraday_return_zscore")
         if ret_z < self._thresholds["intraday_return_zscore"]:
             triggered.append({"rule_id": "intraday_drop_anomaly", "matched_at": now_iso})
             logger.info(
@@ -177,7 +210,7 @@ class RiskAgentFast(AgentBase):
             )
 
         # 규칙 4: 외국인 대규모 순매도 (음수 컨벤션: -100B 이하 = 대규모 순매도)
-        frg_sell = ctx.get("foreign_net_sell_krw", 0.0)
+        frg_sell = self._ctx_float(ctx, "foreign_net_sell_krw")
         if frg_sell < self._thresholds["foreign_net_sell_krw"]:
             triggered.append(
                 {"rule_id": "foreign_net_sell_critical", "matched_at": now_iso}
@@ -200,14 +233,15 @@ class RiskAgentFast(AgentBase):
             logger.info("[risk_fast_cold] rule_dart_critical_disclosure 발동")
 
         # 규칙 6: 뉴스-커뮤니티 방향 불일치
-        divergence = ctx.get("news_comm_divergence", 0.0)
-        if abs(divergence) > self._thresholds["news_comm_divergence"]:
+        divergence_value = self._ctx_float(ctx, "news_comm_divergence")
+        if abs(divergence_value) > self._thresholds["news_comm_divergence"]:
+            uncertainty_score = max(0.0, min(1.0, abs(divergence_value)))
             triggered.append(
                 {"rule_id": "news_comm_divergence_strong", "matched_at": now_iso}
             )
             logger.info(
                 "[risk_fast_cold] rule_news_comm_divergence_strong 발동: div=%.2f",
-                divergence,
+                divergence_value,
             )
             # uncertainty_signal publish (Dual-Source divergence → FDA 연계)
             self._publish_to_bus(
@@ -215,6 +249,13 @@ class RiskAgentFast(AgentBase):
                 {
                     "source": "risk_fast_cold",
                     "trigger": "news_comm_divergence_strong",
+                    "uncertainty_score": uncertainty_score,
+                    "confidence": uncertainty_score,
+                    "scope": trace["scope"],
+                    "event_id": event.get("event_id"),
+                    "ticker": trace["ticker"] or None,
+                    "occurred_at": occurred_at,
+                    "asof": asof,
                     "ts": datetime.now(_KST).isoformat(),
                     "reasoning": "뉴스-커뮤니티 방향 불일치로 불확실성 신호 발행",
                 },
@@ -248,7 +289,7 @@ class RiskAgentFast(AgentBase):
                 "[risk_fast_cold] SLA 초과: %.2fms > %.0fms", latency_ms, self._sla_ms
             )
 
-        return {
+        result = {
             "risk_level": risk_level,
             "stance": stance,
             "fast_rule_match": triggered if triggered else None,
@@ -258,6 +299,9 @@ class RiskAgentFast(AgentBase):
             # consumer 가 len(triggered_rules) 로 동등 계산 가능.
             "latency_ms": round(latency_ms, 2),
         }
+        if uncertainty_score is not None:
+            result["uncertainty_score"] = uncertainty_score
+        return result
 
     def report(self, report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """C5 risk_warning 리포트 생성."""

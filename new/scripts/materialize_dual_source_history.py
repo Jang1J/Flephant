@@ -23,14 +23,16 @@ if str(SRC) not in sys.path:
 from src.data.dual_source_runner import _load_active_universe  # noqa: E402
 from src.data.dual_source_scorer import DualSourceScorer  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
     kospi_trading_start_date,
 )
 
 _KST = ZoneInfo("Asia/Seoul")
-_ARTIFACT_DIR = SRC / "artifacts" / "dual_source"
+_ARTIFACT_DIR = ROOT / "artifacts" / "dual_source"
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "dual_source_history"
+_FALLBACK_MIN_DUAL_SOURCE_NON_NEUTRAL_DATE_COVERAGE = 0.8
 
 
 def _parse_date(date_key: str) -> datetime:
@@ -40,6 +42,16 @@ def _parse_date(date_key: str) -> datetime:
 def _snapshot_ts(date_key: str) -> datetime:
     day = _parse_date(date_key).date()
     return datetime.combine(day, time(8, 30), tzinfo=_KST)
+
+
+def _min_dual_source_non_neutral_date_coverage() -> float:
+    cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
+    return safe_float(
+        cfg.get("min_dual_source_non_neutral_date_coverage"),
+        default=_FALLBACK_MIN_DUAL_SOURCE_NON_NEUTRAL_DATE_COVERAGE,
+        min_value=0.0,
+        max_value=1.0,
+    )
 
 
 def _business_dates(end_date: str, business_days: int) -> list[str]:
@@ -79,6 +91,16 @@ def _as_kst(value: Any, *, default: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=_KST)
     return dt.astimezone(_KST)
+
+
+def _has_value(value: Any) -> bool:
+    return value not in (None, "")
+
+
+def _required_ts(value: Any, *, field: str, snapshot: datetime) -> datetime:
+    if not _has_value(value):
+        raise ValueError(f"raw deploy-quality payload missing required timestamp field: {field}")
+    return _as_kst(value, default=snapshot)
 
 
 def _text_from_event(event: dict[str, Any]) -> str:
@@ -216,7 +238,7 @@ def _payload_rows_from_explicit_rows(
         ticker = str(row.get("ticker", "")).zfill(6)
         if not ticker or ticker == "000000":
             continue
-        data_ts = _as_kst(row.get("data_ts"), default=snapshot)
+        data_ts = _required_ts(row.get("data_ts"), field="rows[].data_ts", snapshot=snapshot)
         if data_ts > snapshot:
             raise ValueError(f"PIT violation: ticker={ticker} data_ts={data_ts.isoformat()} > snapshot={snapshot.isoformat()}")
         rows_by_ticker[ticker] = {
@@ -270,15 +292,16 @@ def _payload_rows_from_events(
         ticker = str(event.get("ticker", "")).zfill(6)
         if not ticker or ticker == "000000":
             continue
-        event_ts = _as_kst(
-            event.get("event_ts") or event.get("published_at") or event.get("ts"),
-            default=snapshot,
-        )
-        if event_ts > snapshot:
-            raise ValueError(f"PIT violation: ticker={ticker} event_ts={event_ts.isoformat()} > snapshot={snapshot.isoformat()}")
         text = _text_from_event(event)
         if not text:
             continue
+        event_ts = _required_ts(
+            event.get("event_ts") or event.get("published_at") or event.get("ts"),
+            field="events[].event_ts",
+            snapshot=snapshot,
+        )
+        if event_ts > snapshot:
+            raise ValueError(f"PIT violation: ticker={ticker} event_ts={event_ts.isoformat()} > snapshot={snapshot.isoformat()}")
         bucket = grouped.setdefault(ticker, {
             "news_texts": [],
             "comm_texts_t1": [],
@@ -385,12 +408,11 @@ def _build_scorer_inputs(
 
 
 def _non_deploy_quality_reason(payload: dict[str, Any]) -> str | None:
-    provenance = payload.get("provenance") or {}
-    if isinstance(provenance, dict) and provenance.get("deploy_quality") is False:
-        return str(
-            provenance.get("reason")
-            or "raw event payload is explicitly marked non-deploy-quality"
-        )
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        return "raw event payload missing provenance.deploy_quality=true"
+    if not safe_bool(provenance.get("deploy_quality"), default=False):
+        return str(provenance.get("reason") or "raw event payload is not deploy-quality")
     return None
 
 
@@ -515,8 +537,9 @@ def materialize_dual_source_history(
                 "error_type": type(e).__name__,
             })
 
+    min_coverage = _min_dual_source_non_neutral_date_coverage()
     coverage = non_neutral_dates / max(len(dates), 1)
-    if coverage < 0.8:
+    if coverage < min_coverage:
         blockers.append("dual_source_non_neutral_coverage_below_threshold")
     if not written:
         blockers.append("no_dual_source_artifacts_written")
@@ -530,6 +553,7 @@ def materialize_dual_source_history(
         "artifact_dir": str(artifact_dir),
         "coverage": {
             "dual_source_non_neutral_date_coverage": coverage,
+            "min_dual_source_non_neutral_date_coverage": min_coverage,
             "written_date_count": len(written),
         },
         "blockers": blockers,

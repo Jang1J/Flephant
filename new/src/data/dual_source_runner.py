@@ -8,7 +8,7 @@ Sprint 4 S4-1. Mode B 사이클(18:00~22:00)과 완전 분리된 장전 배치 �
     2. universe_config.yaml 에서 active 20종목 로드
     3. 종목별 뉴스 텍스트 + 커뮤니티 텍스트 수집 (mock 또는 커넥터)
     4. DualSourceScorer.score_universe() 호출
-    5. 결과 JSON 저장 (new/artifacts/dual_source/YYYYMMDD.json)
+    5. 결과 JSON 저장 (artifacts/dual_source/YYYYMMDD.json)
     6. PIT-Safety: snapshot_ts = 오늘 08:30 KST (장전 배치 기준)
 
 ## PIT-Safety
@@ -39,13 +39,17 @@ from src.connectors.naver_rest import NaverNewsClient, NaverNewsItem
 from src.data.dual_source_scorer import DualSourceScorer
 from src.utils.config_loader import load as config_load
 from src.utils.pit_guard import assert_pit_safe
+from src.utils.safe_cast import safe_bool
 
 logger = logging.getLogger(__name__)
 
 _KST = ZoneInfo("Asia/Seoul")
 
-# 결과 저장 경로: new/artifacts/dual_source/
-_ARTIFACT_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "dual_source"
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# 결과 저장 경로: artifacts/dual_source/
+DEFAULT_DUAL_SOURCE_ARTIFACT_DIR = _REPO_ROOT / "artifacts" / "dual_source"
+_ARTIFACT_DIR = DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
 
 def _load_batch_window() -> tuple[int, int, int, int]:
     """risk_config.yaml dual_source.score_build_window 에서 배치 창 로드.
@@ -73,11 +77,37 @@ def _is_in_batch_window(now: datetime) -> bool:
 
 
 def _load_active_universe() -> list[dict[str, Any]]:
-    """universe_config.yaml 에서 active 종목 메타데이터 로드.
+    """universe_config.yaml 에서 최종 학습 universe 메타데이터 로드.
 
-    과거 구조(cfg["active"])와 현행 sectors 구조를 모두 지원한다.
+    과거 구조(cfg["active"])와 현행 sectors 구조를 모두 지원한다. final_dataset_gate가
+    pending_data를 포함하면 Dual-Source feature도 30종목 기준으로 materialize한다.
     """
     cfg = config_load("universe_config.yaml")
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     universe: list[dict[str, Any]] = []
 
     for item in cfg.get("active", []) or []:
@@ -94,10 +124,10 @@ def _load_active_universe() -> list[dict[str, Any]]:
 
     sectors = cfg.get("sectors", {}) or {}
     for sector in sectors.values():
-        if not isinstance(sector, dict) or sector.get("status") != "confirmed":
+        if not isinstance(sector, dict) or str(sector.get("status")) not in sector_statuses:
             continue
         for stock in sector.get("stocks", []) or []:
-            if not isinstance(stock, dict) or stock.get("status") != "active":
+            if not isinstance(stock, dict) or str(stock.get("status")) not in stock_statuses:
                 continue
             ticker = str(stock.get("ticker", "")).zfill(6)
             if ticker and ticker != "000000":
@@ -331,7 +361,7 @@ def run_dual_source_batch(
     scorer = DualSourceScorer()
     results = scorer.score_universe(universe=universe, snapshot_ts=snap_dt)
 
-    # 결과 저장 (new/artifacts/dual_source/YYYYMMDD.json)
+    # 결과 저장 (artifacts/dual_source/YYYYMMDD.json)
     _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _ARTIFACT_DIR / f"{batch_date.strftime('%Y%m%d')}.json"
 
@@ -354,11 +384,16 @@ def run_dual_source_batch(
     return results
 
 
-def load_latest_scores(date_str: str | None = None) -> list[dict]:
+def load_latest_scores(
+    date_str: str | None = None,
+    *,
+    artifact_dir: Path | None = None,
+) -> list[dict]:
     """저장된 C3A 점수 로드.
 
     Args:
         date_str: 'YYYYMMDD' 형식. None 이면 오늘 날짜.
+        artifact_dir: override root. None이면 root artifacts/dual_source.
 
     Returns:
         list[dict]: C3A 출력 스키마 리스트.
@@ -366,7 +401,8 @@ def load_latest_scores(date_str: str | None = None) -> list[dict]:
     if date_str is None:
         date_str = datetime.now(_KST).strftime("%Y%m%d")
 
-    path = _ARTIFACT_DIR / f"{date_str}.json"
+    root = artifact_dir or _ARTIFACT_DIR
+    path = root / f"{date_str}.json"
     if not path.exists():
         logger.warning("[dual_source] 점수 파일 없음: %s", path)
         return []
@@ -374,7 +410,17 @@ def load_latest_scores(date_str: str | None = None) -> list[dict]:
     with path.open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    return payload.get("scores", [])
+    scores: list[dict] = []
+    for item in payload.get("scores", []):
+        if not isinstance(item, dict):
+            continue
+        enriched = dict(item)
+        enriched.setdefault("batch_date", payload.get("batch_date"))
+        enriched.setdefault("snapshot_ts", payload.get("snapshot_ts"))
+        enriched.setdefault("generated_at", payload.get("generated_at"))
+        enriched.setdefault("source_stats", payload.get("source_stats", {}))
+        scores.append(enriched)
+    return scores
 
 
 if __name__ == "__main__":

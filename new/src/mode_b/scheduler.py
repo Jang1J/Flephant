@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.ops.state_machine import PipelineState, StateMachine
+from src.mode_b.service_policy_verifier import verify_service_policy_evidence
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_bundle_id
 from src.utils.logger import get_logger
@@ -54,6 +54,67 @@ def _check_permission(permission: str) -> None:
         raise PermissionViolationError(permission)
 
 
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    cfg = config_load("risk_config.yaml", "backtest_agent") or {}
+    gate_cfg = (
+        cfg.get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
+def _final_dataset_tickers(gate_cfg: dict[str, Any]) -> list[str]:
+    universe_cfg = config_load("universe_config.yaml") or {}
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    allowed_stock_statuses = {"active"}
+    if include_pending:
+        allowed_stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+    allowed_sector_statuses = {"confirmed"}
+    if include_pending:
+        allowed_sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (universe_cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict):
+            continue
+        if str(sector.get("status")) not in allowed_sector_statuses:
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict):
+                continue
+            if str(stock.get("status")) in allowed_stock_statuses:
+                ticker = str(stock.get("ticker", "")).zfill(6)
+                if ticker != "000000":
+                    tickers.append(ticker)
+    return sorted(dict.fromkeys(tickers))
+
+
+def _final_dataset_lgbm_retrain_kwargs() -> dict[str, Any]:
+    gate_cfg = _final_dataset_gate_cfg()
+    if not safe_bool(gate_cfg.get("required", True), default=True):
+        return {}
+    kwargs: dict[str, Any] = {}
+    tickers = _final_dataset_tickers(gate_cfg)
+    if tickers:
+        kwargs["tickers"] = tickers
+    if gate_cfg.get("expected_start_date"):
+        kwargs["start_date"] = str(gate_cfg["expected_start_date"])
+    if gate_cfg.get("expected_end_date"):
+        kwargs["end_date"] = str(gate_cfg["expected_end_date"])
+    return kwargs
+
+
 class StageTimeoutError(RuntimeError):
     """Stage SLA 초과."""
 
@@ -77,6 +138,7 @@ class ModeBScheduler:
         deployer: Any = None,
         llm_router: Any = None,
         backtest_agent: Any = None,
+        dqr_skip_pit_guard_for_tests: bool = False,
     ) -> None:
         cfg = config_load("risk_config.yaml", "mode_b_scheduler") or {}
         self._stage_timeouts: dict[str, int] = cfg.get("stage_timeouts", {})
@@ -87,6 +149,10 @@ class ModeBScheduler:
         self._deployer = deployer
         self._llm_router = llm_router
         self._backtest_agent = backtest_agent
+        self._dqr_skip_pit_guard_for_tests = safe_bool(
+            dqr_skip_pit_guard_for_tests,
+            default=False,
+        )
         self._bundle_id: str | None = None
         self._current_verdict: str | None = None
         self._current_regression_risk: dict[str, Any] | None = None
@@ -139,6 +205,25 @@ class ModeBScheduler:
                 "stages": [s0],
                 "verdict": "blocked_dqr_critical",
                 "dqr_alerts": s0.get("alerts", []),
+            }
+        if (
+            s0.get("status") == "skipped"
+            and s0.get("reason") in {"weekend", "holiday"}
+        ):
+            logger.info(
+                "[mode_b_scheduler] 비거래일 DQR skip 감지. Mode B 후속 stage 생략: %s",
+                s0.get("reason"),
+            )
+            self._transition(PipelineState.MODE_B_IDLE)
+            return {
+                "bundle_id": self._bundle_id,
+                "date": date_str,
+                "stages": [s0],
+                "verdict": "skipped_non_trading_day",
+                "pipeline_status": "skipped",
+                "deploy_status": "skipped",
+                "deploy_result": "skipped_non_trading_day",
+                "skip_reason": s0.get("reason"),
             }
 
         # Stage 1~5 (EVOLVING phase)
@@ -254,8 +339,8 @@ class ModeBScheduler:
         deploy_status = self._classify_deploy_status(s7)
         pipeline_status = self._classify_pipeline_status(verdict, s6, s7, deploy_status)
 
-        # → IDLE
-        if verdict in ("pass", "blocked"):
+        # → IDLE. warn은 operator review 상태로 남기고, pass/fail/blocked는 닫는다.
+        if pipeline_status != "awaiting_operator_approval":
             self._transition(PipelineState.MODE_B_IDLE)
 
         result = {
@@ -382,8 +467,10 @@ class ModeBScheduler:
             from src.dqr.dqr_runner import DQRRunner
 
             runner = DQRRunner()
-            _test_pit_skip = os.getenv("ELEPHANT_TEST_PIT_SKIP") == "1"
-            report = runner.run_daily(date=date, skip_pit_guard=_test_pit_skip)
+            report = runner.run_daily(
+                date=date,
+                skip_pit_guard=self._dqr_skip_pit_guard_for_tests,
+            )
             output_path = runner.save_report(report)
             alerts = report.get("alerts", [])
             critical_alerts = [a for a in alerts if a.get("severity") == "CRITICAL"]
@@ -593,7 +680,11 @@ class ModeBScheduler:
         try:
             from src.mode_b.nightly_lgbm_retrainer import NightlyLGBMRetrainer
 
-            lgbm_result = NightlyLGBMRetrainer().retrain(bundle_id=self._bundle_id)
+            lgbm_kwargs = {
+                "bundle_id": self._bundle_id,
+                **_final_dataset_lgbm_retrain_kwargs(),
+            }
+            lgbm_result = NightlyLGBMRetrainer().retrain(**lgbm_kwargs)
             lgbm_version = lgbm_result.get("version", "unknown")
             lgbm_path = lgbm_result.get("model_path", "")
             lgbm_metrics = lgbm_result.get("metrics", {})
@@ -790,9 +881,24 @@ class ModeBScheduler:
                     "error": "c12_deploy_evidence_missing",
                 }
             try:
-                from src.mode_b.deployer import RegressionRisk
+                from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
                 risk = self._current_regression_risk or {}
+                policy_verification = verify_service_policy_evidence(
+                    self._current_service_policy_evidence,
+                    bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
+                )
+                if not policy_verification.passed:
+                    return {
+                        "status": "blocked",
+                        "deploy_status": "blocked",
+                        "deploy_result": "service_policy_gate_failed",
+                        "bundle_id": self._bundle_id,
+                        "service_policy_blockers": policy_verification.blockers,
+                        "sanity_check_result": self._current_sanity_check_result,
+                        "regression_risk": self._current_regression_risk or {},
+                        "error": "service_policy_gate_failed",
+                    }
                 return self._deployer.deploy(
                     bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
                     backtest_verdict=self._current_verdict or "fail",
@@ -805,8 +911,28 @@ class ModeBScheduler:
                     feature_quality=self._current_feature_quality,
                     service_policy_evidence=self._current_service_policy_evidence,
                 )
-            except NotImplementedError:
-                pass
+            except NotImplementedError as e:
+                return {
+                    "status": "blocked",
+                    "deploy_status": "blocked",
+                    "deploy_result": "deployer_not_implemented",
+                    "bundle_id": self._bundle_id,
+                    "sanity_check_result": self._current_sanity_check_result,
+                    "regression_risk": self._current_regression_risk or {},
+                    "error": "deployer_not_implemented",
+                    "error_detail": str(e),
+                }
+            except DeployBlocked as e:
+                return {
+                    "status": "blocked",
+                    "deploy_status": "blocked",
+                    "deploy_result": e.reason,
+                    "bundle_id": self._bundle_id,
+                    "sanity_check_result": self._current_sanity_check_result,
+                    "regression_risk": self._current_regression_risk or {},
+                    "error": e.reason,
+                    "error_detail": str(e),
+                }
         return {
             "status": "blocked",
             "deploy_status": "not_configured",
@@ -843,6 +969,8 @@ class ModeBScheduler:
         deploy_status: str,
     ) -> str:
         """C12 verdict와 C14 deploy 결과를 분리해 top-level 실행 상태를 반환."""
+        if deploy_status == "blocked":
+            return "blocked"
         if stage_6.get("error") or stage_7.get("error"):
             return "failed"
         if verdict == "warn" or deploy_status == "awaiting_operator_approval":

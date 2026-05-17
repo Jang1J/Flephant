@@ -62,6 +62,10 @@ def test_run_backtest_fail_closed_on_agent_error(tmp_path):
 
 def test_main_returns_zero_only_for_pass(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(
+        "src.jobs.run_backtest.BacktestAgent",
+        lambda: FailingBacktestAgent(),
+    )
     rc = main([
         "--bundle-id",
         "BUNDLE-NO-SUCH",

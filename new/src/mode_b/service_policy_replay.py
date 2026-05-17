@@ -15,20 +15,28 @@ paper-auto cash-account policy:
 from __future__ import annotations
 
 import math
+import pickle
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 from src.mode_b.validation_tools import (
     BacktestEngine,
     BundleLoadFailed,
     DataUnavailable,
     NaNInMetrics,
+    add_neutral_candidate_alpha_features,
+)
+from src.mode_b.service_policy_verifier import (
+    normalize_service_policy_universe,
+    service_policy_universe_hash,
 )
 from src.utils.config_loader import load as config_load
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -59,7 +67,10 @@ class ServicePolicyConfig:
     allow_position_pyramiding: bool
     turnover_budget_hard_stop: bool
     min_expected_net_alpha_bps: float
+    expected_net_alpha_source: str
     min_service_policy_sharpe: float
+    trade_probability_gate_enabled: bool
+    min_trade_probability: float
 
     @property
     def total_cost_bps(self) -> float:
@@ -83,8 +94,22 @@ class ServicePolicyConfig:
         turnover_cfg = config_load("risk_config.yaml", "turnover_cap") or {}
         cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
         cost_components = cost_cfg.get("components", {}) or {}
+        if not isinstance(cost_components, dict) or not {
+            "commission_bps",
+            "slippage_bps",
+        }.issubset(cost_components):
+            raise DataUnavailable("execution_cost_model_missing")
+        commission_bps = safe_float(cost_components.get("commission_bps"), default=-1.0)
+        slippage_bps = safe_float(cost_components.get("slippage_bps"), default=-1.0)
+        if commission_bps <= 0.0 or slippage_bps <= 0.0:
+            raise DataUnavailable("execution_cost_model_non_positive")
         label_cfg = config_load("risk_config.yaml", "label") or {}
         replay_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
+        trade_gate_cfg = (
+            (config_load("risk_config.yaml", "cost_aware_retraining") or {})
+            .get("trade_probability_gate", {})
+            or {}
+        )
 
         return cls(
             initial_capital=float(backtest_cfg.get("initial_capital", 100_000_000.0)),
@@ -95,8 +120,8 @@ class ServicePolicyConfig:
             max_single_name=float(position_cfg.get("max_single_name", 0.20)),
             min_cash=float(position_cfg.get("min_cash", 0.10)),
             daily_turnover_cap=float(turnover_cfg.get("daily_max", 0.30)),
-            commission_bps=float(cost_components.get("commission_bps", 0.0)),
-            slippage_bps=float(cost_components.get("slippage_bps", 0.0)),
+            commission_bps=commission_bps,
+            slippage_bps=slippage_bps,
             annualization_factor=int(eval_cfg.get("annualization_factor", 252)),
             min_daily_return_std=float(eval_cfg.get("min_daily_pnl_std", 1e-8)),
             decision_stride_bars=max(
@@ -117,7 +142,20 @@ class ServicePolicyConfig:
             min_expected_net_alpha_bps=float(
                 replay_cfg.get("min_expected_net_alpha_bps", cost_components.get("slippage_bps", 0.0))
             ),
+            expected_net_alpha_source=str(
+                replay_cfg.get("expected_net_alpha_source", "rank_score")
+            ),
             min_service_policy_sharpe=float(replay_cfg.get("min_service_policy_sharpe", 0.0)),
+            trade_probability_gate_enabled=safe_bool(
+                trade_gate_cfg.get("enabled"),
+                default=False,
+            ),
+            min_trade_probability=safe_float(
+                trade_gate_cfg.get("min_probability"),
+                default=0.5,
+                min_value=0.0,
+                max_value=1.0,
+            ),
         )
 
 
@@ -152,7 +190,9 @@ class ServicePolicyReplayEngine:
             raise BundleLoadFailed("bundle_id is empty")
 
         replay_start, replay_end = self._resolve_replay_window(start_date, end_date)
-        active_universe = [pad_ticker(t) for t in (universe or self._load_active_universe())]
+        active_universe = normalize_service_policy_universe(
+            universe or self._load_active_universe()
+        )
         if not active_universe:
             raise DataUnavailable("active universe is empty")
 
@@ -163,14 +203,24 @@ class ServicePolicyReplayEngine:
 
         from src.data.dataset_builder import DatasetBuilder
 
-        builder = DatasetBuilder(artifacts_dir=self._artifacts_root / "data")
+        builder = DatasetBuilder(
+            artifacts_dir=self._artifacts_root / "data",
+            dual_source_artifact_dir=self._artifacts_root / "dual_source",
+            exogenous_artifact_dir=self._artifacts_root / "exogenous",
+        )
+        add_neutral_candidate_alpha_features(builder, feature_cols)
         panel = self._engine._build_replay_panel(
             builder,
             active_universe,
             replay_start,
             replay_end,
         )
-        target_col = builder.target_col
+        target_col = BacktestEngine._candidate_target_col(
+            candidate_artifact,
+            builder.target_col,
+        )
+        if target_col != builder.target_col:
+            panel = builder.relabel_panel_for_target(panel, target_col)
 
         missing_features = [col for col in feature_cols if col not in panel.columns]
         if missing_features:
@@ -181,12 +231,17 @@ class ServicePolicyReplayEngine:
         if target_col not in panel.columns:
             raise DataUnavailable(f"target column missing from replay panel: {target_col}")
 
+        trade_probability_model, trade_probability_unavailable_reason = (
+            self._load_trade_probability_model_with_reason(candidate_artifact)
+        )
         result = self._simulate_panel(
             panel=panel,
             model_callable=model_callable,
             feature_cols=feature_cols,
             target_col=target_col,
             policy=self._policy,
+            trade_probability_model=trade_probability_model,
+            trade_probability_unavailable_reason=trade_probability_unavailable_reason,
         )
         result.update({
             "schema_version": "1.0.0",
@@ -197,6 +252,11 @@ class ServicePolicyReplayEngine:
             "date_range": {"start": replay_start, "end": replay_end},
             "universe": active_universe,
             "universe_count": len(active_universe),
+            "universe_hash": service_policy_universe_hash(active_universe),
+            "universe_policy": (
+                "operator_override" if universe is not None else "final_dataset_gate"
+            ),
+            "target_col": target_col,
             "valid_rows": int(len(panel)),
             "external_kis_api": False,
             "registry_mutated": False,
@@ -227,16 +287,37 @@ class ServicePolicyReplayEngine:
         snapshot_hour = int(pit_cfg.get("snapshot_hour", 18))
         today_snapshot = now.replace(hour=snapshot_hour, minute=0, second=0, microsecond=0)
         default_end = today_snapshot if now >= today_snapshot else today_snapshot - timedelta(days=1)
-        default_start = default_end - timedelta(days=90)
         vt_cfg = config_load("risk_config.yaml", "validation_tools.backtest_engine") or {}
+        wf_cfg = config_load("risk_config.yaml", "walk_forward") or {}
         purge_bars = int(vt_cfg.get("purge_bars", 60))
         embargo_bars = int(vt_cfg.get("embargo_bars", 78))
+        from src.utils.trading_calendar import kospi_trading_start_date
+
+        trading_days_needed = (
+            int(wf_cfg.get("train_window_days", 60))
+            + int(math.ceil(purge_bars / 390))
+            + int(math.ceil(embargo_bars / 390))
+            + int(wf_cfg.get("test_window_days", 20))
+            + max(0, int(wf_cfg.get("n_splits", 8)) - 1)
+            * int(wf_cfg.get("step_days", wf_cfg.get("test_window_days", 20)))
+        )
+        default_start_date = kospi_trading_start_date(default_end.date(), trading_days_needed)
+        default_start = default_end.replace(
+            year=default_start_date.year,
+            month=default_start_date.month,
+            day=default_start_date.day,
+        )
         folds = self._engine._build_folds(default_start, default_end, purge_bars, embargo_bars)
         if not folds:
             raise DataUnavailable("default C12 fold window could not be resolved")
         first_fold = folds[0]
-        replay_start = first_fold["test_start"].strftime("%Y%m%d")
-        replay_end = (first_fold["test_end"] - timedelta(days=1)).strftime("%Y%m%d")
+        test_dates = first_fold.get("test_trading_dates") or []
+        if test_dates:
+            replay_start = str(test_dates[0])
+            replay_end = str(test_dates[-1])
+        else:
+            replay_start = first_fold["test_start"].strftime("%Y%m%d")
+            replay_end = (first_fold["test_end"] - timedelta(days=1)).strftime("%Y%m%d")
         return replay_start, replay_end
 
     @staticmethod
@@ -258,18 +339,53 @@ class ServicePolicyReplayEngine:
     @staticmethod
     def _load_active_universe() -> list[str]:
         universe_cfg = config_load("universe_config.yaml") or {}
+        gate_cfg = (
+            config_load(
+                "risk_config.yaml",
+                "backtest_agent.deploy_decision_gate.final_dataset_gate",
+            )
+            or {}
+        )
+        include_pending = safe_bool(
+            gate_cfg.get("include_pending_data_tickers"),
+            default=safe_bool(
+                (universe_cfg.get("backtest_universe_mode") or {}).get("allow_pending"),
+                default=False,
+            ),
+        )
+        allowed_stock_statuses = {"active"}
+        if include_pending:
+            allowed_stock_statuses = {
+                str(status)
+                for status in (
+                    gate_cfg.get("allowed_stock_statuses")
+                    or ["active", "pending_data"]
+                )
+            }
+        allowed_sector_statuses = {"confirmed"}
+        if include_pending:
+            allowed_sector_statuses = {
+                str(status)
+                for status in (
+                    gate_cfg.get("allowed_sector_statuses")
+                    or ["confirmed", "confirmed_pending_data"]
+                )
+            }
         sectors = universe_cfg.get("sectors", {}) or {}
         universe: list[str] = []
         for sector_data in sectors.values():
-            if not isinstance(sector_data, dict) or sector_data.get("status") != "confirmed":
+            if (
+                not isinstance(sector_data, dict)
+                or str(sector_data.get("status")) not in allowed_sector_statuses
+            ):
                 continue
             for stock in sector_data.get("stocks", []) or []:
-                if stock.get("status") == "active":
+                if str(stock.get("status")) in allowed_stock_statuses:
                     universe.append(pad_ticker(stock["ticker"]))
         if universe:
-            return universe
+            return normalize_service_policy_universe(universe)
         fallback = universe_cfg.get("backtest_universe_mode", {}).get("fallback_tickers", [])
-        return [pad_ticker(t) for t in fallback]
+        return normalize_service_policy_universe(fallback)
 
     @staticmethod
     def _model_version_from_artifact(candidate_artifact: dict[str, Any]) -> str:
@@ -287,6 +403,55 @@ class ServicePolicyReplayEngine:
                 return ""
         return ""
 
+    @staticmethod
+    def _candidate_metadata(candidate_artifact: dict[str, Any]) -> dict[str, Any]:
+        metadata = candidate_artifact.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+        metadata_path = Path(str(candidate_artifact.get("metadata_path", "")))
+        if metadata_path.is_file():
+            try:
+                import json
+
+                with metadata_path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                _ = e
+        return {}
+
+    @staticmethod
+    def _load_trade_probability_model(
+        candidate_artifact: dict[str, Any],
+    ) -> Any | None:
+        model, _ = ServicePolicyReplayEngine._load_trade_probability_model_with_reason(
+            candidate_artifact
+        )
+        return model
+
+    @staticmethod
+    def _load_trade_probability_model_with_reason(
+        candidate_artifact: dict[str, Any],
+    ) -> tuple[Any | None, str | None]:
+        metadata = ServicePolicyReplayEngine._candidate_metadata(candidate_artifact)
+        classifier = metadata.get("trade_no_trade_classifier")
+        if not isinstance(classifier, dict) or classifier.get("status") != "PASS":
+            return None, "classifier_missing"
+        if classifier.get("calibration_status") != "PASS":
+            return None, "classifier_uncalibrated"
+        raw_path = str(classifier.get("model_path") or "").strip()
+        if not raw_path:
+            return None, "classifier_missing"
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        try:
+            with path.open("rb") as fh:
+                return pickle.load(fh), None
+        except Exception as e:
+            _ = e
+            return None, "classifier_load_failed"
+
     def _simulate_panel(
         self,
         *,
@@ -296,6 +461,8 @@ class ServicePolicyReplayEngine:
         target_col: str,
         policy: ServicePolicyConfig,
         initial_holdings: dict[str, int] | None = None,
+        trade_probability_model: Any | None = None,
+        trade_probability_unavailable_reason: str | None = None,
     ) -> dict[str, Any]:
         cash = float(policy.initial_capital)
         holdings: dict[str, int] = {
@@ -319,15 +486,38 @@ class ServicePolicyReplayEngine:
         min_holding_skipped_sells = 0
         turnover_budget_skipped_orders = 0
         already_held_skipped_buys = 0
+        trade_gate_stats: dict[str, Any] = {
+            "enabled": policy.trade_probability_gate_enabled,
+            "applied": False,
+            "min_probability": policy.min_trade_probability,
+            "cycles": 0,
+            "candidates_seen": 0,
+            "candidates_rejected": 0,
+            "missing_probability": 0,
+            "model_loaded": trade_probability_model is not None,
+        }
+        panel_flat = panel.drop(
+            columns=[
+                col for col in ("ticker", "ts_close")
+                if col in panel.columns and col in panel.index.names
+            ],
+            errors="ignore",
+        ).reset_index()
+        iter_cols = ["ticker", "close", target_col, *feature_cols]
 
-        for cycle_idx, (ts_close, ts_group) in enumerate(panel.groupby(level="ts_close", sort=True)):
+        for cycle_idx, (ts_close, ts_group) in enumerate(
+            panel_flat.groupby("ts_close", sort=True)
+        ):
             bar_preds: list[tuple[str, float, float, float]] = []
-            for (ticker, _), row in ts_group.iterrows():
+            trade_probs_by_ticker: dict[str, float] = {}
+            valid_rows: list[tuple[str, list[float], float, float]] = []
+            for row in ts_group[iter_cols].itertuples(index=False, name=None):
+                ticker, price_raw, actual_ret_raw, *raw_features = row
                 ticker_s = pad_ticker(ticker)
                 try:
-                    features = [float(row[col]) for col in feature_cols]
-                    actual_ret = float(row[target_col])
-                    price = float(row["close"])
+                    features = [float(value) for value in raw_features]
+                    actual_ret = float(actual_ret_raw)
+                    price = float(price_raw)
                 except Exception as e:
                     raise DataUnavailable(
                         f"invalid replay row ticker={ticker_s} ts={ts_close}: {e}"
@@ -339,13 +529,32 @@ class ServicePolicyReplayEngine:
                     or price <= 0
                 ):
                     continue
-                pred = float(model_callable(features))
+                valid_rows.append((ticker_s, features, actual_ret, price))
+
+            if not valid_rows:
+                continue
+
+            feature_matrix = [features for _, features, _, _ in valid_rows]
+            predictions = self._predict_model_batch(model_callable, feature_matrix)
+            trade_probabilities = self._predict_trade_probabilities(
+                trade_probability_model,
+                feature_matrix,
+            )
+            for (ticker_s, features, actual_ret, price), pred_raw, trade_prob in zip(
+                valid_rows,
+                predictions,
+                trade_probabilities,
+                strict=True,
+            ):
+                pred = float(pred_raw)
                 if math.isnan(pred):
                     raise NaNInMetrics(
                         f"service replay prediction NaN: ticker={ticker_s} ts={ts_close}"
                     )
                 latest_prices[ticker_s] = price
                 bar_preds.append((ticker_s, pred, actual_ret, price))
+                if trade_prob is not None:
+                    trade_probs_by_ticker[ticker_s] = trade_prob
                 predicted_signals.append(pred)
                 actual_returns.append(actual_ret)
 
@@ -367,7 +576,28 @@ class ServicePolicyReplayEngine:
                 daily_equity[day_key] = equity_after
                 continue
 
-            desired = self._desired_tickers(bar_preds, policy)
+            gated_bar_preds, trade_gate_state = self._apply_trade_probability_gate(
+                bar_preds,
+                policy,
+                trade_probs_by_ticker,
+                trade_probability_model=trade_probability_model,
+                unavailable_reason=trade_probability_unavailable_reason,
+            )
+            if trade_gate_state.get("applied"):
+                trade_gate_stats["applied"] = True
+                if trade_gate_state.get("reason") and not trade_gate_stats.get("reason"):
+                    trade_gate_stats["reason"] = trade_gate_state.get("reason")
+                trade_gate_stats["cycles"] += 1
+                trade_gate_stats["candidates_seen"] += int(trade_gate_state.get("n_input", 0))
+                trade_gate_stats["candidates_rejected"] += int(
+                    trade_gate_state.get("n_rejected", 0)
+                )
+                trade_gate_stats["missing_probability"] += int(
+                    trade_gate_state.get("missing_probability", 0)
+                )
+            elif policy.trade_probability_gate_enabled and not trade_gate_stats.get("reason"):
+                trade_gate_stats["reason"] = trade_gate_state.get("reason")
+            desired = self._desired_tickers(gated_bar_preds, policy)
             pred_by_ticker = {ticker: pred for ticker, pred, _, _ in bar_preds}
             price_by_ticker = {ticker: price for ticker, _, _, price in bar_preds}
             orders_this_cycle = 0
@@ -515,6 +745,12 @@ class ServicePolicyReplayEngine:
             max_daily_turnover=max_daily_turnover,
             policy_checks=policy_checks,
         )
+        if (
+            policy.trade_probability_gate_enabled
+            and trade_gate_stats.get("reason")
+            in {"classifier_missing", "classifier_uncalibrated", "classifier_load_failed"}
+        ):
+            blockers.append(f"trade_probability_{trade_gate_stats['reason']}")
         status = "PASS" if not blockers else "BLOCKED"
         policy_checks["deploy_candidate_by_service_policy"] = status == "PASS"
 
@@ -549,7 +785,11 @@ class ServicePolicyReplayEngine:
                 "min_holding_skipped_sells": min_holding_skipped_sells,
                 "turnover_budget_skipped_orders": turnover_budget_skipped_orders,
                 "already_held_skipped_buys": already_held_skipped_buys,
+                "trade_probability_rejected_candidates": int(
+                    trade_gate_stats.get("candidates_rejected", 0)
+                ),
             },
+            "trade_probability_gate": trade_gate_stats,
             "daily_turnover": turnover,
             "daily_equity": daily_equity,
             "orders": orders,
@@ -559,6 +799,122 @@ class ServicePolicyReplayEngine:
                 "prediction_count": len(predicted_signals),
             },
         }
+
+    @staticmethod
+    def _predict_model_batch(model_callable: Any, feature_matrix: list[list[float]]) -> list[float]:
+        if not feature_matrix:
+            return []
+        batch_predict = getattr(model_callable, "batch_predict", None)
+        if callable(batch_predict):
+            raw = np.asarray(batch_predict(feature_matrix), dtype=float).reshape(-1)
+            if raw.size != len(feature_matrix):
+                raise NaNInMetrics(
+                    "service replay batch prediction length mismatch: "
+                    f"expected={len(feature_matrix)} actual={raw.size}"
+                )
+            return [float(value) for value in raw]
+        return [float(model_callable(features)) for features in feature_matrix]
+
+    @staticmethod
+    def _predict_trade_probability(
+        trade_probability_model: Any | None,
+        features: list[float],
+    ) -> float | None:
+        if trade_probability_model is None:
+            return None
+        try:
+            raw = np.asarray(trade_probability_model.predict([features]), dtype=float)
+        except Exception as e:
+            _ = e
+            return None
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if len(raw) < 1 or not math.isfinite(float(raw[0])):
+            return None
+        return safe_float(float(raw[0]), default=0.0, min_value=0.0, max_value=1.0)
+
+    @staticmethod
+    def _predict_trade_probabilities(
+        trade_probability_model: Any | None,
+        feature_matrix: list[list[float]],
+    ) -> list[float | None]:
+        if trade_probability_model is None:
+            return [None] * len(feature_matrix)
+        try:
+            raw = np.asarray(trade_probability_model.predict(feature_matrix), dtype=float)
+        except Exception as e:
+            _ = e
+            return [
+                ServicePolicyReplayEngine._predict_trade_probability(
+                    trade_probability_model,
+                    features,
+                )
+                for features in feature_matrix
+            ]
+        if raw.ndim == 2 and raw.shape[1] >= 2:
+            raw = raw[:, -1]
+        raw = raw.reshape(-1)
+        if raw.size != len(feature_matrix):
+            return [None] * len(feature_matrix)
+        out: list[float | None] = []
+        for value in raw:
+            value_f = float(value)
+            if not math.isfinite(value_f):
+                out.append(None)
+                continue
+            out.append(safe_float(value_f, default=0.0, min_value=0.0, max_value=1.0))
+        return out
+
+    @staticmethod
+    def _apply_trade_probability_gate(
+        bar_preds: list[tuple[str, float, float, float]],
+        policy: ServicePolicyConfig,
+        trade_probs_by_ticker: dict[str, float],
+        *,
+        trade_probability_model: Any | None,
+        unavailable_reason: str | None = None,
+    ) -> tuple[list[tuple[str, float, float, float]], dict[str, Any]]:
+        state: dict[str, Any] = {
+            "enabled": policy.trade_probability_gate_enabled,
+            "applied": False,
+            "min_probability": policy.min_trade_probability,
+        }
+        if not policy.trade_probability_gate_enabled:
+            state["reason"] = "disabled"
+            return bar_preds, state
+        if trade_probability_model is None:
+            state["reason"] = unavailable_reason or "classifier_missing"
+            state.update({
+                "applied": True,
+                "n_input": len(bar_preds),
+                "n_passed": 0,
+                "n_rejected": len(bar_preds),
+                "missing_probability": len(bar_preds),
+            })
+            return [], state
+        filtered: list[tuple[str, float, float, float]] = []
+        missing = 0
+        rejected = 0
+        for row in bar_preds:
+            ticker = row[0]
+            prob = trade_probs_by_ticker.get(ticker)
+            if prob is None:
+                missing += 1
+                rejected += 1
+                continue
+            if prob < policy.min_trade_probability:
+                rejected += 1
+                continue
+            filtered.append(row)
+        state.update({
+            "applied": True,
+            "n_input": len(bar_preds),
+            "n_passed": len(filtered),
+            "n_rejected": rejected,
+            "missing_probability": missing,
+        })
+        return filtered, state
 
     @staticmethod
     def _desired_tickers(
@@ -583,11 +939,13 @@ class ServicePolicyReplayEngine:
             if not eligible:
                 return set()
             bar_preds = eligible
-        if policy.min_expected_net_alpha_bps > 0:
+        if (
+            policy.min_expected_net_alpha_bps > 0
+            and policy.expected_net_alpha_source == "calibrated_net_bps"
+        ):
             eligible = [
                 row for row in bar_preds
-                if (float(row[1]) * 10_000.0 - policy.total_cost_bps)
-                >= policy.min_expected_net_alpha_bps
+                if float(row[1]) >= policy.min_expected_net_alpha_bps
             ]
             if not eligible:
                 return set()

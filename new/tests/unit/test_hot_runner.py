@@ -5,6 +5,8 @@ Integration test: QuantAgent + PPOAllocator + PortfolioManager + FDAAgent 전체
 from __future__ import annotations
 
 
+import time
+
 import numpy as np
 import pytest
 
@@ -122,6 +124,10 @@ def _prime_buffer(runner: HotRunner, tickers: list[str], n: int = 65) -> None:
             runner._quant.on_bar(_make_bar(t, price, i))
 
 
+def _deps_done() -> dict[str, str]:
+    return {"news": "done", "risk": "done", "quant": "done", "debate": "skipped"}
+
+
 @pytest.fixture
 def runner(tmp_path) -> HotRunner:
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm")
@@ -185,6 +191,7 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
         latest_prices={t: 50000.0 + i * 1000 for i, t in enumerate(tickers)},
         portfolio_value=10_000_000.0,
         asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
     )
 
     # QuantAgent passive → 비중 전무 → PM 주문 없음 → FDA approve (empty)
@@ -193,6 +200,27 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
     assert result["final_decision"]["approved"] is True
     assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
     assert "latency_ms" in result
+
+
+def test_run_once_missing_dependency_status_vetoes(runner: HotRunner) -> None:
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "TIMEOUT"
+    assert "news" in result["final_decision"]["veto_reason"]
+    assert "risk" in result["final_decision"]["veto_reason"]
 
 
 def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
@@ -205,6 +233,25 @@ def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:
         asof="2026-04-20T10:00:00+09:00",
     )
     assert result["n_bars_consumed"] == 5
+
+
+def test_run_once_rejects_future_bar_before_quant_buffer(runner: HotRunner) -> None:
+    """asof보다 미래인 1분봉은 Quant buffer에 넣지 않는다."""
+    runner.start()
+    future_bar = _make_bar("005930", 50000.0, 61)  # 10:01 KST
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[future_bar],
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["n_bars_consumed"] == 0
+    assert result["bar_errors"] == [
+        "future_bar_rejected: ticker=005930 "
+        "ts_close=2026-04-20T10:01:00+09:00 asof=2026-04-20T10:00:00+09:00"
+    ]
+    assert runner._quant._bar_buffer.get_latest("005930", n=1) == []
 
 
 def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
@@ -232,6 +279,131 @@ def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
     assert captured["ts"].isoformat() == "2026-05-15T00:00:00+00:00"
 
 
+def test_run_once_filters_future_recent_bars_before_risk_fast(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar도 asof 이후 recent_bars를 보지 않는다."""
+    runner.start()
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(snapshot, ts):
+        captured["recent_bars"] = snapshot["recent_bars"]
+        return {
+            "risk_level": "low",
+            "severity": "low",
+            "fast_rule_match": None,
+            "triggered_rules": [],
+            "affected_tickers": [],
+            "recommended_action": "pass",
+            "stance": "neutral",
+            "rationale": "ok",
+            "latency_ms": 0.0,
+        }
+
+    runner._risk_fast.evaluate = fake_evaluate  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        asof="2026-04-20T10:00:00+09:00",
+        recent_bars={
+            "005930": [
+                _make_bar("005930", 50000.0, 59),
+                _make_bar("005930", 49000.0, 61),
+            ],
+        },
+    )
+
+    assert captured["recent_bars"] == {
+        "005930": [_make_bar("005930", 50000.0, 59)]
+    }
+    assert result["bar_errors"] == [
+        "future_recent_bar_rejected: ticker=005930 "
+        "ts_close=2026-04-20T10:01:00+09:00 asof=2026-04-20T10:00:00+09:00"
+    ]
+
+
+def test_run_once_risk_fast_exception_degrades_nonblocking(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar 예외는 Hot Path core를 fail-close하지 않는다."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+
+    def failing_evaluate(snapshot, ts):
+        raise RuntimeError("risk sidecar unavailable")
+
+    runner._risk_fast.evaluate = failing_evaluate  # type: ignore[method-assign]
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result.get("status") != "FAIL"
+    assert result.get("failure_stage") != "risk_fast"
+    assert result["risk_eval"]["enabled"] is False
+    assert result["risk_eval"]["status"] == "DISABLED"
+    assert result["risk_eval"]["risk_level"] == "high"
+    assert result["risk_eval"]["recommended_action"] == "halt"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_run_once_risk_fast_timeout_degrades_nonblocking(
+    runner: HotRunner,
+) -> None:
+    """RiskFast sidecar timeout도 Hot Path 루프를 오래 붙잡지 않고 fail-closed."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers, n=65)
+    runner._risk_fast._sla_ms = 5.0
+
+    def slow_evaluate(snapshot, ts):
+        time.sleep(0.2)
+        return {
+            "risk_level": "low",
+            "severity": "low",
+            "fast_rule_match": None,
+            "triggered_rules": [],
+            "affected_tickers": [],
+            "recommended_action": "pass",
+            "stance": "neutral",
+            "rationale": "too late",
+            "latency_ms": 200.0,
+        }
+
+    runner._risk_fast.evaluate = slow_evaluate  # type: ignore[method-assign]
+
+    start = time.perf_counter()
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[],
+        latest_prices={t: 50000.0 for t in tickers},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
+    )
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    assert elapsed_ms < 120.0
+    assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result.get("failure_stage") != "risk_fast"
+    assert result["risk_eval"]["enabled"] is False
+    assert result["risk_eval"]["status"] == "DISABLED"
+    assert result["risk_eval"]["error_type"] == "TimeoutError"
+    assert "risk_fast_sidecar_timeout" in result["risk_eval"]["rationale"]
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
 def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
     """잘못된 bar 하나가 들어와도 전체 루프는 중단되지 않음."""
     runner.start()
@@ -240,9 +412,140 @@ def test_run_once_malformed_bar_survives(runner: HotRunner) -> None:
         {"ticker": "000660"},   # 필수 필드 누락
         _make_bar("005930", 50100.0, 1),
     ]
-    result = runner.run_once(tickers=["005930"], bars_batch=bars)
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,
+        asof="2026-04-20T10:00:00+09:00",
+    )
     assert result["n_bars_consumed"] == 2
     assert len(result["bar_errors"]) == 1
+
+
+def test_run_once_non_dict_bar_survives(runner: HotRunner) -> None:
+    """non-dict bar도 AttributeError crash 대신 bar_errors로 흡수한다."""
+    runner.start()
+    bars = [
+        _make_bar("005930", 50000.0, 0),
+        None,
+        _make_bar("005930", 50100.0, 1),
+    ]
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,  # type: ignore[list-item]
+        asof="2026-04-20T10:00:00+09:00",
+    )
+
+    assert result["n_bars_consumed"] == 2
+    assert len(result["bar_errors"]) == 1
+    assert "bar must be dict" in result["bar_errors"][0]
+
+
+def test_run_once_malformed_numeric_bar_fails_closed(runner: HotRunner) -> None:
+    """숫자 필드가 깨진 warm buffer도 루프 raise 대신 structured veto로 닫는다."""
+    runner.start()
+    bars = [_make_bar("005930", 50000.0 + i, i) for i in range(65)]
+    bars[-1]["close"] = "bad"
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=bars,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant"
+    fd = result["final_decision"]
+    assert set(fd) == {
+        "decision_id",
+        "approved",
+        "target_weights",
+        "order_deltas",
+        "veto_reason",
+        "reason_code",
+        "risk_overrides",
+        "confidence",
+        "expiry",
+        "portfolio_patch_ref",
+        "active_reports",
+    }
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert fd["risk_overrides"][0]["override"] == "fail_closed"
+
+
+def test_run_once_requires_asof_for_bar_batch(runner: HotRunner) -> None:
+    """bar batch는 asof 없이 buffer에 넣지 않는다."""
+    runner.start()
+    bar = _make_bar("005930", 50000.0, 0)
+
+    result = runner.run_once(tickers=["005930"], bars_batch=[bar])
+
+    assert result["skipped"] is True
+    assert result["reason"] == "asof_required"
+    assert result["n_bars_consumed"] == 0
+    assert runner._quant._bar_buffer.get_latest("005930") == []
+
+
+def test_run_once_requires_asof_even_without_bar_batch(runner: HotRunner) -> None:
+    """HOT_RUNNING 루프는 기존 buffer를 읽더라도 asof 없이는 열리지 않는다."""
+    runner.start()
+    _prime_buffer(runner, ["005930"], n=65)
+
+    result = runner.run_once(tickers=["005930"], bars_batch=[])
+
+    assert result["skipped"] is True
+    assert result["reason"] == "asof_required"
+    assert result["n_bars_consumed"] == 0
+
+
+def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
+    """PPO가 malformed allocation을 반환해도 Hot Path는 구조화된 veto로 닫는다."""
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers, n=65)
+
+    runner._ppo.allocate = lambda **_: {}  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_ALLOCATION_PLAN_INVALID"
+    assert result["final_decision"]["approved"] is False
+
+
+def test_run_once_vetoes_ppo_policy_universe_mismatch(runner: HotRunner) -> None:
+    """PPO 정책 universe mismatch는 빈 allocation을 정상 approve로 통과시키지 않는다."""
+    runner.start()
+    tickers = ["005930"]
+    _prime_buffer(runner, tickers, n=65)
+    runner._ppo.allocate = lambda **_: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {}},
+        "status": "BLOCKED",
+        "metadata": {
+            "reason": "ppo_policy_universe_mismatch",
+            "policy_tickers": ["000660"],
+            "request_tickers": ["005930"],
+        },
+    }
+
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["ppo_guard_warnings"][0]["reason_code"] == "PPO_POLICY_UNIVERSE_MISMATCH"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
 
 def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
@@ -265,11 +568,115 @@ def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
         bars_batch=[],
         latest_prices={"005930": 50000.0},
         asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
     # Anomaly는 상황에 따라 감지될 수도 안 될 수도 (random seed). 양쪽 허용.
     if result["anomalies"]:
         assert result["final_decision"]["reason_code"] == "QUANT_ANOMALY"
         assert result["final_decision"]["approved"] is False
+
+
+def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> None:
+    """FDA echo는 PPO 원본이 아니라 PM이 실제 주문에 맞춘 target_weights를 사용한다."""
+    runner.start()
+
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "passive",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: [  # type: ignore[method-assign]
+        {"ticker": "005930", "reason": "forced_exit"}
+    ]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.10}}
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 8, "weight": 0.20}],
+        latest_prices={"005930": 50000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+    )
+
+    assert result["pm_result"]["portfolio_patch"]["target_weights"]["005930"] == 0.0
+    assert result["final_decision"]["target_weights"]["005930"] == 0.0
+    assert result["final_decision"]["order_deltas"][0]["reason"] == "risk_reduce"
+
+
+def test_run_once_vetoes_pm_price_unavailable(runner: HotRunner) -> None:
+    """PM이 주문 생성 오류를 보고하면 FDA는 partial patch를 approve하지 않는다."""
+    runner.start()
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.10}}
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        latest_prices={},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["pm_result"]["n_errors"] == 1
+    assert result["pm_guard_warnings"][0]["reason"] == "portfolio_manager_errors"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_run_once_vetoes_ppo_constraint_violation(runner: HotRunner) -> None:
+    """PM이 PPO boundary violation을 보고하면 FDA는 해당 patch를 veto한다."""
+    runner.start()
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9},
+        "ranking": ["005930"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.90}}
+    }
+    runner._pm.plan = lambda **kwargs: {  # type: ignore[method-assign]
+        "portfolio_patch": {
+            "portfolio_patch_id": "PP-TEST",
+            "based_on_ts": "2026-04-20T10:05:00+09:00",
+            "target_weights": {"005930": 0.90},
+            "order_deltas": [{"ticker": "005930", "side": "buy", "qty": 1}],
+        },
+        "n_errors": 0,
+        "errors": [],
+        "ppo_violations": [
+            {
+                "type": "max_single_name_exceeded",
+                "ticker": "005930",
+                "weight": 0.90,
+                "limit": 0.10,
+            }
+        ],
+    }
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        latest_prices={"005930": 50_000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["pm_guard_warnings"][0]["reason"] == "ppo_constraint_violation"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
 
 def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
@@ -281,6 +688,8 @@ def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
         bars_batch=[],
         latest_prices={"005930": 50000.0},
         risk_warnings=[{"ticker": "005930", "severity": "high", "reason": "fake"}],
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
     )
     assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
     assert result["final_decision"]["approved"] is False
@@ -295,6 +704,7 @@ def test_latency_stats(runner: HotRunner) -> None:
             tickers=tickers,
             bars_batch=[],
             latest_prices={t: 50000.0 for t in tickers},
+            asof="2026-04-20T10:05:00+09:00",
         )
     stats = runner.latency_stats()
     assert stats["count"] == 3

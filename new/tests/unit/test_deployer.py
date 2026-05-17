@@ -118,6 +118,7 @@ def _candidate_lgbm_metadata(bundle_id: str = _BUNDLE_ID) -> dict:
         "train_start": "2026-01-01",
         "train_end": "2026-05-01",
         "feature_cols": ["feat_a", "feat_b"],
+        "target_col": "label_5m_ret",
         "label_horizon_bars": 5,
         "label_generation_version": "session_local_v2",
         "label_session_scope": "ticker_trading_day",
@@ -694,6 +695,27 @@ def test_deploy_medium_regression_blocked(tmp_path):
     assert exc_info.value.reason == "regression_risk_flagged"
 
 
+def test_relative_production_root_still_requires_extended_gates(monkeypatch):
+    """Path('artifacts')처럼 상대 production root여도 C14 확장 gate를 우회하지 않는다."""
+    from src.mode_b import deployer as deployer_mod
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
+
+    repo_root = deployer_mod._ARTIFACTS_ROOT.parent  # noqa: SLF001
+    monkeypatch.chdir(repo_root)
+    deployer = _make_deployer(Path("artifacts"))
+
+    with _mode_b_env():
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id=_BUNDLE_ID,
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=False),
+            )
+
+    assert exc_info.value.reason == "feature_quality_gate_failed"
+
+
 def test_service_policy_gate_requires_report_binding(tmp_path):
     """Production service-policy gate는 embedded report path/hash 없으면 차단."""
     from src.mode_b.deployer import DeployBlocked
@@ -729,3 +751,46 @@ def test_service_policy_gate_uses_relative_fallback_when_absolute_path_stale(tmp
     evidence["report_path_relative"] = relative_path
 
     deployer._check_service_policy_gate(evidence, bundle_id=_BUNDLE_ID)
+
+
+def test_deploy_blocks_existing_lgbm_version_with_different_model(tmp_path):
+    """Candidate version collision must fail before active/latest can point at old pkl."""
+    from src.mode_b.deployer import DeployBlocked, RegressionRisk
+
+    _prepare_candidate_bundle(tmp_path)
+    candidate_meta_path = (
+        tmp_path / "bundles" / _BUNDLE_ID / "lgbm" / "latest_model_metadata.json"
+    )
+    candidate_meta = json.loads(candidate_meta_path.read_text(encoding="utf-8"))
+    candidate_meta["version"] = "v2"
+    candidate_meta_path.write_text(
+        json.dumps(candidate_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    _prepare_live_artifacts(tmp_path)
+    (tmp_path / "lgbm" / "v2.pkl").write_bytes(b"OLD_PRODUCTION_MODEL")
+    (tmp_path / "lgbm" / "v2_metadata.json").write_text(
+        json.dumps(
+            {
+                **_candidate_lgbm_metadata(bundle_id="OLD-BUNDLE"),
+                "version": "v2",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    deployer = _make_deployer(tmp_path)
+    with _mode_b_env():
+        with pytest.raises(DeployBlocked) as exc_info:
+            deployer.deploy(
+                bundle_id=_BUNDLE_ID,
+                backtest_verdict="pass",
+                sanity_check_result="ok",
+                regression_risk=RegressionRisk(flagged=False),
+            )
+
+    assert exc_info.value.reason == "lgbm_version_collision"
+    assert (tmp_path / "lgbm" / "v2.pkl").read_bytes() == b"OLD_PRODUCTION_MODEL"
+    assert not (tmp_path / "lgbm" / "registry.json").exists()

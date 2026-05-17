@@ -6,11 +6,20 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.agents.cold.news import NewsAgent
+from src.utils.pit_guard import PITViolationError
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _isolate_default_memory_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.cold.news._DEFAULT_MEMORY_ROOT",
+        tmp_path / "agent_memory",
+    )
+
 
 def _make_llm(success=True, content="삼성전자 buy 매수 추천"):
     """LLMRouter mock 생성. LLMCallResult 유사 객체 반환."""
@@ -192,8 +201,8 @@ class TestAnalyze:
         agent = NewsAgent(llm_router=llm)
         event = {
             "event_type": "news",
-            "ticker": "005930",
-            "title": "삼성 실적 호조",
+            "ticker": "000660",
+            "title": "SK하이닉스 실적 호조",
             "summary": "영업이익 증가",
             "event_id": "E-001",
         }
@@ -203,6 +212,8 @@ class TestAnalyze:
         assert kwargs.get("mode") == "cold" or llm.call.call_args[0][1] == "cold"
         assert kwargs.get("caller") == "news_agent" or llm.call.call_args[0][2] == "news_agent"
         prompt = llm.call.call_args[0][0]
+        assert '"impacted_tickers": ["000660"]' in prompt
+        assert '"impacted_tickers": ["005930"]' not in prompt
         assert '"confidence": 0.0' in prompt
 
     def test_analyze_news_event_returns_news_signal_channel(self):
@@ -214,6 +225,8 @@ class TestAnalyze:
             "title": "test",
             "summary": "test",
             "event_id": "E-1",
+            "occurred_at": "2026-04-20T09:30:00+09:00",
+            "asof": "2026-04-20T09:31:00+09:00",
         })
         assert result["channel"] == "news_signal"
         for key in ("cause_by", "sent_from", "priority", "action_type", "timestamp"):
@@ -222,6 +235,12 @@ class TestAnalyze:
         assert result["payload"]["confidence"] == pytest.approx(0.5)
         assert result["payload"]["scope"] == "ticker:005930"
         assert result["payload"]["ticker"] == "005930"
+        assert result["payload"]["event_id"] == "E-1"
+        assert result["payload"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert result["payload"]["asof"] == "2026-04-20T09:31:00+09:00"
+        assert result["message"]["event_id"] == "E-1"
+        assert result["message"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert result["message"]["asof"] == "2026-04-20T09:31:00+09:00"
 
     def test_analyze_tickers_string_uses_full_code(self):
         """event.tickers가 문자열이어도 첫 글자만 쓰지 않고 6자리 코드를 유지한다."""
@@ -235,6 +254,20 @@ class TestAnalyze:
         })
         assert result["scope"] == "ticker:005930"
 
+    def test_analyze_direct_suffix_ticker_normalized(self):
+        """event.ticker suffix 입력도 C5 payload/scope에서 6자리 코드로 정규화한다."""
+        agent = _make_agent()
+        result = agent.analyze({
+            "event_type": "news",
+            "ticker": "005930.KS",
+            "title": "test",
+            "summary": "test",
+            "event_id": "E-suffix-ticker",
+        })
+        assert result["scope"] == "ticker:005930"
+        assert result["payload"]["ticker"] == "005930"
+        assert result["payload"]["impacted_tickers"] == ["005930"]
+
     def test_analyze_cache_hit_republishes_message(self):
         """cache hit이어도 pubsub가 주입된 direct path에서는 message를 다시 publish한다."""
         cache = _DictCache()
@@ -247,14 +280,20 @@ class TestAnalyze:
             "title": "test",
             "summary": "test",
             "event_id": "E-cache",
+            "occurred_at": "2026-04-20T09:30:00+09:00",
+            "asof": "2026-04-20T09:31:00+09:00",
         }
 
         first = agent.analyze(event)
         second = agent.analyze(event)
 
         assert first["message"]["scope"] == "ticker:005930"
+        assert first["message"]["event_id"] == "E-cache"
         assert second["republished_from_cache"] is True
         assert second["message_id"] == "MSG-CACHED"
+        assert second["message"]["event_id"] == "E-cache"
+        assert second["message"]["occurred_at"] == "2026-04-20T09:30:00+09:00"
+        assert second["message"]["asof"] == "2026-04-20T09:31:00+09:00"
         assert pubsub.publish.call_count == 2
 
     def test_analyze_cache_hit_treats_string_false_fallback_as_false(self):
@@ -315,6 +354,37 @@ class TestAnalyze:
                 "summary": "test",
                 "event_id": "X-1",
             })
+
+    def test_analyze_rejects_future_event_before_llm(self):
+        """직접 호출 경로도 occurred_at > asof 미래 이벤트를 LLM 전에 차단한다."""
+        llm = _make_llm()
+        agent = NewsAgent(llm_router=llm)
+        with pytest.raises(PITViolationError):
+            agent.analyze({
+                "event_type": "news",
+                "ticker": "005930",
+                "title": "미래 뉴스",
+                "summary": "아직 발생하지 않은 뉴스",
+                "event_id": "E-future",
+                "occurred_at": "2026-04-20T10:01:00+09:00",
+                "asof": "2026-04-20T10:00:00+09:00",
+            })
+        llm.call.assert_not_called()
+
+    def test_analyze_requires_asof_for_timestamped_event(self):
+        """직접 호출 이벤트에 occurred_at이 있으면 asof 없이는 LLM 호출하지 않는다."""
+        llm = _make_llm()
+        agent = NewsAgent(llm_router=llm)
+        with pytest.raises(PITViolationError, match="asof_required"):
+            agent.analyze({
+                "event_type": "news",
+                "ticker": "005930",
+                "title": "시각 기준 없는 뉴스",
+                "summary": "occurred_at만 있는 직접 호출",
+                "event_id": "E-no-asof",
+                "occurred_at": "2026-04-20T10:00:00+09:00",
+            })
+        llm.call.assert_not_called()
 
     def test_analyze_llm_failure_stance_neutral_fallback(self):
         """LLMCallResult(success=False) → stance=neutral, llm_fallback=True."""
@@ -411,6 +481,23 @@ class TestParseLlmContent:
         rpt = agent.report("news_signal", parsed)
         assert parsed["confidence"] == pytest.approx(0.82)
         assert rpt["payload"]["confidence"] == pytest.approx(0.82)
+
+    def test_parse_llm_json_impacted_tickers_normalized(self):
+        """LLM JSON impacted_tickers도 suffix/짧은 코드를 6자리로 정규화한다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content(
+            '{"stance":"buy","impacted_tickers":["5930","005930.KS","000660.KS"],'
+            '"impacted_sectors":["반도체"],"narrative":"호재","confidence":0.7}'
+        )
+        assert parsed["impacted_tickers"] == ["005930", "000660"]
+
+    def test_parse_llm_heuristic_tickers_reject_non_universe_numbers(self):
+        """heuristic fallback도 날짜/공시번호 같은 6자리 숫자를 ticker로 오인하지 않는다."""
+        agent = _make_agent()
+        parsed = agent._parse_llm_content(
+            "20260517 공시번호 999999 관련 뉴스. 005930은 호재."
+        )
+        assert parsed["impacted_tickers"] == ["005930"]
 
     def test_parse_confidence_clamps_invalid_values(self):
         """confidence는 finite 0.0~1.0 값으로 정규화된다."""

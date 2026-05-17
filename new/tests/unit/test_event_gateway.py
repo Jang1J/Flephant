@@ -102,6 +102,39 @@ def test_ingest_admitted_event_goes_to_backlog(tmp_path: Path) -> None:
     assert gw.backlog_size() == 1
 
 
+def test_ingest_without_asof_adds_default_asof(tmp_path: Path) -> None:
+    """Cold Path 기본 ingest도 downstream agent가 쓸 기준시각을 보존한다."""
+    gw = _gateway(tmp_path)
+
+    result = gw.ingest(_dart_raw(), source="dart")
+    assert result["status"] == "admitted"
+
+    event = gw._admission.pop_next()
+    assert event is not None
+    assert event.get("asof")
+
+
+def test_ingest_rejects_event_after_asof(tmp_path: Path, monkeypatch) -> None:
+    """EventGateway는 장중 asof 이후 이벤트를 backlog에 넣지 않는다."""
+    import src.data.event_normalizer as en
+    from src.utils.pit_guard import is_pit_safe as real_is_pit_safe
+
+    monkeypatch.setattr(en, "is_pit_safe", real_is_pit_safe)
+    gw = _gateway(tmp_path)
+    raw = {
+        "title": "장중 미래 공시",
+        "corp_name": "테스트",
+        "disclosure_time": "2026-04-19T10:01:00+09:00",
+        "ticker": "005930",
+    }
+
+    result = gw.ingest(raw, source="dart", asof="2026-04-19T10:00:00+09:00")
+
+    assert result["status"] == "normalize_failed"
+    assert "PIT-Safety" in str(result["reason"])
+    assert gw.backlog_size() == 0
+
+
 # ------------------------------------------------------------------
 # 3. 거부 이벤트 status = rejected
 # ------------------------------------------------------------------
@@ -149,6 +182,34 @@ def test_register_handler_and_dispatch(tmp_path: Path) -> None:
     assert result["status"] == "processed"
     assert len(handled) == 1
     assert gw.backlog_size() == 0
+
+
+def test_register_handler_fanout_same_event_type(tmp_path: Path) -> None:
+    gw = _gateway(tmp_path)
+    handled: list[str] = []
+
+    def news_handler(event: dict) -> dict:
+        handled.append("news")
+        return {"event_id": event["event_id"], "status": "news_processed"}
+
+    def risk_handler(event: dict) -> dict:
+        handled.append("risk")
+        return {"event_id": event["event_id"], "status": "risk_processed"}
+
+    gw.register_handler("dart", news_handler)
+    gw.register_handler("dart", risk_handler)
+
+    gw.ingest(_dart_raw(), source="dart")
+    result = gw.dispatch_next()
+
+    assert handled == ["news", "risk"]
+    assert result is not None
+    assert result["status"] == "processed"
+    assert result["handler_count"] == 2
+    assert [item["status"] for item in result["handler_results"]] == [
+        "news_processed",
+        "risk_processed",
+    ]
 
 
 # ------------------------------------------------------------------
@@ -276,6 +337,45 @@ def test_dispatch_next_auto_publish_success(tmp_path: Path) -> None:
     assert active[0]["content"] == "뉴스 분석 결과"
 
 
+def test_dispatch_next_auto_publish_preserves_event_trace(tmp_path: Path) -> None:
+    """auto_publish 메시지는 원 이벤트의 event_id/occurred_at/asof를 보존한다."""
+    from src.blackboard.message_pool import MessagePool
+    from src.blackboard.pubsub import PubSubBroker
+
+    pool = MessagePool()
+    pubsub = PubSubBroker(pool)
+    gw = EventGateway(
+        admission=_admission(tmp_path),
+        normalizer=EventNormalizer(),
+        pubsub=pubsub,
+    )
+    asof = datetime.now(_KST).isoformat()
+
+    def news_handler(event: dict) -> dict:
+        return {
+            "content": "뉴스 분석 결과",
+            "cause_by": "NewsAgent",
+            "sent_from": "news_agent",
+            "priority": "normal",
+            "confidence": 0.8,
+            "reasoning": "뉴스 긍정 신호 감지",
+            "scope": "005930",
+            "action_type": "signal",
+            "timestamp": _recent_ts(),
+        }
+
+    gw.register_handler("dart", news_handler, publish_channel="news_signal")
+    admitted = gw.ingest(_dart_raw(), source="dart", asof=asof)
+    result = gw.dispatch_next()
+
+    assert result is not None
+    active = pool.get_active_messages("news_signal")
+    assert len(active) == 1
+    assert active[0]["event_id"] == admitted["event_id"]
+    assert active[0]["occurred_at"] == result["occurred_at"]
+    assert active[0]["asof"] == asof
+
+
 def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> None:
     """NewsAgent attach_to_gateway 결과가 EventGateway auto_publish C4 schema를 만족한다."""
     from src.agents.cold.news import NewsAgent
@@ -299,7 +399,8 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
     )
     NewsAgent(llm_router=router).attach_to_gateway(gw)
 
-    gw.ingest(
+    asof = datetime.now(_KST).isoformat()
+    admitted = gw.ingest(
         {
             "title": "삼성전자 호재",
             "summary": "영업이익 증가",
@@ -307,6 +408,7 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
             "ticker": "005930",
         },
         source="naver_news",
+        asof=asof,
     )
     result = gw.dispatch_next()
 
@@ -317,6 +419,9 @@ def test_news_agent_attach_to_gateway_auto_publish_schema(tmp_path: Path) -> Non
     assert len(messages) == 1
     assert messages[0]["confidence"] == pytest.approx(0.82)
     assert messages[0]["scope"] == "ticker:005930"
+    assert messages[0]["event_id"] == admitted["event_id"]
+    assert messages[0]["occurred_at"] == result["occurred_at"]
+    assert messages[0]["asof"] == asof
 
 
 def test_news_agent_gateway_skips_fallback_neutral_publish(tmp_path: Path) -> None:

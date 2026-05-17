@@ -203,3 +203,40 @@ def test_push_ignores_out_of_order_bar():
     result = bb.get_latest("005930", n=10)
     assert len(result) == 1
     assert result[0]["ts_close"] == "2026-04-17T09:02:00+09:00"
+
+
+def test_get_latest_asof_filters_future_bars():
+    """asof 이후 bar는 반환하지 않는다."""
+    from src.data.bar_buffer import BarBuffer
+
+    bb = BarBuffer(max_bars=10)
+    bb.push({**_make_bar(price=70000), "ts_close": "2026-04-17T09:00:00+09:00"})
+    bb.push({**_make_bar(price=70100), "ts_close": "2026-04-17T09:01:00+09:00"})
+    bb.push({**_make_bar(price=70200), "ts_close": "2026-04-17T09:02:00+09:00"})
+
+    result = bb.get_latest_asof("005930", n=10, asof="2026-04-17T09:01:00+09:00")
+
+    assert [bar["ts_close"] for bar in result] == [
+        "2026-04-17T09:00:00+09:00",
+        "2026-04-17T09:01:00+09:00",
+    ]
+
+
+def test_get_batch_asof_filters_multiple_tickers():
+    """여러 ticker batch 조회도 asof 경계를 지킨다."""
+    from src.data.bar_buffer import BarBuffer
+
+    bb = BarBuffer(max_bars=10)
+    for ticker in ["005930", "000660"]:
+        bb.push({**_make_bar(ticker=ticker, price=70000), "ts_close": "2026-04-17T09:00:00+09:00"})
+        bb.push({**_make_bar(ticker=ticker, price=70100), "ts_close": "2026-04-17T09:03:00+09:00"})
+
+    result = bb.get_batch_asof(
+        ["005930", "000660"],
+        n_bars=5,
+        asof="2026-04-17T09:00:00+09:00",
+    )
+
+    assert set(result) == {"005930", "000660"}
+    assert all(len(items) == 1 for items in result.values())
+    assert all(items[0]["ts_close"] == "2026-04-17T09:00:00+09:00" for items in result.values())

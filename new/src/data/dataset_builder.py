@@ -38,7 +38,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from src.data.dual_source_runner import load_latest_scores
+from src.data.dual_source_runner import (
+    DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+    load_latest_scores,
+)
 from src.data.exogenous_feature_store import (
     DEFAULT_EXOGENOUS_ARTIFACT_DIR,
     is_non_neutral,
@@ -81,6 +84,7 @@ EXOGENOUS_FEATURES: tuple[str, ...] = (
 logger = get_logger("dataset_builder")
 
 _KST = ZoneInfo("Asia/Seoul")
+_ALLOWED_DUAL_SOURCE_INPUT_MODES = {"real", "archived_raw_events"}
 
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts" / "data"
 
@@ -131,10 +135,14 @@ class DatasetBuilder:
     def __init__(
         self,
         artifacts_dir: Path | None = None,
+        dual_source_artifact_dir: Path | None = None,
+        exogenous_artifact_dir: Path | None = None,
         allow_synthetic_fallback: bool = False,
         synthetic_seed: int | None = None,
     ) -> None:
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_ROOT
+        self._dual_source_artifact_dir = dual_source_artifact_dir
+        self._exogenous_artifact_dir = exogenous_artifact_dir
         self._allow_synthetic_fallback = safe_bool(
             allow_synthetic_fallback,
             default=False,
@@ -150,8 +158,10 @@ class DatasetBuilder:
         self._cfg_nightly: dict = config_load("risk_config.yaml", "nightly_retrainer") or {}
         self._cfg_cost_model: dict = config_load("risk_config.yaml", "execution_cost_model") or {}
         self._cfg_service_policy: dict = config_load("risk_config.yaml", "service_policy_replay") or {}
+        self._cfg_cost_aware: dict = config_load("risk_config.yaml", "cost_aware_retraining") or {}
 
         self._horizon: int = int(self._cfg_label["horizon_bars"])
+        self._aux_label_horizons: list[int] = self._load_aux_label_horizons()
         self._target_col: str = str(self._cfg_label["target_col"])
         self._rank_col: str = str(self._cfg_label["rank_col"])
         self._leakage_guard: bool = safe_bool(
@@ -386,20 +396,89 @@ class DatasetBuilder:
         )
         return panel
 
+    @staticmethod
+    def _parse_artifact_datetime(value: object) -> datetime | None:
+        if value in (None, ""):
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+
+    @staticmethod
+    def _market_open_ts(date_key: str) -> datetime:
+        clean = str(date_key).replace("-", "")[:8]
+        parsed = datetime.strptime(clean, "%Y%m%d")
+        return parsed.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=_KST)
+
+    def _dual_source_artifact_blockers(
+        self,
+        date_key: str,
+        scores_list: list[dict],
+    ) -> list[str]:
+        blockers: set[str] = set()
+        market_open = self._market_open_ts(date_key)
+        for item in scores_list:
+            source_stats = item.get("source_stats")
+            if not isinstance(source_stats, dict) or not source_stats:
+                blockers.add("dual_source_provenance_missing")
+            else:
+                input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+                if input_mode not in _ALLOWED_DUAL_SOURCE_INPUT_MODES:
+                    blockers.add("dual_source_non_real_input_mode")
+                if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+                    blockers.add("dual_source_neutral_rehearsal_artifact")
+            snapshot_dt = self._parse_artifact_datetime(
+                item.get("snapshot_ts") or item.get("asof")
+            )
+            if snapshot_dt is not None and snapshot_dt > market_open:
+                blockers.add("dual_source_snapshot_after_market_open")
+        return sorted(blockers)
+
+    def _exogenous_artifact_blockers(self, date_key: str, stats: dict[str, Any]) -> list[str]:
+        blockers: set[str] = set()
+        source_stats = stats.get("source_stats")
+        if not isinstance(source_stats, dict) or not source_stats:
+            blockers.add("exogenous_provenance_missing")
+        else:
+            input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+            if input_mode and input_mode != "real":
+                blockers.add("exogenous_non_real_input_mode")
+            if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+                blockers.add("exogenous_neutral_rehearsal_artifact")
+            provider_availability = source_stats.get("provider_availability")
+            if isinstance(provider_availability, dict) and any(
+                not bool(value) for value in provider_availability.values()
+            ):
+                blockers.add("exogenous_provider_unavailable")
+            us_source = source_stats.get("us_market_source")
+            if us_source and str(us_source) != "yfinance":
+                blockers.add("exogenous_us_market_source_not_yfinance")
+        snapshot_dt = self._parse_artifact_datetime(stats.get("snapshot_ts"))
+        if snapshot_dt is not None and snapshot_dt > self._market_open_ts(date_key):
+            blockers.add("exogenous_snapshot_after_market_open")
+        return sorted(blockers)
+
     def _join_exogenous_features(self, panel):
         """C3 외생 feature_manifest 컬럼을 panel에 추가.
 
-        daily exogenous artifact(new/artifacts/exogenous/YYYYMMDD.json)가 있으면
+        daily exogenous artifact(artifacts/exogenous/YYYYMMDD.json)가 있으면
         날짜/ticker 기준으로 join한다. 파일 또는 ticker별 값이 없으면
         risk_config.yaml exogenous_features.neutral_defaults로 채운다.
         """
+        exogenous_artifact_dir = (
+            self._exogenous_artifact_dir or DEFAULT_EXOGENOUS_ARTIFACT_DIR
+        )
         panel = panel.copy()
         for col in self._exog_feature_cols:
             panel[col] = float(self._exog_defaults.get(col, 0.0))
 
         if panel.empty:
             panel.attrs["exogenous_join_stats"] = {
-                "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+                "artifact_dir": str(exogenous_artifact_dir),
                 "dates_found": 0,
                 "dates_missing": 0,
                 "rows_total": 0,
@@ -427,9 +506,15 @@ class DatasetBuilder:
                 date_key,
                 feature_cols=self._exog_feature_cols,
                 defaults=self._exog_defaults,
-                artifact_dir=DEFAULT_EXOGENOUS_ARTIFACT_DIR,
+                artifact_dir=exogenous_artifact_dir,
             )
             if stats["status"] == "found":
+                blockers = self._exogenous_artifact_blockers(date_key, stats)
+                if blockers:
+                    raise DatasetBuildError(
+                        "unsafe exogenous artifact "
+                        f"date={date_key} blockers={','.join(blockers)}"
+                    )
                 dates_found += 1
                 date_score_maps[date_key] = score_map
             else:
@@ -465,7 +550,7 @@ class DatasetBuilder:
 
         rows_total = int(len(panel))
         panel.attrs["exogenous_join_stats"] = {
-            "artifact_dir": str(DEFAULT_EXOGENOUS_ARTIFACT_DIR),
+            "artifact_dir": str(exogenous_artifact_dir),
             "dates_found": dates_found,
             "dates_missing": dates_missing,
             "rows_total": rows_total,
@@ -737,9 +822,6 @@ class DatasetBuilder:
                 f"{sorted(missing_cols)}"
             )
 
-        h = self._horizon
-        drop_count = max(h, self._drop_last_n)
-
         out = df.copy()
         out["ts_close"] = self._normalize_ts_close_kst(out["ts_close"], pd)
         sort_cols = ["ts_close"]
@@ -751,10 +833,32 @@ class DatasetBuilder:
 
         out["_label_session"] = out["ts_close"].dt.date
 
-        labels = np.full(len(out), np.nan, dtype=float)
-        session_close_labels = np.full(len(out), np.nan, dtype=float)
         close_values = out["close"].to_numpy(dtype=float)
         grouped_positions = out.groupby(group_cols, sort=False).indices
+
+        def forward_labels_for_horizon(horizon: int) -> np.ndarray:
+            labels = np.full(len(out), np.nan, dtype=float)
+            drop_count = max(horizon, self._drop_last_n)
+            for positions in grouped_positions.values():
+                positions_arr = np.asarray(positions, dtype=np.int64)
+                valid_count = max(0, len(positions_arr) - drop_count)
+                if valid_count <= 0:
+                    continue
+                closes = close_values[positions_arr]
+                now = closes[:valid_count]
+                future = closes[horizon:horizon + valid_count]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    labels[positions_arr[:valid_count]] = np.where(
+                        now > 1e-8,
+                        future / now - 1.0,
+                        np.nan,
+                    )
+            return labels
+
+        h = self._horizon
+        labels = forward_labels_for_horizon(h)
+        session_close_labels = np.full(len(out), np.nan, dtype=float)
+        drop_count = max(h, self._drop_last_n)
         for positions in grouped_positions.values():
             positions = np.asarray(positions, dtype=np.int64)
             valid_count = max(0, len(positions) - drop_count)
@@ -762,13 +866,6 @@ class DatasetBuilder:
                 continue
             closes = close_values[positions]
             now = closes[:valid_count]
-            future = closes[h:h + valid_count]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                labels[positions[:valid_count]] = np.where(
-                    now > 1e-8,
-                    future / now - 1.0,
-                    np.nan,
-                )
             session_close = float(closes[-1])
             with np.errstate(divide="ignore", invalid="ignore"):
                 session_close_labels[positions[:valid_count]] = np.where(
@@ -785,6 +882,17 @@ class DatasetBuilder:
         out[f"label_{h}m_tradeable"] = (
             out[active_net_col] >= self._label_min_expected_net_bps
         ).astype("Int64")
+        for aux_horizon in self._aux_label_horizons:
+            if aux_horizon == h:
+                continue
+            aux_label_col = f"label_{aux_horizon}m_ret"
+            aux_net_col = f"label_{aux_horizon}m_net_bps"
+            out[aux_label_col] = forward_labels_for_horizon(aux_horizon)
+            out[aux_net_col] = out[aux_label_col] * 10_000.0 - self._label_total_cost_bps
+            out[f"label_{aux_horizon}m_net_ret"] = out[aux_net_col] / 10_000.0
+            out[f"label_{aux_horizon}m_tradeable"] = (
+                out[aux_net_col] >= self._label_min_expected_net_bps
+            ).astype("Int64")
         out["label_session_close_ret"] = session_close_labels
         out["label_session_close_net_bps"] = (
             out["label_session_close_ret"] * 10_000.0 - self._label_total_cost_bps
@@ -796,6 +904,26 @@ class DatasetBuilder:
         out = out.dropna(subset=[self._target_col]).copy()
 
         return out
+
+    def _load_aux_label_horizons(self) -> list[int]:
+        """Cost-aware integer horizon candidates whose labels should exist in panel."""
+        horizons: list[int] = []
+        for raw in self._cfg_cost_aware.get("horizon_candidates", []) or []:
+            try:
+                horizon = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if horizon > 0 and horizon not in horizons:
+                horizons.append(horizon)
+        try:
+            min_holding_horizon = int(self._cfg_service_policy.get("min_holding_bars", 0) or 0)
+        except (TypeError, ValueError):
+            min_holding_horizon = 0
+        if min_holding_horizon > 0 and min_holding_horizon not in horizons:
+            horizons.append(min_holding_horizon)
+        if self._horizon not in horizons:
+            horizons.insert(0, self._horizon)
+        return horizons
 
     @staticmethod
     def _normalize_ts_close_kst(ts_close, pd):
@@ -897,6 +1025,9 @@ class DatasetBuilder:
         pd = _import_pandas()
         start = _parse_yyyymmdd(start_date)
         end = _parse_yyyymmdd(end_date)
+        dual_source_artifact_dir = (
+            self._dual_source_artifact_dir or DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
+        )
 
         # 날짜 범위 내 모든 날짜의 Dual-Source 점수를 미리 로드
         # {date_str: {ticker: {feat: val}}}
@@ -905,8 +1036,17 @@ class DatasetBuilder:
         current = start
         while current <= end:
             date_str = current.strftime("%Y%m%d")
-            scores_list: list[dict] = load_latest_scores(date_str)
+            scores_list: list[dict] = load_latest_scores(
+                date_str,
+                artifact_dir=dual_source_artifact_dir,
+            )
             if scores_list:
+                blockers = self._dual_source_artifact_blockers(date_str, scores_list)
+                if blockers:
+                    raise DatasetBuildError(
+                        "unsafe dual-source artifact "
+                        f"date={date_str} blockers={','.join(blockers)}"
+                    )
                 ticker_map: dict[str, dict[str, float]] = {}
                 for item in scores_list:
                     t = str(item.get("ticker", "")).zfill(6)
@@ -933,6 +1073,7 @@ class DatasetBuilder:
 
         if not date_ticker_scores:
             panel.attrs["dual_source_join_stats"] = {
+                "artifact_dir": str(dual_source_artifact_dir),
                 "dates_found": 0,
                 "dates_missing": (end - start).days + 1,
                 "rows_total": int(len(panel)),
@@ -961,6 +1102,7 @@ class DatasetBuilder:
 
         if not ds_records:
             panel.attrs["dual_source_join_stats"] = {
+                "artifact_dir": str(dual_source_artifact_dir),
                 "dates_found": len(date_ticker_scores),
                 "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
                 "rows_total": int(len(panel)),
@@ -1012,6 +1154,7 @@ class DatasetBuilder:
 
         total = join_hit + join_miss
         panel.attrs["dual_source_join_stats"] = {
+            "artifact_dir": str(dual_source_artifact_dir),
             "dates_found": len(date_ticker_scores),
             "dates_missing": max(0, (end - start).days + 1 - len(date_ticker_scores)),
             "rows_total": int(len(panel)),

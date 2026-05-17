@@ -70,13 +70,14 @@ _MINIMAL_CFG_EVAL = {
 }
 
 
-def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None):
+def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None, cost_aware=None):
     """config_load 패치용 side_effect."""
     _vt = vt or _MINIMAL_CFG_VT
     _wf = wf or _MINIMAL_CFG_WF
     _cost = cost or _MINIMAL_CFG_COST
     _eval = eval_ or _MINIMAL_CFG_EVAL
     _service = service or {}
+    _cost_aware = cost_aware or {}
 
     def _loader(file: str = "risk_config.yaml", key: str | None = None):
         if key == "validation_tools.backtest_engine":
@@ -89,6 +90,8 @@ def _make_cfg_loader(vt=None, wf=None, cost=None, eval_=None, service=None):
             return _eval
         if key == "service_policy_replay":
             return _service
+        if key == "cost_aware_retraining":
+            return _cost_aware
         # pit_safety 등 기타 키 → 빈 dict
         return {}
 
@@ -138,13 +141,18 @@ def test_service_policy_bool_strings_are_not_truthy() -> None:
         service={
             "allow_position_pyramiding": "false",
             "turnover_budget_hard_stop": "false",
-        }
+        },
+        cost_aware={
+            "trade_probability_gate": {"enabled": "false", "min_probability": "0.7"}
+        },
     )
 
     policy = engine._service_policy_config()
 
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is False
+    assert policy.trade_probability_gate_enabled is False
+    assert policy.min_trade_probability == 0.7
 
 
 class _mode_b_env:
@@ -219,6 +227,63 @@ def test_replay_panel_includes_manifest_side_features() -> None:
         assert col in panel.columns
     assert "ticker" not in panel.columns
     assert "ts_close" not in panel.columns
+
+
+def test_real_bar_replay_materializes_neutral_alpha_factor_features(monkeypatch, tmp_path):
+    """C12 real-bar replay도 active alpha factor 후보 컬럼을 neutral feature로 맞춘다."""
+    import pandas as pd
+
+    class _Builder:
+        target_col = "label_5m_ret"
+        _ds_enabled_for_lgbm = False
+        _exog_enabled_for_lgbm = False
+
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+            self._neutral_feature_cols: list[str] = []
+
+        def add_neutral_feature_columns(self, columns: list[str]) -> None:
+            self._neutral_feature_cols.extend(columns)
+
+        def _load_ticker_bars(self, ticker, start_date, end_date):
+            _ = start_date, end_date
+            return pd.DataFrame(
+                {
+                    "ticker": [ticker],
+                    "ts_close": [pd.Timestamp("2026-01-12 09:00:00", tz="Asia/Seoul")],
+                    "close": [100.0],
+                }
+            )
+
+        def _compute_rolling_features(self, raw):
+            raw = raw.copy()
+            raw["feature_score"] = 3.0
+            return raw
+
+        def _generate_labels(self, with_feats):
+            with_feats = with_feats.copy()
+            with_feats["label_5m_ret"] = 0.01
+            return with_feats
+
+        def _join_neutral_feature_columns(self, panel):
+            panel = panel.copy()
+            for col in self._neutral_feature_cols:
+                panel[col] = 0.0
+            return panel
+
+    monkeypatch.setattr("src.data.dataset_builder.DatasetBuilder", _Builder)
+    engine = _make_engine(artifacts_root=tmp_path)
+
+    result = engine._run_single_fold_real_bars(
+        fold={"fold_idx": 0, "test_trading_dates": ["20260112"]},
+        universe=["005930"],
+        model_callable=lambda features: features[0] + features[1],
+        feature_cols=["feature_score", "alpha_factor_0"],
+        candidate_artifact={"metadata": {"target_col": "label_5m_ret"}},
+    )
+
+    assert result["bar_count"] == 1
+    assert result["predicted_signals"] == [3.0]
 
 
 def test_service_policy_expected_date_range_uses_first_test_fold() -> None:
@@ -329,6 +394,30 @@ def test_purge_embargo_applied():
             f"fold {fold['fold_idx']}: test_start={fold['test_start'].date()} "
             f"< buffer_end={buffer_end.date()}"
         )
+
+
+def test_build_folds_uses_kospi_trading_days_not_calendar() -> None:
+    """walk_forward *_days는 calendar day가 아니라 KOSPI 거래일 수로 해석한다."""
+    engine = _make_engine()
+
+    folds = engine._build_folds(
+        start_dt=datetime(2026, 1, 2, tzinfo=_KST),  # Friday
+        end_dt=datetime(2026, 2, 1, tzinfo=_KST),
+        purge_bars=390,
+        embargo_bars=390,
+    )
+
+    first = folds[0]
+    assert first["train_trading_dates"] == [
+        "20260102",
+        "20260105",
+        "20260106",
+        "20260107",
+        "20260108",
+    ]
+    assert first["test_trading_dates"] == ["20260113", "20260114", "20260115"]
+    assert first["test_start"].strftime("%Y%m%d") == "20260113"
+    assert (first["test_end"] - timedelta(days=1)).strftime("%Y%m%d") == "20260115"
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -470,7 +559,8 @@ def test_loads_candidate_bundle_model(tmp_path: Path):
                     "feat_5m_ret",
                     "feat_30m_vol",
                     "feat_60m_trend",
-                ]
+                ],
+                "target_col": "label_5m_ret",
             },
             fh,
             ensure_ascii=False,
@@ -478,8 +568,15 @@ def test_loads_candidate_bundle_model(tmp_path: Path):
         )
     universe = ["005930", "000660", "042700", "403870"]
     for idx, ticker in enumerate(universe):
-        _write_backtest_day(tmp_path, ticker, "20260109", seed=idx)
-        _write_backtest_day(tmp_path, ticker, "20260112", seed=idx + 10)
+        for day_offset, trading_date in enumerate([
+            "20260113",
+            "20260114",
+            "20260115",
+            "20260116",
+            "20260119",
+            "20260120",
+        ]):
+            _write_backtest_day(tmp_path, ticker, trading_date, seed=idx + day_offset * 10)
 
     engine = _make_engine(artifacts_root=tmp_path)
     with _mode_b_env():
@@ -512,6 +609,7 @@ def test_candidate_bundle_metadata_synthetic_fallback_is_exposed(tmp_path: Path)
         json.dump(
             {
                 "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_5m_ret",
                 "data_source": "synthetic_fallback",
                 "synthetic_fallback": True,
             },
@@ -546,6 +644,7 @@ def test_candidate_bundle_metadata_synthetic_fallback_string_false(tmp_path: Pat
         json.dump(
             {
                 "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_5m_ret",
                 "data_source": "artifact_bars",
                 "synthetic_fallback": "false",
             },
@@ -560,6 +659,70 @@ def test_candidate_bundle_metadata_synthetic_fallback_string_false(tmp_path: Pat
     assert artifact["loaded"] is True
     assert artifact["synthetic_fallback"] is False
     assert artifact["data_source"] == "artifact_bars"
+
+
+def test_candidate_bundle_exposes_target_col_metadata(tmp_path: Path):
+    """C12 replay는 candidate metadata의 target_col을 artifact summary로 보존한다."""
+    bundle_id = "BUNDLE-20260509-TARGET01"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_30m_net_ret",
+                "label_horizon_bars": 30,
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    _, _, artifact = engine._resolve_candidate_model(bundle_id)
+
+    assert artifact["metadata"]["target_col"] == "label_30m_net_ret"
+    assert artifact["metadata"]["label_horizon_bars"] == 30
+    assert engine._candidate_target_col(artifact, "label_5m_ret") == "label_30m_net_ret"
+
+
+def test_candidate_bundle_exposes_trade_classifier_metadata(tmp_path: Path):
+    """service-policy replay가 candidate summary만으로 trade classifier를 로드한다."""
+    from src.mode_b.service_policy_replay import ServicePolicyReplayEngine
+
+    bundle_id = "BUNDLE-20260509-TRADE01"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    classifier_path = lgbm_dir / "trade_classifier.pkl"
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with classifier_path.open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "feature_cols": ["f1", "f2", "f3", "f4"],
+                "target_col": "label_session_close_net_ret",
+                "trade_no_trade_classifier": {
+                    "status": "PASS",
+                    "calibration_status": "PASS",
+                    "model_path": str(classifier_path),
+                },
+            },
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+    _, _, artifact = engine._resolve_candidate_model(bundle_id)
+    loaded_classifier = ServicePolicyReplayEngine._load_trade_probability_model(artifact)
+
+    assert artifact["metadata"]["trade_no_trade_classifier"]["status"] == "PASS"
+    assert loaded_classifier is not None
+    assert loaded_classifier.predict([[1.0, 2.0, 3.0, 4.0]]) == [0.1]
 
 
 def test_candidate_bundle_requires_metadata(tmp_path: Path):
@@ -581,6 +744,29 @@ def test_candidate_bundle_requires_metadata(tmp_path: Path):
                 universe=["005930"],
                 date_range=_default_date_range(25),
             )
+
+
+def test_candidate_bundle_requires_target_col_metadata(tmp_path: Path):
+    """staged candidate는 target_col 누락 시 기본 5m 평가로 fallback하지 않는다."""
+    from src.mode_b.validation_tools import BundleLoadFailed
+
+    bundle_id = "BUNDLE-20260509-NOTARGET"
+    lgbm_dir = tmp_path / "bundles" / bundle_id / "lgbm"
+    lgbm_dir.mkdir(parents=True)
+    with (lgbm_dir / "latest_model.pkl").open("wb") as fh:
+        pickle.dump(_CandidateModel(), fh)
+    with (lgbm_dir / "latest_model_metadata.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {"feature_cols": ["f1", "f2", "f3", "f4"]},
+            fh,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    engine = _make_engine(artifacts_root=tmp_path)
+
+    with pytest.raises(BundleLoadFailed, match="target_col"):
+        engine._resolve_candidate_model(bundle_id)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -676,7 +862,7 @@ def test_bar_count_match():
 
     expected = 0
     for fold in folds:
-        test_days = max(1, (fold["test_end"] - fold["test_start"]).days)
+        test_days = len(fold.get("test_trading_dates") or [])
         expected += test_days * len(universe) * wf_cfg["trading_minutes_per_day"]
 
     assert result["bar_count"] == expected, (

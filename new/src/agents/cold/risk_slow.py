@@ -21,6 +21,8 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
+from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("risk_slow")
 
@@ -75,6 +77,29 @@ class RiskAgentSlow(AgentBase):
         except Exception as e:
             logger.warning("[risk_slow] 설정 로드 실패: %s. 기본값 사용", e)
             return 300
+
+    @staticmethod
+    def _event_trace(event: dict[str, Any]) -> dict[str, Any]:
+        """RiskSlow direct/fallback publish trace를 6자리 ticker 기준으로 정규화한다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        ticker = normalize_ticker(event.get("ticker") or payload.get("ticker"))
+        raw_scope = str(event.get("scope") or "").strip()
+        if raw_scope.startswith("ticker:"):
+            scoped_ticker = normalize_ticker(raw_scope.split(":", 1)[1])
+            scope = f"ticker:{scoped_ticker}" if scoped_ticker else "market"
+        elif raw_scope:
+            scope = raw_scope
+        elif ticker:
+            scope = f"ticker:{ticker}"
+        else:
+            scope = "market"
+        return {
+            "event_id": event.get("event_id"),
+            "occurred_at": event.get("occurred_at"),
+            "asof": event.get("asof"),
+            "ticker": ticker or None,
+            "scope": scope,
+        }
 
     # ------------------------------------------------------------------
     # C5 report 생성
@@ -135,6 +160,11 @@ class RiskAgentSlow(AgentBase):
         ticker = event.get("ticker") or event.get("payload", {}).get("ticker", "")
         payload_raw = event.get("payload", {})
         occurred_at = event.get("occurred_at", "")
+        if occurred_at and not event.get("asof"):
+            raise PITViolationError("[risk_slow] asof_required: occurred_at 이벤트는 asof가 필요합니다.")
+        if occurred_at:
+            assert_pit_safe(occurred_at, snapshot_ts=event["asof"])
+        trace = self._event_trace(event)
 
         prompt = self._build_prompt(
             event_type=event_type,
@@ -169,17 +199,23 @@ class RiskAgentSlow(AgentBase):
                 "micro_note_ref": None,
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
                 "narrative": parsed.get("narrative", "")[:self._narrative_max_chars],
-                "affected_tickers": parsed.get("affected_tickers", [ticker] if ticker else []),
+                "affected_tickers": parsed.get(
+                    "affected_tickers",
+                    [trace["ticker"]] if trace["ticker"] else [],
+                ),
                 "regime_signal": parsed.get("regime_signal"),
                 "llm_model": llm_result.model_used,
                 "llm_latency_ms": llm_result.latency_ms,
+                **trace,
             },
             channel=publish_channel,
         )
         self._publish_if_available(publish_channel, rpt)
 
         # macro memory 저장
-        self._save_macro_memory(event_type, ticker, parsed)
+        memory_error = self._save_macro_memory(event_type, ticker, parsed)
+        if memory_error is not None:
+            rpt["memory_write_error"] = memory_error
 
         return rpt
 
@@ -244,13 +280,15 @@ class RiskAgentSlow(AgentBase):
         else:
             stance = "neutral"
 
-        tickers = re.findall(r"\b(\d{6})\b", content)
+        ticker_candidates = re.findall(r"(?<!\d)(\d{6})(?!\d)", content)
 
         return {
             "stance": stance,
             "risk_level": "high" if stance == "veto_recommendation" else "medium",
             "regime_signal": "regime" in lower or "체제" in content,
-            "affected_tickers": list(dict.fromkeys(tickers)),
+            "affected_tickers": self._safe_ticker_list(
+                [f"mentioned {ticker}" for ticker in ticker_candidates]
+            ),
             "narrative": content[:self._narrative_max_chars],
         }
 
@@ -262,7 +300,11 @@ class RiskAgentSlow(AgentBase):
         if value is None:
             return default
         if isinstance(value, (int, float)):
-            return bool(value)
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+            return default
         if isinstance(value, str):
             normalized = value.strip().lower()
             if normalized in {"true", "yes", "y", "1", "regime", "regime_change", "체제", "변화"}:
@@ -279,12 +321,9 @@ class RiskAgentSlow(AgentBase):
         for item in raw_items:
             if item is None:
                 continue
-            text = str(item).strip()
-            if not text:
-                continue
-            match = re.search(r"\d{1,6}", text)
-            if match:
-                tickers.append(match.group(0).zfill(6))
+            ticker = normalize_ticker(item)
+            if ticker:
+                tickers.append(ticker)
         return list(dict.fromkeys(tickers))
 
     def _choose_publish_channel(self, parsed: dict[str, Any]) -> str:
@@ -304,11 +343,19 @@ class RiskAgentSlow(AgentBase):
         fast_eval: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """LLM 실패 시 fast_eval 기반 fallback 응답."""
-        stance = "neutral"
-        risk_level = "low"
         if fast_eval:
             stance = fast_eval.get("stance", "neutral")
             risk_level = fast_eval.get("risk_level", "low")
+            regime_signal = self._safe_bool(fast_eval.get("regime_signal", False))
+            narrative = "[LLM 호출 실패. Fast Rule 결과 기반 fallback]"
+        else:
+            stance, risk_level, regime_signal, narrative = (
+                self._fallback_without_fast_eval(event)
+            )
+        trace = self._event_trace(event)
+        publish_channel = self._choose_publish_channel(
+            {"stance": stance, "regime_signal": regime_signal}
+        )
 
         rpt = self.report(
             "risk_warning",
@@ -318,12 +365,45 @@ class RiskAgentSlow(AgentBase):
                 "macro_note_ref": None,
                 "micro_note_ref": None,
                 "fast_rule_match": fast_eval.get("fast_rule_match") if fast_eval else None,
-                "narrative": "[LLM 호출 실패. Fast Rule 결과 기반 fallback]",
-                "affected_tickers": [],
+                "narrative": narrative,
+                "affected_tickers": [trace["ticker"]] if trace["ticker"] else [],
+                "regime_signal": regime_signal,
+                **trace,
             },
+            channel=publish_channel,
         )
-        self._publish_if_available(str(rpt.get("channel", "risk_warning")), rpt)
+        self._publish_if_available(publish_channel, rpt)
         return rpt
+
+    def _fallback_without_fast_eval(
+        self,
+        event: dict[str, Any],
+    ) -> tuple[str, str, bool, str]:
+        """LLM과 Fast Rule이 모두 없으면 neutral/low로 열지 않는다."""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_type = str(event.get("event_type") or "").strip().lower()
+        priority = str(event.get("priority") or payload.get("priority") or "").strip().lower()
+        severity = str(event.get("severity") or payload.get("severity") or "").strip().lower()
+        is_critical = self._safe_bool(event.get("critical") or payload.get("critical"), default=False)
+        high_risk = (
+            event_type == "dart"
+            or priority in {"critical", "urgent"}
+            or severity in {"critical", "urgent", "high"}
+            or is_critical
+        )
+        if high_risk:
+            return (
+                "veto_recommendation",
+                "high",
+                False,
+                "[LLM 호출 실패 + Fast Rule 없음. 중요 이벤트는 fail-closed veto 처리]",
+            )
+        return (
+            "risk_reduce",
+            "medium",
+            False,
+            "[LLM 호출 실패 + Fast Rule 없음. 보수적 risk_reduce fallback]",
+        )
 
     def _publish_if_available(self, channel: str, message: dict[str, Any]) -> None:
         """Direct RiskSlow calls should also reach MessagePool when pubsub is injected."""
@@ -345,11 +425,10 @@ class RiskAgentSlow(AgentBase):
         event_type: str,
         ticker: str,
         parsed: dict[str, Any],
-    ) -> None:
+    ) -> str | None:
         """macro_notes JSONL 저장."""
         today = datetime.now(_KST).strftime("%Y%m%d")
         path = self._memory_root / "risk_agent" / "macro" / f"{today}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
@@ -358,5 +437,12 @@ class RiskAgentSlow(AgentBase):
             "risk_level": parsed.get("risk_level"),
             "regime_signal": parsed.get("regime_signal"),
         }
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            error = str(e)
+            logger.warning("[risk_slow] memory 저장 실패: path=%s error=%s", path, error)
+            return error
+        return None

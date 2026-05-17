@@ -112,6 +112,7 @@ alpha_decay:
 execution:
   mode: "mock"                 # mock | paper | live
   live_enabled: false          # true면 실계좌 주문 가능
+  allowed_order_types: ["00"]  # KIS ORD_DVSN whitelist. 기본 지정가만 허용
 
 paper_trading:
   report_dir: "artifacts/reports/paper_trading"
@@ -124,6 +125,9 @@ paper_trading:
 paper_auto_trading:
   report_dir: "artifacts/reports/paper_auto_trading"
   confirm_start_phrase: "PAPER_AUTO_OK"
+  enforce_market_session: true
+  market_open_time: "09:00"
+  market_close_time: "15:30"
   require_virtual_mode: true
   require_prelive_pass: true
   require_active_model: true
@@ -137,6 +141,7 @@ paper_auto_trading:
 
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"
+  confirm_deploy_phrase: "DEPLOY_CANDIDATE_OK"
 
 bounded_execution:
   news_agent_max_sec: 10
@@ -171,6 +176,7 @@ event_admission:
   comparator_sort_key: ["priority", "trigger_type", "scope", "recency"]
   dedupe_ttl_sec: 300          # dedupe cache TTL (5분)
   dead_letter_path: "artifacts/dead_letter.jsonl"   # C11 dead_letter_log 경로
+  dead_letter_retention_days: 30   # C11 dead_letter_log.retention_days
 
 llm_budget:
   kanana_daily_limit: 100        # Kanana-o 일일 호출 한도
@@ -275,7 +281,7 @@ backtest_agent:
       rehearsal_business_days: 80
       rationale: "80거래일 수집은 paper/flow rehearsal 전용이다. v1 실계좌 직전 C12/C14/deploy_quality PASS는 KIS retention probe로 확인된 20250509~20260515 30종목 1분봉 학습 메타데이터가 있어야만 허용한다. 10년 벤더 데이터는 v2 research 목표로 분리한다."
     on_pass:
-      human_approval_required: false
+      human_approval_required: true
       action: "deploy"
     on_warn:
       human_approval_required: true    # operator 수동 확인
@@ -611,6 +617,12 @@ connector_defaults:
   max_retries: 3        # 네트워크 실패 재시도 횟수
   backoff_base: 2       # 지수 백오프 base (2 ** attempt)
 
+kis_rest:
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5       # retry 소진 call 연속 N회 실패 시 OPEN
+    open_duration_sec: 60      # OPEN 유지 후 half-open 1회 허용
+
 # PIT-Safety snapshot policy (불변 원칙 1 enforcement)
 # pit_guard.py가 참조. 18:00 KST = snapshot cutoff
 pit_safety:
@@ -713,6 +725,29 @@ preprocessor:
 
 exogenous_features:
   enabled_for_lgbm: true
+  us_market_holidays_2025:
+    - "2025-01-01"
+    - "2025-01-09"
+    - "2025-01-20"
+    - "2025-02-17"
+    - "2025-04-18"
+    - "2025-05-26"
+    - "2025-06-19"
+    - "2025-07-04"
+    - "2025-09-01"
+    - "2025-11-27"
+    - "2025-12-25"
+  us_market_holidays_2026:
+    - "2026-01-01"
+    - "2026-01-19"
+    - "2026-02-16"
+    - "2026-04-03"
+    - "2026-05-25"
+    - "2026-06-19"
+    - "2026-07-03"
+    - "2026-09-07"
+    - "2026-11-26"
+    - "2026-12-25"
   neutral_defaults:
     us_sp500_change: 0.0
     us_nasdaq_change: 0.0
@@ -802,8 +837,23 @@ walk_forward:
 live_data_readiness:
   min_rows_per_day: 300             # KIS virtual 과거 분봉은 일부 종목 381 rows도 정상으로 허용
   train_min_rows_per_day: 300       # LightGBM real artifact 날짜 인정 최소 row 수
+  min_session_span_minutes: 300      # 오전장 일부만 있는 300-row artifact를 학습 가능 날짜에서 제외
+  max_bar_gap_minutes: 5             # 중간 구간 누락/큰 timestamp jump artifact 차단
+  allow_closing_auction_gap: true     # KIS 1분봉은 15:19 이후 단일 15:30 종가 bar가 정상
+  max_closing_auction_gap_minutes: 15
+  known_market_halt_intervals:
+    - date: "20260304"                # KRX KOSPI/KOSDAQ circuit breaker; 11:17~11:48 거래정지/단일가 구간
+      start: "11:17"
+      end: "11:48"
+      reason: "KRX KOSPI/KOSDAQ circuit breaker"
+    - date: "20260309"                # KRX circuit breaker; 10:32~11:01 거래정지/단일가 구간
+      start: "10:32"
+      end: "11:01"
+      reason: "KRX circuit breaker"
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
+  max_consecutive_backfill_failed_dates: 3
+  backfill_failed_ticker_ratio_threshold: 0.8
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"
@@ -890,6 +940,7 @@ service_policy_replay:
   allow_position_pyramiding: false
   turnover_budget_hard_stop: true
   min_expected_net_alpha_bps: 15.0
+  expected_net_alpha_source: "rank_score"  # LambdaRank score를 bps로 환산하지 않는다. calibrated_net_bps head 생성 전까지 threshold gate 비활성.
   min_service_policy_sharpe: 0.0
 
 # Cost-aware retraining preparation. 이 섹션은 모델을 자동 deploy하지 않는다.
@@ -914,6 +965,14 @@ cost_aware_retraining:
     min_expected_net_alpha_bps_from_service_policy: true
     require_phase2_non_neutral_coverage: true
     require_service_policy_replay_before_deploy: true
+  trade_probability_gate:
+    enabled: false
+    min_probability: 0.50
+    apply_to_policy: "heuristic_only"
+  label_horizon_gate:
+    min_mean_net_bps: 2.5
+    min_positive_net_rate: 0.53
+    allow_warn_for_research_only: false
 
 # S4-4 추가 (2026-05-02) — Hot Path 성능 최적화
 # HotPathProfiler 단계별 SLA 임계값. 전체 p95 SSOT = quant_agent.latency_p95_target_ms.
@@ -1003,6 +1062,7 @@ model_registry:
     - data_version
     - created_at
     - label_horizon_bars
+    - target_col
     - label_generation_version
     - label_session_scope
 

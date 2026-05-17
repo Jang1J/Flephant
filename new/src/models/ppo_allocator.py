@@ -24,6 +24,7 @@ import numpy as np
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_portfolio_patch_id
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_float
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("ppo_allocator")
@@ -62,12 +63,29 @@ class PPOAllocator:
         pos_cfg = config_load("risk_config.yaml", "position_limits")
         turnover_cfg = config_load("risk_config.yaml", "turnover_cap")
         regime_cfg = config_load("risk_config.yaml", "regime_gate")
+        cost_cfg = config_load("risk_config.yaml", "cost_aware_retraining") or {}
+        trade_gate_cfg = cost_cfg.get("trade_probability_gate") or {}
+        sector_cfg = config_load("sector_config.yaml", "ticker_to_sector") or {}
 
         self._max_names: int = int(pos_cfg["max_names"])
         self._max_single_name: float = float(pos_cfg["max_single_name"])
         self._max_sector: float = float(pos_cfg["max_sector"])
         self._min_cash: float = float(pos_cfg["min_cash"])
         self._min_confidence: float = float(pos_cfg["min_confidence"])
+        self._trade_probability_gate_enabled = safe_bool(
+            trade_gate_cfg.get("enabled"),
+            default=False,
+        )
+        self._min_trade_probability = safe_float(
+            trade_gate_cfg.get("min_probability"),
+            default=0.5,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        self._ticker_to_sector: dict[str, str] = {
+            pad_ticker(str(ticker)): str(sector)
+            for ticker, sector in sector_cfg.items()
+        }
 
         self._daily_turnover_max: float = float(turnover_cfg["daily_max"])
         self._regime_actions: dict[str, Any] = dict(regime_cfg["actions"])
@@ -118,16 +136,30 @@ class PPOAllocator:
         if self._policy is not None:
             return self._allocate_ppo(scores, current_positions, market_state, quant_output)
 
+        scores, trade_rejected, trade_gate = self._apply_trade_probability_gate(
+            scores,
+            quant_output,
+        )
+        if not scores:
+            return self._empty_allocation(
+                quant_output,
+                rejected=trade_rejected,
+                reason="all_below_min_trade_probability",
+                trade_probability_gate=trade_gate,
+            )
+
         # 2. Cross-sectional confidence (softmax 기반, heuristic_v1)
         confidence = self._compute_confidence(scores)
 
         # 3. min_confidence 필터
         filtered, rejected = self._apply_min_confidence(scores, confidence)
+        rejected = trade_rejected + rejected
         if not filtered:
             return self._empty_allocation(
                 quant_output,
                 rejected=rejected,
                 reason="all_below_min_confidence",
+                trade_probability_gate=trade_gate,
             )
 
         # 4. Top-K 선택
@@ -140,13 +172,16 @@ class PPOAllocator:
         # 6. max_single_name cap
         capped_weights = self._apply_max_single_cap(raw_weights)
 
-        # 7. regime_gate multiplier
+        # 7. max_sector cap
+        sector_capped_weights = self._apply_max_sector_cap(capped_weights)
+
+        # 8. regime_gate multiplier
         regime_multiplier = self._resolve_regime_multiplier(market_state)
         scaled_weights = {
-            t: float(w * regime_multiplier) for t, w in capped_weights.items()
+            t: float(w * regime_multiplier) for t, w in sector_capped_weights.items()
         }
 
-        # 8. cash_weight
+        # 9. cash_weight
         total_weight = float(sum(scaled_weights.values()))
         cash_weight = max(float(self._min_cash), 1.0 - total_weight)
         # target_weights 합 + cash_weight > 1 이면 비례 축소
@@ -166,6 +201,7 @@ class PPOAllocator:
             rejected=rejected,
             quant_output=quant_output,
             regime_multiplier=regime_multiplier,
+            trade_probability_gate=trade_gate,
         )
 
     # ================================================================== #
@@ -184,8 +220,12 @@ class PPOAllocator:
                 if not isinstance(item, dict) or "ticker" not in item:
                     continue
                 t = pad_ticker(str(item["ticker"]))
-                s = float(item.get("score", 0.0))
-                scores[t] = s
+                try:
+                    s = float(item.get("score", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(s):
+                    scores[t] = s
             return scores
 
         if isinstance(quant_output, dict):
@@ -195,7 +235,12 @@ class PPOAllocator:
                 for t, s in raw_scores.items():
                     if s is None:
                         continue
-                    scores[pad_ticker(str(t))] = float(s)
+                    try:
+                        score = float(s)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(score):
+                        scores[pad_ticker(str(t))] = score
                 return scores
             # 또는 직접 {ticker: score} 형태
             for t, s in quant_output.items():
@@ -263,6 +308,70 @@ class PPOAllocator:
         ]
         return top_k, rejected
 
+    def _apply_trade_probability_gate(
+        self,
+        scores: dict[str, float],
+        quant_output: dict[str, Any] | list[dict[str, Any]],
+    ) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any]]:
+        """Filter low trade/no-trade probabilities when QuantAgent provides them."""
+        state: dict[str, Any] = {
+            "enabled": self._trade_probability_gate_enabled,
+            "applied": False,
+            "min_probability": self._min_trade_probability,
+        }
+        if not self._trade_probability_gate_enabled:
+            state["reason"] = "disabled"
+            return scores, [], state
+        trade_probs = self._normalize_trade_probs(quant_output)
+        if not trade_probs:
+            state["reason"] = "trade_probs_missing"
+            return scores, [], state
+
+        filtered: dict[str, float] = {}
+        rejected: list[dict[str, Any]] = []
+        for ticker, score in scores.items():
+            prob = trade_probs.get(ticker)
+            if prob is None:
+                rejected.append({
+                    "ticker": ticker,
+                    "reason": "missing_trade_probability",
+                    "min_trade_probability": self._min_trade_probability,
+                })
+                continue
+            if prob < self._min_trade_probability:
+                rejected.append({
+                    "ticker": ticker,
+                    "reason": "below_min_trade_probability",
+                    "trade_probability": prob,
+                    "min_trade_probability": self._min_trade_probability,
+                })
+                continue
+            filtered[ticker] = score
+
+        state.update({
+            "applied": True,
+            "n_input": len(scores),
+            "n_passed": len(filtered),
+            "n_rejected": len(rejected),
+        })
+        return filtered, rejected, state
+
+    @staticmethod
+    def _normalize_trade_probs(
+        quant_output: dict[str, Any] | list[dict[str, Any]],
+    ) -> dict[str, float]:
+        if not isinstance(quant_output, dict):
+            return {}
+        raw = quant_output.get("trade_probs")
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, float] = {}
+        for ticker, value in raw.items():
+            prob = safe_float(value, default=float("nan"), min_value=0.0, max_value=1.0)
+            if math.isfinite(prob):
+                out[pad_ticker(str(ticker))] = prob
+        return out
+
     def _compute_weights(
         self,
         top_k_items: list[tuple[str, float]],
@@ -309,6 +418,35 @@ class PPOAllocator:
                     capped[t] = new_w
         return capped
 
+    def _apply_max_sector_cap(self, weights: dict[str, float]) -> dict[str, float]:
+        """Scale each mapped sector down to max_sector, leaving overflow as cash."""
+        if not weights:
+            return weights
+
+        sector_totals: dict[str, float] = {}
+        for ticker, weight in weights.items():
+            sector = self._sector_for_ticker(ticker)
+            sector_totals[sector] = sector_totals.get(sector, 0.0) + weight
+
+        capped = dict(weights)
+        for sector, sector_weight in sector_totals.items():
+            if sector_weight <= self._max_sector + 1e-9:
+                continue
+            scale = self._max_sector / sector_weight
+            for ticker in capped:
+                if self._sector_for_ticker(ticker) == sector:
+                    capped[ticker] = capped[ticker] * scale
+            logger.warning(
+                "[ppo_allocator] max_sector(%.2f) 초과 sector=%s weight=%.4f scale=%.4f",
+                self._max_sector, sector, sector_weight, scale,
+            )
+        return capped
+
+    def _sector_for_ticker(self, ticker: str) -> str:
+        """Return configured sector. Unmapped tickers are capped independently."""
+        padded = pad_ticker(str(ticker))
+        return self._ticker_to_sector.get(padded, f"__unmapped__:{padded}")
+
     def _resolve_regime_multiplier(
         self,
         market_state: dict[str, Any] | None,
@@ -337,6 +475,7 @@ class PPOAllocator:
         rejected: list[dict[str, Any]],
         quant_output: dict | list,
         regime_multiplier: float,
+        trade_probability_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """C7 output 구조 + metadata."""
         ts = self._extract_ts(quant_output)
@@ -370,6 +509,10 @@ class PPOAllocator:
                 "rejected": rejected,
                 "total_weight": total_weight,
                 "regime_multiplier": regime_multiplier,
+                "trade_probability_gate": trade_probability_gate or {
+                    "enabled": self._trade_probability_gate_enabled,
+                    "applied": False,
+                },
             },
         }
 
@@ -378,6 +521,7 @@ class PPOAllocator:
         quant_output: dict | list,
         rejected: list[dict[str, Any]] | None = None,
         reason: str = "empty_input",
+        trade_probability_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ts = self._extract_ts(quant_output)
         pp_id = generate_portfolio_patch_id()
@@ -402,6 +546,10 @@ class PPOAllocator:
                 "rejected": rejected or [],
                 "total_weight": 0.0,
                 "reason": reason,
+                "trade_probability_gate": trade_probability_gate or {
+                    "enabled": self._trade_probability_gate_enabled,
+                    "applied": False,
+                },
             },
         }
 
@@ -499,6 +647,7 @@ class PPOAllocator:
 
         # constraints (기존 heuristic 경로와 동일)
         capped_weights = self._apply_max_single_cap(target_weights)
+        capped_weights = self._apply_max_sector_cap(capped_weights)
         regime_multiplier = self._resolve_regime_multiplier(market_state)
         scaled_weights = {t: float(w * regime_multiplier) for t, w in capped_weights.items()}
 

@@ -37,6 +37,7 @@ def _cfg(overrides: dict | None = None) -> dict:
             "comparator_sort_key": ["priority", "trigger_type", "scope", "recency"],
             "dedupe_ttl_sec": 5,   # 테스트에서 짧은 TTL 사용
             "dead_letter_path": "artifacts/dead_letter.jsonl",
+            "dead_letter_retention_days": 30,
         }
     }
     if overrides:
@@ -51,6 +52,7 @@ def _make_event(
     scope: str = "market",
     occurred_at: str | None = None,
     expires_at: str | None = None,
+    asof: str | None = None,
     supersedes: str | None = None,
 ) -> dict:
     """테스트용 정규화 이벤트 dict 생성."""
@@ -59,7 +61,7 @@ def _make_event(
         occurred_at = (now - timedelta(minutes=5)).isoformat()
     if expires_at is None:
         expires_at = (now + timedelta(hours=1)).isoformat()
-    return {
+    event = {
         "event_id": event_id,
         "source": "naver_news",
         "event_type": event_type,
@@ -76,6 +78,9 @@ def _make_event(
         "pit_safe": True,
         "payload": {},
     }
+    if asof is not None:
+        event["asof"] = asof
+    return event
 
 
 # ------------------------------------------------------------------
@@ -135,6 +140,18 @@ def test_supersedes_blocks_reprocess(tmp_path: Path) -> None:
     assert any(json.loads(l)["drop_reason"] == "SUPERSEDED" for l in lines)
 
 
+def test_supersedes_ttl_expiry_allows_reference_again(tmp_path: Path) -> None:
+    cfg = _cfg({"dedupe_ttl_sec": 0})
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    original = _make_event(event_id="EVT-ORIG-TTL")
+    later = _make_event(event_id="EVT-LATER-TTL", supersedes="EVT-ORIG-TTL")
+
+    assert ea.admit(original) is True
+    assert ea.admit(later) is True
+    assert ea.backlog_size() == 2
+
+
 # ------------------------------------------------------------------
 # 4. stale_drop: expires_at < now
 # ------------------------------------------------------------------
@@ -150,6 +167,48 @@ def test_stale_drop_expired_event(tmp_path: Path, _enable_stale_check) -> None:
     lines = (tmp_path / "dl.jsonl").read_text(encoding="utf-8").strip().splitlines()
     entry = json.loads(lines[0])
     assert entry["drop_reason"] == "STALE"
+
+
+def test_stale_drop_uses_event_asof_for_historical_replay(
+    tmp_path: Path,
+    _enable_stale_check,
+) -> None:
+    """과거 시나리오 이벤트는 wall-clock now가 아니라 event asof 기준으로 stale 판단."""
+    cfg = _cfg()
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    asof = datetime(2026, 5, 4, 9, 30, 0, tzinfo=_KST)
+    ev = _make_event(
+        event_id="EVT-HIST-ASOF-001",
+        occurred_at=asof.isoformat(),
+        expires_at=(asof + timedelta(minutes=30)).isoformat(),
+        asof=asof.isoformat(),
+    )
+
+    assert ea.admit(ev) is True
+
+
+def test_leaked_test_freshness_skip_does_not_bypass_runtime_stale_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """테스트용 env 가 런타임으로 새도 stale live/cold 이벤트는 거부."""
+    monkeypatch.setenv("ELEPHANT_TEST_FRESHNESS_SKIP", "1")
+    cfg = _cfg()
+    ea = EventAdmission(config=cfg, dead_letter_path=tmp_path / "dl.jsonl")
+
+    past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
+    ev = _make_event(
+        event_id="EVT-STALE-LEAKED-ENV",
+        event_type="news",
+        expires_at=past_expires,
+    )
+    assert ea.admit(ev) is False
+
+    lines = (tmp_path / "dl.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    entry = json.loads(lines[0])
+    assert entry["drop_reason"] == "STALE"
+    assert entry["event_id"] == "EVT-STALE-LEAKED-ENV"
 
 
 # ------------------------------------------------------------------
@@ -295,6 +354,44 @@ def test_dead_letter_log_jsonl_format(tmp_path: Path, _enable_stale_check) -> No
     datetime.fromisoformat(entry["timestamp"])
 
 
+def test_dead_letter_retention_prunes_old_entries(
+    tmp_path: Path,
+    _enable_stale_check,
+) -> None:
+    path = tmp_path / "dl.jsonl"
+    old_ts = (datetime.now(_KST) - timedelta(days=31)).isoformat()
+    recent_ts = (datetime.now(_KST) - timedelta(days=1)).isoformat()
+    path.write_text(
+        "\n".join([
+            json.dumps({
+                "timestamp": old_ts,
+                "event_id": "EVT-OLD",
+                "drop_reason": "STALE",
+                "original_event_ref": "EVT-OLD",
+            }, ensure_ascii=False),
+            json.dumps({
+                "timestamp": recent_ts,
+                "event_id": "EVT-RECENT",
+                "drop_reason": "STALE",
+                "original_event_ref": "EVT-RECENT",
+            }, ensure_ascii=False),
+            "{malformed-json",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    cfg = _cfg({"dead_letter_retention_days": 30})
+    ea = EventAdmission(config=cfg, dead_letter_path=path)
+
+    past_expires = (datetime.now(_KST) - timedelta(hours=1)).isoformat()
+    assert ea.admit(_make_event(event_id="EVT-NEW", expires_at=past_expires)) is False
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert all("EVT-OLD" not in line for line in lines)
+    assert any("EVT-RECENT" in line for line in lines)
+    assert any("malformed-json" in line for line in lines)
+    assert any("EVT-NEW" in line for line in lines)
+
+
 # ------------------------------------------------------------------
 # 11. config YAML 연동 (실제 risk_config.yaml 로드)
 # ------------------------------------------------------------------
@@ -311,11 +408,13 @@ def test_config_loads_from_yaml(tmp_path: Path) -> None:
     assert ea_cfg.get("max_cold_path_jobs_per_minute") == 10
     assert ea_cfg.get("dedupe_ttl_sec") == 300
     assert ea_cfg.get("dead_letter_path") == "artifacts/dead_letter.jsonl"
+    assert ea_cfg.get("dead_letter_retention_days") == 30
 
     # EventAdmission 실제 인스턴스화
     ea = EventAdmission(dead_letter_path=tmp_path / "dl.jsonl")
     assert ea._max_backlog == 3
     assert ea._dedupe_ttl_sec == 300
+    assert ea._dead_letter_retention_days == 30
 
 
 # ------------------------------------------------------------------

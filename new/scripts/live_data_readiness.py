@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -36,7 +37,7 @@ from src.connectors.naver_rest import NaverNewsClient  # noqa: E402
 from src.connectors.us_market import USMarketClient  # noqa: E402
 from src.data.backfill import Backfill  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -146,13 +147,43 @@ def _community_post_date(post: Any) -> str | None:
     return None
 
 
+def _final_dataset_gate_cfg() -> dict[str, Any]:
+    cfg = config_load("risk_config.yaml", "backtest_agent") or {}
+    gate_cfg = (
+        cfg.get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    return gate_cfg if isinstance(gate_cfg, dict) else {}
+
+
 def _load_active_tickers(max_tickers: int | None) -> list[str]:
     with _UNIVERSE_PATH.open("r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
+    gate_cfg = _final_dataset_gate_cfg()
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
+    allowed_stock_statuses = {"active"}
+    allowed_sector_statuses = {"confirmed"}
+    if include_pending:
+        allowed_stock_statuses = {
+            str(status)
+            for status in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        allowed_sector_statuses = {
+            str(status)
+            for status in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in allowed_sector_statuses:
+            continue
         for stock in sector.get("stocks", []) or []:
-            if stock.get("status") == "active":
+            if str(stock.get("status")) in allowed_stock_statuses:
                 tickers.append(pad_ticker(str(stock["ticker"])))
     if max_tickers is not None:
         tickers = tickers[:max_tickers]
@@ -215,25 +246,88 @@ def _saved_file_summary(
         row_counts: dict[str, int | None] = {}
         valid_dates: dict[str, bool] = {}
         timestamp_dates_match: dict[str, bool | None] = {}
+        ticker_matches: dict[str, bool | None] = {}
+        missing_timestamp_counts: dict[str, int | None] = {}
+        ticker_mismatch_counts: dict[str, int | None] = {}
+        duplicate_ts_counts: dict[str, int | None] = {}
+        out_of_hours_counts: dict[str, int | None] = {}
+        first_ts_by_date: dict[str, str | None] = {}
+        last_ts_by_date: dict[str, str | None] = {}
+        session_span_minutes_by_date: dict[str, float | None] = {}
+        session_span_ok_by_date: dict[str, bool | None] = {}
+        max_gap_minutes_by_date: dict[str, float | None] = {}
+        max_gap_ok_by_date: dict[str, bool | None] = {}
+        unexpected_max_gap_minutes_by_date: dict[str, float | None] = {}
+        allowed_closing_auction_gap_counts: dict[str, int | None] = {}
+        allowed_market_halt_gap_counts: dict[str, int | None] = {}
+        missing_ohlcv_counts: dict[str, int | None] = {}
+        non_finite_ohlcv_counts: dict[str, int | None] = {}
+        invalid_ohlcv_counts: dict[str, int | None] = {}
+        duplicate_date_artifacts: dict[str, list[str]] = {}
         file_mtime_ns: dict[str, int] = {}
         if ticker_dir.exists():
+            paths_by_date: dict[str, list[Path]] = {}
             for file_path in sorted(ticker_dir.iterdir()):
                 name = file_path.name
                 if not name.startswith("bars_1m_"):
                     continue
                 date_part = name.removeprefix("bars_1m_").split(".", 1)[0]
                 if start <= date_part <= end:
-                    files.append(str(file_path))
-                    relative_files.append(_repo_relative(file_path))
-                    rows = _count_bar_file_rows(file_path)
-                    date_matches = _bar_file_date_matches(file_path, date_part)
-                    row_counts[date_part] = rows
-                    timestamp_dates_match[date_part] = date_matches
-                    file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
-                    valid_dates[date_part] = (
-                        rows is not None and int(rows) >= int(min_rows)
-                        and date_matches is True
-                    )
+                    paths_by_date.setdefault(date_part, []).append(file_path)
+            for date_part, paths in sorted(paths_by_date.items()):
+                if len(paths) > 1:
+                    duplicate_date_artifacts[date_part] = [
+                        _repo_relative(path) for path in paths
+                    ]
+                file_path = _preferred_bar_artifact(paths)
+                files.append(str(file_path))
+                relative_files.append(_repo_relative(file_path))
+                inspection = _inspect_bar_file(
+                    file_path,
+                    date_part,
+                    pad_ticker(ticker),
+                    min_rows_per_day=int(min_rows),
+                )
+                rows = inspection.get("rows")
+                row_counts[date_part] = rows
+                timestamp_dates_match[date_part] = inspection.get("timestamp_dates_match")
+                ticker_matches[date_part] = inspection.get("ticker_matches")
+                missing_timestamp_counts[date_part] = inspection.get("missing_timestamp_count")
+                ticker_mismatch_counts[date_part] = inspection.get("ticker_mismatch_count")
+                duplicate_ts_counts[date_part] = inspection.get("duplicate_ts_count")
+                out_of_hours_counts[date_part] = inspection.get("out_of_hours_count")
+                first_ts_by_date[date_part] = inspection.get("first_ts")
+                last_ts_by_date[date_part] = inspection.get("last_ts")
+                session_span_minutes_by_date[date_part] = inspection.get("session_span_minutes")
+                session_span_ok_by_date[date_part] = inspection.get("session_span_ok")
+                max_gap_minutes_by_date[date_part] = inspection.get("max_gap_minutes")
+                max_gap_ok_by_date[date_part] = inspection.get("max_gap_ok")
+                unexpected_max_gap_minutes_by_date[date_part] = inspection.get(
+                    "unexpected_max_gap_minutes"
+                )
+                allowed_closing_auction_gap_counts[date_part] = inspection.get(
+                    "allowed_closing_auction_gap_count"
+                )
+                allowed_market_halt_gap_counts[date_part] = inspection.get(
+                    "allowed_market_halt_gap_count"
+                )
+                missing_ohlcv_counts[date_part] = inspection.get("missing_ohlcv_count")
+                non_finite_ohlcv_counts[date_part] = inspection.get("non_finite_ohlcv_count")
+                invalid_ohlcv_counts[date_part] = inspection.get("invalid_ohlcv_count")
+                file_mtime_ns[date_part] = int(file_path.stat().st_mtime_ns)
+                valid_dates[date_part] = (
+                    rows is not None and int(rows) >= int(min_rows)
+                    and inspection.get("timestamp_dates_match") is True
+                    and inspection.get("ticker_matches") is True
+                    and int(inspection.get("duplicate_ts_count") or 0) == 0
+                    and int(inspection.get("out_of_hours_count") or 0) == 0
+                    and inspection.get("session_span_ok") is True
+                    and inspection.get("max_gap_ok") is True
+                    and int(inspection.get("missing_ohlcv_count") or 0) == 0
+                    and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+                    and int(inspection.get("invalid_ohlcv_count") or 0) == 0
+                    and date_part not in duplicate_date_artifacts
+                )
         summary[pad_ticker(ticker)] = {
             "files": files,
             "relative_files": relative_files,
@@ -241,6 +335,24 @@ def _saved_file_summary(
             "row_counts": row_counts,
             "valid_dates": valid_dates,
             "timestamp_dates_match": timestamp_dates_match,
+            "ticker_matches": ticker_matches,
+            "missing_timestamp_counts": missing_timestamp_counts,
+            "ticker_mismatch_counts": ticker_mismatch_counts,
+            "duplicate_ts_counts": duplicate_ts_counts,
+            "out_of_hours_counts": out_of_hours_counts,
+            "first_ts": first_ts_by_date,
+            "last_ts": last_ts_by_date,
+            "session_span_minutes": session_span_minutes_by_date,
+            "session_span_ok": session_span_ok_by_date,
+            "max_gap_minutes": max_gap_minutes_by_date,
+            "max_gap_ok": max_gap_ok_by_date,
+            "unexpected_max_gap_minutes": unexpected_max_gap_minutes_by_date,
+            "allowed_closing_auction_gap_counts": allowed_closing_auction_gap_counts,
+            "allowed_market_halt_gap_counts": allowed_market_halt_gap_counts,
+            "missing_ohlcv_counts": missing_ohlcv_counts,
+            "non_finite_ohlcv_counts": non_finite_ohlcv_counts,
+            "invalid_ohlcv_counts": invalid_ohlcv_counts,
+            "duplicate_date_artifacts": duplicate_date_artifacts,
             "file_mtime_ns": file_mtime_ns,
         }
     return summary
@@ -267,6 +379,30 @@ def _artifact_date_quality(
             row_counts = info.get("row_counts", {})
             valid_dates = info.get("valid_dates", {})
             timestamp_dates_match = info.get("timestamp_dates_match", {})
+            ticker_matches = info.get("ticker_matches", {})
+            missing_timestamp_counts = info.get("missing_timestamp_counts", {})
+            ticker_mismatch_counts = info.get("ticker_mismatch_counts", {})
+            duplicate_ts_counts = info.get("duplicate_ts_counts", {})
+            out_of_hours_counts = info.get("out_of_hours_counts", {})
+            first_ts = info.get("first_ts", {})
+            last_ts = info.get("last_ts", {})
+            session_span_minutes = info.get("session_span_minutes", {})
+            session_span_ok = info.get("session_span_ok", {})
+            max_gap_minutes = info.get("max_gap_minutes", {})
+            max_gap_ok = info.get("max_gap_ok", {})
+            unexpected_max_gap_minutes = info.get("unexpected_max_gap_minutes", {})
+            allowed_closing_auction_gap_counts = info.get(
+                "allowed_closing_auction_gap_counts",
+                {},
+            )
+            allowed_market_halt_gap_counts = info.get(
+                "allowed_market_halt_gap_counts",
+                {},
+            )
+            missing_ohlcv_counts = info.get("missing_ohlcv_counts", {})
+            non_finite_ohlcv_counts = info.get("non_finite_ohlcv_counts", {})
+            invalid_ohlcv_counts = info.get("invalid_ohlcv_counts", {})
+            duplicate_date_artifacts = info.get("duplicate_date_artifacts", {})
             rows = row_counts.get(day)
             if valid_dates.get(day) is True:
                 valid_tickers.append(padded)
@@ -275,6 +411,28 @@ def _artifact_date_quality(
                     "ticker": padded,
                     "rows": rows,
                     "timestamp_dates_match": timestamp_dates_match.get(day),
+                    "ticker_matches": ticker_matches.get(day),
+                    "missing_timestamp_count": missing_timestamp_counts.get(day),
+                    "ticker_mismatch_count": ticker_mismatch_counts.get(day),
+                    "duplicate_ts_count": duplicate_ts_counts.get(day),
+                    "out_of_hours_count": out_of_hours_counts.get(day),
+                    "first_ts": first_ts.get(day),
+                    "last_ts": last_ts.get(day),
+                    "session_span_minutes": session_span_minutes.get(day),
+                    "session_span_ok": session_span_ok.get(day),
+                    "max_gap_minutes": max_gap_minutes.get(day),
+                    "max_gap_ok": max_gap_ok.get(day),
+                    "unexpected_max_gap_minutes": unexpected_max_gap_minutes.get(day),
+                    "allowed_closing_auction_gap_count": (
+                        allowed_closing_auction_gap_counts.get(day)
+                    ),
+                    "allowed_market_halt_gap_count": (
+                        allowed_market_halt_gap_counts.get(day)
+                    ),
+                    "missing_ohlcv_count": missing_ohlcv_counts.get(day),
+                    "non_finite_ohlcv_count": non_finite_ohlcv_counts.get(day),
+                    "invalid_ohlcv_count": invalid_ohlcv_counts.get(day),
+                    "duplicate_date_artifacts": duplicate_date_artifacts.get(day, []),
                     "valid_date": valid_dates.get(day, False),
                 })
         quality[day] = {
@@ -289,16 +447,272 @@ def _artifact_date_quality(
 def _count_bar_file_rows(file_path: Path) -> int | None:
     """parquet/jsonl row count. 읽기 실패 시 None."""
     try:
-        if file_path.suffix == ".jsonl":
-            with file_path.open("r", encoding="utf-8") as fh:
-                return sum(1 for line in fh if line.strip())
-        if file_path.suffix == ".parquet":
-            import pandas as pd  # type: ignore[import]
-
-            return int(len(pd.read_parquet(file_path)))
+        rows = _load_bar_rows(file_path)
+        return len(rows) if rows is not None else None
     except Exception:
         return None
     return None
+
+
+def _preferred_bar_artifact(paths: list[Path]) -> Path:
+    """Prefer parquet over jsonl for the same ticker/date, then newest mtime."""
+    return sorted(
+        paths,
+        key=lambda path: (
+            0 if path.suffix == ".parquet" else 1,
+            -int(path.stat().st_mtime_ns),
+            path.name,
+        ),
+    )[0]
+
+
+def _load_bar_rows(file_path: Path) -> list[dict[str, Any]] | None:
+    if file_path.suffix == ".jsonl":
+        rows: list[dict[str, Any]] = []
+        with file_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    rows.append(json.loads(line))
+        return rows
+    if file_path.suffix == ".parquet":
+        import pandas as pd  # type: ignore[import]
+
+        return pd.read_parquet(file_path).to_dict("records")
+    return None
+
+
+def _parse_bar_timestamp(row: dict[str, Any]) -> datetime | None:
+    for field in ("ts_close", "timestamp", "ts", "datetime"):
+        raw = row.get(field)
+        if raw is None:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_KST)
+        return parsed.astimezone(_KST)
+    return None
+
+
+def _inspect_bar_file(
+    file_path: Path,
+    yyyymmdd: str,
+    ticker: str,
+    min_rows_per_day: int | None = None,
+) -> dict[str, Any]:
+    """Inspect one saved bar artifact for date/ticker/timestamp integrity."""
+    empty_inspection = {
+        "rows": None,
+        "timestamp_dates_match": None,
+        "ticker_matches": None,
+        "missing_timestamp_count": None,
+        "ticker_mismatch_count": None,
+        "duplicate_ts_count": None,
+        "out_of_hours_count": None,
+        "first_ts": None,
+        "last_ts": None,
+        "session_span_minutes": None,
+        "session_span_ok": None,
+        "max_gap_minutes": None,
+        "max_gap_ok": None,
+        "unexpected_max_gap_minutes": None,
+        "allowed_closing_auction_gap_count": None,
+        "allowed_market_halt_gap_count": None,
+        "missing_ohlcv_count": None,
+        "non_finite_ohlcv_count": None,
+        "invalid_ohlcv_count": None,
+    }
+    expected_date = date(
+        int(yyyymmdd[:4]),
+        int(yyyymmdd[4:6]),
+        int(yyyymmdd[6:]),
+    )
+    try:
+        rows = _load_bar_rows(file_path)
+    except Exception:
+        return empty_inspection
+    if rows is None:
+        return empty_inspection
+
+    timestamps = [_parse_bar_timestamp(row) for row in rows]
+    present_timestamps = [ts for ts in timestamps if ts is not None]
+    timestamp_dates = {ts.date() for ts in present_timestamps}
+    missing_timestamp_count = len(rows) - len(present_timestamps)
+    timestamp_dates_match = (
+        bool(rows)
+        and missing_timestamp_count == 0
+        and timestamp_dates == {expected_date}
+    )
+
+    expected_ticker = pad_ticker(ticker)
+    row_tickers = [
+        pad_ticker(str(row.get("ticker")))
+        if row.get("ticker") is not None
+        else None
+        for row in rows
+    ]
+    ticker_mismatch_count = sum(1 for row_ticker in row_tickers if row_ticker != expected_ticker)
+    ticker_matches = bool(rows) and ticker_mismatch_count == 0
+
+    iso_timestamps = [ts.isoformat() for ts in present_timestamps]
+    duplicate_ts_count = len(iso_timestamps) - len(set(iso_timestamps))
+    market_open = time(9, 0)
+    market_close = time(15, 30)
+    out_of_hours_count = sum(
+        1
+        for ts in present_timestamps
+        if ts.time() < market_open or ts.time() > market_close
+    )
+    sorted_timestamps = sorted(present_timestamps)
+    first_ts = sorted_timestamps[0] if sorted_timestamps else None
+    last_ts = sorted_timestamps[-1] if sorted_timestamps else None
+    session_span_minutes = (
+        (last_ts - first_ts).total_seconds() / 60.0
+        if first_ts is not None and last_ts is not None
+        else None
+    )
+    readiness_cfg = _readiness_cfg()
+    allow_closing_auction_gap = safe_bool(
+        readiness_cfg.get("allow_closing_auction_gap", True),
+        default=True,
+    )
+    closing_auction_start = time(15, 20)
+    closing_auction_left_floor = (
+        datetime.combine(expected_date, closing_auction_start, tzinfo=_KST)
+        - timedelta(minutes=5)
+    ).time()
+    max_closing_auction_gap = float(
+        readiness_cfg.get("max_closing_auction_gap_minutes", 15)
+    )
+    known_halt_intervals = [
+        interval
+        for interval in readiness_cfg.get("known_market_halt_intervals", [])
+        if isinstance(interval, dict) and str(interval.get("date")) == yyyymmdd
+    ]
+    gap_minutes = []
+    unexpected_gap_minutes = []
+    allowed_closing_auction_gap_count = 0
+    allowed_market_halt_gap_count = 0
+    for left, right in zip(sorted_timestamps, sorted_timestamps[1:]):
+        gap = (right - left).total_seconds() / 60.0
+        gap_minutes.append(gap)
+        missing_start = left + timedelta(minutes=1)
+        missing_end = right - timedelta(minutes=1)
+        is_closing_auction_gap = (
+            allow_closing_auction_gap
+            and left.date() == right.date()
+            and closing_auction_left_floor <= left.time() < closing_auction_start
+            and right.time() == market_close
+            and gap <= max_closing_auction_gap
+        )
+        is_market_halt_gap = _is_known_market_halt_gap(
+            known_halt_intervals,
+            missing_start=missing_start,
+            missing_end=missing_end,
+        )
+        if is_closing_auction_gap:
+            allowed_closing_auction_gap_count += 1
+        elif is_market_halt_gap:
+            allowed_market_halt_gap_count += 1
+        elif gap > 1.0:
+            unexpected_gap_minutes.append(gap)
+    max_gap_minutes = max(gap_minutes) if gap_minutes else (0.0 if sorted_timestamps else None)
+    unexpected_max_gap_minutes = (
+        max(unexpected_gap_minutes)
+        if unexpected_gap_minutes
+        else (0.0 if sorted_timestamps else None)
+    )
+    min_session_span = float(
+        readiness_cfg.get(
+            "min_session_span_minutes",
+            min_rows_per_day or _readiness_min_rows("min_rows_per_day"),
+        )
+    )
+    max_allowed_gap = float(readiness_cfg.get("max_bar_gap_minutes", 5))
+    session_span_ok = (
+        timestamp_dates_match is True
+        and session_span_minutes is not None
+        and session_span_minutes >= min_session_span
+    )
+    max_gap_ok = (
+        timestamp_dates_match is True
+        and unexpected_max_gap_minutes is not None
+        and unexpected_max_gap_minutes <= max_allowed_gap
+    )
+    required_ohlcv = ("open", "high", "low", "close", "volume")
+    missing_ohlcv_count = 0
+    non_finite_ohlcv_count = 0
+    invalid_ohlcv_count = 0
+    for row in rows:
+        if any(row.get(field) is None for field in required_ohlcv):
+            missing_ohlcv_count += 1
+            continue
+        try:
+            open_price = float(row["open"])
+            high_price = float(row["high"])
+            low_price = float(row["low"])
+            close_price = float(row["close"])
+            volume = float(row["volume"])
+        except (TypeError, ValueError):
+            non_finite_ohlcv_count += 1
+            continue
+        values = (open_price, high_price, low_price, close_price, volume)
+        if not all(math.isfinite(value) for value in values):
+            non_finite_ohlcv_count += 1
+            continue
+        if (
+            open_price <= 0
+            or high_price <= 0
+            or low_price <= 0
+            or high_price < low_price
+            or high_price < max(open_price, close_price)
+            or low_price > min(open_price, close_price)
+            or close_price <= 0
+            or volume < 0
+        ):
+            invalid_ohlcv_count += 1
+    return {
+        "rows": len(rows),
+        "timestamp_dates_match": timestamp_dates_match,
+        "ticker_matches": ticker_matches,
+        "missing_timestamp_count": missing_timestamp_count,
+        "ticker_mismatch_count": ticker_mismatch_count,
+        "duplicate_ts_count": duplicate_ts_count,
+        "out_of_hours_count": out_of_hours_count,
+        "first_ts": first_ts.isoformat() if first_ts else None,
+        "last_ts": last_ts.isoformat() if last_ts else None,
+        "session_span_minutes": session_span_minutes,
+        "session_span_ok": session_span_ok,
+        "max_gap_minutes": max_gap_minutes,
+        "max_gap_ok": max_gap_ok,
+        "unexpected_max_gap_minutes": unexpected_max_gap_minutes,
+        "allowed_closing_auction_gap_count": allowed_closing_auction_gap_count,
+        "allowed_market_halt_gap_count": allowed_market_halt_gap_count,
+        "missing_ohlcv_count": missing_ohlcv_count,
+        "non_finite_ohlcv_count": non_finite_ohlcv_count,
+        "invalid_ohlcv_count": invalid_ohlcv_count,
+    }
+
+
+def _is_known_market_halt_gap(
+    intervals: list[dict[str, Any]],
+    *,
+    missing_start: datetime,
+    missing_end: datetime,
+) -> bool:
+    if missing_end < missing_start:
+        return False
+    for interval in intervals:
+        try:
+            halt_start = time.fromisoformat(str(interval.get("start", "")))
+            halt_end = time.fromisoformat(str(interval.get("end", "")))
+        except ValueError:
+            continue
+        if halt_start <= missing_start.time() and missing_end.time() <= halt_end:
+            return True
+    return False
 
 
 def _bar_file_date_matches(file_path: Path, yyyymmdd: str) -> bool | None:
@@ -561,10 +975,21 @@ def run_backfill(
         cfg = _readiness_cfg()
         min_rows = _readiness_min_rows("min_rows_per_day")
         require_all = safe_bool(cfg.get("require_all_tickers_for_backfill", True), default=True)
+        max_failed_dates = safe_int(
+            cfg.get("max_consecutive_backfill_failed_dates", 3),
+            default=3,
+            min_value=1,
+        )
+        failed_ticker_ratio_threshold = float(
+            cfg.get("backfill_failed_ticker_ratio_threshold", 1.0)
+        )
+        failed_ticker_ratio_threshold = min(max(failed_ticker_ratio_threshold, 0.0), 1.0)
         backfill = Backfill()
         counts = {pad_ticker(ticker): 0 for ticker in tickers}
         fetch_counts_by_date: dict[str, dict[str, int]] = {}
         skipped_existing_dates: list[str] = []
+        consecutive_failed_dates = 0
+        circuit_breaker: dict[str, Any] = {"triggered": False}
         start = datetime.strptime(start_date, "%Y%m%d").date()
         end = datetime.strptime(end_date, "%Y%m%d").date()
         business_dates = _business_dates_between(start, end)
@@ -602,6 +1027,31 @@ def run_backfill(
             }
             for ticker, count in day_counts.items():
                 counts[pad_ticker(ticker)] = counts.get(pad_ticker(ticker), 0) + count
+            short_fetch_count = sum(
+                1
+                for ticker in tickers
+                if int(fetch_counts_by_date[day].get(pad_ticker(ticker), 0)) < min_rows
+            )
+            short_fetch_ratio = short_fetch_count / max(len(tickers), 1)
+            failed_today = (
+                short_fetch_ratio >= failed_ticker_ratio_threshold
+                if require_all
+                else all(int(count) <= 0 for count in fetch_counts_by_date[day].values())
+            )
+            consecutive_failed_dates = consecutive_failed_dates + 1 if failed_today else 0
+            if consecutive_failed_dates >= max_failed_dates:
+                circuit_breaker = {
+                    "triggered": True,
+                    "date": day,
+                    "consecutive_failed_dates": consecutive_failed_dates,
+                    "max_consecutive_backfill_failed_dates": max_failed_dates,
+                    "min_rows_per_day": min_rows,
+                    "short_fetch_count": short_fetch_count,
+                    "expected_ticker_count": len(tickers),
+                    "short_fetch_ratio": short_fetch_ratio,
+                    "failed_ticker_ratio_threshold": failed_ticker_ratio_threshold,
+                }
+                break
         files = _saved_file_summary(tickers, start_date, end_date, min_rows)
         artifact_missing_or_empty: list[str] = []
         current_fetch_missing_or_short: list[dict[str, Any]] = []
@@ -630,6 +1080,7 @@ def run_backfill(
                 "files": files,
                 "missing_or_empty_tickers": artifact_missing_or_empty,
                 "current_fetch_missing_or_short": current_fetch_missing_or_short,
+                "backfill_circuit_breaker": circuit_breaker,
             },
         )
     except Exception as e:
@@ -648,10 +1099,33 @@ def run_train_if_ready(
     min_rows = _readiness_min_rows("train_min_rows_per_day")
     require_all = safe_bool(cfg.get("require_all_tickers_for_train", True), default=True)
     quality = _artifact_date_quality(tickers, start_date, end_date, min_rows)
+    requested_dates = list(quality.keys())
     if require_all:
         dates = sorted(day for day, item in quality.items() if item["is_valid"])
     else:
         dates = [d for d in _artifact_dates(tickers) if start_date <= d <= end_date]
+    invalid_requested_dates = [
+        day for day in requested_dates if day not in set(dates)
+    ]
+    if require_all and invalid_requested_dates:
+        status = "FAIL" if require_train else "SKIP"
+        return {
+            "status": status,
+            "reason": "invalid_requested_artifact_dates",
+            "available_dates": len(dates),
+            "required_dates": len(requested_dates),
+            "invalid_requested_date_count": len(invalid_requested_dates),
+            "invalid_requested_dates_sample": invalid_requested_dates[:10],
+            "first_date": dates[0] if dates else None,
+            "last_date": dates[-1] if dates else None,
+            "min_rows_per_day": min_rows,
+            "require_all_tickers": require_all,
+            "date_quality_sample": {
+                day: quality[day]
+                for day in invalid_requested_dates[:5]
+                if day in quality
+            },
+        }
     if len(dates) < min_dates:
         status = "FAIL" if require_train else "SKIP"
         return {

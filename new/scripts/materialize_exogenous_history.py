@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -30,6 +30,7 @@ from src.data.exogenous_feature_store import (  # noqa: E402
     write_exogenous_payload,
 )
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -39,6 +40,7 @@ from src.utils.trading_calendar import (  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "exogenous_history"
+_FALLBACK_MIN_EXOGENOUS_NON_NEUTRAL_DATE_COVERAGE = 0.8
 
 
 def _parse_date(date_key: str) -> datetime:
@@ -50,18 +52,78 @@ def _snapshot_ts(date_key: str) -> datetime:
     return datetime.combine(day, time(8, 30), tzinfo=_KST)
 
 
+def _min_exogenous_non_neutral_date_coverage() -> float:
+    cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
+    return safe_float(
+        cfg.get("min_exogenous_non_neutral_date_coverage"),
+        default=_FALLBACK_MIN_EXOGENOUS_NON_NEUTRAL_DATE_COVERAGE,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+
 def _business_dates(end_date: str, business_days: int) -> list[str]:
     end = _parse_date(end_date).date()
     start = kospi_trading_start_date(end, business_days)
     return kospi_trading_dates_between(start, end)
 
 
+def _configured_us_market_holidays(year: int) -> set[date]:
+    cfg = config_load("risk_config.yaml", "exogenous_features") or {}
+    raw_dates = cfg.get(f"us_market_holidays_{year}", []) or []
+    holidays: set[date] = set()
+    for raw in raw_dates:
+        try:
+            holidays.add(date.fromisoformat(str(raw)))
+        except ValueError:
+            continue
+    return holidays
+
+
+def _is_us_market_close_day(value: date) -> bool:
+    return value.weekday() < 5 and value not in _configured_us_market_holidays(value.year)
+
+
+def _latest_us_close_date_before_snapshot(date_key: str) -> date:
+    cur = _snapshot_ts(date_key).date() - timedelta(days=1)
+    while not _is_us_market_close_day(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+
 def _active_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
         for item in sector.get("stocks", []) or []:
-            if str(item.get("status", "")).lower() == "active":
+            if str(item.get("status", "")) in stock_statuses:
                 tickers.append(pad_ticker(str(item.get("ticker", ""))))
     fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
     tickers.extend(pad_ticker(str(t)) for t in fallback)
@@ -96,8 +158,10 @@ def _collect_global_features(
     us_client: USMarketClient,
     ecos_client: ECOSRestClient,
 ) -> tuple[dict[str, float], dict[str, Any]]:
-    as_of_dash = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
-    us = us_client.get_indices(as_of=as_of_dash)
+    expected_us_date = _latest_us_close_date_before_snapshot(date_key)
+    expected_us_as_of = expected_us_date.isoformat()
+    request_as_of = (expected_us_date + timedelta(days=1)).isoformat()
+    us = us_client.get_indices(as_of=request_as_of)
     macro = ecos_client.get_macro_pack(date_key)
     features = {
         "us_sp500_change": float(us.us_sp500_change),
@@ -110,6 +174,8 @@ def _collect_global_features(
     return features, {
         "us_market_source": us.source,
         "us_market_as_of_date": us.as_of_date,
+        "us_market_expected_as_of_date": expected_us_as_of,
+        "us_market_request_as_of_date": request_as_of,
         "ecos_macro_pack_date": date_key,
     }
 
@@ -276,6 +342,40 @@ def materialize_exogenous_history(
                     us_client=us_client,
                     ecos_client=ecos_client,
                 )
+                if str(global_stats.get("us_market_source")) != "yfinance":
+                    blocker = "us_market_source_not_yfinance"
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                    per_date.append({
+                        "date": date_key,
+                        "status": "BLOCKED",
+                        "reason": blocker,
+                        "artifact_written": False,
+                        "non_neutral": False,
+                        "source_stats": global_stats,
+                    })
+                    continue
+                actual_us_date = _normalize_date_key(global_stats.get("us_market_as_of_date"))
+                expected_us_date = _normalize_date_key(
+                    global_stats.get("us_market_expected_as_of_date")
+                )
+                if actual_us_date != expected_us_date:
+                    blocker = (
+                        "us_market_as_of_after_expected_close"
+                        if actual_us_date and expected_us_date and actual_us_date > expected_us_date
+                        else "us_market_as_of_mismatch"
+                    )
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                    per_date.append({
+                        "date": date_key,
+                        "status": "BLOCKED",
+                        "reason": blocker,
+                        "artifact_written": False,
+                        "non_neutral": False,
+                        "source_stats": global_stats,
+                    })
+                    continue
                 per_ticker, investor_stats = _collect_investor_features(
                     date_key,
                     tickers,
@@ -339,8 +439,9 @@ def materialize_exogenous_history(
                     "error_type": type(e).__name__,
                 })
 
+    min_coverage = _min_exogenous_non_neutral_date_coverage()
     coverage = non_neutral_dates / max(len(dates), 1)
-    if coverage < 0.8:
+    if coverage < min_coverage:
         blockers.append("exogenous_non_neutral_coverage_below_threshold")
     if not written:
         blockers.append("no_exogenous_artifacts_written")
@@ -355,6 +456,7 @@ def materialize_exogenous_history(
         "provider_availability": availability,
         "coverage": {
             "exogenous_non_neutral_date_coverage": coverage,
+            "min_exogenous_non_neutral_date_coverage": min_coverage,
             "written_date_count": len(written),
         },
         "blockers": sorted(set(blockers)),

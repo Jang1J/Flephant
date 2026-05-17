@@ -7,19 +7,22 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from src.connectors.kis_rest import KISRestClient
 from src.execution.execution_gateway import ExecutionGateway
+from src.execution.kill_switch import KillSwitch
 from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
 from src.orchestration.hot_runner import HotRunner
+from src.ops.audit_logger import AuditLogger
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_int, safe_lossless_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
+from src.utils.trading_calendar import is_kospi_trading_day
 
 logger = get_logger("paper_auto_trading")
 _KST = ZoneInfo("Asia/Seoul")
@@ -39,6 +42,9 @@ class PaperAutoTrader:
         hot_runner: HotRunner | None = None,
         report_dir: Path | str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+        required_bundle_id: str | None = None,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -49,9 +55,27 @@ class PaperAutoTrader:
         self._hot_runner = hot_runner or HotRunner(ppo=self._make_ppo_allocator())
         self._report_dir = Path(report_dir) if report_dir else default_report_dir
         self._report_dir.mkdir(parents=True, exist_ok=True)
+        self._audit_logger = AuditLogger(
+            log_path=self._report_dir / "paper_auto_execution_audit.jsonl"
+        )
         self._sleep = sleep_fn or time.sleep
+        self._now = now_fn or (lambda: datetime.now(_KST))
+        self._required_bundle_id = str(required_bundle_id or "").strip() or None
+        self._kill_switch = kill_switch or KillSwitch()
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
+        self._enforce_market_session = safe_bool(
+            self._cfg.get("enforce_market_session", True),
+            default=True,
+        )
+        self._market_open_time = self._parse_hhmm(
+            self._cfg.get("market_open_time", "09:00"),
+            default=dt_time(9, 0),
+        )
+        self._market_close_time = self._parse_hhmm(
+            self._cfg.get("market_close_time", "15:30"),
+            default=dt_time(15, 30),
+        )
         self._require_virtual_mode = safe_bool(
             self._cfg.get("require_virtual_mode", True),
             default=True,
@@ -74,6 +98,7 @@ class PaperAutoTrader:
             self._cfg.get("allow_market_order", False),
             default=False,
         )
+        self._run_guard_passed = False
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -97,6 +122,14 @@ class PaperAutoTrader:
             report["status"] = "SKIP" if start_guard.get("safe_skip") else "FAIL"
             return self._finish_report(report, write_report)
 
+        market_session_guard = self._market_session_check()
+        report["stages"]["market_session_guard"] = market_session_guard
+        if market_session_guard["status"] != "PASS":
+            report["status"] = (
+                "SKIP" if market_session_guard.get("safe_skip") else "FAIL"
+            )
+            return self._finish_report(report, write_report)
+
         mode_guard = self._paper_mode_check()
         report["stages"]["mode_guard"] = mode_guard
         if mode_guard["status"] != "PASS":
@@ -109,21 +142,36 @@ class PaperAutoTrader:
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
-        try:
-            if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
-                self._hot_runner.start()
-        except AttributeError:
-            self._hot_runner.start()
+        cycles_int = safe_int(cycles, default=0, min_value=0)
+        if cycles_int < 1:
+            report["stages"]["cycles"] = {
+                "status": "FAIL",
+                "reason": "cycles_must_be_positive",
+                "requested_cycles": cycles,
+                "cycles": cycles_int,
+                "items": [],
+            }
+            report["status"] = "FAIL"
+            return self._finish_report(report, write_report)
 
         cycle_reports: list[dict[str, Any]] = []
-        cycles_int = safe_int(cycles, default=0, min_value=0)
-        for idx in range(cycles_int):
-            cycle = self.run_once(tickers=tickers, cycle_index=idx)
-            cycle_reports.append(cycle)
-            if cycle.get("status") == "FAIL":
-                break
-            if idx < cycles_int - 1:
-                self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        self._run_guard_passed = True
+        try:
+            try:
+                if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
+                    self._hot_runner.start()
+            except AttributeError:
+                self._hot_runner.start()
+
+            for idx in range(cycles_int):
+                cycle = self.run_once(tickers=tickers, cycle_index=idx)
+                cycle_reports.append(cycle)
+                if cycle.get("status") == "FAIL":
+                    break
+                if idx < cycles_int - 1:
+                    self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        finally:
+            self._run_guard_passed = False
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
@@ -133,8 +181,24 @@ class PaperAutoTrader:
         return self._finish_report(report, write_report)
 
     def run_once(self, *, tickers: list[str], cycle_index: int = 0) -> dict[str, Any]:
-        padded = [pad_ticker(str(t)) for t in tickers]
         started_at = datetime.now(_KST).isoformat()
+        if not self._run_guard_passed:
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "run_once_requires_start_guard",
+            }
+        market_session_guard = self._market_session_check()
+        if market_session_guard["status"] != "PASS":
+            return {
+                "status": "PASS" if market_session_guard.get("safe_skip") else "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "market_session_guard": market_session_guard,
+                "execution": None,
+            }
+        padded = [pad_ticker(str(t)) for t in tickers]
         balance = self._kis_client.get_balance()
         bars_by_ticker = self._fetch_recent_bars(padded)
         latest_prices = self._latest_prices(bars_by_ticker)
@@ -158,6 +222,12 @@ class PaperAutoTrader:
             portfolio_value=portfolio_value,
             asof=started_at,
             recent_bars=bars_by_ticker,
+            dependency_status={
+                "news": "skipped",
+                "risk": "done",
+                "quant": "done",
+                "debate": "skipped",
+            },
         )
 
         if hot_result.get("skipped"):
@@ -173,10 +243,7 @@ class PaperAutoTrader:
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
         ]
-        qty_clipping = self._clip_order_quantities(final_decision)
         order_guard = self._order_guard(final_decision)
-        if qty_clipping["items"]:
-            order_guard["qty_clipping"] = qty_clipping
         if order_guard["status"] != "PASS":
             return {
                 "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
@@ -188,6 +255,8 @@ class PaperAutoTrader:
             }
 
         gateway = ExecutionGateway(
+            kill_switch=self._kill_switch,
+            audit_logger=self._audit_logger,
             kis_client=self._kis_client,
             mode_override="paper",
             live_enabled_override=False,
@@ -199,7 +268,7 @@ class PaperAutoTrader:
         ok_statuses = {"submitted", "filled", "partial_filled"}
         order_history = self._order_history_verification(execution)
         status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
-        if order_history.get("status") == "FAIL":
+        if order_history.get("status") != "PASS":
             status = "FAIL"
         return {
             "status": status,
@@ -269,7 +338,7 @@ class PaperAutoTrader:
             ticker = pad_ticker(str(pos.get("ticker", "")))
             if ticker == "000000":
                 continue
-            qty = safe_int(pos.get("qty", 0), default=0, min_value=0)
+            qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
             price = latest_prices.get(
                 ticker,
                 safe_float(pos.get("current_price", 0.0), default=0.0),
@@ -288,6 +357,39 @@ class PaperAutoTrader:
             }
         return {"status": "PASS"}
 
+    def _market_session_check(self) -> dict[str, Any]:
+        if not self._enforce_market_session:
+            return {"status": "PASS", "enforced": False}
+        now = self._now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_KST)
+        else:
+            now = now.astimezone(_KST)
+        if not is_kospi_trading_day(now.date()):
+            return {
+                "status": "SKIP",
+                "safe_skip": True,
+                "reason": "not_kospi_trading_day",
+                "now": now.isoformat(),
+            }
+        now_time = now.time().replace(tzinfo=None)
+        if now_time < self._market_open_time or now_time > self._market_close_time:
+            return {
+                "status": "SKIP",
+                "safe_skip": True,
+                "reason": "outside_market_session",
+                "now": now.isoformat(),
+                "market_open_time": self._market_open_time.strftime("%H:%M"),
+                "market_close_time": self._market_close_time.strftime("%H:%M"),
+            }
+        return {
+            "status": "PASS",
+            "enforced": True,
+            "now": now.isoformat(),
+            "market_open_time": self._market_open_time.strftime("%H:%M"),
+            "market_close_time": self._market_close_time.strftime("%H:%M"),
+        }
+
     def _paper_mode_check(self) -> dict[str, Any]:
         mode = str(getattr(self._kis_client, "mode", "unknown")).lower()
         if self._require_virtual_mode and mode != "virtual":
@@ -300,19 +402,36 @@ class PaperAutoTrader:
 
     def _active_model_check(self) -> dict[str, Any]:
         quant = getattr(self._hot_runner, "_quant", None)
-        has_model = bool(getattr(quant, "has_model", True))
+        has_model = safe_bool(getattr(quant, "has_model", False), default=False)
         metadata = getattr(quant, "model_metadata", None)
-        if self._require_active_model and not has_model:
+        bundle_id = (
+            (metadata or {}).get("bundle_id")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if self._require_active_model and (not has_model or not bundle_id):
             return {
                 "status": "FAIL",
                 "error_code": "ACTIVE_MODEL_REQUIRED",
                 "message": "QuantAgent active model이 없어 paper auto trading을 시작할 수 없다.",
+                "has_model": has_model,
+                "bundle_id": bundle_id,
+            }
+        if self._required_bundle_id and bundle_id != self._required_bundle_id:
+            return {
+                "status": "FAIL",
+                "error_code": "ACTIVE_MODEL_BUNDLE_MISMATCH",
+                "message": "QuantAgent active model bundle_id가 요청 bundle_id와 다르다.",
+                "has_model": has_model,
+                "bundle_id": bundle_id,
+                "required_bundle_id": self._required_bundle_id,
             }
         return {
             "status": "PASS",
             "has_model": has_model,
             "model_version": (metadata or {}).get("version") if isinstance(metadata, dict) else None,
-            "bundle_id": (metadata or {}).get("bundle_id") if isinstance(metadata, dict) else None,
+            "bundle_id": bundle_id,
+            "required_bundle_id": self._required_bundle_id,
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
@@ -355,7 +474,7 @@ class PaperAutoTrader:
                 continue
             ticker = pad_ticker(str(od.get("ticker", "")))
             side = str(od.get("side", "")).lower()
-            qty = safe_int(od.get("qty", 0), default=0)
+            qty = safe_lossless_int(od.get("qty", 0), default=0)
             order_type = str(od.get("order_type", "00") or "00")
             price = safe_float(od.get("price", 0.0), default=0.0)
             if ticker == "000000" or not is_valid_ticker(ticker):
@@ -370,6 +489,13 @@ class PaperAutoTrader:
                     "side": side,
                 })
             if qty <= 0:
+                violations.append({
+                    "ticker": ticker,
+                    "reason": "qty_out_of_limit",
+                    "qty": qty,
+                    "max_order_qty_per_order": self._max_order_qty_per_order,
+                })
+            elif qty > self._max_order_qty_per_order:
                 violations.append({
                     "ticker": ticker,
                     "reason": "qty_out_of_limit",
@@ -391,32 +517,12 @@ class PaperAutoTrader:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
         return {"status": "PASS", "n_orders": len(order_deltas)}
 
-    def _clip_order_quantities(self, final_decision: dict[str, Any]) -> dict[str, Any]:
-        """paper-safe qty clipping. 수량은 감소만 허용한다."""
-        clipped: list[dict[str, Any]] = []
-        for od in final_decision.get("order_deltas", []):
-            if not isinstance(od, dict):
-                continue
-            original_qty = safe_int(od.get("qty", 0), default=0)
-            if original_qty > self._max_order_qty_per_order:
-                od["qty"] = self._max_order_qty_per_order
-                clipped.append({
-                    "ticker": od.get("ticker"),
-                    "original_qty": original_qty,
-                    "clipped_qty": self._max_order_qty_per_order,
-                    "direction": "decrease_only",
-                })
-        return {
-            "status": "PASS",
-            "items": clipped,
-        }
-
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(self._kis_client, "get_order_history"):
-            return {"status": "SKIP", "reason": "kis_client_no_get_order_history"}
+            return {"status": "FAIL", "reason": "kis_client_no_get_order_history"}
         fills = list(execution.get("execution_report", {}).get("fills", []))
         if not fills:
-            return {"status": "SKIP", "reason": "no_broker_fills"}
+            return {"status": "FAIL", "reason": "no_broker_fills"}
 
         queries: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
@@ -541,10 +647,20 @@ class PaperAutoTrader:
                 "tickers": [pad_ticker(str(t)) for t in tickers],
                 "cycles": int(cycles),
                 "interval_sec": float(interval_sec),
+                "required_bundle_id": self._required_bundle_id,
             },
             "stages": {},
             "failures": [],
         }
+
+    @staticmethod
+    def _parse_hhmm(value: Any, *, default: dt_time) -> dt_time:
+        try:
+            hour, minute = str(value).strip().split(":", 1)
+            return dt_time(int(hour), int(minute))
+        except Exception as e:
+            logger.warning("[paper_auto_trading] 장중 시간 설정 파싱 실패: %s", e)
+            return default
 
     def _finish_report(self, report: dict[str, Any], write_report: bool) -> dict[str, Any]:
         report["failures"] = self._collect_failures(report)

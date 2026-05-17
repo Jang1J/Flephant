@@ -265,6 +265,35 @@ def test_pit_violation_detected() -> None:
         n.normalize(raw, source="dart")
 
 
+def test_asof_rejects_same_day_future_event() -> None:
+    """장중 asof 기준 이후 이벤트는 18:00 전이라도 PIT 위반이다."""
+    n = EventNormalizer()
+    raw = {
+        "title": "장중 미래 공시",
+        "corp_name": "테스트",
+        "disclosure_time": "2026-04-19T10:01:00+09:00",
+        "summary": "아직 알 수 없는 이벤트",
+    }
+
+    with pytest.raises(PITViolationError):
+        n.normalize(raw, source="dart", asof="2026-04-19T10:00:00+09:00")
+
+
+def test_asof_allows_prior_intraday_event() -> None:
+    """장중 asof 이전 이벤트는 정상 처리된다."""
+    n = EventNormalizer()
+    raw = {
+        "title": "장중 과거 공시",
+        "corp_name": "테스트",
+        "disclosure_time": "2026-04-19T09:59:00+09:00",
+        "summary": "이미 발생한 이벤트",
+    }
+
+    out = n.normalize(raw, source="dart", asof="2026-04-19T10:00:00+09:00")
+
+    assert out["pit_safe"] is True
+
+
 # ------------------------------------------------------------------ #
 # 13. event_id unique
 # ------------------------------------------------------------------ #

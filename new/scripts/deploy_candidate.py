@@ -119,6 +119,30 @@ def _write_report(report: dict[str, Any]) -> Path:
     return path
 
 
+def _required_deploy_confirm_phrase() -> str:
+    cfg = config_load("risk_config.yaml", "mode_b_deploy") or {}
+    phrase = str(cfg.get("confirm_deploy_phrase", "")).strip()
+    if not phrase:
+        raise RuntimeError("mode_b_deploy.confirm_deploy_phrase missing")
+    return phrase
+
+
+def _confirmation_blocked_report(bundle_id: str, reason: str) -> dict[str, Any]:
+    return {
+        "status": "BLOCKED",
+        "bundle_id": bundle_id,
+        "reason": reason,
+        "registry_mutated": False,
+        "live_trading_allowed": False,
+        "deployability": {
+            "deployable": False,
+            "dry_run": False,
+            "registry_mutated": False,
+            "bundle_id": bundle_id,
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deploy C14 candidate bundle")
     parser.add_argument("--bundle-id", required=True)
@@ -128,6 +152,11 @@ def main(argv: list[str] | None = None) -> int:
         help="배포 가능성만 평가하고 registry/artifacts를 변경하지 않는다.",
     )
     parser.add_argument("--no-write-report", action="store_true")
+    parser.add_argument(
+        "--confirm-deploy",
+        default="",
+        help="실제 registry deploy 승인 문구. dry-run에는 필요 없음.",
+    )
     args = parser.parse_args(argv)
 
     bundle_id = str(args.bundle_id)
@@ -139,22 +168,29 @@ def main(argv: list[str] | None = None) -> int:
             if backtest_path and backtest
             else _latest_any_backtest(bundle_id)
         )
+        deployability = _deployability_payload(
+            bundle_id,
+            latest_path,
+            latest_backtest,
+            deployable=bool(backtest_path and backtest),
+            dry_run=True,
+        )
         report = {
             "status": "PASS" if backtest_path and backtest else "BLOCKED",
             "dry_run": True,
             "bundle_id": bundle_id,
+            "deployable": bool(deployability.get("deployable", False)),
+            "service_policy_gate_pass": bool(
+                deployability.get("service_policy_gate_pass", False)
+            ),
+            "registry_mutated": False,
+            "live_trading_allowed": False,
             "reason": (
                 "deployable_backtest_found"
                 if backtest_path and backtest
                 else "deployable_backtest_not_found"
             ),
-            "deployability": _deployability_payload(
-                bundle_id,
-                latest_path,
-                latest_backtest,
-                deployable=bool(backtest_path and backtest),
-                dry_run=True,
-            ),
+            "deployability": deployability,
         }
         if not args.no_write_report:
             _write_report(report)
@@ -175,6 +211,28 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=False,
             ),
         }
+        if not args.no_write_report:
+            _write_report(report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    try:
+        required_confirm = _required_deploy_confirm_phrase()
+    except Exception as e:
+        report = _confirmation_blocked_report(
+            bundle_id,
+            f"deploy_confirm_phrase_unavailable:{type(e).__name__}",
+        )
+        if not args.no_write_report:
+            _write_report(report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
+
+    if str(args.confirm_deploy).strip() != required_confirm:
+        report = _confirmation_blocked_report(
+            bundle_id,
+            "production_deploy_confirmation_required",
+        )
         if not args.no_write_report:
             _write_report(report)
         print(json.dumps(report, ensure_ascii=False, indent=2))

@@ -70,6 +70,20 @@ def _business_dates(end_date: str, business_days: int) -> list[str]:
     return kospi_trading_dates_between(start, end)
 
 
+def _client_is_real(client: Any) -> bool:
+    return not bool(getattr(client, "_is_mock", True))
+
+
+def _write_report(report_dir: Path, report: dict[str, Any]) -> dict[str, Any]:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
+    report_path = report_dir / f"build_news_dart_archive_{ts}.json"
+    with report_path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=2)
+    report["report_path"] = str(report_path)
+    return report
+
+
 def _parse_iso_kst(value: str, *, default: datetime | None = None) -> datetime:
     if not value:
         return default if default is not None else datetime.now(_KST)
@@ -355,6 +369,28 @@ def build_archive(
 
     dart = DARTRestClient()
     naver = NaverNewsClient()
+    provider_availability = {
+        "dart_real": _client_is_real(dart),
+        "naver_real": _client_is_real(naver),
+    }
+    if not all(provider_availability.values()):
+        return _write_report(report_dir, {
+            "status": "BLOCKED",
+            "generated_at": datetime.now(_KST).isoformat(),
+            "end_date": end_date,
+            "business_days_requested": business_days,
+            "date_count": len(dates),
+            "ticker_count": len(ticker_meta),
+            "output_dir": str(output_dir),
+            "files_written": [],
+            "total_events": 0,
+            "provider_availability": provider_availability,
+            "fetch_stats": {},
+            "sector_broadcast_stats": {},
+            "market_broadcast_stats": {},
+            "per_date": [],
+            "blockers": ["required_real_provider_unavailable"],
+        })
 
     # Stage A: ticker별 한 번씩 fetch (80일 통째로)
     events_by_ticker: dict[str, list[dict[str, Any]]] = {}
@@ -432,11 +468,22 @@ def build_archive(
     per_date_report: list[dict[str, Any]] = []
     files_written: list[str] = []
     total_events = 0
+    zero_event_dates: list[str] = []
 
     for date_key in dates:
         snapshot = _snapshot_ts(date_key)
         window_start = _window_start(date_key)
         events_in_window = distributed[date_key]
+        if not events_in_window:
+            zero_event_dates.append(date_key)
+            per_date_report.append({
+                "date": date_key,
+                "status": "BLOCKED",
+                "reason": "no_events_in_window",
+                "event_count": 0,
+                "path": None,
+            })
+            continue
 
         per_ticker_in_window: dict[str, int] = {}
         for ev in events_in_window:
@@ -465,12 +512,18 @@ def build_archive(
         total_events += len(events_in_window)
         per_date_report.append({
             "date": date_key,
+            "status": "PASS",
             "event_count": len(events_in_window),
             "path": str(out_path),
         })
 
+    blockers: list[str] = []
+    if not files_written:
+        blockers.append("no_archive_files_written")
+    if total_events <= 0:
+        blockers.append("no_events_archived")
     report: dict[str, Any] = {
-        "status": "PASS" if files_written else "BLOCKED",
+        "status": "PASS" if not blockers else "BLOCKED",
         "generated_at": datetime.now(_KST).isoformat(),
         "end_date": end_date,
         "business_days_requested": business_days,
@@ -479,18 +532,16 @@ def build_archive(
         "output_dir": str(output_dir),
         "files_written": files_written,
         "total_events": total_events,
+        "provider_availability": provider_availability,
         "fetch_stats": fetch_stats,
         "sector_broadcast_stats": sector_broadcast_stats,
         "market_broadcast_stats": market_broadcast_stats,
+        "zero_event_date_count": len(zero_event_dates),
+        "zero_event_dates_sample": zero_event_dates[:10],
         "per_date": per_date_report,
+        "blockers": blockers,
     }
-    report_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
-    report_path = report_dir / f"build_news_dart_archive_{ts}.json"
-    with report_path.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, ensure_ascii=False, indent=2)
-    report["report_path"] = str(report_path)
-    return report
+    return _write_report(report_dir, report)
 
 
 def main(argv: list[str] | None = None) -> int:

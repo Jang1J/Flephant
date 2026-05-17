@@ -327,6 +327,23 @@ def test_paper_submit_probe_rejects_malformed_qty_without_crash(tmp_path: Path) 
     assert client.orders == []
 
 
+def test_paper_submit_probe_rejects_fractional_qty_without_truncation(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)
+
+    report = runner.submit_probe_order(
+        ticker="005930",
+        side="buy",
+        qty="1.9",  # type: ignore[arg-type]
+        price=70000,
+        confirm_phrase=runner.confirm_phrase,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["stages"]["order_guard"]["reason"] == "qty_out_of_probe_limit"
+    assert client.orders == []
+
+
 def test_paper_submit_probe_rejects_malformed_price_without_crash(tmp_path: Path) -> None:
     client = FakePaperKIS()
     runner = PaperTradingRunner(kis_client=client, report_dir=tmp_path)

@@ -19,7 +19,7 @@ from typing import Any
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_portfolio_patch_id
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_lossless_int
 from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("portfolio_manager")
@@ -105,10 +105,21 @@ class PortfolioManager:
 
         Returns: C8 output + metadata (turnover, turnover_exceeded, errors)
         """
-        target_weights_norm = {
-            pad_ticker(str(t)): safe_float(w, default=0.0)
-            for t, w in (target_weights or {}).items()
-        }
+        errors: list[dict[str, Any]] = []
+        malformed_weight_tickers: set[str] = set()
+        target_weights_norm: dict[str, float] = {}
+        for t, w in (target_weights or {}).items():
+            ticker = pad_ticker(str(t))
+            parsed_weight, weight_ok = self._parse_weight(w)
+            if not weight_ok:
+                malformed_weight_tickers.add(ticker)
+                errors.append({
+                    "ticker": ticker,
+                    "error": "MALFORMED_TARGET_WEIGHT",
+                    "raw_weight": w,
+                })
+                continue
+            target_weights_norm[ticker] = parsed_weight
         current_positions = current_positions or []
         latest_prices = latest_prices or {}
         latest_prices_norm = {
@@ -125,6 +136,24 @@ class PortfolioManager:
         # Codex 권고 8 (2026-05-09): PM boundary 정책. respect_ppo_weights=True 면 PPO weights
         # 변경 안 함 + violation 만 errors 에 보고. False (default backward-compat) 면 clip/drop/renorm.
         ppo_violations: list[dict[str, Any]] = []
+
+        negative_weight_tickers = [
+            {"ticker": ticker, "weight": weight}
+            for ticker, weight in target_weights_norm.items()
+            if weight < 0.0
+        ]
+        if negative_weight_tickers:
+            ppo_violations.extend([
+                {"type": "negative_target_weight", **row}
+                for row in negative_weight_tickers
+            ])
+            for row in negative_weight_tickers:
+                errors.append({
+                    "ticker": row["ticker"],
+                    "error": "NEGATIVE_TARGET_WEIGHT",
+                    "weight": row["weight"],
+                })
+                target_weights_norm[row["ticker"]] = 0.0
 
         # max_names 초과 시 하위 종목 제거
         if len(target_weights_norm) > self._max_names:
@@ -182,13 +211,23 @@ class PortfolioManager:
                         t: w / total for t, w in target_weights_norm.items()
                     }
 
-        current_weights = {
-            pad_ticker(str(p["ticker"])): safe_float(p.get("weight", 0.0), default=0.0)
-            for p in current_positions
-            if "ticker" in p
-        }
+        current_weights: dict[str, float] = {}
+        for p in current_positions:
+            if "ticker" not in p:
+                continue
+            ticker = pad_ticker(str(p["ticker"]))
+            parsed_weight, weight_ok = self._parse_weight(p.get("weight", 0.0))
+            if not weight_ok:
+                malformed_weight_tickers.add(ticker)
+                errors.append({
+                    "ticker": ticker,
+                    "error": "MALFORMED_CURRENT_WEIGHT",
+                    "raw_weight": p.get("weight"),
+                })
+                continue
+            current_weights[ticker] = parsed_weight
         current_qty = {
-            pad_ticker(str(p["ticker"])): safe_int(
+            pad_ticker(str(p["ticker"])): safe_lossless_int(
                 p.get("qty", 0),
                 default=0,
                 min_value=0,
@@ -216,10 +255,11 @@ class PortfolioManager:
             set(current_weights.keys()) | set(target_weights_norm.keys())
         )
         order_deltas: list[dict[str, Any]] = []
-        errors: list[dict[str, Any]] = []
         sell_caps_applied: list[dict[str, Any]] = []
 
         for ticker in all_tickers:
+            if ticker in malformed_weight_tickers:
+                continue
             target_w = target_weights_norm.get(ticker, 0.0)
             current_w = current_weights.get(ticker, 0.0)
             delta_w = (target_w - current_w) * scale_factor
@@ -251,8 +291,8 @@ class PortfolioManager:
 
             side = "buy" if delta_w > 0 else "sell"
             if side == "sell":
-                held_qty = current_qty.get(ticker)
-                if held_qty is not None and qty > held_qty:
+                held_qty = current_qty.get(ticker, 0)
+                if qty > held_qty:
                     sell_caps_applied.append({
                         "ticker": ticker,
                         "requested_qty": qty,
@@ -309,6 +349,7 @@ class PortfolioManager:
             "ppo_violations": ppo_violations,
             "cold_path_exit_overrides": cold_path_exit_overrides,
             "sell_caps_applied": sell_caps_applied,
+            "malformed_weight_tickers": sorted(malformed_weight_tickers),
             "respect_ppo_weights": self._respect_ppo_weights,
             "constraints_applied": {
                 "max_names": self._max_names,
@@ -321,6 +362,16 @@ class PortfolioManager:
     # ================================================================== #
     # Internal
     # ================================================================== #
+
+    @staticmethod
+    def _parse_weight(value: Any) -> tuple[float, bool]:
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            return 0.0, False
+        if not math.isfinite(weight):
+            return 0.0, False
+        return weight, True
 
     @staticmethod
     def _compute_turnover(

@@ -25,7 +25,8 @@ from src.agents._base import AgentBase
 from src.utils.config_loader import load as config_load
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
-from src.utils.ticker_utils import pad_ticker
+from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.ticker_utils import normalize_ticker
 
 logger = get_logger("debate")
 
@@ -165,9 +166,11 @@ class DebateAgent(AgentBase):
               skipped_reason: str | None,
             }
         """
+        self._assert_signals_pit_safe(signals)
         conflict = self._detect_conflict(signals)
 
         if not conflict["detected"]:
+            ranked_base = self._resolve_candidates(candidates, signals)
             logger.info(
                 "[debate] 충돌 없음. debate skip. skipped_reason=%s",
                 conflict.get("reason", "no_conflict"),
@@ -176,7 +179,7 @@ class DebateAgent(AgentBase):
                 "conflict_detected": False,
                 "debate_id": None,
                 "winner_view": None,
-                "ranked_tickers": candidates or [],
+                "ranked_tickers": ranked_base,
                 "uncertainty_delta": 0.0,
                 "comparison_count": 0,
                 "debate_resolution_msg": None,
@@ -285,9 +288,9 @@ class DebateAgent(AgentBase):
                 logger.warning("[debate] debate_resolution publish 실패: %s", e)
 
         # memory 저장
-        self._save_debate_history(debate_id, resolution_payload)
+        memory_error = self._save_debate_history(debate_id, resolution_payload)
 
-        return {
+        result = {
             "conflict_detected": True,
             "debate_id": debate_id,
             "winner_view": winner_view,
@@ -300,6 +303,36 @@ class DebateAgent(AgentBase):
             "pairwise_msgs": pairwise_msgs,
             "skipped_reason": None,
         }
+        if memory_error is not None:
+            result["memory_write_error"] = memory_error
+        return result
+
+    def _assert_signals_pit_safe(self, signals: list[dict[str, Any]]) -> None:
+        """Direct-call Debate inputs must not contain future observations."""
+        for signal in signals:
+            if not isinstance(signal, dict):
+                continue
+            payload = signal.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            data_ts = (
+                signal.get("occurred_at")
+                or signal.get("timestamp")
+                or payload.get("occurred_at")
+                or payload.get("timestamp")
+            )
+            asof = (
+                signal.get("asof")
+                or signal.get("snapshot_ts")
+                or payload.get("asof")
+                or payload.get("snapshot_ts")
+            )
+            if data_ts and not asof:
+                raise PITViolationError("[debate] asof_required: timestamped signal은 asof가 필요합니다.")
+            if not data_ts:
+                data_ts = signal.get("ts") or payload.get("ts")
+            if data_ts and asof:
+                assert_pit_safe(data_ts, snapshot_ts=asof)
 
     # ------------------------------------------------------------------
     # 충돌 감지
@@ -382,8 +415,8 @@ class DebateAgent(AgentBase):
         resolved: list[str] = []
         seen: set[str] = set()
         for raw in raw_candidates:
-            ticker = pad_ticker(str(raw))
-            if not ticker.isdigit() or ticker in seen:
+            ticker = normalize_ticker(raw)
+            if not ticker or ticker in seen:
                 continue
             resolved.append(ticker)
             seen.add(ticker)
@@ -473,11 +506,11 @@ class DebateAgent(AgentBase):
             raw_pair = item.get("pair", [])
             if not isinstance(raw_pair, list) or len(raw_pair) != 2:
                 continue
-            left = pad_ticker(str(raw_pair[0]))
-            right = pad_ticker(str(raw_pair[1]))
-            if not left.isdigit() or not right.isdigit():
+            left = normalize_ticker(raw_pair[0])
+            right = normalize_ticker(raw_pair[1])
+            if not left or not right:
                 continue
-            winner = pad_ticker(str(item.get("winner", "")))
+            winner = normalize_ticker(item.get("winner", ""))
             if winner not in {left, right}:
                 winner = left
             parsed_by_pair[frozenset((left, right))] = {
@@ -572,11 +605,10 @@ class DebateAgent(AgentBase):
 
     def _save_debate_history(
         self, debate_id: str, result: dict[str, Any]
-    ) -> None:
+    ) -> str | None:
         """debate_history JSONL 저장."""
         today = datetime.now(_KST).strftime("%Y%m%d")
         path = self._memory_root / "debate_agent" / f"{today}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "debate_id": debate_id,
@@ -585,5 +617,12 @@ class DebateAgent(AgentBase):
             "comparison_count": result.get("comparison_count", 0),
             "uncertainty_delta": result.get("uncertainty_delta", 0.0),
         }
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            error = str(e)
+            logger.warning("[debate] memory 저장 실패: path=%s error=%s", path, error)
+            return error
+        return None

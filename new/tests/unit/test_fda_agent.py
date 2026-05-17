@@ -3,16 +3,54 @@ from __future__ import annotations
 
 import pytest
 
+from src.agents import fda as fda_module
 from src.agents.fda import (
+    FDAConfigError,
     FDAAgent,
     IllegalDeltaModificationError,
     MissingReasonCodeError,
 )
 
+_VALID_REASON_CODES = [
+    "NEWS_DIVERGENCE",
+    "RISK_FAST_TRIGGER",
+    "DEBATE_CONFLICT",
+    "NORMAL_APPROVE",
+    "TIMEOUT",
+    "QUANT_ANOMALY",
+    "MISSING_PORTFOLIO_PATCH",
+]
+
 
 @pytest.fixture
 def fda() -> FDAAgent:
     return FDAAgent()
+
+
+def _valid_fda_config() -> dict[str, dict]:
+    return {
+        "debate": {"uncertainty_threshold": 0.7},
+        "fda_uncertainty_link": {
+            "uncertainty_threshold": 0.5,
+            "veto_prior_boost": 0.15,
+        },
+        "reason_code_catalog": {
+            "status": "final",
+            "candidates": list(_VALID_REASON_CODES),
+        },
+    }
+
+
+def _patch_fda_config(monkeypatch: pytest.MonkeyPatch, config: dict[str, dict]) -> None:
+    def fake_config_load(config_file: str = "risk_config.yaml", key: str | None = None):
+        assert config_file == "risk_config.yaml"
+        if key is None:
+            return config
+        if key not in config:
+            raise KeyError(key)
+        return config[key]
+
+    monkeypatch.setattr(fda_module, "config_load", fake_config_load)
 
 
 # ====================================================================== #
@@ -27,6 +65,40 @@ def test_can_change_weight_false(fda: FDAAgent) -> None:
 
 def test_allowed_publish_channels(fda: FDAAgent) -> None:
     assert fda.ALLOWED_PUBLISH_CHANNELS == frozenset({"final_decision"})
+
+
+# ====================================================================== #
+# 1-A. Config fail-closed
+# ====================================================================== #
+
+
+def test_config_missing_debate_section_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _valid_fda_config()
+    del config["debate"]
+    _patch_fda_config(monkeypatch, config)
+
+    with pytest.raises(FDAConfigError, match="fail-closed"):
+        FDAAgent()
+
+
+def test_config_malformed_threshold_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _valid_fda_config()
+    config["fda_uncertainty_link"]["uncertainty_threshold"] = "0.5"
+    _patch_fda_config(monkeypatch, config)
+
+    with pytest.raises(FDAConfigError, match="fail-closed"):
+        FDAAgent()
+
+
+def test_config_missing_reason_code_candidate_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _valid_fda_config()
+    config["reason_code_catalog"]["candidates"].remove("QUANT_ANOMALY")
+    _patch_fda_config(monkeypatch, config)
+
+    with pytest.raises(FDAConfigError, match="QUANT_ANOMALY"):
+        FDAAgent()
 
 
 # ====================================================================== #
@@ -91,6 +163,29 @@ def test_veto_dependency_timeout(fda: FDAAgent) -> None:
     assert len(fd["risk_overrides"]) == 1
 
 
+def test_veto_dependency_timeout_normalizes_status(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        dependency_status={"news": " TIMEOUT ", "risk": "done", "quant": "done"},
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert "news" in fd["veto_reason"]
+
+
+def test_veto_dependency_missing_or_unknown(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        dependency_status={"news": "missing", "risk": "unknown", "quant": "done"},
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "TIMEOUT"
+    assert "news" in fd["veto_reason"]
+    assert "risk" in fd["veto_reason"]
+
+
 def test_veto_risk_high_severity(fda: FDAAgent) -> None:
     result = fda.decide(
         portfolio_patch_ref="PP-001",
@@ -146,12 +241,116 @@ def test_hot_path_latency_under_10ms(fda: FDAAgent) -> None:
 # ====================================================================== #
 
 
-def test_cold_mode_implemented_s2_9(fda: FDAAgent) -> None:
-    """S2-9 완료: Cold Path가 NotImplementedError 아닌 정상 결과 반환."""
+def test_cold_mode_without_llm_router_fail_closed(fda: FDAAgent) -> None:
+    """Cold Path router 미주입은 approve fallback 없이 veto로 닫는다."""
     result = fda.decide(portfolio_patch_ref="PP-001", mode="cold")
     # Cold Path 결과는 final_decision 포함 딕셔너리
     assert "final_decision" in result
-    assert result["final_decision"]["reason_code"] is not None
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "NEWS_DIVERGENCE"
+
+
+def test_cold_llm_failure_fail_closed() -> None:
+    """Cold Path LLM 실패는 approve fallback이 아니라 veto로 닫는다."""
+    class FailedRouter:
+        def call(self, *args, **kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": False,
+                    "content": "",
+                    "error": "timeout",
+                },
+            )()
+
+    fda = FDAAgent(llm_router=FailedRouter())
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        risk_warnings=[],
+        debate_result={"conflict_detected": False},
+        agent_signals=[],
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+
+
+def test_cold_llm_invalid_reason_code_fail_closed() -> None:
+    """LLM이 승인과 invalid reason_code를 같이 보내도 approve하지 않는다."""
+    class InvalidReasonRouter:
+        def call(self, *args, **kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "content": (
+                        '{"approved": true, "reason_code": "BAD_CODE", '
+                        '"veto_reason": null, "confidence": 0.9}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    fda = FDAAgent(llm_router=InvalidReasonRouter())
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        risk_warnings=[],
+        debate_result={"conflict_detected": False},
+        agent_signals=[],
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+
+
+def test_cold_approve_preserves_active_reports() -> None:
+    class ApprovedRouter:
+        def call(self, *args, **kwargs):
+            return type(
+                "Result",
+                (),
+                {
+                    "success": True,
+                    "content": (
+                        '{"approved": true, "reason_code": "NORMAL_APPROVE", '
+                        '"veto_reason": null, "confidence": 0.82}'
+                    ),
+                    "error": None,
+                },
+            )()
+
+    fda = FDAAgent(llm_router=ApprovedRouter())
+    reports = ["RPT-NEWS-001", "RPT-RISK-001", "RPT-DEBATE-001"]
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        risk_warnings=[],
+        debate_result={"conflict_detected": False},
+        agent_signals=[],
+        active_reports=reports,
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is True
+    assert fd["active_reports"] == reports
+
+
+def test_cold_veto_preserves_active_reports(fda: FDAAgent) -> None:
+    reports = ["RPT-NEWS-001", "RPT-RISK-001"]
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        mode="cold",
+        active_reports=reports,
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+    assert fd["active_reports"] == reports
 
 
 # ====================================================================== #

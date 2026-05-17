@@ -32,6 +32,15 @@ from src.utils.safe_cast import safe_float
 logger = get_logger("fda")
 
 _FDA_COLD_CALLER = "fda_cold_path"
+_FDA_REQUIRED_REASON_CODES = frozenset({
+    "NORMAL_APPROVE",
+    "TIMEOUT",
+    "RISK_FAST_TRIGGER",
+    "DEBATE_CONFLICT",
+    "NEWS_DIVERGENCE",
+    "QUANT_ANOMALY",
+    "MISSING_PORTFOLIO_PATCH",
+})
 
 
 class MissingPortfolioPatchError(ValueError):
@@ -48,6 +57,10 @@ class IllegalDeltaModificationError(RuntimeError):
 
 class MissingReasonCodeError(RuntimeError):
     """C9 error: MISSING_REASON_CODE."""
+
+
+class FDAConfigError(RuntimeError):
+    """FDA risk_config 로드/검증 실패. fail-closed."""
 
 
 class FDAAgent(AgentBase):
@@ -67,56 +80,105 @@ class FDAAgent(AgentBase):
     def __init__(self, llm_router: Any | None = None) -> None:
         """
         llm_router: LLMRouter 인스턴스 (S2-9 Cold Path 전용).
-                    None이면 Cold Path 호출 시 heuristic fallback.
+                    None이면 Cold Path 호출 시 NEWS_DIVERGENCE fail-closed.
         """
         self._llm_router = llm_router
-        # debate uncertainty_threshold 로드 (불변 원칙 5)
-        try:
-            debate_cfg = config_load("risk_config.yaml", "debate") or {}
-            self._debate_uncertainty_threshold = float(
-                debate_cfg.get("uncertainty_threshold", 0.7)
-            )
-        except Exception as e:
-            logger.warning("[fda] debate 섹션 로드 실패: %s. 기본값 사용", e)
-            self._debate_uncertainty_threshold = 0.7
-        # fda_uncertainty_link 로드 (Dual-Source → FDA 연계, 불변 원칙 5)
-        try:
-            unc_cfg = config_load("risk_config.yaml", "fda_uncertainty_link") or {}
-            self._uncertainty_threshold: float = float(unc_cfg.get("uncertainty_threshold", 0.5))
-            self._veto_prior_boost: float = float(unc_cfg.get("veto_prior_boost", 0.2))
-        except Exception as e:
-            logger.warning("[fda] fda_uncertainty_link 섹션 로드 실패: %s. 기본값 사용", e)
-            self._uncertainty_threshold = 0.5
-            self._veto_prior_boost = 0.2
-        # reason_code catalog 로드 (risk_config.yaml reason_code_catalog)
-        try:
-            rc_cfg = config_load("risk_config.yaml", "reason_code_catalog")
-            candidates = rc_cfg.get("candidates", [])
-            self._valid_reason_codes: frozenset[str] = frozenset(
-                {str(c) for c in candidates}
-            )
-        except (KeyError, TypeError):
-            # reason_code_catalog 없는 경우 7종 전체 enum (S2-9 최종 확정)
-            self._valid_reason_codes = frozenset({
-                "NORMAL_APPROVE", "TIMEOUT", "RISK_FAST_TRIGGER",
-                "DEBATE_CONFLICT", "NEWS_DIVERGENCE",
-                "QUANT_ANOMALY", "MISSING_PORTFOLIO_PATCH",
-            })
-        # reason_code_catalog에 7종 전부 있는지 확인.
-        # risk_config.yaml candidates에 QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH 포함 여부 점검.
-        # status="final"(S2-9 완료)이므로 7종 모두 yaml에 있음 → unconditional union 불필요.
-        # yaml 값만 사용하며, 누락 시 경고 후 보완.
-        _expected = {"QUANT_ANOMALY", "MISSING_PORTFOLIO_PATCH"}
-        _missing = _expected - self._valid_reason_codes
-        if _missing:
-            logger.warning("[fda] reason_code_catalog에 %s 누락. 코드 내부 보완.", _missing)
-            self._valid_reason_codes = frozenset(self._valid_reason_codes | _missing)
+        # 설정 누락/오염 시 magic fallback 없이 초기화 단계에서 fail-closed.
+        debate_cfg = self._require_config_section("debate")
+        self._debate_uncertainty_threshold = self._require_probability(
+            debate_cfg,
+            section="debate",
+            key="uncertainty_threshold",
+        )
+
+        unc_cfg = self._require_config_section("fda_uncertainty_link")
+        self._uncertainty_threshold = self._require_probability(
+            unc_cfg,
+            section="fda_uncertainty_link",
+            key="uncertainty_threshold",
+        )
+        self._veto_prior_boost = self._require_probability(
+            unc_cfg,
+            section="fda_uncertainty_link",
+            key="veto_prior_boost",
+        )
+
+        self._valid_reason_codes = self._load_reason_code_catalog()
 
         logger.info(
             "[fda] 초기화: CAN_CHANGE_WEIGHT=%s, reason_codes=%d종, cold_path=%s",
             self.CAN_CHANGE_WEIGHT, len(self._valid_reason_codes),
-            "enabled" if self._llm_router else "heuristic_fallback",
+            "enabled" if self._llm_router else "disabled_fail_closed",
         )
+
+    @staticmethod
+    def _require_config_section(section: str) -> dict[str, Any]:
+        try:
+            cfg = config_load("risk_config.yaml", section)
+        except Exception as e:
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section} 섹션 로드 실패. FDA fail-closed."
+            ) from e
+        if not isinstance(cfg, dict) or not cfg:
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section} 섹션이 비어 있거나 dict가 아님. "
+                "FDA fail-closed."
+            )
+        return cfg
+
+    @staticmethod
+    def _require_probability(cfg: dict[str, Any], *, section: str, key: str) -> float:
+        if key not in cfg:
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section}.{key} 누락. FDA fail-closed."
+            )
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section}.{key} 타입 오류: {type(value).__name__}. "
+                "FDA fail-closed."
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0 or numeric > 1.0:
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section}.{key} 범위 오류: {value}. "
+                "FDA fail-closed."
+            )
+        return numeric
+
+    def _load_reason_code_catalog(self) -> frozenset[str]:
+        rc_cfg = self._require_config_section("reason_code_catalog")
+        if rc_cfg.get("status") != "final":
+            raise FDAConfigError(
+                "[fda] risk_config.yaml reason_code_catalog.status가 final이 아님. "
+                "FDA fail-closed."
+            )
+
+        candidates = rc_cfg.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise FDAConfigError(
+                "[fda] risk_config.yaml reason_code_catalog.candidates 오류. "
+                "FDA fail-closed."
+            )
+
+        invalid = [
+            c for c in candidates
+            if not isinstance(c, str) or not c.strip()
+        ]
+        if invalid:
+            raise FDAConfigError(
+                "[fda] risk_config.yaml reason_code_catalog.candidates에 "
+                f"비문자열/빈 값 존재: {invalid}. FDA fail-closed."
+            )
+
+        codes = frozenset(c.strip() for c in candidates)
+        missing = _FDA_REQUIRED_REASON_CODES - codes
+        if missing:
+            raise FDAConfigError(
+                "[fda] risk_config.yaml reason_code_catalog 후보 누락: "
+                f"{sorted(missing)}. FDA fail-closed."
+            )
+        return codes
 
     # ================================================================== #
     # Public API
@@ -157,15 +219,27 @@ class FDAAgent(AgentBase):
         t0 = time.perf_counter()
 
         if mode == "cold":
+            cold_signals = agent_signals or []
+            resolved_uncertainty_score = safe_float(
+                uncertainty_score,
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            if resolved_uncertainty_score == 0.0:
+                resolved_uncertainty_score = self._uncertainty_score_from_signals(
+                    cold_signals
+                )
             result = self._decide_cold(
                 portfolio_patch_ref=portfolio_patch_ref,
                 target_weights=target_weights or {},
                 order_deltas=order_deltas or [],
                 risk_warnings=risk_warnings or [],
                 debate_result=debate_result,
-                agent_signals=agent_signals or [],
+                agent_signals=cold_signals,
+                active_reports=active_reports or [],
                 t0=t0,
-                uncertainty_score=float(uncertainty_score),
+                uncertainty_score=resolved_uncertainty_score,
             )
             result["mode"] = "cold"  # Cold Path임을 C9 mode 필드에 명시
             return result
@@ -185,16 +259,23 @@ class FDAAgent(AgentBase):
         anomalies = anomalies or []
         risk_warnings = risk_warnings or []
 
-        # 2. dependency timeout 체크
+        # 2. dependency timeout/missing 체크
         # (risk_fast_eval은 step 3에서 처리)
         timeout_deps = [
             name for name, status in dependency_status.items()
-            if status == "timeout"
+            if str(status).strip().lower() in {
+                "timeout",
+                "missing",
+                "unknown",
+                "error",
+                "failed",
+                "fail",
+            }
         ]
         if timeout_deps:
             return self._build_veto_decision(
                 reason_code="TIMEOUT",
-                veto_reason=f"dependency timeout: {sorted(timeout_deps)}",
+                veto_reason=f"dependency unavailable: {sorted(timeout_deps)}",
                 target_weights=target_weights or {},
                 order_deltas=order_deltas or [],
                 portfolio_patch_ref=portfolio_patch_ref,
@@ -203,8 +284,10 @@ class FDAAgent(AgentBase):
                     {
                         "rule": "dependency_wait",
                         "original": "all_done",
-                        "override": f"timeout_{name}",
-                        "justification": "agent did not respond within SLA",
+                        "override": (
+                            f"{str(dependency_status.get(name)).strip().lower()}_{name}"
+                        ),
+                        "justification": "agent did not provide usable dependency evidence",
                     }
                     for name in timeout_deps
                 ],
@@ -297,6 +380,7 @@ class FDAAgent(AgentBase):
         order_deltas: list[dict[str, Any]],
         portfolio_patch_ref: str,
         t0: float,
+        active_reports: list[str] | None = None,
         risk_overrides: list[dict[str, Any]] | None = None,
         confidence: float | None = None,
     ) -> dict[str, Any]:
@@ -308,6 +392,7 @@ class FDAAgent(AgentBase):
             order_deltas=order_deltas,
             portfolio_patch_ref=portfolio_patch_ref,
             t0=t0,
+            active_reports=active_reports,
             risk_overrides=risk_overrides,
             confidence=confidence,
         )
@@ -398,6 +483,7 @@ class FDAAgent(AgentBase):
         risk_warnings: list[dict[str, Any]],
         debate_result: dict[str, Any] | None,
         agent_signals: list[dict[str, Any]],
+        active_reports: list[str],
         t0: float,
         uncertainty_score: float = 0.0,
     ) -> dict[str, Any]:
@@ -419,6 +505,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref or "",
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 1. 기본 규칙 (Hot과 동일): portfolio_patch 없으면 veto
@@ -430,6 +517,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref="",
                 t0=t0,
+                active_reports=active_reports,
             )
 
         # 2. debate_result: 충돌 있고 uncertainty_delta > 임계값 → DEBATE_CONFLICT veto
@@ -451,6 +539,7 @@ class FDAAgent(AgentBase):
                     order_deltas=order_deltas,
                     portfolio_patch_ref=portfolio_patch_ref,
                     t0=t0,
+                    active_reports=active_reports,
                 )
 
         # 3. risk_warnings 검토 (risk_warning stance=veto_recommendation)
@@ -467,17 +556,20 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
             )
 
-        # 4. LLM CoT (선택): llm_router 없으면 heuristic approve
+        # 4. LLM CoT: router 미주입 또는 호출 실패 시 approve하지 않고 fail-closed
         if self._llm_router is None:
-            return self._build_approve_decision(
+            logger.warning("[fda] Cold Path LLM router 없음. NEWS_DIVERGENCE fail-closed.")
+            return self._build_veto_decision(
+                reason_code="NEWS_DIVERGENCE",
+                veto_reason="Cold Path LLM router 없음. FDA fail-closed.",
                 target_weights=target_weights,
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
-                active_reports=[],
                 t0=t0,
-                reason_code="NORMAL_APPROVE",
+                active_reports=active_reports,
             )
 
         # 5. Kanana-o CoT 판단
@@ -489,25 +581,26 @@ class FDAAgent(AgentBase):
         )
 
         if not llm_result.success:
-            logger.warning("[fda] Cold Path LLM 실패. heuristic approve fallback.")
-            return self._build_approve_decision(
+            logger.warning("[fda] Cold Path LLM 실패. NEWS_DIVERGENCE fail-closed.")
+            return self._build_veto_decision(
+                reason_code="NEWS_DIVERGENCE",
+                veto_reason="Cold Path LLM 실패. FDA fail-closed.",
                 target_weights=target_weights,
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
-                active_reports=[],
                 t0=t0,
-                reason_code="NORMAL_APPROVE",
+                active_reports=active_reports,
             )
 
         parsed = self._parse_cold_llm(llm_result.content)
-        if parsed.get("approved", True):
+        if parsed.get("approved") is True:
             return self._build_approve_decision(
                 target_weights=target_weights,
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
-                active_reports=[],
+                active_reports=active_reports,
                 t0=t0,
-                reason_code=parsed.get("reason_code", "NORMAL_APPROVE"),
+                reason_code=parsed["reason_code"],
                 confidence=parsed.get("confidence"),
             )
         else:
@@ -518,6 +611,7 @@ class FDAAgent(AgentBase):
                 order_deltas=order_deltas,
                 portfolio_patch_ref=portfolio_patch_ref,
                 t0=t0,
+                active_reports=active_reports,
                 confidence=parsed.get("confidence"),
             )
 
@@ -542,6 +636,27 @@ class FDAAgent(AgentBase):
             active_reports=active_reports,
             confidence=confidence,
         )
+
+    @staticmethod
+    def _uncertainty_score_from_signals(agent_signals: list[dict[str, Any]]) -> float:
+        """Extract the strongest RiskFast uncertainty_signal score for cold FDA."""
+        best = 0.0
+        for signal in agent_signals:
+            if not isinstance(signal, dict):
+                continue
+            payload = signal.get("payload")
+            payload = payload if isinstance(payload, dict) else signal
+            channel = str(signal.get("channel") or payload.get("channel") or "")
+            if channel != "uncertainty_signal":
+                continue
+            score = safe_float(
+                payload.get("uncertainty_score", payload.get("confidence", 0.0)),
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            best = max(best, score)
+        return best
 
     def _build_cold_prompt(
         self,
@@ -590,29 +705,57 @@ class FDAAgent(AgentBase):
         """FDA Cold Path LLM 응답 파싱."""
         try:
             parsed = parse_llm_json(content)
-            rc = str(parsed.get("reason_code", "NORMAL_APPROVE"))
+            if not isinstance(parsed, dict):
+                raise TypeError(f"LLM JSON root must be object. got={type(parsed)}")
+            approved = self._safe_bool(parsed.get("approved"), default=None)
+            if approved is None:
+                raise ValueError("LLM approved must be bool-like finite true/false")
+            rc = str(parsed.get("reason_code", "")).strip()
             if rc not in self._valid_reason_codes:
-                rc = "NORMAL_APPROVE"
+                logger.warning(
+                    "[fda] Cold Path LLM reason_code 오류. NEWS_DIVERGENCE fail-closed: %s",
+                    rc,
+                )
+                return {
+                    "approved": False,
+                    "reason_code": "NEWS_DIVERGENCE",
+                    "veto_reason": "Cold Path LLM reason_code 오류. FDA fail-closed.",
+                    "confidence": parsed.get("confidence"),
+                }
+            if approved is True and rc != "NORMAL_APPROVE":
+                raise ValueError(
+                    f"LLM approved=true inconsistent with reason_code={rc}"
+                )
+            if approved is False and rc == "NORMAL_APPROVE":
+                raise ValueError("LLM veto inconsistent with NORMAL_APPROVE")
             return {
-                "approved": self._safe_bool(parsed.get("approved", True), default=True),
+                "approved": approved,
                 "reason_code": rc,
                 "veto_reason": parsed.get("veto_reason"),
-                "confidence": self._safe_confidence(parsed.get("confidence", 0.7), default=0.7),
+                "confidence": parsed.get("confidence"),
             }
-        except (json.JSONDecodeError, ValueError, TypeError):
-            lower = content.lower()
-            approved = "veto" not in lower and "거부" not in lower
-            return {"approved": approved, "reason_code": "NORMAL_APPROVE" if approved else "NEWS_DIVERGENCE"}
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("[fda] Cold Path LLM 응답 파싱 실패. NEWS_DIVERGENCE fail-closed: %s", e)
+            return {
+                "approved": False,
+                "reason_code": "NEWS_DIVERGENCE",
+                "veto_reason": "Cold Path LLM 응답 파싱 실패. FDA fail-closed.",
+            }
 
     @staticmethod
-    def _safe_bool(value: Any, default: bool = True) -> bool:
+    def _safe_bool(value: Any, default: bool | None = True) -> bool | None:
         """LLM bool-like 값을 문자열까지 안전하게 해석한다."""
         if isinstance(value, bool):
             return value
         if value is None:
             return default
         if isinstance(value, (int, float)):
-            return bool(value)
+            as_float = float(value)
+            if not math.isfinite(as_float):
+                return default
+            if as_float in (0.0, 1.0):
+                return bool(int(as_float))
+            return default
         if isinstance(value, str):
             normalized = value.strip().lower()
             if normalized in {"true", "yes", "y", "1", "approve", "approved", "승인"}:

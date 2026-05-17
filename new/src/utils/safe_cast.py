@@ -79,3 +79,30 @@ def safe_int(
     if max_value is not None:
         out = min(max_value, out)
     return out
+
+
+def safe_lossless_int(
+    value: Any,
+    default: int = 0,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    """Convert integer-like external values without truncating fractions."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        out = value
+    else:
+        try:
+            out_float = float(str(value).strip() if isinstance(value, str) else value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(out_float) or not out_float.is_integer():
+            return default
+        out = int(out_float)
+    if min_value is not None and out < min_value:
+        return default
+    if max_value is not None and out > max_value:
+        return default
+    return out

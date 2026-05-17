@@ -22,7 +22,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from src.data.dataset_builder import DUAL_SOURCE_FEATURES, EXOGENOUS_FEATURES  # noqa: E402
-from src.data.dual_source_runner import load_latest_scores  # noqa: E402
+from src.data.dual_source_runner import (  # noqa: E402
+    DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+    load_latest_scores,
+)
 from src.data.exogenous_feature_store import (  # noqa: E402
     build_neutral_payload as build_neutral_exogenous_payload,
     is_non_neutral,
@@ -30,20 +33,54 @@ from src.data.exogenous_feature_store import (  # noqa: E402
     write_exogenous_payload,
 )
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
+from src.utils.trading_calendar import (  # noqa: E402
+    kospi_trading_dates_between,
+    kospi_trading_start_date,
+)
+from scripts.live_data_readiness import _inspect_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
-_DUAL_SOURCE_DIR = SRC / "artifacts" / "dual_source"
+_DUAL_SOURCE_DIR = DEFAULT_DUAL_SOURCE_ARTIFACT_DIR
 _REPORT_DIR = ROOT / "artifacts" / "reports" / "phase2_feature_backfill"
+_ALLOWED_DUAL_SOURCE_INPUT_MODES = {"real", "archived_raw_events"}
 
 
 def _active_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
         for item in sector.get("stocks", []) or []:
-            if str(item.get("status", "")).lower() == "active":
+            if str(item.get("status", "")) in stock_statuses:
                 tickers.append(pad_ticker(str(item.get("ticker", ""))))
     fallback = (cfg.get("backtest_universe_mode") or {}).get("fallback_tickers", [])
     tickers.extend(pad_ticker(str(t)) for t in fallback)
@@ -61,16 +98,58 @@ def _extract_date(path: Path) -> str | None:
     return match.group(1)
 
 
-def _common_artifact_dates(artifacts_dir: Path, tickers: list[str]) -> list[str]:
+def _valid_bar_artifact(path: Path, *, date_key: str, ticker: str, min_rows: int) -> bool:
+    if not path.name.startswith("bars_1m_"):
+        return False
+    if path.suffix not in {".parquet", ".jsonl"}:
+        return False
+    inspection = _inspect_bar_file(path, date_key, pad_ticker(ticker))
+    rows = inspection.get("rows")
+    return (
+        rows is not None
+        and int(rows) >= min_rows
+        and inspection.get("timestamp_dates_match") is True
+        and inspection.get("ticker_matches") is True
+        and int(inspection.get("duplicate_ts_count") or 0) == 0
+        and int(inspection.get("out_of_hours_count") or 0) == 0
+        and inspection.get("session_span_ok") is True
+        and inspection.get("max_gap_ok") is True
+        and int(inspection.get("missing_ohlcv_count") or 0) == 0
+        and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+        and int(inspection.get("invalid_ohlcv_count") or 0) == 0
+    )
+
+
+def _common_artifact_dates(
+    artifacts_dir: Path,
+    tickers: list[str],
+    *,
+    min_rows: int,
+) -> list[str]:
     counts: dict[str, int] = {}
     for ticker in tickers:
         ticker_dir = artifacts_dir / ticker
         if not ticker_dir.exists():
             continue
-        seen: set[str] = set()
+        paths_by_date: dict[str, list[Path]] = {}
         for path in ticker_dir.iterdir():
             date_key = _extract_date(path)
-            if date_key:
+            if (
+                date_key
+                and path.name.startswith("bars_1m_")
+                and path.suffix in {".parquet", ".jsonl"}
+            ):
+                paths_by_date.setdefault(date_key, []).append(path)
+        seen: set[str] = set()
+        for date_key, paths in paths_by_date.items():
+            if len(paths) != 1:
+                continue
+            if _valid_bar_artifact(
+                paths[0],
+                date_key=date_key,
+                ticker=ticker,
+                min_rows=min_rows,
+            ):
                 seen.add(date_key)
         for date_key in seen:
             counts[date_key] = counts.get(date_key, 0) + 1
@@ -84,13 +163,35 @@ def _select_dates(
     *,
     end_date: str,
     business_days: int,
+    min_rows: int,
 ) -> list[str]:
-    dates = [date_key for date_key in _common_artifact_dates(artifacts_dir, tickers) if date_key <= end_date]
-    return dates[-business_days:]
+    expected = _expected_artifact_dates(end_date=end_date, business_days=business_days)
+    common = set(_common_artifact_dates(artifacts_dir, tickers, min_rows=min_rows))
+    return [date_key for date_key in expected if date_key in common]
+
+
+def _expected_artifact_dates(*, end_date: str, business_days: int) -> list[str]:
+    end_dt = datetime.strptime(end_date, "%Y%m%d").date()
+    start_dt = kospi_trading_start_date(end_dt, business_days)
+    return kospi_trading_dates_between(start_dt, end_dt)
 
 
 def _dual_source_non_neutral(scores: list[dict[str, Any]]) -> bool:
     for row in scores:
+        if _dual_source_row_non_neutral(row):
+            return True
+    return False
+
+
+def _ticker_from_record(row: dict[str, Any]) -> str | None:
+    ticker = pad_ticker(str(row.get("ticker", "")))
+    if ticker == "000000":
+        return None
+    return ticker
+
+
+def _dual_source_row_non_neutral(row: dict[str, Any]) -> bool:
+    try:
         if abs(float(row.get("news_score_t", 0.0))) > 1e-12:
             return True
         if abs(float(row.get("comm_score_t_1", 0.0))) > 1e-12:
@@ -101,7 +202,52 @@ def _dual_source_non_neutral(scores: list[dict[str, Any]]) -> bool:
             return True
         if abs(float(row.get("community_noise_multiplier", 1.0)) - 1.0) > 1e-12:
             return True
+    except (TypeError, ValueError):
+        return False
     return False
+
+
+def _dual_source_tickers(scores: list[dict[str, Any]]) -> set[str]:
+    tickers: set[str] = set()
+    for row in scores:
+        if not isinstance(row, dict):
+            continue
+        ticker = _ticker_from_record(row)
+        if ticker:
+            tickers.add(ticker)
+    return tickers
+
+
+def _dual_source_non_neutral_tickers(scores: list[dict[str, Any]]) -> set[str]:
+    tickers: set[str] = set()
+    for row in scores:
+        if not isinstance(row, dict):
+            continue
+        ticker = _ticker_from_record(row)
+        if ticker and _dual_source_row_non_neutral(row):
+            tickers.add(ticker)
+    return tickers
+
+
+def _exogenous_tickers(scores: dict[str, dict[str, Any]]) -> set[str]:
+    tickers: set[str] = set()
+    for ticker in scores:
+        padded = pad_ticker(str(ticker))
+        if padded != "000000":
+            tickers.add(padded)
+    return tickers
+
+
+def _exogenous_non_neutral_tickers(
+    scores: dict[str, dict[str, Any]],
+    defaults: dict[str, float],
+) -> set[str]:
+    tickers: set[str] = set()
+    for ticker, values in scores.items():
+        padded = pad_ticker(str(ticker))
+        if padded != "000000" and is_non_neutral(values, defaults):
+            tickers.add(padded)
+    return tickers
 
 
 def _neutral_dual_source_payload(date_key: str, tickers: list[str]) -> dict[str, Any]:
@@ -130,6 +276,61 @@ def _neutral_dual_source_payload(date_key: str, tickers: list[str]) -> dict[str,
     }
 
 
+def _load_dual_source_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"source_stats": {"payload_read_error": True}}
+    return data if isinstance(data, dict) else {}
+
+
+def _dual_source_artifact_blockers(payload: dict[str, Any]) -> list[str]:
+    if not payload:
+        return []
+    source_stats = payload.get("source_stats")
+    if not isinstance(source_stats, dict):
+        return ["dual_source_provenance_missing"]
+
+    blockers: list[str] = []
+    input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+    if input_mode not in _ALLOWED_DUAL_SOURCE_INPUT_MODES:
+        blockers.append("dual_source_non_real_input_mode")
+    if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+        blockers.append("dual_source_neutral_rehearsal_artifact")
+    if safe_bool(source_stats.get("payload_read_error"), default=False):
+        blockers.append("dual_source_payload_read_error")
+    return blockers
+
+
+def _exogenous_artifact_blockers(stats: dict[str, Any]) -> list[str]:
+    if stats.get("status") != "found":
+        return []
+    if "source_stats" not in stats:
+        return []
+    source_stats = stats.get("source_stats")
+    if not isinstance(source_stats, dict) or not source_stats:
+        return ["exogenous_provenance_missing"]
+
+    blockers: list[str] = []
+    input_mode = str(source_stats.get("input_mode", "")).strip().lower()
+    if input_mode and input_mode != "real":
+        blockers.append("exogenous_non_real_input_mode")
+    if safe_bool(source_stats.get("neutral_rehearsal_file"), default=False):
+        blockers.append("exogenous_neutral_rehearsal_artifact")
+    provider_availability = source_stats.get("provider_availability")
+    if isinstance(provider_availability, dict) and any(
+        not bool(value) for value in provider_availability.values()
+    ):
+        blockers.append("exogenous_provider_unavailable")
+    us_source = source_stats.get("us_market_source")
+    if us_source and str(us_source) != "yfinance":
+        blockers.append("exogenous_us_market_source_not_yfinance")
+    return blockers
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
@@ -144,46 +345,82 @@ def run_phase2_feature_backfill(
     artifacts_dir: Path,
     output_dir: Path,
 ) -> dict[str, Any]:
+    gate_cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
+    readiness_cfg = config_load("risk_config.yaml", "live_data_readiness") or {}
+    min_artifact_rows = int(
+        gate_cfg.get(
+            "min_rows_per_day",
+            readiness_cfg.get("train_min_rows_per_day", 300),
+        )
+    )
     tickers = _active_tickers()
     selected_dates = _select_dates(
         artifacts_dir,
         tickers,
         end_date=end_date,
         business_days=business_days,
+        min_rows=min_artifact_rows,
     )
-    if not selected_dates:
-        raise RuntimeError("no common 1m artifact dates found for active tickers")
+    expected_dates = _expected_artifact_dates(end_date=end_date, business_days=business_days)
+    missing_artifact_dates = [
+        date_key for date_key in expected_dates if date_key not in set(selected_dates)
+    ]
 
     exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
     defaults = {
         col: float((exog_cfg.get("neutral_defaults") or {}).get(col, 0.0))
         for col in EXOGENOUS_FEATURES
     }
-    gate_cfg = config_load("risk_config.yaml", "phase2_feature_backfill") or {}
     min_ds_cov = float(gate_cfg.get("min_dual_source_non_neutral_date_coverage", 0.8))
     min_exog_cov = float(gate_cfg.get("min_exogenous_non_neutral_date_coverage", 0.8))
+
+    expected_tickers = sorted({pad_ticker(ticker) for ticker in tickers})
+    expected_ticker_set = set(expected_tickers)
+    expected_ticker_dates = len(selected_dates) * max(len(expected_tickers), 1)
 
     per_date: list[dict[str, Any]] = []
     dual_source_found = 0
     dual_source_non_neutral = 0
+    dual_source_ticker_dates = 0
+    dual_source_full_ticker_dates = 0
+    dual_source_non_neutral_ticker_dates = 0
     exogenous_found = 0
     exogenous_non_neutral = 0
+    exogenous_ticker_dates = 0
+    exogenous_full_ticker_dates = 0
+    exogenous_non_neutral_ticker_dates = 0
     files_written: list[str] = []
 
     for date_key in selected_dates:
         ds_path = _DUAL_SOURCE_DIR / f"{date_key}.json"
+        ds_payload = _load_dual_source_payload(ds_path)
+        ds_artifact_blockers = _dual_source_artifact_blockers(ds_payload)
         ds_scores = load_latest_scores(date_key)
         ds_found = bool(ds_scores)
         ds_non_neutral = _dual_source_non_neutral(ds_scores)
+        ds_tickers = _dual_source_tickers(ds_scores) & expected_ticker_set
+        ds_non_neutral_tickers = (
+            _dual_source_non_neutral_tickers(ds_scores) & expected_ticker_set
+        )
         if not ds_found and write_neutral_placeholders:
             payload = _neutral_dual_source_payload(date_key, tickers)
             _write_json(ds_path, payload)
+            ds_payload = payload
+            ds_artifact_blockers = _dual_source_artifact_blockers(ds_payload)
             files_written.append(str(ds_path.relative_to(ROOT)))
             ds_scores = payload["scores"]
             ds_found = True
             ds_non_neutral = False
+            ds_tickers = _dual_source_tickers(ds_scores) & expected_ticker_set
+            ds_non_neutral_tickers = set()
+        if ds_artifact_blockers:
+            ds_non_neutral = False
+            ds_non_neutral_tickers = set()
         dual_source_found += int(ds_found)
         dual_source_non_neutral += int(ds_non_neutral)
+        dual_source_ticker_dates += len(ds_tickers)
+        dual_source_full_ticker_dates += int(ds_tickers == expected_ticker_set)
+        dual_source_non_neutral_ticker_dates += len(ds_non_neutral_tickers)
 
         exog_scores, exog_stats = load_exogenous_scores(
             date_key,
@@ -191,7 +428,12 @@ def run_phase2_feature_backfill(
             defaults=defaults,
         )
         exog_found = exog_stats["status"] == "found"
+        exog_artifact_blockers = _exogenous_artifact_blockers(exog_stats)
         exog_non_neutral = any(is_non_neutral(values, defaults) for values in exog_scores.values())
+        exog_tickers = _exogenous_tickers(exog_scores) & expected_ticker_set
+        exog_non_neutral_tickers = (
+            _exogenous_non_neutral_tickers(exog_scores, defaults) & expected_ticker_set
+        )
         if not exog_found and write_neutral_placeholders:
             payload = build_neutral_exogenous_payload(
                 date_key,
@@ -206,29 +448,89 @@ def run_phase2_feature_backfill(
                 feature_cols=list(EXOGENOUS_FEATURES),
                 defaults=defaults,
             )
+            exog_artifact_blockers = _exogenous_artifact_blockers(exog_stats)
             exog_found = True
             exog_non_neutral = False
+            exog_tickers = _exogenous_tickers(exog_scores) & expected_ticker_set
+            exog_non_neutral_tickers = set()
+        if exog_artifact_blockers:
+            exog_non_neutral = False
+            exog_non_neutral_tickers = set()
         exogenous_found += int(exog_found)
         exogenous_non_neutral += int(exog_non_neutral)
+        exogenous_ticker_dates += len(exog_tickers)
+        exogenous_full_ticker_dates += int(exog_tickers == expected_ticker_set)
+        exogenous_non_neutral_ticker_dates += len(exog_non_neutral_tickers)
 
         per_date.append({
             "date": date_key,
             "dual_source_found": ds_found,
             "dual_source_non_neutral": ds_non_neutral,
+            "dual_source_artifact_blockers": ds_artifact_blockers,
             "dual_source_score_count": len(ds_scores),
+            "dual_source_ticker_count": len(ds_tickers),
+            "dual_source_missing_tickers_sample": sorted(
+                expected_ticker_set - ds_tickers
+            )[:20],
+            "dual_source_non_neutral_ticker_count": len(ds_non_neutral_tickers),
             "exogenous_found": exog_found,
             "exogenous_non_neutral": exog_non_neutral,
+            "exogenous_artifact_blockers": exog_artifact_blockers,
             "exogenous_record_count": int(exog_stats.get("record_count", 0)),
+            "exogenous_ticker_count": len(exog_tickers),
+            "exogenous_missing_tickers_sample": sorted(
+                expected_ticker_set - exog_tickers
+            )[:20],
+            "exogenous_non_neutral_ticker_count": len(exog_non_neutral_tickers),
         })
 
     date_count = len(selected_dates)
     dual_source_non_neutral_coverage = dual_source_non_neutral / max(date_count, 1)
     exogenous_non_neutral_coverage = exogenous_non_neutral / max(date_count, 1)
+    dual_source_ticker_coverage = dual_source_ticker_dates / max(
+        expected_ticker_dates,
+        1,
+    )
+    exogenous_ticker_coverage = exogenous_ticker_dates / max(expected_ticker_dates, 1)
+    dual_source_full_ticker_date_coverage = dual_source_full_ticker_dates / max(
+        date_count,
+        1,
+    )
+    exogenous_full_ticker_date_coverage = exogenous_full_ticker_dates / max(
+        date_count,
+        1,
+    )
+    dual_source_non_neutral_row_coverage = dual_source_non_neutral_ticker_dates / max(
+        expected_ticker_dates,
+        1,
+    )
+    exogenous_non_neutral_row_coverage = exogenous_non_neutral_ticker_dates / max(
+        expected_ticker_dates,
+        1,
+    )
     blockers: list[str] = []
-    if dual_source_non_neutral_coverage < min_ds_cov:
-        blockers.append("dual_source_non_neutral_coverage_below_threshold")
-    if exogenous_non_neutral_coverage < min_exog_cov:
-        blockers.append("exogenous_non_neutral_coverage_below_threshold")
+    dual_source_artifact_blockers = sorted({
+        blocker
+        for item in per_date
+        for blocker in item.get("dual_source_artifact_blockers", [])
+    })
+    blockers.extend(dual_source_artifact_blockers)
+    exogenous_artifact_blockers = sorted({
+        blocker
+        for item in per_date
+        for blocker in item.get("exogenous_artifact_blockers", [])
+    })
+    blockers.extend(exogenous_artifact_blockers)
+    if missing_artifact_dates:
+        blockers.append("kis_1m_artifact_date_coverage_below_threshold")
+    if dual_source_ticker_coverage < 1.0:
+        blockers.append("dual_source_ticker_coverage_below_threshold")
+    if exogenous_ticker_coverage < 1.0:
+        blockers.append("exogenous_ticker_coverage_below_threshold")
+    if dual_source_non_neutral_row_coverage < min_ds_cov:
+        blockers.append("dual_source_non_neutral_row_coverage_below_threshold")
+    if exogenous_non_neutral_row_coverage < min_exog_cov:
+        blockers.append("exogenous_non_neutral_row_coverage_below_threshold")
 
     report = {
         "status": "PASS" if not blockers else "BLOCKED",
@@ -236,8 +538,20 @@ def run_phase2_feature_backfill(
         "end_date": end_date,
         "business_days_requested": business_days,
         "date_count": date_count,
-        "date_range": {"start": selected_dates[0], "end": selected_dates[-1]},
+        "date_range": (
+            {"start": selected_dates[0], "end": selected_dates[-1]}
+            if selected_dates
+            else {"start": None, "end": None}
+        ),
+        "artifact_date_coverage": {
+            "expected_date_count": len(expected_dates),
+            "selected_date_count": date_count,
+            "missing_date_count": len(missing_artifact_dates),
+            "missing_dates_sample": missing_artifact_dates[:20],
+        },
         "ticker_count": len(tickers),
+        "expected_tickers": expected_tickers,
+        "min_artifact_rows_per_day": min_artifact_rows,
         "thresholds": {
             "min_dual_source_non_neutral_date_coverage": min_ds_cov,
             "min_exogenous_non_neutral_date_coverage": min_exog_cov,
@@ -245,8 +559,20 @@ def run_phase2_feature_backfill(
         "coverage": {
             "dual_source_file_coverage": dual_source_found / max(date_count, 1),
             "dual_source_non_neutral_date_coverage": dual_source_non_neutral_coverage,
+            "dual_source_ticker_coverage": dual_source_ticker_coverage,
+            "dual_source_full_ticker_date_coverage": (
+                dual_source_full_ticker_date_coverage
+            ),
+            "dual_source_non_neutral_row_coverage": (
+                dual_source_non_neutral_row_coverage
+            ),
             "exogenous_file_coverage": exogenous_found / max(date_count, 1),
             "exogenous_non_neutral_date_coverage": exogenous_non_neutral_coverage,
+            "exogenous_ticker_coverage": exogenous_ticker_coverage,
+            "exogenous_full_ticker_date_coverage": exogenous_full_ticker_date_coverage,
+            "exogenous_non_neutral_row_coverage": (
+                exogenous_non_neutral_row_coverage
+            ),
         },
         "blockers": blockers,
         "files_written": files_written,
@@ -256,7 +582,10 @@ def run_phase2_feature_backfill(
     ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
     path = output_dir / f"phase2_feature_backfill_{ts}.json"
     report["report_path"] = str(path)
-    report["report_path_relative"] = str(path.relative_to(ROOT))
+    try:
+        report["report_path_relative"] = str(path.relative_to(ROOT))
+    except ValueError:
+        report["report_path_relative"] = str(path)
     _write_json(path, report)
     return report
 

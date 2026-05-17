@@ -43,7 +43,8 @@ _MESSAGE_REQUIRED_FIELDS: frozenset[str] = frozenset({
 })
 _MESSAGE_OPTIONAL_FIELDS: frozenset[str] = frozenset({
     "message_id", "send_to", "evidence_ids", "uncertainty", "prediction",
-    "risk_level", "ttl", "expires_at", "event_id", "supersedes", "portfolio_patch_id",
+    "risk_level", "ttl", "expires_at", "event_id", "occurred_at", "asof",
+    "supersedes", "portfolio_patch_id",
 })
 
 # publish_channels SSOT (api_contracts.md message_taxonomy L57~72): 15개
@@ -79,6 +80,36 @@ _VALID_PRIORITIES: frozenset[str] = frozenset({"urgent", "normal", "low"})
 
 # risk_level SSOT (api_contracts.md C4 message_schema L312): None 허용
 _VALID_RISK_LEVELS: frozenset[str | None] = frozenset({"low", "medium", "high", None})
+
+
+def _parse_iso_datetime_field(message: dict, field_name: str) -> datetime:
+    """publish-time ISO datetime validation for C4 timestamp fields."""
+    raw = message.get(field_name)
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"MESSAGE_SCHEMA_INVALID: {field_name} must be ISO datetime string"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"MESSAGE_SCHEMA_INVALID: {field_name} invalid ISO datetime '{raw}'"
+        ) from e
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed
+
+
+def _validate_pit_trace_fields(message: dict) -> None:
+    if "occurred_at" not in message or "asof" not in message:
+        return
+    occurred_at = _parse_iso_datetime_field(message, "occurred_at")
+    asof = _parse_iso_datetime_field(message, "asof")
+    if occurred_at > asof:
+        raise ValueError(
+            "MESSAGE_PIT_VIOLATION: occurred_at "
+            f"{occurred_at.isoformat()} > asof {asof.isoformat()}"
+        )
 
 
 @dataclass
@@ -123,7 +154,7 @@ class MessagePool:
         self._subscribers: dict[str, list[tuple[Callable, Callable | None]]] = defaultdict(list)
 
         # dependency_activation 레지스트리
-        # key → {"required": set, "callback": Callable, "seen": set, "latest_messages": dict}
+        # key → {"required": set, "callback": Callable, "contexts": {correlation_key: state}}
         self._dependencies: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -169,8 +200,18 @@ class MessagePool:
         if risk_level not in _VALID_RISK_LEVELS:
             raise ValueError(f"MESSAGE_SCHEMA_INVALID: risk_level='{risk_level}' not valid")
 
+        _parse_iso_datetime_field(message, "timestamp")
+        if "expires_at" in message:
+            _parse_iso_datetime_field(message, "expires_at")
+        for trace_ts_field in ("occurred_at", "asof"):
+            if trace_ts_field in message:
+                _parse_iso_datetime_field(message, trace_ts_field)
+        _validate_pit_trace_fields(message)
+
         # 2. message_id
         message_id = message.get("message_id") or generate_message_id()
+        if message_id in self._messages:
+            raise ValueError(f"MESSAGE_ID_CONFLICT: message_id='{message_id}' already exists")
         message["message_id"] = message_id
 
         # 3. expires_at + timestamp 자동 계산
@@ -234,6 +275,21 @@ class MessagePool:
             "[message_pool] 구독 등록: channel=%s handler=%s",
             channel, getattr(handler, "__name__", repr(handler)),
         )
+
+    def remove_subscriber(self, channel: str, handler: Callable[[dict], None]) -> int:
+        """채널에서 특정 handler 구독을 제거하고 제거 건수를 반환."""
+        if channel not in _VALID_CHANNELS:
+            raise ValueError(f"INVALID_SCOPE: channel='{channel}' not registered")
+        subscribers = self._subscribers[channel]
+        kept = [(hh, ff) for hh, ff in subscribers if hh is not handler]
+        removed = len(subscribers) - len(kept)
+        self._subscribers[channel] = kept
+        if removed:
+            logger.info(
+                "[message_pool] 구독 해제: channel=%s handler=%s removed=%d",
+                channel, getattr(handler, "__name__", repr(handler)), removed,
+            )
+        return removed
 
     def ack(self, message_id: str, ack_by: str = "unknown") -> None:
         """메시지 처리 완료 확인.
@@ -318,10 +374,31 @@ class MessagePool:
             self._by_channel[entry.channel] = [
                 x for x in self._by_channel[entry.channel] if x != mid
             ]
+        if to_remove:
+            self._prune_dependency_contexts(set(to_remove))
 
         if to_remove:
             logger.info("[message_pool] expire: 제거=%d", len(to_remove))
         return len(to_remove)
+
+    def _prune_dependency_contexts(self, removed_ids: set[str]) -> None:
+        for dep in self._dependencies.values():
+            contexts = dep.get("contexts", {})
+            for corr_key, context in list(contexts.items()):
+                latest_ids = context.get("latest_message_ids", {})
+                removed_channels = {
+                    channel
+                    for channel, message_id in latest_ids.items()
+                    if message_id in removed_ids
+                }
+                if not removed_channels:
+                    continue
+                context["seen"].difference_update(removed_channels)
+                for channel in removed_channels:
+                    context["latest_messages"].pop(channel, None)
+                    latest_ids.pop(channel, None)
+                if not context["seen"]:
+                    contexts.pop(corr_key, None)
 
     # ------------------------------------------------------------------
     # dependency_activation (C4 delivery_semantics)
@@ -348,13 +425,20 @@ class MessagePool:
         self._dependencies[activation_key] = {
             "required": set(required_channels),
             "callback": callback,
-            "seen": set(),
-            "latest_messages": {},
+            "contexts": {},
         }
         logger.info(
             "[message_pool] dependency 등록: key=%s requires=%s",
             activation_key, sorted(required_channels),
         )
+
+    @staticmethod
+    def _dependency_correlation_key(message: dict[str, Any]) -> str:
+        for field_name in ("event_id", "portfolio_patch_id"):
+            value = message.get(field_name)
+            if value:
+                return f"{field_name}:{value}"
+        return f"scope:{message.get('scope', '')}"
 
     def _check_dependencies(self, just_published_channel: str) -> None:
         """publish 직후 호출. 모든 required channel 수신 완료 시 callback."""
@@ -362,23 +446,36 @@ class MessagePool:
             if just_published_channel not in dep["required"]:
                 continue
 
-            dep["seen"].add(just_published_channel)
             # 최신 메시지 캐시
             ids = self._by_channel[just_published_channel]
             if ids:
                 last_id = ids[-1]
-                dep["latest_messages"][just_published_channel] = self._messages[last_id].message
+                message = self._messages[last_id].message
+                corr_key = self._dependency_correlation_key(message)
+                context = dep["contexts"].setdefault(
+                    corr_key,
+                    {"seen": set(), "latest_messages": {}, "latest_message_ids": {}},
+                )
+                context["seen"].add(just_published_channel)
+                context["latest_messages"][just_published_channel] = message
+                context["latest_message_ids"][just_published_channel] = last_id
+            else:
+                continue
 
-            if dep["seen"] == dep["required"]:
+            if context["seen"] == dep["required"]:
                 try:
-                    dep["callback"](dep["latest_messages"])
-                    logger.info("[message_pool] dependency activated: key=%s", key)
+                    dep["callback"](context["latest_messages"])
+                    logger.info(
+                        "[message_pool] dependency activated: key=%s corr=%s",
+                        key,
+                        corr_key,
+                    )
                 except Exception as e:
                     logger.warning(
                         "[message_pool] dependency callback 예외: key=%s err=%s", key, e
                     )
-                # 한 사이클 완료 후 seen 리셋. 재활성화 지원
-                dep["seen"] = set()
+                # 한 사이클 완료 후 context 제거. correlation별 재활성화 지원
+                dep["contexts"].pop(corr_key, None)
 
     # ------------------------------------------------------------------
     # 조회 helpers

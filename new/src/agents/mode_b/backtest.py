@@ -1,6 +1,7 @@
 """C12 Backtest Agent. Mode B 전용. 장중 경로 절대 미개입."""
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
 from typing import Any
@@ -153,6 +154,7 @@ class BacktestAgent(AgentBase):
             # universe/date_range는 bundle_id에서 파싱하거나 기본값 사용
             # (Sprint 4 KB 통합 전까지 기본 universe/date_range 사용)
             from datetime import timedelta
+            from src.utils.trading_calendar import kospi_trading_start_date
             # SHIP-fix C-4 (GPT Pro 2026-05-09): PIT-Safety guard.
             # 실행 시각이 snapshot_hour (18:00 KST) 이전이면 default_end 를 어제 18:00 으로 후퇴.
             # 18:00 이후 실행 시에만 오늘 18:00 까지 포함 (정상 Mode B 시점).
@@ -170,7 +172,25 @@ class BacktestAgent(AgentBase):
                 )
             else:
                 default_end = today_snapshot
-            default_start = (default_end - timedelta(days=90))
+            wf_cfg = config_load("risk_config.yaml", "walk_forward") or {}
+            vt_cfg = config_load("risk_config.yaml", "validation_tools.backtest_engine") or {}
+            trading_days_needed = (
+                int(wf_cfg.get("train_window_days", 60))
+                + int(math.ceil(int(vt_cfg.get("purge_bars", 60)) / 390))
+                + int(math.ceil(int(vt_cfg.get("embargo_bars", 78)) / 390))
+                + int(wf_cfg.get("test_window_days", 20))
+                + max(0, int(wf_cfg.get("n_splits", 8)) - 1)
+                * int(wf_cfg.get("step_days", wf_cfg.get("test_window_days", 20)))
+            )
+            default_start_date = kospi_trading_start_date(
+                default_end.date(),
+                trading_days_needed,
+            )
+            default_start = default_end.replace(
+                year=default_start_date.year,
+                month=default_start_date.month,
+                day=default_start_date.day,
+            )
             date_range = {
                 "start": default_start.isoformat(),
                 "end": default_end.isoformat(),

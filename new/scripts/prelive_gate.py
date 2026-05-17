@@ -22,7 +22,11 @@ NEW_ROOT = REPO_ROOT / "new"
 if str(NEW_ROOT) not in sys.path:
     sys.path.insert(0, str(NEW_ROOT))
 
-from src.mode_b.service_policy_verifier import service_policy_gate_pass  # noqa: E402
+from src.mode_b.service_policy_verifier import (  # noqa: E402
+    normalize_service_policy_universe,
+    service_policy_gate_pass,
+    service_policy_universe_hash,
+)
 from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
@@ -30,6 +34,7 @@ from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_start_date,
     previous_kospi_trading_day,
 )
+from scripts.live_data_readiness import _inspect_bar_file as _inspect_live_bar_file  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATA_ROOT = REPO_ROOT / "artifacts" / "data"
@@ -166,6 +171,21 @@ def _metadata_ticker_count(metadata: dict[str, Any]) -> tuple[int, list[str]]:
     return safe_int(metadata.get("n_tickers", 0), default=0, min_value=0), []
 
 
+def _metadata_ticker_sets(metadata: dict[str, Any]) -> dict[str, list[str]]:
+    sets: dict[str, list[str]] = {}
+    for key in ("requested_tickers", "loaded_tickers"):
+        raw = metadata.get(key)
+        if isinstance(raw, list):
+            tickers = normalize_service_policy_universe([
+                str(ticker)
+                for ticker in raw
+                if str(ticker).strip()
+            ])
+            if tickers:
+                sets[key] = tickers
+    return sets
+
+
 def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
     gate_cfg = _final_dataset_gate_cfg()
     if not gate_cfg:
@@ -215,6 +235,32 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
     ticker_count, tickers = _metadata_ticker_count(metadata)
     if ticker_count < min_tickers:
         blockers.append("ticker_count_below_final_dataset_min")
+    expected_tickers = (
+        normalize_service_policy_universe(_active_tickers(min_tickers))
+        if min_tickers > 0
+        else []
+    )
+    if min_tickers > 0:
+        if not expected_tickers:
+            blockers.append("final_dataset_expected_universe_missing")
+        elif len(expected_tickers) != min_tickers:
+            blockers.append("final_dataset_expected_universe_incomplete")
+    expected_universe_hash = (
+        service_policy_universe_hash(expected_tickers) if expected_tickers else None
+    )
+    observed_sets = _metadata_ticker_sets(metadata)
+    observed_hashes = {
+        key: service_policy_universe_hash(value)
+        for key, value in observed_sets.items()
+    }
+    if expected_tickers:
+        if ticker_count != len(expected_tickers):
+            blockers.append("ticker_count_final_universe_mismatch")
+        if not observed_sets:
+            blockers.append("ticker_set_missing_for_final_dataset")
+        for key, observed_tickers in observed_sets.items():
+            if observed_tickers != expected_tickers:
+                blockers.append(f"{key}_final_universe_mismatch")
     if data_source_required and data_source != data_source_required:
         blockers.append("model_data_source_not_allowed_for_final_dataset")
     if safe_bool(metadata.get("synthetic_fallback"), default=False):
@@ -236,6 +282,9 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
         "ticker_count": ticker_count,
         "min_tickers": min_tickers,
         "sample_tickers": tickers[:5],
+        "expected_ticker_count": len(expected_tickers),
+        "expected_universe_hash": expected_universe_hash,
+        "observed_universe_hashes": observed_hashes,
         "data_source": data_source or None,
         "required_data_source": data_source_required or None,
     }
@@ -243,6 +292,16 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
     return _final_dataset_gate_result(payload).get("status") == "PASS"
+
+
+def _label_target_gate_pass(payload: dict[str, Any]) -> bool:
+    """Deployable C12 evidence must match the current label target SSOT."""
+    cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
+    required_target_col = str((cfg.get("label") or {}).get("target_col") or "").strip()
+    if not required_target_col:
+        return False
+    metadata = _extract_model_metadata(payload)
+    return str(metadata.get("target_col") or "").strip() == required_target_col
 
 
 def _final_gate_min_business_days(default: int = 80) -> int:
@@ -275,6 +334,79 @@ def _count_rows(path: Path) -> int | None:
         return int(len(pd.read_parquet(path)))
     except Exception:
         return None
+
+
+def _bar_artifact_paths_for_date(ticker: str, day: str) -> list[Path]:
+    ticker_dir = _DATA_ROOT / ticker
+    if not ticker_dir.exists():
+        return []
+    prefix = f"bars_1m_{day}"
+    return sorted(
+        path
+        for path in ticker_dir.iterdir()
+        if path.name.startswith(prefix) and path.suffix in {".parquet", ".jsonl"}
+    )
+
+
+def _duplicate_bar_artifact(
+    paths: list[Path],
+    ticker: str,
+    day: str,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "rows": None,
+        "valid_artifact": False,
+        "reason": "duplicate_date_artifacts",
+        "date": day,
+        "duplicate_date_artifacts": [_repo_relative(path) for path in paths],
+    }
+
+
+def _inspect_bar_artifact(path: Path, ticker: str, day: str) -> dict[str, Any]:
+    """Inspect saved 1m parquet before counting it as train-ready evidence."""
+    if not path.exists():
+        return {
+            "ticker": ticker,
+            "rows": None,
+            "valid_artifact": False,
+            "reason": "missing_file",
+        }
+    inspection = _inspect_live_bar_file(path, day, pad_ticker(ticker), min_rows_per_day=300)
+    rows = inspection.get("rows")
+    valid_artifact = (
+        rows is not None
+        and inspection.get("timestamp_dates_match") is True
+        and inspection.get("ticker_matches") is True
+        and int(inspection.get("duplicate_ts_count") or 0) == 0
+        and int(inspection.get("out_of_hours_count") or 0) == 0
+        and inspection.get("session_span_ok") is True
+        and inspection.get("max_gap_ok") is True
+        and int(inspection.get("missing_ohlcv_count") or 0) == 0
+        and int(inspection.get("non_finite_ohlcv_count") or 0) == 0
+        and int(inspection.get("invalid_ohlcv_count") or 0) == 0
+    )
+    reason = None if valid_artifact else "artifact_integrity_failed"
+    return {
+        "ticker": ticker,
+        "rows": rows,
+        "valid_artifact": valid_artifact,
+        "reason": reason,
+        "timestamp_dates_match": inspection.get("timestamp_dates_match"),
+        "ticker_matches": inspection.get("ticker_matches"),
+        "duplicate_ts_count": inspection.get("duplicate_ts_count"),
+        "out_of_hours_count": inspection.get("out_of_hours_count"),
+        "first_ts": inspection.get("first_ts"),
+        "last_ts": inspection.get("last_ts"),
+        "session_span_minutes": inspection.get("session_span_minutes"),
+        "session_span_ok": inspection.get("session_span_ok"),
+        "max_gap_minutes": inspection.get("max_gap_minutes"),
+        "max_gap_ok": inspection.get("max_gap_ok"),
+        "missing_ohlcv_count": inspection.get("missing_ohlcv_count"),
+        "non_finite_ohlcv_count": inspection.get("non_finite_ohlcv_count"),
+        "invalid_ohlcv_count": inspection.get("invalid_ohlcv_count"),
+        "path": _repo_relative(path),
+    }
 
 
 def _latest_matching_report(
@@ -342,11 +474,13 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
         stages = data.get("stages", {})
         smoke = stages.get("smoke", {})
         backfill = stages.get("backfill", {})
+        train = stages.get("train", {})
         return (
             data.get("status") == "PASS"
             and data.get("end_date") == end_yyyymmdd
             and bool(smoke)
             and backfill.get("status") == "PASS"
+            and train.get("status") == "PASS"
             and not safe_bool(data.get("allow_mock", False), default=True)
         )
 
@@ -365,6 +499,7 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
     secret_presence = data.get("runtime", {}).get("secret_presence", {})
     smoke = data.get("stages", {}).get("smoke", {})
     backfill = data.get("stages", {}).get("backfill", {})
+    train = data.get("stages", {}).get("train", {})
     return _stage(
         "PASS",
         "Latest real readiness report passed.",
@@ -383,6 +518,8 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
                 if backfill.get("counts")
                 else None
             ),
+            "train_status": train.get("status"),
+            "train_data_source": train.get("data_source"),
         },
     )
 
@@ -402,10 +539,19 @@ def _check_80_day_artifacts(
     for day in required_dates:
         missing_or_short: list[dict[str, Any]] = []
         for ticker in tickers:
-            path = _DATA_ROOT / ticker / f"bars_1m_{day}.parquet"
-            rows = _count_rows(path) if path.exists() else None
-            if rows is None or rows < min_rows_per_day:
-                missing_or_short.append({"ticker": ticker, "rows": rows})
+            paths = _bar_artifact_paths_for_date(ticker, day)
+            if len(paths) > 1:
+                missing_or_short.append(_duplicate_bar_artifact(paths, ticker, day))
+                continue
+            path = paths[0] if paths else _DATA_ROOT / ticker / f"bars_1m_{day}.parquet"
+            inspection = _inspect_bar_artifact(path, ticker, day)
+            rows = inspection.get("rows")
+            if (
+                rows is None
+                or rows < min_rows_per_day
+                or inspection.get("valid_artifact") is not True
+            ):
+                missing_or_short.append(inspection)
         if missing_or_short:
             if len(sample_missing) < 5:
                 sample_missing[day] = missing_or_short[:5]
@@ -477,19 +623,56 @@ def _latest_lgbm_metadata(
     return str(latest.get("version")), latest
 
 
+def _staged_lgbm_metadata(
+    bundle_id: str,
+) -> tuple[str | None, dict[str, Any] | None, Path, Path]:
+    bundle_lgbm_dir = REPO_ROOT / "artifacts" / "bundles" / bundle_id / "lgbm"
+    metadata_path = bundle_lgbm_dir / "latest_model_metadata.json"
+    model_path = bundle_lgbm_dir / "latest_model.pkl"
+    if not metadata_path.exists():
+        return None, None, metadata_path, model_path
+    meta = _load_json(metadata_path)
+    if not isinstance(meta, dict):
+        return None, None, metadata_path, model_path
+    version = str(meta.get("version") or "staged_bundle")
+    return version, meta, metadata_path, model_path
+
+
 def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     requested_bundle_id = str(bundle_id or "").strip()
-    version, meta = _latest_lgbm_metadata(requested_bundle_id or None)
+    metadata_source = "production_registry"
+    staged_metadata_path: Path | None = None
+    staged_model_path: Path | None = None
+    if requested_bundle_id:
+        version, meta, staged_metadata_path, staged_model_path = _staged_lgbm_metadata(
+            requested_bundle_id
+        )
+        metadata_source = "staged_bundle"
+    else:
+        version, meta = _latest_lgbm_metadata(None)
     if not meta:
         detail = (
-            {"requested_bundle_id": requested_bundle_id}
+            {
+                "requested_bundle_id": requested_bundle_id,
+                "metadata_source": metadata_source,
+                "metadata_path": (
+                    str(staged_metadata_path.relative_to(REPO_ROOT))
+                    if staged_metadata_path is not None
+                    else None
+                ),
+                "model_path": (
+                    str(staged_model_path.relative_to(REPO_ROOT))
+                    if staged_model_path is not None
+                    else None
+                ),
+            }
             if requested_bundle_id
             else None
         )
         return _stage(
             "BLOCKED",
             (
-                "No LightGBM registry metadata was found for the requested bundle id."
+                "No staged LightGBM metadata was found for the requested bundle id."
                 if requested_bundle_id
                 else "No LightGBM registry metadata was found."
             ),
@@ -499,6 +682,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     label_cfg = risk_cfg.get("label") or {}
     required_label_version = label_cfg.get("generation_version")
     required_label_scope = label_cfg.get("session_scope")
+    required_target_col = label_cfg.get("target_col")
     if not required_label_version:
         return _stage(
             "BLOCKED",
@@ -509,17 +693,32 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "BLOCKED",
             "risk_config.yaml label.session_scope is required for real LightGBM gate.",
         )
-    model_path = meta.get("model_path")
-    model_exists = bool(model_path and (REPO_ROOT / str(model_path)).exists())
+    if not required_target_col:
+        return _stage(
+            "BLOCKED",
+            "risk_config.yaml label.target_col is required for real LightGBM gate.",
+        )
+    if staged_model_path is not None:
+        model_path = str(staged_model_path.relative_to(REPO_ROOT))
+        model_exists = staged_model_path.exists() and staged_model_path.stat().st_size > 0
+    else:
+        model_path = meta.get("model_path")
+        model_exists = bool(model_path and (REPO_ROOT / str(model_path)).exists())
     synthetic = safe_bool(meta.get("synthetic_fallback"), default=False)
     data_source = meta.get("data_source")
     real_data_source = data_source == "artifact_bars"
     bundle_id = meta.get("bundle_id")
+    bundle_id_matches_request = (
+        bundle_id == requested_bundle_id if requested_bundle_id else None
+    )
     actual_label_version = meta.get("label_generation_version")
     actual_label_scope = meta.get("label_session_scope")
+    actual_target_col = meta.get("target_col")
     label_version_ok = actual_label_version == required_label_version
     label_scope_ok = actual_label_scope == required_label_scope
+    target_col_ok = actual_target_col == required_target_col
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
+    final_dataset_gate_ok = final_dataset_gate.get("status") == "PASS"
     status = (
         "PASS"
         if model_exists
@@ -527,13 +726,25 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         and real_data_source
         and label_version_ok
         and label_scope_ok
+        and target_col_ok
+        and final_dataset_gate_ok
+        and (bundle_id_matches_request is not False)
         else "BLOCKED"
     )
     message = "Latest LightGBM artifact inspected."
-    if not label_version_ok:
+    if bundle_id_matches_request is False:
+        message = "Staged LightGBM artifact bundle_id does not match the requested bundle id."
+    elif not model_exists:
+        message = "Staged LightGBM model file is missing or empty." if requested_bundle_id else "Latest LightGBM model file is missing."
+    elif not label_version_ok:
         message = "Latest LightGBM artifact has stale or missing label generation metadata."
     elif not label_scope_ok:
         message = "Latest LightGBM artifact has stale or missing label session scope metadata."
+    elif not target_col_ok:
+        message = "Latest LightGBM artifact target_col does not match risk_config.yaml label.target_col."
+    elif not final_dataset_gate_ok:
+        blockers = final_dataset_gate.get("blockers") or ["final_dataset_gate_blocked"]
+        message = f"Latest LightGBM artifact failed final_dataset_gate: {blockers}"
     elif not real_data_source:
         message = "Latest LightGBM artifact is not marked as artifact_bars real data."
     return _stage(
@@ -542,11 +753,15 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         {
             "version": version,
             "requested_bundle_id": requested_bundle_id or None,
+            "metadata_source": metadata_source,
+            "metadata_path": (
+                str(staged_metadata_path.relative_to(REPO_ROOT))
+                if staged_metadata_path is not None
+                else None
+            ),
             "bundle_id": bundle_id,
             "candidate_bundle_id": bundle_id,
-            "bundle_id_matches_request": (
-                bundle_id == requested_bundle_id if requested_bundle_id else None
-            ),
+            "bundle_id_matches_request": bundle_id_matches_request,
             "registry_status": meta.get("status"),
             "model_path": model_path,
             "model_exists": model_exists,
@@ -557,6 +772,8 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "required_label_generation_version": required_label_version,
             "label_session_scope": actual_label_scope,
             "required_label_session_scope": required_label_scope,
+            "target_col": actual_target_col,
+            "required_target_col": required_target_col,
             "n_train_rows": meta.get("n_train_rows"),
             "train_start": meta.get("train_start"),
             "train_end": meta.get("train_end"),
@@ -589,6 +806,7 @@ def _is_deployable_backtest_report(payload: dict[str, Any], bundle_id: str) -> b
         and _feature_quality_gate_pass(payload)
         and _service_policy_gate_pass(payload, bundle_id)
         and _final_dataset_gate_pass(payload)
+        and _label_target_gate_pass(payload)
     )
 
 
@@ -625,6 +843,7 @@ def _service_policy_gate_pass(payload: dict[str, Any], bundle_id: str) -> bool:
             payload.get("service_policy_expected_date_range")
             or payload.get("date_range")
         ),
+        expected_universe=_active_tickers(_final_gate_min_tickers()),
     )
 
 
@@ -751,6 +970,216 @@ def _latest_paper_report(action: str) -> tuple[Path | None, dict[str, Any] | Non
     )
 
 
+def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for key in ("bundle_id", "model_bundle_id"):
+        value = data.get(key)
+        if value:
+            out.add(str(value))
+    active_model = (
+        ((data.get("stages") or {}).get("paper_auto_cycle") or {})
+        .get("stages", {})
+        .get("active_model_guard")
+    )
+    if isinstance(active_model, dict) and active_model.get("bundle_id"):
+        out.add(str(active_model["bundle_id"]))
+    return out
+
+
+def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
+    cycle_stage = ((data.get("stages") or {}).get("paper_auto_cycle") or {})
+    cycle_stages = cycle_stage.get("stages") if isinstance(cycle_stage, dict) else None
+    cycles = cycle_stages.get("cycles") if isinstance(cycle_stages, dict) else None
+    items = cycles.get("items", []) if isinstance(cycles, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        history = item.get("order_history_verification")
+        if not isinstance(history, dict) or history.get("status") != "PASS":
+            continue
+        for query in history.get("queries", []) or []:
+            if isinstance(query, dict) and safe_int(
+                query.get("matched_order_count", 0),
+                default=0,
+                min_value=0,
+            ) > 0:
+                return True
+    return False
+
+
+def _parse_report_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed.astimezone(_KST)
+
+
+def _paper_evidence_max_age_sec() -> int:
+    cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
+    paper_cfg = cfg.get("paper_trading", {})
+    return safe_int(
+        paper_cfg.get("evidence_max_age_sec", 86400),
+        default=86400,
+        min_value=1,
+    )
+
+
+def _fresh_generated_at_state(
+    value: Any,
+    *,
+    max_age_sec: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    generated_at = _parse_report_ts(value)
+    if generated_at is None:
+        return {
+            "status": "BLOCKED",
+            "reason": "generated_at_missing_or_invalid",
+            "generated_at": value,
+            "max_age_sec": max_age_sec,
+        }
+    ref_now = now or datetime.now(_KST)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=_KST)
+    age_sec = (ref_now.astimezone(_KST) - generated_at).total_seconds()
+    fresh = 0 <= age_sec <= max_age_sec
+    return {
+        "status": "PASS" if fresh else "BLOCKED",
+        "reason": None if fresh else "generated_at_stale_or_future",
+        "generated_at": generated_at.isoformat(),
+        "age_sec": round(age_sec, 3),
+        "max_age_sec": max_age_sec,
+    }
+
+
+def _paper_auto_evidence_guard(data: dict[str, Any]) -> dict[str, Any]:
+    guard = data.get("evidence_guard")
+    if isinstance(guard, dict):
+        return guard
+    preflight = (data.get("stages") or {}).get("preflight")
+    if not isinstance(preflight, dict):
+        return {}
+    paper_evidence = (preflight.get("stages") or {}).get("paper_evidence")
+    if not isinstance(paper_evidence, dict):
+        return {}
+    nested_guard = paper_evidence.get("evidence_guard")
+    return nested_guard if isinstance(nested_guard, dict) else {}
+
+
+def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, Any]:
+    broker_evidence = data.get("broker_evidence")
+    if not isinstance(broker_evidence, dict):
+        return {
+            "status": "BLOCKED",
+            "reason": "broker_evidence_missing",
+            "stage_statuses": {},
+        }
+    required = (
+        "balance_reconciliation",
+        "probe_order",
+        "order_history_requery",
+    )
+    statuses: dict[str, str] = {}
+    for name in required:
+        stage = broker_evidence.get(name)
+        statuses[name] = (
+            str(stage.get("status", "MISSING")).upper()
+            if isinstance(stage, dict)
+            else "MISSING"
+        )
+    passed = all(status == "PASS" for status in statuses.values())
+    return {
+        "status": "PASS" if passed else "BLOCKED",
+        "reason": None if passed else "broker_evidence_stage_not_pass",
+        "stage_statuses": statuses,
+    }
+
+
+def _latest_paper_auto_bundle_report(
+    bundle_id: str | None,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if not requested_bundle_id:
+        return None, None
+    return _latest_matching_report(
+        _REPORT_ROOT / "paper_auto_trading",
+        "paper_auto_service_rehearsal_",
+        lambda data: (
+            safe_bool(data.get("external_kis_api"), default=False)
+            and requested_bundle_id in _paper_auto_bundle_ids(data)
+        ),
+    )
+
+
+def _paper_auto_bundle_stage(
+    bundle_id: str,
+    stage_name: str,
+    *,
+    require_order_history_match: bool = False,
+) -> dict[str, Any]:
+    path, data = _latest_paper_auto_bundle_report(bundle_id)
+    if not path or not data:
+        return _stage(
+            "BLOCKED",
+            "No external paper-auto bundle evidence report was found.",
+            {
+                "blocker": "paper_auto_bundle_evidence_missing",
+                "bundle_id": bundle_id,
+            },
+        )
+    stage_statuses = data.get("stage_statuses", {})
+    if not isinstance(stage_statuses, dict):
+        stage_statuses = {}
+    history_matched = _paper_auto_cycle_history_matched(data)
+    freshness = _fresh_generated_at_state(
+        data.get("generated_at"),
+        max_age_sec=_paper_evidence_max_age_sec(),
+    )
+    nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+    evidence_guard = _paper_auto_evidence_guard(data)
+    evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
+    passed = (
+        data.get("status") == "PASS"
+        and stage_statuses.get(stage_name) == "PASS"
+        and freshness.get("status") == "PASS"
+        and nested_evidence.get("status") == "PASS"
+        and evidence_guard_pass
+        and (
+            not require_order_history_match
+            or (
+                stage_statuses.get("order_history_requery") == "PASS"
+                and history_matched
+            )
+        )
+    )
+    return _stage(
+        "PASS" if passed else "BLOCKED",
+        "Latest external paper-auto bundle evidence inspected.",
+        {
+            "report_path": _repo_relative(path),
+            "bundle_id": bundle_id,
+            "bundle_ids": sorted(_paper_auto_bundle_ids(data)),
+            "external_kis_api": safe_bool(data.get("external_kis_api"), default=False),
+            "evidence_level": data.get("evidence_level"),
+            "report_status": data.get("status"),
+            "stage_name": stage_name,
+            "stage_statuses": stage_statuses,
+            "freshness": freshness,
+            "broker_evidence_nested": nested_evidence,
+            "evidence_guard": evidence_guard,
+            "paper_auto_cycle_history_matched": history_matched,
+        },
+    )
+
+
 def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
     if not isinstance(report_or_stage, dict):
         return 0
@@ -763,7 +1192,13 @@ def _matched_order_count(report_or_stage: dict[str, Any] | None) -> int:
     return 0
 
 
-def _check_paper_balance() -> dict[str, Any]:
+def _check_paper_balance(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "balance_reconciliation",
+        )
     path, data = _latest_paper_report("balance_reconciliation")
     if not path or not data:
         return _stage("BLOCKED", "No paper balance report was found.")
@@ -780,7 +1215,13 @@ def _check_paper_balance() -> dict[str, Any]:
     )
 
 
-def _check_paper_reconciliation() -> dict[str, Any]:
+def _check_paper_reconciliation(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "balance_reconciliation",
+        )
     path, data = _latest_paper_report("balance_reconciliation")
     if not path or not data:
         return _stage("BLOCKED", "No paper reconciliation report was found.")
@@ -796,7 +1237,14 @@ def _check_paper_reconciliation() -> dict[str, Any]:
     )
 
 
-def _check_probe_order() -> dict[str, Any]:
+def _check_probe_order(bundle_id: str | None = None) -> dict[str, Any]:
+    requested_bundle_id = str(bundle_id or "").strip()
+    if requested_bundle_id:
+        return _paper_auto_bundle_stage(
+            requested_bundle_id,
+            "probe_order",
+            require_order_history_match=True,
+        )
     path, data = _latest_paper_report("submit_probe_order")
     if not path or not data:
         return _stage("BLOCKED", "No paper probe order report was found.")
@@ -931,9 +1379,15 @@ def build_report(
     stages["05_backtest_real_candidate"] = _check_backtest_gate(
         stages["04_lgbm_real_train"]
     )
-    stages["06_paper_balance"] = _check_paper_balance()
-    stages["07_paper_reconciliation"] = _check_paper_reconciliation()
-    stages["08_paper_probe_order"] = _check_probe_order()
+    stages["06_paper_balance"] = _check_paper_balance(
+        requested_bundle_id or None
+    )
+    stages["07_paper_reconciliation"] = _check_paper_reconciliation(
+        requested_bundle_id or None
+    )
+    stages["08_paper_probe_order"] = _check_probe_order(
+        requested_bundle_id or None
+    )
     stages["09_ops_risk"] = _check_ops_risk()
 
     blockers = [
@@ -982,7 +1436,7 @@ def _next_commands(end_date: str, business_days: int, max_tickers: int) -> dict[
         ),
         "deploy_candidate_after_backtest_pass": (
             f"ELEPHANT_MODE=mode_b {py_prefix} new/scripts/deploy_candidate.py "
-            "--bundle-id {bundle_id}"
+            "--bundle-id {bundle_id} --dry-run"
         ),
         "paper_probe_user_terminal_after_balance_pass": (
             f"{py_prefix} new/scripts/paper_trading_smoke.py --action submit-probe "
@@ -991,7 +1445,7 @@ def _next_commands(end_date: str, business_days: int, max_tickers: int) -> dict[
         ),
         "paper_auto_after_gate_pass": (
             f"{py_prefix} new/scripts/paper_auto_trade.py --cycles 1 "
-            "--confirm-phrase PAPER_AUTO_OK"
+            "--bundle-id {bundle_id} --confirm-phrase PAPER_AUTO_OK"
         ),
     }
 

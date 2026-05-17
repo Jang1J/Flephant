@@ -4,8 +4,8 @@
   1. DatasetBuilder로 panel 생성 (raw parquet → 피처 + label + cs_rank + relevance)
   2. WalkForwardSplitter로 fold 분할 (purge/embargo 자동 적용)
   3. 각 fold에서 lgb.train → val 메트릭 수집
-  4. 최종 모델: 마지막 fold의 train set로 학습한 booster
-  5. 평균 메트릭 + 최종 booster → ModelRegistry.save()
+  4. 최종 모델: 전체 요청 window panel로 재학습한 booster
+  5. 평균 fold 메트릭 + 최종 booster → ModelRegistry.save()
 
 S3-6 야간 재학습도 동일 LGBMTrainer 재사용 (version 파라미터만 다르게).
 
@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -37,6 +40,8 @@ from src.utils.logger import get_logger
 from src.utils.safe_cast import safe_bool
 
 logger = get_logger("lgbm_trainer")
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_PRODUCTION_LGBM_DIR = _REPO_ROOT / "artifacts" / "lgbm"
 
 
 def _load_feature_cols() -> list[str]:
@@ -79,10 +84,14 @@ class LGBMTrainer:
         dataset_builder: DatasetBuilder | None = None,
         splitter: WalkForwardSplitter | None = None,
         registry: ModelRegistry | None = None,
+        allow_production_active_write: bool = False,
+        allow_production_candidate_write: bool = False,
     ) -> None:
         self.builder = dataset_builder or DatasetBuilder()
         self.splitter = splitter or WalkForwardSplitter()
         self.registry = registry or ModelRegistry()
+        self._allow_production_active_write = bool(allow_production_active_write)
+        self._allow_production_candidate_write = bool(allow_production_candidate_write)
 
         self.feature_cols: list[str] = _load_feature_cols()
         # target_col / top_k_fraction은 yaml 경유 (불변 원칙 5).
@@ -127,11 +136,33 @@ class LGBMTrainer:
                 resolved_bundle_id,
             )
             effective_is_latest = False
+        if (
+            effective_is_latest
+            and self._uses_production_registry()
+            and not self._allow_production_active_write
+        ):
+            raise RuntimeError(
+                "production registry active/latest write는 명시 승인 없이는 차단됨. "
+                "bundle_id 후보 저장 또는 allow_production_active_write=True 필요"
+            )
 
         start_date_norm = self._normalize_yyyymmdd(start_date)
         end_date_norm = self._normalize_yyyymmdd(end_date)
 
         effective_target_col = str(target_col_override or self.target_col)
+        if (
+            target_col_override
+            and self._uses_production_registry()
+            and not self._allow_production_candidate_write
+        ):
+            raise RuntimeError(
+                "target_col_override candidate write는 production registry에 직접 저장할 수 없음. "
+                "research registry 또는 allow_production_candidate_write=True 필요"
+            )
+        target_horizon_bars, target_horizon_kind = self._target_horizon_metadata(
+            effective_target_col,
+            default_horizon=int(self.builder.horizon_bars),
+        )
 
         # 1. Panel 생성
         logger.info(
@@ -167,6 +198,7 @@ class LGBMTrainer:
         params = build_lgbm_params()
         tc = get_training_control()
         fold_metrics: list[dict[str, float]] = []
+        best_iterations: list[int] = []
         last_booster = None
         last_train_panel = None
         last_val_panel = None
@@ -188,6 +220,9 @@ class LGBMTrainer:
                 target_col=effective_target_col,
             )
             fold_metrics.append({"fold": fold_idx, **metrics})
+            best_iteration = int(getattr(booster, "best_iteration", 0) or 0)
+            if best_iteration > 0:
+                best_iterations.append(best_iteration)
             logger.info(
                 "[lgbm_trainer] fold %d: IC=%.4f, RankIC=%.4f, SR=%.4f, MDD=%.4f",
                 fold_idx, metrics["ic"], metrics["rank_ic"],
@@ -208,6 +243,22 @@ class LGBMTrainer:
         # 5. Registry 저장
         if last_booster is None:
             raise RuntimeError("학습 실패: last_booster None")
+        final_train_panel = panel.sort_index(level="ts_close")
+        final_num_boost_round = self._final_num_boost_round(best_iterations, tc)
+        final_booster = self._train_final_model(
+            final_train_panel,
+            params,
+            lgb,
+            num_boost_round=final_num_boost_round,
+        )
+        trade_classifier = self._train_trade_no_trade_classifier(
+            final_train_panel,
+            params,
+            lgb,
+            version=version,
+            target_col=effective_target_col,
+            num_boost_round=final_num_boost_round,
+        )
 
         preprocessor_cfg = config_load("risk_config.yaml", "preprocessor")
         feature_set = set(self.feature_cols)
@@ -230,6 +281,8 @@ class LGBMTrainer:
                 ),
             },
             "label_horizon_bars": self.builder.horizon_bars,
+            "target_horizon_bars": target_horizon_bars,
+            "target_horizon_kind": target_horizon_kind,
             "label_generation_version": self.builder.label_generation_version,
             "label_session_scope": self.builder.label_session_scope,
             "target_col": effective_target_col,
@@ -242,16 +295,26 @@ class LGBMTrainer:
             "missing_tickers": list(data_source.get("missing_tickers", [])),
             "synthetic_tickers": list(data_source.get("synthetic_tickers", [])),
             "n_folds": len(folds),
-            "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
+            "n_train_rows": int(len(final_train_panel)),
+            "n_final_train_rows": int(len(final_train_panel)),
+            "n_cv_last_train_rows": (
+                int(len(last_train_panel)) if last_train_panel is not None else 0
+            ),
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
+            "final_model_scope": "full_requested_window",
+            "final_model_train_start": self._yyyymmdd_to_iso(start_date_norm),
+            "final_model_train_end": self._yyyymmdd_to_iso(end_date_norm),
+            "final_num_boost_round": final_num_boost_round,
+            "cv_best_iterations": best_iterations,
             "fold_metrics": fold_metrics,
             "n_tickers": len(tickers),
             "lgbm_params": params,
             "training_control": tc,
             "metric_scope": metric_scope,
+            "trade_no_trade_classifier": trade_classifier,
         }
         pkl_path = self.registry.save(
-            last_booster,
+            final_booster,
             metadata,
             is_latest=effective_is_latest,
         )
@@ -267,8 +330,14 @@ class LGBMTrainer:
             "metrics": avg_metrics,
             "n_folds": len(folds),
             "fold_metrics": fold_metrics,
-            "n_train_rows": int(len(last_train_panel)) if last_train_panel is not None else 0,
+            "n_train_rows": int(len(final_train_panel)),
+            "n_final_train_rows": int(len(final_train_panel)),
+            "n_cv_last_train_rows": (
+                int(len(last_train_panel)) if last_train_panel is not None else 0
+            ),
             "n_val_rows": int(len(last_val_panel)) if last_val_panel is not None else 0,
+            "final_model_scope": "full_requested_window",
+            "final_num_boost_round": final_num_boost_round,
             "is_latest": effective_is_latest,
             "data_source": data_source.get("data_source", "artifact_bars"),
             "synthetic_fallback": safe_bool(data_source.get("synthetic_fallback", False), default=False),
@@ -276,12 +345,147 @@ class LGBMTrainer:
             "label_generation_version": self.builder.label_generation_version,
             "label_session_scope": self.builder.label_session_scope,
             "target_col": effective_target_col,
+            "target_horizon_bars": target_horizon_bars,
+            "target_horizon_kind": target_horizon_kind,
             "metric_scope": metric_scope,
+            "trade_no_trade_classifier": trade_classifier,
         }
 
     # ================================================================== #
     # Internal
     # ================================================================== #
+
+    @staticmethod
+    def _target_horizon_metadata(
+        target_col: str,
+        *,
+        default_horizon: int,
+    ) -> tuple[int, str]:
+        """Infer target horizon metadata from generated label column names."""
+        import re
+
+        target = str(target_col)
+        match = re.match(r"^label_(\d+)m(?:_net)?_ret$", target)
+        if match:
+            return int(match.group(1)), "minute"
+        if target == "label_session_close_ret" or target == "label_session_close_net_ret":
+            return 0, "session_close"
+        return int(default_horizon), "unknown"
+
+    @staticmethod
+    def _tradeable_col_for_target(target_col: str) -> str | None:
+        target = str(target_col)
+        match = re.match(r"^label_(\d+)m(?:_net)?_ret$", target)
+        if match:
+            return f"label_{match.group(1)}m_tradeable"
+        if target in {"label_session_close_ret", "label_session_close_net_ret"}:
+            return "label_session_close_tradeable"
+        return None
+
+    @staticmethod
+    def _binary_classifier_params(params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "learning_rate": float(params.get("learning_rate", 0.05)),
+            "num_leaves": int(params.get("num_leaves", 31)),
+            "min_child_samples": int(params.get("min_child_samples", 20)),
+            "subsample": float(params.get("subsample", 1.0)),
+            "colsample_bytree": float(params.get("colsample_bytree", 1.0)),
+            "random_state": int(params.get("random_state", 42)),
+            "verbose": -1,
+        }
+
+    def _train_trade_no_trade_classifier(
+        self,
+        final_train_panel,
+        params: dict[str, Any],
+        lgb,
+        *,
+        version: str,
+        target_col: str,
+        num_boost_round: int,
+    ) -> dict[str, Any]:
+        objective_cfg = (config_load("risk_config.yaml", "cost_aware_retraining") or {}).get(
+            "objective",
+            {},
+        )
+        enabled = safe_bool(
+            (objective_cfg or {}).get("trade_no_trade_classifier"),
+            default=False,
+        )
+        tradeable_col = self._tradeable_col_for_target(target_col)
+        base = {
+            "enabled": enabled,
+            "status": "DISABLED" if not enabled else "BLOCKED",
+            "target_col": target_col,
+            "tradeable_col": tradeable_col,
+            "model_path": None,
+        }
+        if not enabled:
+            return base
+        if tradeable_col is None:
+            return {**base, "reason": "unsupported_target_col"}
+        if tradeable_col not in final_train_panel.columns:
+            return {**base, "reason": "tradeable_label_missing"}
+
+        import pandas as pd_
+
+        work = final_train_panel[self.feature_cols + [tradeable_col]].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        work = work.dropna(subset=self.feature_cols + [tradeable_col])
+        if work.empty:
+            return {**base, "reason": "no_trade_classifier_rows"}
+        y = pd_.Series(work[tradeable_col]).astype(float).round().clip(0, 1).astype(int)
+        class_counts = {str(k): int(v) for k, v in y.value_counts().sort_index().items()}
+        positive_rate = float((y == 1).mean())
+        if y.nunique() < 2:
+            return {
+                **base,
+                "status": "SKIPPED",
+                "reason": "single_class_tradeable_label",
+                "n_train_rows": int(len(y)),
+                "positive_rate": positive_rate,
+                "class_counts": class_counts,
+            }
+
+        classifier_path = Path(self.registry.base_dir) / f"{version}_trade_classifier.pkl"
+        X = work[self.feature_cols].to_numpy(dtype=float)
+        ds = lgb.Dataset(X, label=y.to_numpy(dtype=int), free_raw_data=False)
+        binary_params = self._binary_classifier_params(params)
+        booster = lgb.train(
+            binary_params,
+            ds,
+            num_boost_round=max(1, int(num_boost_round)),
+        )
+        with classifier_path.open("wb") as fh:
+            pickle.dump(booster, fh)
+        try:
+            model_path = str(classifier_path.resolve().relative_to(_REPO_ROOT))
+        except ValueError:
+            model_path = str(classifier_path)
+        return {
+            **base,
+            "status": "PASS",
+            "model_path": model_path,
+            "calibration_status": "UNAVAILABLE",
+            "calibration_required_for_service_gate": True,
+            "deploy_gate_eligible": False,
+            "calibration_reason": "full_train_classifier_without_oof_calibration",
+            "n_train_rows": int(len(y)),
+            "positive_rate": positive_rate,
+            "class_counts": class_counts,
+            "params": binary_params,
+        }
+
+    def _uses_production_registry(self) -> bool:
+        base_dir = Path(getattr(self.registry, "base_dir", ""))
+        try:
+            return base_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
+        except OSError:
+            return base_dir == _PRODUCTION_LGBM_DIR
 
     def _train_fold(
         self,
@@ -326,6 +530,32 @@ class LGBMTrainer:
             daily_pnl=daily_pnl,
         )
         return booster, bundle.to_dict()
+
+    @staticmethod
+    def _final_num_boost_round(best_iterations: list[int], tc: dict[str, int]) -> int:
+        """Choose final full-window training rounds from fold early-stopping results."""
+        if best_iterations:
+            return max(1, int(np.median(best_iterations)))
+        return max(1, int(tc["n_estimators"]))
+
+    def _train_final_model(
+        self,
+        final_train_panel,
+        params: dict[str, Any],
+        lgb,
+        *,
+        num_boost_round: int,
+    ):
+        """Train deploy candidate booster on the full requested panel window."""
+        train_ds = make_lgbm_dataset(
+            final_train_panel,
+            feature_cols=self.feature_cols,
+        )
+        return lgb.train(
+            params,
+            train_ds,
+            num_boost_round=num_boost_round,
+        )
 
     def _assert_feature_manifest(self, panel) -> None:
         """훈련 feature manifest와 실제 panel columns를 강제 일치시킨다."""
@@ -499,13 +729,72 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="실험용 label 컬럼 override (예: label_session_close_net_ret)",
     )
+    p.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="ModelRegistry 저장 디렉터리. cost-aware 실험은 artifacts/lgbm_research 권장",
+    )
+    p.add_argument(
+        "--allow-production-candidate-write",
+        action="store_true",
+        help="target_col_override를 production artifacts/lgbm에 쓰는 것을 명시 허용",
+    )
+    p.add_argument(
+        "--allow-production-active-write",
+        action="store_true",
+        help="bundle_id 없는 active/latest production 저장을 명시 허용",
+    )
     return p.parse_args(argv)
+
+
+def _resolve_registry_dir(raw: str | None) -> Path | None:
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else _REPO_ROOT / path
+
+
+def _uses_production_registry(registry_dir: Path | None) -> bool:
+    if registry_dir is None:
+        return True
+    try:
+        return registry_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
+    except OSError:
+        return registry_dir == _PRODUCTION_LGBM_DIR
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
-    trainer = LGBMTrainer()
+    registry_dir = _resolve_registry_dir(args.registry_dir)
+    if (
+        args.target_col_override
+        and _uses_production_registry(registry_dir)
+        and not bool(args.allow_production_candidate_write)
+    ):
+        logger.error(
+            "[lgbm_trainer] target_col_override 실험은 production registry에 직접 저장하지 않음. "
+            "--registry-dir artifacts/lgbm_research/... 또는 --allow-production-candidate-write 필요"
+        )
+        return 1
+    if (
+        not args.bundle_id
+        and _uses_production_registry(registry_dir)
+        and not bool(args.allow_production_active_write)
+    ):
+        logger.error(
+            "[lgbm_trainer] production active/latest 저장은 명시 승인 없이는 차단됨. "
+            "--bundle-id 또는 --registry-dir artifacts/lgbm_research/... 또는 "
+            "--allow-production-active-write 필요"
+        )
+        return 1
+    registry = ModelRegistry(artifacts_dir=registry_dir) if registry_dir is not None else None
+    trainer = LGBMTrainer(
+        registry=registry,
+        allow_production_active_write=bool(args.allow_production_active_write),
+        allow_production_candidate_write=bool(args.allow_production_candidate_write),
+    )
     try:
         result = trainer.train(
             tickers=tickers,

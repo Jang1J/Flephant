@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import pickle
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,12 +14,14 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_backtest_id, generate_pa_id, generate_replay_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_float
 from src.utils.ticker_utils import pad_ticker
+from src.utils.trading_calendar import kospi_trading_dates_between
 
 logger = get_logger("BacktestEngine")
 _KST = ZoneInfo("Asia/Seoul")
 _ARTIFACTS_ROOT = Path(__file__).resolve().parents[3] / "artifacts"
+_ALPHA_FACTOR_FEATURE_RE = re.compile(r"^alpha_factor_\d+$")
 
 # ────────────────────────────────────────────────────────────────────
 # C13 forbidden_callers 검증 (불변 원칙 3: Backtest Agent Mode B 전용)
@@ -86,6 +89,27 @@ class LeakageDetected(BacktestError):
         super().__init__("LEAKAGE_DETECTED", detail)
 
 
+def add_neutral_candidate_alpha_features(builder: Any, feature_cols: list[str]) -> list[str]:
+    """Mirror NightlyLGBMRetrainer's neutral alpha-factor feature staging."""
+    alpha_cols = sorted({
+        str(col)
+        for col in feature_cols
+        if _ALPHA_FACTOR_FEATURE_RE.fullmatch(str(col))
+    })
+    if not alpha_cols:
+        return []
+    if hasattr(builder, "add_neutral_feature_columns"):
+        builder.add_neutral_feature_columns(alpha_cols)
+        return alpha_cols
+
+    existing = [str(col) for col in getattr(builder, "_neutral_feature_cols", []) or []]
+    for col in alpha_cols:
+        if col not in existing:
+            existing.append(col)
+    setattr(builder, "_neutral_feature_cols", existing)
+    return alpha_cols
+
+
 # ────────────────────────────────────────────────────────────────────
 # BacktestEngine
 # ────────────────────────────────────────────────────────────────────
@@ -127,6 +151,7 @@ class BacktestEngine:
         self._cfg_turnover = config_load("risk_config.yaml", "turnover_cap") or {}
         self._cfg_label = config_load("risk_config.yaml", "label") or {}
         self._cfg_service_policy = config_load("risk_config.yaml", "service_policy_replay") or {}
+        self._cfg_cost_aware = config_load("risk_config.yaml", "cost_aware_retraining") or {}
         # S3 Critical 8: 하드코딩 제거. mock_data 파라미터를 yaml에서 로드.
         _mock_cfg: dict[str, Any] = (self._cfg_vt or {}).get("mock_data", {})
         self._mock_base_price: float = float(_mock_cfg.get("base_price", 50000.0))
@@ -345,6 +370,7 @@ class BacktestEngine:
             # 현재는 메타 필드만 명시 (실 KB write 없음).
             "_persistence_target": "kb_30d",  # TODO Sprint 4: KB integration
             "candidate_artifact": candidate_artifact,
+            "target_col": str(fold_results[0].get("target_col", "")) if fold_results else "",
             "backtest_data_sources": backtest_data_sources,
             "feature_quality": _feature_quality,
             "service_policy_expected_date_range": self._service_policy_expected_date_range(folds),
@@ -384,20 +410,39 @@ class BacktestEngine:
 
         purge_days = math.ceil(purge_bars / 390)   # 390분봉 = 1거래일
         embargo_days = math.ceil(embargo_bars / 390)
+        buffer_days = purge_days + embargo_days
+        tzinfo = start_dt.tzinfo or _KST
+        trading_dates = [
+            datetime.strptime(raw, "%Y%m%d").date()
+            for raw in kospi_trading_dates_between(start_dt.date(), end_dt.date())
+        ]
+
+        def _dt(day) -> datetime:
+            return datetime.combine(day, datetime.min.time(), tzinfo=tzinfo)
 
         folds = []
         for i in range(n_splits):
-            fold_start = start_dt + timedelta(days=i * step_days)
-            train_end = fold_start + timedelta(days=train_days)
-            test_start = train_end + timedelta(days=purge_days + embargo_days)
-            test_end = test_start + timedelta(days=test_days)
+            train_start_idx = i * step_days
+            train_end_idx = train_start_idx + train_days
+            test_start_idx = train_end_idx + buffer_days
+            test_end_idx = test_start_idx + test_days
+            if test_end_idx > len(trading_dates):
+                break
+
+            train_dates = trading_dates[train_start_idx:train_end_idx]
+            test_dates = trading_dates[test_start_idx:test_end_idx]
+            fold_start = _dt(train_dates[0])
+            train_end = _dt(trading_dates[train_end_idx])
+            test_start = _dt(test_dates[0])
+            test_end = _dt(test_dates[-1] + timedelta(days=1))
 
             if test_end > end_dt:
                 break
 
             # Leakage 검증: test_start >= train_end + purge + embargo
-            buffer_end = train_end + timedelta(days=purge_days + embargo_days)
-            if test_start < buffer_end:
+            buffer_end_idx = train_end_idx + buffer_days
+            buffer_end = _dt(trading_dates[buffer_end_idx])
+            if test_start < buffer_end or test_start_idx < buffer_end_idx:
                 raise LeakageDetected(
                     f"fold {i}: test_start={test_start.date()} < "
                     f"buffer_end={buffer_end.date()} "
@@ -410,6 +455,12 @@ class BacktestEngine:
                 "train_end": train_end,
                 "test_start": test_start,
                 "test_end": test_end,
+                "train_trading_dates": [
+                    day.strftime("%Y%m%d") for day in train_dates
+                ],
+                "test_trading_dates": [
+                    day.strftime("%Y%m%d") for day in test_dates
+                ],
                 "purge_bars": purge_bars,
                 "embargo_bars": embargo_bars,
             })
@@ -456,6 +507,9 @@ class BacktestEngine:
         if not folds:
             return {}
         first_fold = folds[0]
+        test_dates = first_fold.get("test_trading_dates") or []
+        if test_dates:
+            return {"start": str(test_dates[0]), "end": str(test_dates[-1])}
         test_start = first_fold.get("test_start")
         test_end = first_fold.get("test_end")
         if not hasattr(test_start, "strftime") or not hasattr(test_end, "strftime"):
@@ -515,13 +569,19 @@ class BacktestEngine:
                 universe=universe,
                 model_callable=effective_model,
                 feature_cols=feature_cols,
+                candidate_artifact=candidate_artifact,
             )
 
         import pandas as pd
 
         test_start = fold["test_start"]
         test_end = fold["test_end"]
-        test_days = max(1, (test_end - test_start).days)
+        test_trading_dates = fold.get("test_trading_dates") or []
+        test_days = (
+            len(test_trading_dates)
+            if test_trading_dates
+            else max(1, (test_end - test_start).days)
+        )
         trading_minutes = int(self._cfg_wf["trading_minutes_per_day"])
         n_features = max(1, int(feature_width or 4))
 
@@ -548,7 +608,12 @@ class BacktestEngine:
         }
 
         for day_offset in range(test_days):
-            day = test_start + timedelta(days=day_offset)
+            if test_trading_dates:
+                day = datetime.strptime(
+                    str(test_trading_dates[day_offset]), "%Y%m%d"
+                ).replace(tzinfo=test_start.tzinfo or _KST)
+            else:
+                day = test_start + timedelta(days=day_offset)
             session_open = day.replace(hour=9, minute=0, second=0, microsecond=0)
             for bar_idx in range(trading_minutes):
                 ts_close = session_open + timedelta(minutes=bar_idx)
@@ -601,6 +666,7 @@ class BacktestEngine:
         from src.mode_b.service_policy_replay import ServicePolicyConfig
 
         cost_components = (self._cfg_cost or {}).get("components", {}) or {}
+        trade_gate_cfg = (self._cfg_cost_aware.get("trade_probability_gate", {}) or {})
 
         return ServicePolicyConfig(
             initial_capital=float(self._initial_capital),
@@ -645,8 +711,21 @@ class BacktestEngine:
             min_expected_net_alpha_bps=float(
                 self._cfg_service_policy.get("min_expected_net_alpha_bps", 0.0)
             ),
+            expected_net_alpha_source=str(
+                self._cfg_service_policy.get("expected_net_alpha_source", "rank_score")
+            ),
             min_service_policy_sharpe=float(
                 self._cfg_service_policy.get("min_service_policy_sharpe", 0.0)
+            ),
+            trade_probability_gate_enabled=safe_bool(
+                trade_gate_cfg.get("enabled"),
+                default=False,
+            ),
+            min_trade_probability=safe_float(
+                trade_gate_cfg.get("min_probability"),
+                default=0.5,
+                min_value=0.0,
+                max_value=1.0,
             ),
         )
 
@@ -705,6 +784,7 @@ class BacktestEngine:
             "daily_pnl": daily_pnl,
             "trade_log": trade_log,
             "bar_count": len(predicted_signals),
+            "target_col": target_col,
             "data_source": data_source,
             "feature_quality": feature_quality,
             "service_policy_gate": replay_result.get("gate", {}),
@@ -807,6 +887,7 @@ class BacktestEngine:
         universe: list[str],
         model_callable: Any,
         feature_cols: list[str],
+        candidate_artifact: dict[str, Any],
     ) -> dict[str, Any]:
         """candidate bundle backtest를 real artifact 1분봉 replay로 실행한다."""
         if not feature_cols:
@@ -815,15 +896,25 @@ class BacktestEngine:
         try:
             from src.data.dataset_builder import DatasetBuilder
 
-            start_date = fold["test_start"].strftime("%Y%m%d")
-            # _build_folds의 test_end는 exclusive 성격이므로 전일까지만 로드.
-            end_dt = fold["test_end"] - timedelta(days=1)
-            end_date = end_dt.strftime("%Y%m%d")
+            test_dates = fold.get("test_trading_dates") or []
+            if test_dates:
+                start_date = str(test_dates[0])
+                end_date = str(test_dates[-1])
+            else:
+                start_date = fold["test_start"].strftime("%Y%m%d")
+                # _build_folds의 test_end는 exclusive 성격이므로 전일까지만 로드.
+                end_dt = fold["test_end"] - timedelta(days=1)
+                end_date = end_dt.strftime("%Y%m%d")
             builder = DatasetBuilder(
                 artifacts_dir=self._artifacts_root / "data",
+                dual_source_artifact_dir=self._artifacts_root / "dual_source",
+                exogenous_artifact_dir=self._artifacts_root / "exogenous",
             )
+            add_neutral_candidate_alpha_features(builder, feature_cols)
             panel = self._build_replay_panel(builder, universe, start_date, end_date)
-            target_col = builder.target_col
+            target_col = self._candidate_target_col(candidate_artifact, builder.target_col)
+            if target_col != builder.target_col:
+                panel = builder.relabel_panel_for_target(panel, target_col)
             feature_quality = self._panel_feature_quality(panel)
         except Exception as e:
             raise DataUnavailable(
@@ -858,6 +949,19 @@ class BacktestEngine:
             data_source="artifact_bars",
             feature_quality=feature_quality,
         )
+
+    @staticmethod
+    def _candidate_target_col(
+        candidate_artifact: dict[str, Any],
+        default_target_col: str,
+    ) -> str:
+        """Resolve candidate evaluation target from model metadata."""
+        metadata = candidate_artifact.get("metadata", {})
+        if isinstance(metadata, dict):
+            raw_target = metadata.get("target_col")
+            if isinstance(raw_target, str) and raw_target.strip():
+                return raw_target.strip()
+        return str(default_target_col)
 
     @staticmethod
     def _panel_feature_quality(panel: Any) -> dict[str, int]:
@@ -1023,6 +1127,8 @@ class BacktestEngine:
             feature_cols = []
         if not feature_cols:
             raise BundleLoadFailed(f"candidate metadata feature_cols 없음: {metadata_path}")
+        if not isinstance(metadata.get("target_col"), str) or not metadata["target_col"].strip():
+            raise BundleLoadFailed(f"candidate metadata target_col 없음: {metadata_path}")
         feature_width = len(feature_cols) if feature_cols else 4
         metadata_synthetic_fallback = safe_bool(
             metadata.get("synthetic_fallback", False),
@@ -1043,6 +1149,11 @@ class BacktestEngine:
             "n_train_rows",
             "label_generation_version",
             "label_session_scope",
+            "label_horizon_bars",
+            "target_col",
+            "target_horizon_bars",
+            "target_horizon_kind",
+            "trade_no_trade_classifier",
         ]
 
         return model_callable, feature_width, {
@@ -1074,6 +1185,18 @@ class BacktestEngine:
                 raise NaNInMetrics("candidate model predict 결과가 비어있음")
             return float(arr[0])
 
+        def _batch_call(rows: list[list[float]]) -> list[float]:
+            x = np.asarray(rows, dtype=float)
+            pred = model.predict(x)
+            arr = np.asarray(pred, dtype=float).reshape(-1)
+            if arr.size != len(rows):
+                raise NaNInMetrics(
+                    "candidate model batch predict 길이 불일치: "
+                    f"expected={len(rows)} actual={arr.size}"
+                )
+            return [float(value) for value in arr]
+
+        _call.batch_predict = _batch_call  # type: ignore[attr-defined]
         return _call
 
     # ────────────────────────────────────────────────────

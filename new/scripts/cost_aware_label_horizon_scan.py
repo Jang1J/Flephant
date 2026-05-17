@@ -8,6 +8,7 @@ It does not train, deploy, call KIS, or mutate any registry.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -25,18 +26,55 @@ if str(SRC) not in sys.path:
 
 from src.data.dataset_builder import DatasetBuilder  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 _DATE_RE = re.compile(r"(20\d{6})")
 
 
+def _universe_hash(tickers: list[str]) -> str:
+    payload = json.dumps(
+        sorted({pad_ticker(str(ticker)) for ticker in tickers}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _active_tickers() -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
+    final_gate = (
+        (config_load("risk_config.yaml", "backtest_agent") or {})
+        .get("deploy_decision_gate", {})
+        .get("final_dataset_gate", {})
+    )
+    if not isinstance(final_gate, dict):
+        final_gate = {}
+    include_pending = safe_bool(
+        final_gate.get("include_pending_data_tickers"),
+        default=False,
+    )
+    stock_statuses = {"active"}
+    sector_statuses = {"confirmed"}
+    if include_pending:
+        stock_statuses = {
+            str(status)
+            for status in final_gate.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        sector_statuses = {
+            str(status)
+            for status in final_gate.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
     tickers: list[str] = []
     for sector in (cfg.get("sectors") or {}).values():
+        if str(sector.get("status")) not in sector_statuses:
+            continue
         for row in sector.get("stocks", []) or []:
-            if str(row.get("status", "")).lower() == "active":
+            if str(row.get("status", "")) in stock_statuses:
                 tickers.append(pad_ticker(str(row.get("ticker", ""))))
     if tickers:
         return sorted(set(tickers))
@@ -74,6 +112,7 @@ def _available_dates(artifacts_dir: Path, tickers: list[str]) -> list[date]:
 def _default_horizons() -> list[str]:
     label_cfg = config_load("risk_config.yaml", "label") or {}
     pre_cfg = config_load("risk_config.yaml", "preprocessor") or {}
+    service_policy_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
     horizons: list[int] = []
     label_horizon = int(label_cfg.get("horizon_bars", 0) or 0)
     if label_horizon > 0:
@@ -82,6 +121,9 @@ def _default_horizons() -> list[str]:
         as_int = int(value)
         if as_int > 1:
             horizons.append(as_int)
+    min_holding = int(service_policy_cfg.get("min_holding_bars", 0) or 0)
+    if min_holding > 1:
+        horizons.append(min_holding)
     deduped = [str(v) for v in sorted(set(horizons))]
     return deduped + ["session_close"]
 
@@ -89,17 +131,56 @@ def _default_horizons() -> list[str]:
 def _cost_bps() -> float:
     cost_cfg = config_load("risk_config.yaml", "execution_cost_model") or {}
     components = cost_cfg.get("components") or {}
-    return float(components.get("commission_bps", 0.0)) + float(
-        components.get("slippage_bps", 0.0)
-    )
+    if not isinstance(components, dict) or not {
+        "commission_bps",
+        "slippage_bps",
+    }.issubset(components):
+        raise ValueError("execution_cost_model_missing")
+    commission_bps = safe_float(components.get("commission_bps"), default=-1.0)
+    slippage_bps = safe_float(components.get("slippage_bps"), default=-1.0)
+    if commission_bps <= 0.0 or slippage_bps <= 0.0:
+        raise ValueError("execution_cost_model_non_positive")
+    return commission_bps + slippage_bps
 
 
-def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, float]:
-    pos_cfg = config_load("risk_config.yaml", "position_limits") or {}
-    min_confidence = float(pos_cfg.get("min_confidence", 0.0))
+def _diagnostic_thresholds(total_cost_bps: float) -> dict[str, Any]:
+    cost_cfg = config_load("risk_config.yaml", "cost_aware_retraining") or {}
+    gate_cfg = cost_cfg.get("label_horizon_gate", {}) or {}
     return {
-        "min_mean_net_bps": float(total_cost_bps),
-        "min_positive_net_rate": min(1.0, 0.5 + min_confidence),
+        "min_mean_net_bps": safe_float(
+            gate_cfg.get("min_mean_net_bps"),
+            default=total_cost_bps,
+            min_value=0.0,
+        ),
+        "min_positive_net_rate": safe_float(
+            gate_cfg.get("min_positive_net_rate"),
+            default=1.0,
+            min_value=0.0,
+            max_value=1.0,
+        ),
+        "allow_warn_for_research_only": safe_bool(
+            gate_cfg.get("allow_warn_for_research_only"),
+            default=False,
+        ),
+    }
+
+
+def _label_generation_settings() -> dict[str, int]:
+    """DatasetBuilder label-row policy used by this read-only diagnostic."""
+    label_cfg = config_load("risk_config.yaml", "label") or {}
+    active_horizon_bars = safe_int(
+        label_cfg.get("horizon_bars"),
+        default=5,
+        min_value=1,
+    )
+    drop_last_n_bars = safe_int(
+        label_cfg.get("drop_last_n_bars"),
+        default=active_horizon_bars,
+        min_value=0,
+    )
+    return {
+        "active_horizon_bars": active_horizon_bars,
+        "drop_last_n_bars": drop_last_n_bars,
     }
 
 
@@ -176,35 +257,264 @@ def _quantiles(values: np.ndarray) -> dict[str, float | None]:
     }
 
 
-def _horizon_returns(panel, horizon: str) -> np.ndarray:
+def _horizon_return_series(
+    panel,
+    horizon: str,
+    *,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+):
     df = panel.copy()
     df["_session"] = df["ts_close"].dt.date
+    labels = np.full(len(df), np.nan, dtype=float)
+    close_values = df["close"].to_numpy(dtype=float)
+    grouped_positions = df.groupby(["ticker", "_session"], sort=False).indices
     if horizon == "session_close":
-        grouped = df.groupby(["ticker", "_session"], sort=False)
-        future_close = grouped["close"].transform("last")
-        last_ts = grouped["ts_close"].transform("last")
-        mask = df["ts_close"] < last_ts
+        active_bars = safe_int(active_horizon, default=5, min_value=1)
+        drop_count = max(active_bars, drop_last_n_bars)
+        for positions in grouped_positions.values():
+            positions_arr = np.asarray(positions, dtype=np.int64)
+            valid_count = max(0, len(positions_arr) - drop_count)
+            if valid_count <= 0:
+                continue
+            closes = close_values[positions_arr]
+            now = closes[:valid_count]
+            future = float(closes[-1])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                labels[positions_arr[:valid_count]] = np.where(
+                    now > 1e-8,
+                    future / now - 1.0,
+                    np.nan,
+                )
     else:
         bars = int(horizon)
-        grouped = df.groupby(["ticker", "_session"], sort=False)
-        future_close = grouped["close"].shift(-bars)
-        mask = future_close.notna()
+        drop_count = max(bars, drop_last_n_bars)
+        for positions in grouped_positions.values():
+            positions_arr = np.asarray(positions, dtype=np.int64)
+            valid_count = max(0, len(positions_arr) - drop_count)
+            if valid_count <= 0:
+                continue
+            closes = close_values[positions_arr]
+            now = closes[:valid_count]
+            future = closes[bars:bars + valid_count]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                labels[positions_arr[:valid_count]] = np.where(
+                    now > 1e-8,
+                    future / now - 1.0,
+                    np.nan,
+                )
+    pd = __import__("pandas")
+    return pd.Series(labels, index=panel.index, dtype=float)
 
-    close = df["close"].astype(float)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        returns = np.where(close > 1e-8, future_close.astype(float) / close - 1.0, np.nan)
-    values = np.asarray(returns[mask], dtype=float)
+
+def _horizon_returns(
+    panel,
+    horizon: str,
+    *,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+) -> np.ndarray:
+    values = np.asarray(
+        _horizon_return_series(
+            panel,
+            horizon,
+            drop_last_n_bars=drop_last_n_bars,
+            active_horizon=active_horizon,
+        ).dropna(),
+        dtype=float,
+    )
     return values[np.isfinite(values)]
+
+
+def _label_topk_stats(
+    *,
+    panel,
+    horizon: str,
+    total_cost_bps: float,
+    top_k_fraction: float,
+    drop_last_n_bars: int = 0,
+    active_horizon: str | int | None = None,
+) -> dict[str, Any]:
+    """Diagnostic top-K of the candidate label itself, not model performance."""
+    returns = _horizon_return_series(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
+    joined = panel[["ticker", "ts_close"]].copy()
+    joined["_return"] = returns
+    joined = joined.replace([np.inf, -np.inf], np.nan).dropna(subset=["_return"])
+    if joined.empty:
+        return {
+            "method": "candidate_label_topk_net_bps",
+            "top_k_fraction": top_k_fraction,
+            "groups": 0,
+            "rows": 0,
+            "mean_net_bps": None,
+            "positive_net_rate": None,
+        }
+
+    selected: list[float] = []
+    groups = 0
+    for _, group in joined.groupby("ts_close", sort=False):
+        if group.empty:
+            continue
+        k = max(1, int(np.ceil(len(group) * top_k_fraction)))
+        top = group.nlargest(k, "_return")
+        net_bps = top["_return"].to_numpy(dtype=float) * 10000.0 - total_cost_bps
+        finite_net = net_bps[np.isfinite(net_bps)]
+        if finite_net.size == 0:
+            continue
+        selected.extend(float(value) for value in finite_net)
+        groups += 1
+
+    if not selected:
+        return {
+            "method": "candidate_label_topk_net_bps",
+            "top_k_fraction": top_k_fraction,
+            "groups": 0,
+            "rows": 0,
+            "mean_net_bps": None,
+            "positive_net_rate": None,
+        }
+    values = np.asarray(selected, dtype=float)
+    return {
+        "method": "candidate_label_topk_net_bps",
+        "top_k_fraction": top_k_fraction,
+        "groups": int(groups),
+        "rows": int(values.size),
+        "mean_net_bps": float(values.mean()),
+        "positive_net_rate": float((values > 0.0).mean()),
+    }
+
+
+def _horizon_selection_score(report: dict[str, Any]) -> tuple[float, float, float, float, int]:
+    topk = report.get("label_topk")
+    if not isinstance(topk, dict):
+        topk = {}
+    status_rank = 1.0 if report.get("status") == "PASS" else 0.0
+    return (
+        status_rank,
+        safe_float(topk.get("mean_net_bps"), default=-1e18),
+        safe_float(topk.get("positive_net_rate"), default=-1.0),
+        safe_float(report.get("mean_net_bps"), default=-1e18),
+        safe_int(report.get("valid_rows"), default=0, min_value=0),
+    )
+
+
+def _select_best_horizon_report(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return max(reports, key=_horizon_selection_score, default=None)
+
+
+def _selection_impact(
+    *,
+    panel,
+    horizon: str,
+    active_horizon: str,
+    top_k_fraction: float,
+    drop_last_n_bars: int = 0,
+) -> dict[str, Any]:
+    if horizon == active_horizon:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": 1.0,
+            "rank_correlation": 1.0,
+            "selection_changes": 0,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": True,
+        }
+
+    pd = __import__("pandas")
+    active = _horizon_return_series(
+        panel,
+        active_horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
+    candidate = _horizon_return_series(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
+    joined = panel[["ticker", "ts_close"]].copy()
+    joined["_active"] = active
+    joined["_candidate"] = candidate
+    joined = joined.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["_active", "_candidate"]
+    )
+    if joined.empty:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": None,
+            "rank_correlation": None,
+            "selection_changes": None,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": False,
+        }
+
+    overlaps: list[float] = []
+    rank_corrs: list[float] = []
+    selection_changes = 0
+    for _, group in joined.groupby("ts_close", sort=False):
+        if len(group) < 2:
+            continue
+        k = max(1, int(np.ceil(len(group) * top_k_fraction)))
+        active_top = set(group.nlargest(k, "_active")["ticker"].astype(str))
+        candidate_top = set(group.nlargest(k, "_candidate")["ticker"].astype(str))
+        overlaps.append(len(active_top & candidate_top) / max(len(active_top), 1))
+        if active_top != candidate_top:
+            selection_changes += 1
+
+        active_rank = group["_active"].rank(method="average")
+        candidate_rank = group["_candidate"].rank(method="average")
+        corr = active_rank.corr(candidate_rank, method="spearman")
+        if pd.notna(corr):
+            rank_corrs.append(float(corr))
+
+    groups_compared = len(overlaps)
+    if groups_compared == 0:
+        return {
+            "active_horizon": active_horizon,
+            "topk_overlap_rate": None,
+            "rank_correlation": None,
+            "selection_changes": None,
+            "groups_compared": 0,
+            "rank_equivalent_to_active_horizon": False,
+        }
+    topk_overlap_rate = float(np.mean(overlaps))
+    rank_correlation = float(np.mean(rank_corrs)) if rank_corrs else None
+    return {
+        "active_horizon": active_horizon,
+        "topk_overlap_rate": topk_overlap_rate,
+        "rank_correlation": rank_correlation,
+        "selection_changes": int(selection_changes),
+        "groups_compared": groups_compared,
+        "rank_equivalent_to_active_horizon": (
+            selection_changes == 0
+            and topk_overlap_rate == 1.0
+            and (rank_correlation is None or rank_correlation >= 0.999999)
+        ),
+    }
 
 
 def _summarize_horizon(
     *,
     panel,
     horizon: str,
+    active_horizon: str,
     total_cost_bps: float,
     thresholds: dict[str, float],
+    top_k_fraction: float,
+    drop_last_n_bars: int = 0,
 ) -> dict[str, Any]:
-    returns = _horizon_returns(panel, horizon)
+    returns = _horizon_returns(
+        panel,
+        horizon,
+        drop_last_n_bars=drop_last_n_bars,
+        active_horizon=active_horizon,
+    )
     gross_bps = returns * 10000.0
     net_bps = gross_bps - total_cost_bps
     valid_rows = int(net_bps.size)
@@ -214,6 +524,13 @@ def _summarize_horizon(
             "status": "BLOCKED",
             "valid_rows": 0,
             "reason": "no_valid_rows",
+            "selection_impact": _selection_impact(
+                panel=panel,
+                horizon=horizon,
+                active_horizon=active_horizon,
+                top_k_fraction=top_k_fraction,
+                drop_last_n_bars=drop_last_n_bars,
+            ),
         }
 
     mean_gross = float(gross_bps.mean())
@@ -235,6 +552,21 @@ def _summarize_horizon(
         "net_bps_quantiles": _quantiles(net_bps),
         "pass_mean_net_threshold": bool(pass_mean),
         "pass_positive_net_rate_threshold": bool(pass_hit),
+        "label_topk": _label_topk_stats(
+            panel=panel,
+            horizon=horizon,
+            total_cost_bps=total_cost_bps,
+            top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
+            active_horizon=active_horizon,
+        ),
+        "selection_impact": _selection_impact(
+            panel=panel,
+            horizon=horizon,
+            active_horizon=active_horizon,
+            top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
+        ),
     }
 
 
@@ -270,18 +602,41 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     total_cost_bps = _cost_bps()
     thresholds = _diagnostic_thresholds(total_cost_bps)
+    label_settings = _label_generation_settings()
+    active_horizon = str(label_settings["active_horizon_bars"])
+    drop_last_n_bars = label_settings["drop_last_n_bars"]
+    eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
+    top_k_fraction = safe_float(
+        eval_cfg.get("top_k_fraction"),
+        default=0.25,
+        min_value=0.0,
+        max_value=1.0,
+    )
     horizon_reports = [
         _summarize_horizon(
             panel=panel,
             horizon=horizon,
+            active_horizon=active_horizon,
             total_cost_bps=total_cost_bps,
             thresholds=thresholds,
+            top_k_fraction=top_k_fraction,
+            drop_last_n_bars=drop_last_n_bars,
         )
         for horizon in horizons
     ]
     valid_reports = [r for r in horizon_reports if r.get("valid_rows", 0)]
-    best = max(valid_reports, key=lambda r: float(r.get("mean_net_bps", -1e18)), default=None)
+    best = _select_best_horizon_report(valid_reports)
     deployable = bool(best and best.get("status") == "PASS")
+    best_topk = best.get("label_topk") if isinstance(best, dict) else {}
+    if not isinstance(best_topk, dict):
+        best_topk = {}
+    research_trainable = bool(
+        best
+        and safe_float(best_topk.get("mean_net_bps"), default=-1e18)
+        >= thresholds["min_mean_net_bps"]
+        and safe_float(best_topk.get("positive_net_rate"), default=-1.0)
+        >= thresholds["min_positive_net_rate"]
+    )
     return {
         "status": "PASS" if deployable else "WARN",
         "action": "cost_aware_label_horizon_scan",
@@ -294,6 +649,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "start_date": start_date,
             "end_date": end_date,
             "ticker_count": len(tickers),
+            "tickers": tickers,
+            "universe_hash": _universe_hash(tickers),
             "loaded_rows": int(len(panel)),
             "missing_tickers": missing_tickers,
         },
@@ -301,8 +658,23 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "total_cost_bps": total_cost_bps,
             "thresholds": thresholds,
         },
+        "selection_impact_baseline": {
+            "active_horizon": active_horizon,
+            "top_k_fraction": top_k_fraction,
+            "label_generation_parity": {
+                "source": "DatasetBuilder._generate_labels",
+                "drop_last_n_bars": drop_last_n_bars,
+                "session_close_drop_uses_active_horizon": active_horizon,
+            },
+        },
         "best_horizon": best.get("horizon") if best else None,
+        "best_horizon_selection": {
+            "method": "status_then_candidate_label_topk_net_bps",
+            "score": list(_horizon_selection_score(best)) if best else None,
+            "note": "label_topk is label separability diagnostic, not model OOS PnL",
+        },
         "deployable_label_recommendation": deployable,
+        "research_trainable_label_recommendation": research_trainable,
         "warnings": warnings,
         "horizons": horizon_reports,
     }

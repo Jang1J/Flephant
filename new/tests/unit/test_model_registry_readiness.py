@@ -70,6 +70,7 @@ class _StringFalseDeployQualityRegistry:
             "data_version": "test",
             "created_at": "2026-05-15T00:00:00+09:00",
             "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
             "label_generation_version": "test",
             "label_session_scope": "regular",
             "model_path": str(model_path.name),
@@ -80,6 +81,14 @@ class _StringFalseDeployQualityRegistry:
             },
         }
         return object(), metadata
+
+
+class _TopLevelMetricScopeRegistry(_StringFalseDeployQualityRegistry):
+    def load_version(self, version):
+        model, metadata = super().load_version(version)
+        metadata["metric_scope"] = "trainer_validation_proxy"
+        metadata["metrics"]["metric_scope"] = "legacy_nested_scope"
+        return model, metadata
 
 
 def test_model_registry_readiness_treats_string_false_deploy_quality_as_warn(
@@ -102,3 +111,21 @@ def test_model_registry_readiness_treats_string_false_deploy_quality_as_warn(
     assert "candidate_not_marked_deploy_quality" in report["warnings"]
     assert report["checks"]["deploy_quality"]["status"] == "WARN"
     assert report["checks"]["deploy_quality"]["value"] is False
+
+
+def test_model_registry_readiness_reports_top_level_metric_scope(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        model_registry_readiness,
+        "ModelRegistry",
+        _TopLevelMetricScopeRegistry,
+    )
+
+    report = model_registry_readiness.build_report(
+        registry_dir=str(tmp_path),
+        require_active=True,
+    )
+
+    assert report["checks"]["deploy_quality"]["metric_scope"] == "trainer_validation_proxy"

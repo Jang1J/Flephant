@@ -84,6 +84,8 @@ def test_join_dual_source_features_applies_scores(builder_ds_enabled: DatasetBui
     mock_scores = [
         {
             "ticker": "005930",
+            "snapshot_ts": "2026-01-02T08:30:00+09:00",
+            "source_stats": {"input_mode": "archived_raw_events"},
             "news_score_t": 0.7,
             "comm_score_t_1": 0.3,
             "comm_score_t_2": -0.1,

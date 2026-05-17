@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", default=datetime.now(_KST).strftime("%Y%m%d"))
     parser.add_argument("--tickers", default=None)
-    parser.add_argument("--output-dir", default="new/artifacts/dual_source")
+    parser.add_argument("--output-dir", default="artifacts/dual_source")
     args = parser.parse_args(argv)
 
     tickers = (

@@ -54,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--business-days", type=int, default=80)
     parser.add_argument("--registry-dir", default=None)
+    parser.add_argument("--bundle-id", default="", help="strict prelive/paper auto 대상 bundle id")
     parser.add_argument(
         "--prelive-scope",
         choices=["strict", "paper-rehearsal"],
@@ -76,6 +77,16 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 1
+    requested_bundle_id = str(args.bundle_id).strip()
+    if not requested_bundle_id:
+        out = {
+            "status": "BLOCKED",
+            "action": "paper_auto_trade",
+            "reason": "bundle_id_required_for_strict_paper_auto_trade",
+            "prelive_scope": args.prelive_scope,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
 
     tickers = _parse_tickers(str(args.tickers), int(args.max_tickers))
     prelive = None
@@ -84,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             end_date=str(args.end_date),
             business_days=int(args.business_days),
             max_tickers=int(args.max_tickers),
+            bundle_id=requested_bundle_id,
         )
         if prelive.get("status") != "PASS":
             out = {
@@ -96,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 1
 
-    trader = PaperAutoTrader()
+    trader = PaperAutoTrader(required_bundle_id=requested_bundle_id)
     report = trader.run(
         tickers=tickers,
         cycles=int(args.cycles),
