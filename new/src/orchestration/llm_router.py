@@ -280,15 +280,16 @@ class _CircuitBreaker:
     def record_failure(self) -> None:
         """실패 기록. threshold 도달 시 OPEN 전이."""
         with self._lock:
-            self._failures += 1
-
             if self._state == CircuitState.HALF_OPEN:
-                # HALF_OPEN 실패: 즉시 OPEN 복귀, 타이머 리셋
+                # HALF_OPEN 실패는 새 차단 주기로 보고 누적 실패를 리셋한다.
+                self._failures = 0
                 self._state = CircuitState.OPEN
                 self._opened_at = time.time()
                 self._half_open_probe_in_flight = False
                 logger.warning(f"circuit OPEN (HALF_OPEN 실패, {self._open_duration_sec}s 재차단)")
                 return
+
+            self._failures += 1
 
             if self._failures >= self._threshold:
                 self._state = CircuitState.OPEN

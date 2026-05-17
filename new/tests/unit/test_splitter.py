@@ -125,3 +125,20 @@ def test_split_embargo_applied() -> None:
 
     # 원래 test 2*10*2 = 40 rows. embargo 5 ts → 15 ts × 2 = 30 rows.
     assert len(test_idx) < 40
+
+
+def test_split_skips_when_purge_or_embargo_consumes_entire_window(caplog) -> None:
+    panel = _make_panel(n_days=2, n_tickers=1, bars_per_day=2)
+    s = WalkForwardSplitter()
+    s.train_window_days = 1
+    s.test_window_days = 1
+    s.step_days = 1
+    s.n_splits = 1
+    s.purge_bars = 2
+    s.embargo_bars = 2
+
+    with caplog.at_level("WARNING", logger="splitter"):
+        folds = list(s.split(panel))
+
+    assert folds == []
+    assert "purge/embargo 후 empty. skip." in caplog.text

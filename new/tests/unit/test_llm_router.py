@@ -284,6 +284,7 @@ def test_circuit_breaker_reopens_on_half_open_failure(monkeypatch) -> None:
 
     cb.record_failure()
     assert cb.state == CircuitState.OPEN.value
+    assert cb.failure_count == 0
 
 
 def test_circuit_breaker_allows_only_one_half_open_probe_before_result() -> None:
