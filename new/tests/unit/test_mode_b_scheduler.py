@@ -155,6 +155,11 @@ def _install_fast_candidate_stages(
 
 
 def _valid_service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict:
+    from src.mode_b.deployer import _active_service_policy_universe
+    from src.mode_b.service_policy_verifier import service_policy_universe_hash
+
+    universe = _active_service_policy_universe()
+    universe_hash = service_policy_universe_hash(universe)
     report = {
         "bundle_id": bundle_id,
         "status": "PASS",
@@ -166,6 +171,10 @@ def _valid_service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict:
             "cash_guard_respected": True,
         },
         "order_stats": {"naked_short_attempts": 0},
+        "universe": list(universe),
+        "universe_count": len(universe),
+        "universe_hash": universe_hash,
+        "universe_policy": "final_dataset_gate",
     }
     path = tmp_path / f"{bundle_id}_service_policy_replay.json"
     raw = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
