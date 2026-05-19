@@ -29,8 +29,20 @@ community:
   real_provider: "naver_search"
   naver_search_providers: ["cafearticle", "blog"]
   naver_query_suffix: "주식"
-  max_posts_per_ticker: 3
+  naver_query_suffixes: ["주식", "종목토론", "실적", "목표가", "급락", "공시", "토론"]
+  include_ticker_queries: true
+  naver_ticker_query_suffixes: ["주식"]
+  include_sector_queries: true
+  sector_query_suffix: "관련주"
+  max_queries_per_ticker: 10
+  display_per_query: 10
+  max_posts_per_ticker: 10
   sort: "date"
+  compliance:
+    stores_raw_content: false
+    stores_derived_signal_only: true
+    terms_review_required_for_durable_archive: true
+    durable_raw_archive_allowed: false
 
 divergence:
   threshold: 0.5

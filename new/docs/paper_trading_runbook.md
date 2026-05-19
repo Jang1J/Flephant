@@ -24,11 +24,11 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export KIS_MODE=virtual
-export KIS_APP_KEY="$KIS_PAPER_APP_KEY"
-export KIS_APP_SECRET="$KIS_PAPER_APP_SECRET"
-export KIS_ACCOUNT_NUMBER="$KIS_PAPER_ACCOUNT_NUMBER"
-export KIS_ACCOUNT_PRODUCT_CODE="$KIS_PAPER_ACCOUNT_PRODUCT_CODE"
 ```
+
+Inject the KIS paper app key, app secret, account number, and product code from
+the operator terminal only. Do not write those values or env assignments into
+repo files or release notes.
 
 Check sanitized readiness:
 

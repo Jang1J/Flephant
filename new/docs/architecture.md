@@ -450,7 +450,7 @@ NewsAgent = {
   - micro: `artifacts/agent_memory/news_agent/{ticker}/{YYYYMMDD}.jsonl`
   - macro: `artifacts/agent_memory/macro/{YYYYMMDD}.jsonl`
 - Dual-Source: 뉴스 vs 커뮤니티 divergence 감지는 Sprint 4 S4-1 `DualSourceScorer`와 연계
-- LLM content 파싱: heuristic (`buy`/`sell`/`neutral` 키워드). Sprint 4 S4-6 실 API 도입 시 JSON mode로 교체
+- LLM content 파싱: Kanana prompt-level JSON instruction + local parser fail-closed. JSON parse 실패 시 heuristic fallback (`buy`/`sell`/`neutral` 키워드)
 - narrative 최대 길이: `text_pack_settings.narrative_max_chars` (`news_filter.yaml` SSOT, 기본 200). 하드코딩 금지 원칙 5 준수
 - 구현 파일: `new/src/agents/cold/news.py` (S2-7, pytest 612 → 640)
 
@@ -1835,6 +1835,13 @@ GPT-4o / o3-mini (추론/코드 전문):
 result = router.call(prompt, mode="cold", caller="news_agent")
 # mode: 'cold' (Kanana 우선) | 'mode_b' (GPT-4o 전용) | 'hot' (raise)
 # caller: risk_config.yaml llm_budget.budget_allocation 키
+# mode 값은 exact enum만 허용. "HOT", "hot ", "mode_a" 등은 UNKNOWN_LLM_MODE fail-closed
+# Cold Path에서 force_model="gpt-4o" 금지. GPT는 fallback 또는 Mode B에서만 사용
+# Kanana: OpenAI-compatible chat.completions.create(model="kanana-o", messages=[...])
+# KANANA_API_URL: full endpoint가 아니라 /v1 base URL
+# 로컬 legacy 호환: KANANA_API_URL 없으면 KANANA_BASE_URL alias 사용
+# GPT-4o: store=false, structured_schema 제공 시 strict json_schema response_format
+# schema: Kanana는 prompt-level JSON 지시 + local parser fail-closed, GPT는 strict schema
 
 # 예시:
 result = router.call(prompt, mode="cold", caller="news_agent")   # Kanana-o 우선

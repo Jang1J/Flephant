@@ -243,6 +243,10 @@
   ※ Hot Path (평상시): Quant Agent만 활성 (추론 <100ms, LLM 미호출)
   ※ Cold Path (이벤트 시): News/Risk 분석 → 충돌 감지 시 Debate Agent 활성 (LLM 호출, 10~30초)
      트리거: 뉴스감지 | 급등락 | regime변화 | anomaly
+     LLM routing: Kanana-o 우선(OpenAI-compatible Chat Completions, KANANA_API_URL=/v1 base URL; legacy alias KANANA_BASE_URL)
+     fallback: Kanana 실패/한도초과/circuit OPEN 시 GPT-4o, GPT 호출은 store=false
+     schema: Kanana는 prompt-level JSON 지시, GPT는 strict json_schema response_format
+  ※ Mode B (18:00 이후): Backtest/Factor 진단은 GPT-4o 전용, Kanana daily budget 미사용
   ※ FDA 출력: 8필드: approved, target_weights(RO), order_deltas(RO), veto_reason, reason_code, risk_overrides(audit), confidence, expiry (BUY/HOLD/SELL 아님)
   ※ 현재 적용 범위: 연구형/모의운용형 (실계좌 자동매매 아직 부적합)
 ```
@@ -629,14 +633,21 @@ Risk Fast sidecar 예외: Hot Path bar_buffer 직접 감지, EventGateway bypass
 │ call(prompt, mode, caller, structured_schema)          │
 │   ↓ mode='hot' → RuntimeError (불변 원칙 4)             │
 │   ↓ mode='mode_b' → caller 화이트리스트 검증 → GPT-4o   │
+│      + ELEPHANT_MODE=mode_b + execution_window guard   │
 │   ↓ mode='cold':                                        │
-│     _BudgetTracker.can_call(caller)                     │
+│     _BudgetTracker.try_reserve(caller)                  │
 │       ├─ PASS → _CircuitBreaker(kanana).can_attempt()   │
 │       │          ├─ PASS → _call_kanana()               │
+│       │          │   OpenAI-compatible chat.completions │
 │       │          │   ├─ 성공 → record_success           │
 │       │          │   └─ 실패 → record_failure + fallback│
 │       │          └─ OPEN → fallback to GPT-4o           │
 │       └─ 예산 초과 → fallback to GPT-4o                 │
+│                                                         │
+│ provider policy:                                        │
+│   exact mode enum only, Cold force_model='gpt-4o' 금지  │
+│   Kanana KANANA_API_URL=/v1 base URL (or KANANA_BASE_URL alias), prompt JSON only │
+│   GPT-4o store=false, strict json_schema when schema set │
 │                                                         │
 │ caller allocation (100회/일 총합):                      │
 │   news_agent=30, dart=3, risk=15, community=5           │
