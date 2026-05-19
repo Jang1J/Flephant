@@ -155,14 +155,15 @@ def _install_fast_candidate_stages(
 
 
 def _valid_service_policy_evidence(tmp_path: Path, bundle_id: str) -> dict:
-    from src.mode_b.deployer import _active_service_policy_universe
+    from src.mode_b.scheduler import _final_dataset_gate_cfg, _final_dataset_tickers
     from src.mode_b.service_policy_verifier import service_policy_universe_hash
 
-    universe = _active_service_policy_universe()
+    universe = _final_dataset_tickers(_final_dataset_gate_cfg())
     universe_hash = service_policy_universe_hash(universe)
     report = {
         "bundle_id": bundle_id,
         "status": "PASS",
+        "date_range": {"start": "20250917", "end": "20251021"},
         "gate": {"status": "PASS"},
         "policy_checks": {
             "deploy_candidate_by_service_policy": True,
@@ -708,7 +709,57 @@ def test_stage_7_blocks_invalid_service_policy_evidence_before_deployer(schedule
     assert result["deploy_status"] == "blocked"
     assert result["deploy_result"] == "service_policy_gate_failed"
     assert result["error"] == "service_policy_gate_failed"
-    assert "service_policy_report_path_missing" in result["service_policy_blockers"]
+    assert "service_policy_expected_date_range_missing" in result["service_policy_blockers"]
+
+
+def test_stage_7_uses_repo_root_for_relative_service_policy_report(
+    scheduler,
+    monkeypatch,
+    tmp_path,
+):
+    """stage_7 사전 검증도 repo-relative report path를 deployer와 동일하게 해석한다."""
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    evidence = _valid_service_policy_evidence(tmp_path, "BUNDLE-TEST")
+    report_path = Path(evidence["service_policy_report_path"])
+    repo_root = report_path.parent.parent.parent.parent
+    relative_path = str(report_path.relative_to(repo_root))
+    evidence["service_policy_report_path"] = "/producer/machine/missing/pass.json"
+    evidence["service_policy_report_path_relative"] = relative_path
+    evidence["report_path"] = "/producer/machine/missing/pass.json"
+    evidence["report_path_relative"] = relative_path
+
+    monkeypatch.setattr(
+        "src.mode_b.scheduler._service_policy_repo_root",
+        lambda: repo_root,
+    )
+
+    class _MockDeployer:
+        def __init__(self):
+            self.kwargs = None
+
+        def deploy(self, **kwargs):
+            self.kwargs = kwargs
+            return {"status": "deployed", "deploy_status": "deployed"}
+
+    deployer = _MockDeployer()
+    scheduler._bundle_id = "BUNDLE-TEST"
+    scheduler._current_verdict = "pass"
+    scheduler._current_sanity_check_result = "ok"
+    scheduler._current_regression_risk = {"flagged": False, "severity": "low", "evidence": []}
+    scheduler._current_feature_quality = {
+        "dual_source_rows": 100,
+        "dual_source_non_neutral_rows": 90,
+        "exogenous_rows": 100,
+        "exogenous_non_neutral_rows": 90,
+    }
+    scheduler._current_service_policy_evidence = evidence
+    scheduler._deployer = deployer
+
+    result = scheduler.stage_7_deploy()
+
+    assert result["deploy_status"] == "deployed"
+    assert deployer.kwargs["service_policy_evidence"] == evidence
 
 
 def test_stage_7_reports_configured_deployer_not_implemented(scheduler, monkeypatch, tmp_path):

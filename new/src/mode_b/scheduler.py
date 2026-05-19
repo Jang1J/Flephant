@@ -5,7 +5,6 @@ Stage 내부 로직(Alpha Factor Engine, Co-STEER 등)은 Sprint 3 S3-1+ 에서 
 현재 각 stage는 기반 인프라(bundle_id, 상태 전이, audit_log, timeout)가 실동작.
 """
 from __future__ import annotations
-from src.mode_b.deployer import _active_service_policy_universe
 
 import concurrent.futures
 import json
@@ -99,6 +98,22 @@ def _final_dataset_tickers(gate_cfg: dict[str, Any]) -> list[str]:
                 if ticker != "000000":
                     tickers.append(ticker)
     return sorted(dict.fromkeys(tickers))
+
+
+def _service_policy_repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _service_policy_expected_date_range(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    value = (
+        evidence.get("service_policy_expected_date_range")
+        or evidence.get("date_range")
+    )
+    if not isinstance(value, dict):
+        return None
+    if not value.get("start") or not value.get("end"):
+        return None
+    return value
 
 
 def _final_dataset_lgbm_retrain_kwargs() -> dict[str, Any]:
@@ -885,16 +900,29 @@ class ModeBScheduler:
                 from src.mode_b.deployer import DeployBlocked, RegressionRisk
 
                 risk = self._current_regression_risk or {}
+                expected_date_range = _service_policy_expected_date_range(
+                    self._current_service_policy_evidence,
+                )
+                if expected_date_range is None:
+                    return {
+                        "status": "blocked",
+                        "deploy_status": "blocked",
+                        "deploy_result": "service_policy_gate_failed",
+                        "bundle_id": self._bundle_id,
+                        "service_policy_blockers": [
+                            "service_policy_expected_date_range_missing",
+                        ],
+                        "sanity_check_result": self._current_sanity_check_result,
+                        "regression_risk": self._current_regression_risk or {},
+                        "error": "service_policy_gate_failed",
+                    }
+                gate_cfg = _final_dataset_gate_cfg()
                 policy_verification = verify_service_policy_evidence(
                     self._current_service_policy_evidence,
                     bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
-                    expected_date_range=(
-                        (self._current_service_policy_evidence or {}).get(
-                            "service_policy_expected_date_range"
-                        )
-                        or (self._current_service_policy_evidence or {}).get("date_range")
-                    ),
-                    expected_universe=_active_service_policy_universe(),
+                    repo_root=_service_policy_repo_root(),
+                    expected_date_range=expected_date_range,
+                    expected_universe=_final_dataset_tickers(gate_cfg),
                 )
                 if not policy_verification.passed:
                     return {

@@ -183,6 +183,7 @@ def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) ->
     report = {
         "status": "PASS",
         "bundle_id": bundle_id,
+        "date_range": {"start": "20250917", "end": "20251021"},
         "gate": {"status": "PASS"},
         "policy_checks": {
             "deploy_candidate_by_service_policy": True,
@@ -205,6 +206,7 @@ def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) ->
         "bundle_id": bundle_id,
         "service_policy_report_path": "artifacts/reports/service_policy_replay/pass.json",
         "service_policy_report_sha256": digest,
+        "date_range": dict(report["date_range"]),
         "gate": dict(report["gate"]),
         "policy_checks": dict(report["policy_checks"]),
         "order_stats": dict(report["order_stats"]),
@@ -751,6 +753,60 @@ def test_service_policy_gate_accepts_bound_pass_report(tmp_path):
         _passing_service_policy_evidence(tmp_path),
         bundle_id=_BUNDLE_ID,
     )
+
+
+def test_service_policy_gate_requires_expected_date_range(tmp_path):
+    """Production deployer는 date_range 없는 service-policy evidence를 fail-closed 처리."""
+    from src.mode_b.deployer import DeployBlocked
+
+    deployer = _make_deployer(tmp_path)
+    evidence = _passing_service_policy_evidence(tmp_path)
+    evidence.pop("date_range", None)
+    evidence.pop("service_policy_expected_date_range", None)
+
+    with pytest.raises(DeployBlocked) as exc_info:
+        deployer._check_service_policy_gate(evidence, bundle_id=_BUNDLE_ID)
+
+    assert exc_info.value.reason == "service_policy_gate_failed"
+    assert "service_policy_expected_date_range_missing" in str(exc_info.value)
+
+
+def test_active_service_policy_universe_treats_string_false_as_false(monkeypatch):
+    """include_pending_data_tickers='false' 문자열은 pending universe를 열면 안 된다."""
+    from src.mode_b import deployer as deployer_mod
+
+    def _loader(name, section=None):
+        if name == "risk_config.yaml":
+            return {
+                "deploy_decision_gate": {
+                    "final_dataset_gate": {
+                        "include_pending_data_tickers": "false",
+                        "allowed_stock_statuses": ["active", "pending_data"],
+                        "allowed_sector_statuses": ["confirmed", "confirmed_pending_data"],
+                    }
+                }
+            }
+        if name == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "confirmed": {
+                        "status": "confirmed",
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                            {"ticker": "000660", "status": "pending_data"},
+                        ],
+                    },
+                    "pending_sector": {
+                        "status": "confirmed_pending_data",
+                        "stocks": [{"ticker": "035420", "status": "active"}],
+                    },
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(deployer_mod, "config_load", _loader)
+
+    assert deployer_mod._active_service_policy_universe() == ["005930"]  # noqa: SLF001
 
 
 def test_service_policy_gate_uses_relative_fallback_when_absolute_path_stale(tmp_path):

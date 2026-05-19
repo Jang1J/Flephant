@@ -42,6 +42,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_deploy_id, generate_regression_case_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("ModeBDeployer")
 _KST = ZoneInfo("Asia/Seoul")
@@ -137,11 +138,15 @@ _OPTIONAL_COMPONENT_PATH = {
     ),
 }
 
+
 def _active_service_policy_universe() -> list[str]:
     cfg = config_load("risk_config.yaml", "backtest_agent") or {}
     gate_cfg = cfg.get("deploy_decision_gate", {}).get("final_dataset_gate", {}) or {}
     universe_cfg = config_load("universe_config.yaml") or {}
-    include_pending = bool(gate_cfg.get("include_pending_data_tickers", False))
+    include_pending = safe_bool(
+        gate_cfg.get("include_pending_data_tickers"),
+        default=False,
+    )
     allowed_stock = {"active"}
     allowed_sector = {"confirmed"}
     if include_pending:
@@ -169,7 +174,20 @@ def _active_service_policy_universe() -> list[str]:
                 ticker = str(stock.get("ticker", "")).zfill(6)
                 if ticker != "000000":
                     tickers.append(ticker)
-    return sorted(dict.fromkeys(tickers))
+    return sorted(set(tickers))
+
+
+def _service_policy_expected_date_range(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    value = (
+        evidence.get("service_policy_expected_date_range")
+        or evidence.get("date_range")
+    )
+    if not isinstance(value, dict):
+        return None
+    if not value.get("start") or not value.get("end"):
+        return None
+    return value
+
 
 class ModeBDeployer:
     """C14 ModeBDeployer: 22:00 배포 게이트 실구현.
@@ -410,14 +428,17 @@ class ModeBDeployer:
 
     def _check_service_policy_gate(self, evidence: dict[str, Any], *, bundle_id: str) -> None:
         """Block production deploy unless service-policy replay is PASS."""
+        expected_date_range = _service_policy_expected_date_range(evidence)
+        if expected_date_range is None:
+            raise DeployBlocked(
+                "service_policy_gate_failed",
+                "blockers=['service_policy_expected_date_range_missing']",
+            )
         verification = verify_service_policy_evidence(
             evidence,
             bundle_id=bundle_id,
             repo_root=self._repo_root_for_evidence(),
-            expected_date_range=(
-                evidence.get("service_policy_expected_date_range")
-                or evidence.get("date_range")
-            ),
+            expected_date_range=expected_date_range,
             expected_universe=_active_service_policy_universe(),
         )
         if not verification.passed:
