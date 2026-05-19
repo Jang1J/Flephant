@@ -176,6 +176,8 @@ def run_pipeline(
     target_col_override: str | None = None,
     registry_dir: str | None = None,
     allow_production_candidate_write: bool = False,
+    disable_dual_source_features: bool = False,
+    disable_exogenous_features: bool = False,
 ) -> dict[str, Any]:
     end_dt = datetime.strptime(end_date, "%Y%m%d").date()
     start_date = _business_start_date(end_dt, business_days).strftime("%Y%m%d")
@@ -191,6 +193,10 @@ def run_pipeline(
         "bundle_id": resolved_bundle_id,
         "target_col_override": target_col_override,
         "registry_dir": registry_dir,
+        "feature_policy": {
+            "dual_source_features_enabled": not bool(disable_dual_source_features),
+            "exogenous_features_enabled": not bool(disable_exogenous_features),
+        },
         "runtime": {
             "elephant_mode": os.environ.get("ELEPHANT_MODE"),
             "kis_mode": os.environ.get("KIS_MODE"),
@@ -252,6 +258,8 @@ def run_pipeline(
         lgbm_result = NightlyLGBMRetrainer(
             registry_dir=registry_dir,
             allow_production_candidate_write=allow_production_candidate_write,
+            include_dual_source_features=False if disable_dual_source_features else None,
+            include_exogenous_features=False if disable_exogenous_features else None,
         ).retrain(
             bundle_id=resolved_bundle_id,
             tickers=training_tickers,
@@ -441,6 +449,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-col-override", default="")
     parser.add_argument("--registry-dir", default="")
     parser.add_argument("--allow-production-candidate-write", action="store_true")
+    parser.add_argument("--disable-dual-source-features", action="store_true")
+    parser.add_argument("--disable-exogenous-features", action="store_true")
     parser.add_argument("--no-write-report", action="store_true")
     return parser.parse_args(argv)
 
@@ -464,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
         target_col_override=str(args.target_col_override).strip() or None,
         registry_dir=str(args.registry_dir).strip() or None,
         allow_production_candidate_write=bool(args.allow_production_candidate_write),
+        disable_dual_source_features=bool(args.disable_dual_source_features),
+        disable_exogenous_features=bool(args.disable_exogenous_features),
     )
     if not bool(args.no_write_report):
         _write_report(report)

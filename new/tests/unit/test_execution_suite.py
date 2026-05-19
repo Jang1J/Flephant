@@ -182,7 +182,19 @@ def _patch_execution_config(monkeypatch, mode: str, live_enabled: bool = False) 
         if file_name == "universe_config.yaml":
             return _execution_universe_config()
         if section == "execution":
-            return {"mode": mode, "live_enabled": live_enabled}
+            return {
+                "mode": mode,
+                "live_enabled": live_enabled,
+                "price_tick_bands": [
+                    {"min_price": 0, "tick_size": 1},
+                    {"min_price": 1000, "tick_size": 5},
+                    {"min_price": 5000, "tick_size": 10},
+                    {"min_price": 10000, "tick_size": 50},
+                    {"min_price": 50000, "tick_size": 100},
+                    {"min_price": 100000, "tick_size": 500},
+                    {"min_price": 500000, "tick_size": 1000},
+                ],
+            }
         if section == "execution_cost_model":
             return {"components": {"slippage_bps": 10}}
         return {}
@@ -323,11 +335,11 @@ def test_execute_paper_submits_via_injected_kis_client(monkeypatch, tmp_path: Pa
     assert client.calls == [("005930", "buy", 10, 70000.0)]
 
 
-def test_execute_paper_rejects_pending_universe_ticker_without_submit(
+def test_execute_paper_rejects_non_universe_ticker_without_submit(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """paper 주문은 pending_data 종목을 broker submit 전에 차단한다."""
+    """paper 주문은 trade universe 밖 종목을 broker submit 전에 차단한다."""
     _patch_execution_config(monkeypatch, mode="paper")
 
     class FakeKISClient:
@@ -348,14 +360,14 @@ def test_execute_paper_rejects_pending_universe_ticker_without_submit(
     )
     fd = _final_decision(
         approved=True,
-        order_deltas=[{"ticker": "105560", "side": "buy", "qty": 1, "price": 70000.0}],
+        order_deltas=[{"ticker": "123456", "side": "buy", "qty": 1, "price": 70000.0}],
     )
 
     result = gw.execute(fd)
     report = result["execution_report"]
 
     assert report["status"] == "rejected"
-    assert "order_ticker_not_active_universe: 105560" in report["rejection_reason"]
+    assert "order_ticker_not_active_universe: 123456" in report["rejection_reason"]
     assert client.called is False
 
 
@@ -502,7 +514,13 @@ def test_execute_paper_rejects_client_without_submit_order(
 def test_execution_gateway_reads_nested_slippage_bps(monkeypatch) -> None:
     def fake_config_load(file_name: str, section: str):
         if section == "execution":
-            return {"mode": "mock", "live_enabled": False}
+            return {
+                "mode": "mock",
+                "live_enabled": False,
+                "price_tick_bands": [
+                    {"min_price": 0, "tick_size": 1},
+                ],
+            }
         if section == "execution_cost_model":
             return {"components": {"slippage_bps": 25}}
         return {}

@@ -202,7 +202,12 @@ class FakePaperKISNoHistoryMethod:
 
 
 class FakeHotRunner:
-    def __init__(self, qty: int = 1, approved: bool = True) -> None:
+    def __init__(
+        self,
+        qty: int = 1,
+        approved: bool = True,
+        price: float = 70000.0,
+    ) -> None:
         self.state = SimpleNamespace(value="BOOTSTRAP")
         self._quant = SimpleNamespace(
             has_model=True,
@@ -210,6 +215,7 @@ class FakeHotRunner:
         )
         self.qty = qty
         self.approved = approved
+        self.price = price
         self.calls: list[dict[str, Any]] = []
 
     def start(self) -> None:
@@ -227,7 +233,7 @@ class FakeHotRunner:
                         "ticker": "005930",
                         "side": "buy",
                         "qty": self.qty,
-                        "price": 70000.0,
+                        "price": self.price,
                         "order_type": "00",
                         "reason": "rebalance",
                     }
@@ -243,6 +249,84 @@ class FakeMarketHotRunner(FakeHotRunner):
         result["final_decision"]["order_deltas"][0]["order_type"] = "01"
         result["final_decision"]["order_deltas"][0]["price"] = 0.0
         return result
+
+
+class FakeMultiOrderHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "final_decision": {
+                "decision_id": "FDA-MULTI",
+                "approved": True,
+                "reason_code": "APPROVED",
+                "order_deltas": [
+                    {
+                        "ticker": "035420",
+                        "side": "buy",
+                        "qty": 7,
+                        "price": 180000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                        "delta_weight": 0.01,
+                    },
+                    {
+                        "ticker": "000660",
+                        "side": "buy",
+                        "qty": 8,
+                        "price": 150000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                        "delta_weight": 0.05,
+                    },
+                    {
+                        "ticker": "005930",
+                        "side": "buy",
+                        "qty": 6,
+                        "price": 70000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                        "delta_weight": 0.03,
+                    },
+                    {
+                        "ticker": "042700",
+                        "side": "buy",
+                        "qty": 9,
+                        "price": 110000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                        "delta_weight": 0.02,
+                    },
+                    {
+                        "ticker": "403870",
+                        "side": "buy",
+                        "qty": 10,
+                        "price": 45000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                        "delta_weight": 0.04,
+                    },
+                ],
+            },
+            "latency_ms": 1.0,
+        }
+
+
+class FakeRiskAwareHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        warnings = list(kwargs.get("risk_warnings") or [])
+        if warnings:
+            reason_code = warnings[0].get("recommended_fda_reason_code") or "RISK_FAST_TRIGGER"
+            return {
+                "final_decision": {
+                    "decision_id": "FDA-COLD-RISK",
+                    "approved": False,
+                    "reason_code": reason_code,
+                    "order_deltas": [],
+                },
+                "latency_ms": 1.0,
+            }
+        return super().run_once(**kwargs)
 
 
 class FakeNoModelFlagHotRunner(FakeHotRunner):
@@ -338,6 +422,72 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
         "quant": "done",
         "debate": "skipped",
     }
+
+
+def test_paper_auto_forwards_cold_path_risk_warnings_and_skips_order(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeRiskAwareHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        risk_warnings=[
+            {
+                "risk_level": "high",
+                "recommended_fda_reason_code": "NEWS_COMMUNITY_DIVERGENCE",
+                "reason": "cold_path_fda_veto",
+            }
+        ],
+        write_report=False,
+    )
+
+    assert report["status"] == "PASS"
+    assert client.orders == []
+    assert report["stages"]["cold_path_risk_warnings"]["count"] == 1
+    assert hot_runner.calls[0]["risk_warnings"][0]["severity"] == "high"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["cold_path_risk_warning_count"] == 1
+    assert cycle["order_guard"]["reason"] == "fda_veto"
+    assert cycle["order_guard"]["reason_code"] == "NEWS_COMMUNITY_DIVERGENCE"
+
+
+def test_paper_auto_normalizes_limit_price_to_krx_tick(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1, price=275750.0),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "PASS"
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 276000.0,
+        "order_type": "00",
+    }]
+    fill = report["stages"]["cycles"]["items"][0]["execution"]["execution_report"]["fills"][0]
+    assert fill["broker_response"]["price"] == 276000.0
 
 
 def test_paper_auto_respects_active_kill_switch(tmp_path: Path) -> None:
@@ -680,11 +830,11 @@ def test_paper_auto_fails_when_order_history_method_missing(tmp_path: Path) -> N
     assert cycle["order_history_verification"]["reason"] == "kis_client_no_get_order_history"
 
 
-def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: Path) -> None:
+def test_paper_auto_caps_qty_over_limit_before_execution(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
         kis_client=client,
-        hot_runner=FakeHotRunner(qty=2),
+        hot_runner=FakeHotRunner(qty=3),
         report_dir=tmp_path,
         now_fn=_paper_session_now,
     )
@@ -697,14 +847,65 @@ def test_paper_auto_rejects_qty_over_limit_without_mutating_decision(tmp_path: P
         write_report=False,
     )
 
-    assert report["status"] == "FAIL"
-    assert client.orders == []
+    assert report["status"] == "PASS"
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 2,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
     cycle = report["stages"]["cycles"]["items"][0]
-    assert cycle["order_guard"]["reason"] == "order_guard_violations"
-    assert cycle["order_guard"]["violations"][0]["reason"] == "qty_out_of_limit"
-    assert cycle["order_guard"]["violations"][0]["qty"] == 2
-    assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["qty"] == 2
-    assert cycle["execution"] is None
+    assert cycle["order_guard"]["status"] == "PASS"
+    assert cycle["order_caps_applied"] == [{
+        "index": 0,
+        "ticker": "005930",
+        "side": "buy",
+        "original_qty": 3,
+        "capped_qty": 2,
+        "max_order_qty_per_order": 2,
+    }]
+    assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["qty"] == 3
+    assert cycle["execution"]["execution_report"]["status"] == "submitted"
+
+
+def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeMultiOrderHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930", "000660", "035420", "042700", "403870"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "PASS"
+    assert cycle["order_guard"] == {"status": "PASS", "n_orders": 3}
+    assert len(cycle["hot_result"]["final_decision"]["order_deltas"]) == 5
+    assert [order["ticker"] for order in client.orders] == [
+        "000660",
+        "403870",
+        "005930",
+    ]
+    assert [order["qty"] for order in client.orders] == [2, 2, 2]
+    assert cycle["order_count_caps_applied"][0]["original_count"] == 5
+    assert cycle["order_count_caps_applied"][0]["capped_count"] == 3
+    assert cycle["order_count_caps_applied"][0]["max_orders_per_cycle"] == 3
+    assert [
+        item["ticker"] for item in cycle["order_count_caps_applied"][0]["kept"]
+    ] == ["000660", "403870", "005930"]
+    assert [
+        item["ticker"] for item in cycle["order_count_caps_applied"][0]["dropped"]
+    ] == ["042700", "035420"]
+    assert len(cycle["order_caps_applied"]) == 3
 
 
 def test_paper_auto_treats_string_false_market_order_as_disabled(
@@ -851,6 +1052,49 @@ def test_paper_auto_cli_requires_bundle_id_for_strict(capsys) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "BLOCKED"
     assert out["reason"] == "bundle_id_required_for_strict_paper_auto_trade"
+
+
+def test_paper_auto_cli_defaults_to_final_dataset_gate_date(monkeypatch, capsys) -> None:
+    script = _load_paper_auto_trade_script()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        script.prelive_gate,
+        "_final_dataset_gate_cfg",
+        lambda: {"expected_end_date": "20260515", "rehearsal_business_days": 80},
+    )
+    monkeypatch.setattr(
+        script,
+        "config_load",
+        lambda _file_name, _section=None: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 0,
+            "max_tickers": 1,
+            "require_prelive_pass": True,
+        },
+    )
+
+    def fake_build_report(**kwargs: Any) -> dict[str, Any]:
+        calls["prelive"] = kwargs
+        return {"status": "BLOCKED", "blockers": ["expected_test_blocker"]}
+
+    monkeypatch.setattr(script.prelive_gate, "build_report", fake_build_report)
+
+    rc = script.main([
+        "--tickers",
+        "005930",
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--confirm-phrase",
+        "PAPER_AUTO_OK",
+        "--no-write-report",
+    ])
+
+    assert rc == 1
+    assert calls["prelive"]["end_date"] == "20260515"
+    assert calls["prelive"]["business_days"] == 80
+    out = json.loads(capsys.readouterr().out)
+    assert out["reason"] == "prelive_gate_not_pass"
 
 
 def test_paper_auto_cli_passes_bundle_to_prelive_and_trader(monkeypatch, capsys) -> None:

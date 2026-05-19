@@ -297,11 +297,23 @@ def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
 def _label_target_gate_pass(payload: dict[str, Any]) -> bool:
     """Deployable C12 evidence must match the current label target SSOT."""
     cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
-    required_target_col = str((cfg.get("label") or {}).get("target_col") or "").strip()
-    if not required_target_col:
+    allowed_target_cols = _allowed_deploy_target_cols(cfg)
+    if not allowed_target_cols:
         return False
     metadata = _extract_model_metadata(payload)
-    return str(metadata.get("target_col") or "").strip() == required_target_col
+    return str(metadata.get("target_col") or "").strip() in allowed_target_cols
+
+
+def _allowed_deploy_target_cols(risk_cfg: dict[str, Any]) -> list[str]:
+    label_cfg = risk_cfg.get("label") or {}
+    values = label_cfg.get("deploy_target_cols")
+    cols: list[str] = []
+    if isinstance(values, list):
+        cols.extend(str(value).strip() for value in values)
+    fallback = str(label_cfg.get("target_col") or "").strip()
+    if fallback:
+        cols.append(fallback)
+    return [col for col in dict.fromkeys(cols) if col]
 
 
 def _final_gate_min_business_days(default: int = 80) -> int:
@@ -500,6 +512,9 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
     smoke = data.get("stages", {}).get("smoke", {})
     backfill = data.get("stages", {}).get("backfill", {})
     train = data.get("stages", {}).get("train", {})
+    train_result = train.get("result", {}) if isinstance(train, dict) else {}
+    if not isinstance(train_result, dict):
+        train_result = {}
     return _stage(
         "PASS",
         "Latest real readiness report passed.",
@@ -519,7 +534,7 @@ def _check_real_readiness(end_yyyymmdd: str) -> dict[str, Any]:
                 else None
             ),
             "train_status": train.get("status"),
-            "train_data_source": train.get("data_source"),
+            "train_data_source": train.get("data_source") or train_result.get("data_source"),
         },
     )
 
@@ -682,7 +697,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     label_cfg = risk_cfg.get("label") or {}
     required_label_version = label_cfg.get("generation_version")
     required_label_scope = label_cfg.get("session_scope")
-    required_target_col = label_cfg.get("target_col")
+    allowed_target_cols = _allowed_deploy_target_cols(risk_cfg)
     if not required_label_version:
         return _stage(
             "BLOCKED",
@@ -693,10 +708,10 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "BLOCKED",
             "risk_config.yaml label.session_scope is required for real LightGBM gate.",
         )
-    if not required_target_col:
+    if not allowed_target_cols:
         return _stage(
             "BLOCKED",
-            "risk_config.yaml label.target_col is required for real LightGBM gate.",
+            "risk_config.yaml label.deploy_target_cols or label.target_col is required for real LightGBM gate.",
         )
     if staged_model_path is not None:
         model_path = str(staged_model_path.relative_to(REPO_ROOT))
@@ -716,7 +731,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     actual_target_col = meta.get("target_col")
     label_version_ok = actual_label_version == required_label_version
     label_scope_ok = actual_label_scope == required_label_scope
-    target_col_ok = actual_target_col == required_target_col
+    target_col_ok = str(actual_target_col or "").strip() in allowed_target_cols
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
     final_dataset_gate_ok = final_dataset_gate.get("status") == "PASS"
     status = (
@@ -773,7 +788,8 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "label_session_scope": actual_label_scope,
             "required_label_session_scope": required_label_scope,
             "target_col": actual_target_col,
-            "required_target_col": required_target_col,
+            "required_target_col": label_cfg.get("target_col"),
+            "allowed_deploy_target_cols": allowed_target_cols,
             "n_train_rows": meta.get("n_train_rows"),
             "train_start": meta.get("train_start"),
             "train_end": meta.get("train_end"),
@@ -1281,6 +1297,7 @@ def _check_ops_risk() -> dict[str, Any]:
     execution = risk_cfg.get("execution", {})
     paper = risk_cfg.get("paper_trading", {})
     paper_auto = risk_cfg.get("paper_auto_trading", {})
+    paper_auto_qty_cap = int(paper_auto.get("max_order_qty_per_order_prelive_cap", 1))
     checks = {
         "execution_live_disabled": not safe_bool(execution.get("live_enabled"), default=True),
         "execution_not_live": execution.get("mode") != "live",
@@ -1292,7 +1309,9 @@ def _check_ops_risk() -> dict[str, Any]:
         "paper_auto_requires_prelive_pass": safe_bool(paper_auto.get("require_prelive_pass"), default=False),
         "paper_auto_requires_active_model": safe_bool(paper_auto.get("require_active_model"), default=False),
         "paper_auto_confirm_phrase_configured": bool(paper_auto.get("confirm_start_phrase")),
-        "paper_auto_order_qty_limited": int(paper_auto.get("max_order_qty_per_order", 0)) <= 1,
+        "paper_auto_order_qty_limited": (
+            int(paper_auto.get("max_order_qty_per_order", 0)) <= paper_auto_qty_cap
+        ),
         "paper_auto_market_order_disabled": not safe_bool(paper_auto.get("allow_market_order"), default=True),
     }
     status = "PASS" if all(checks.values()) else "FAIL"
@@ -1461,10 +1480,28 @@ def write_report(report: dict[str, Any]) -> Path:
     return path
 
 
-def _parse_args() -> argparse.Namespace:
-    default_end = _previous_business_day().strftime("%Y%m%d")
+def _default_cli_end_date() -> str:
+    """Default strict pre-live checks to the audited final dataset SSOT.
+
+    The pre-live gate validates a frozen candidate bundle by default. Falling
+    back to the previous business day can make a valid frozen bundle look stale
+    when the latest market day has not been promoted into that bundle yet.
+    """
+    gate_cfg = _final_dataset_gate_cfg()
+    expected = _parse_dataset_date(gate_cfg.get("expected_end_date"))
+    if expected is not None:
+        return expected.strftime("%Y%m%d")
+    return _previous_business_day().strftime("%Y%m%d")
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_end = _default_cli_end_date()
     parser = argparse.ArgumentParser(description="Elephant Lab pre-live 1~9 gate")
-    parser.add_argument("--end-date", default=default_end, help="YYYYMMDD")
+    parser.add_argument(
+        "--end-date",
+        default=default_end,
+        help="YYYYMMDD. Defaults to final_dataset_gate.expected_end_date.",
+    )
     parser.add_argument("--business-days", type=int, default=_final_gate_min_business_days())
     parser.add_argument("--max-tickers", type=int, default=_final_gate_min_tickers())
     parser.add_argument(
@@ -1473,7 +1510,7 @@ def _parse_args() -> argparse.Namespace:
         help="Optional candidate bundle id to use for the C12 backtest gate.",
     )
     parser.add_argument("--no-write-report", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:

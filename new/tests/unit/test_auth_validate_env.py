@@ -134,6 +134,39 @@ def test_kis_token_auth_error_includes_sanitized_kis_message(monkeypatch):
     assert "super-secret" not in message
 
 
+def test_kis_token_rate_limit_retries_without_leaking_secret(monkeypatch):
+    """EGW00133 tokenP 1분 제한은 configured wait 후 같은 프로세스에서 재시도한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    monkeypatch.setenv("KIS_APP_KEY", "app-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "super-secret")
+    monkeypatch.setattr(AuthManager, "_shared_kis_token", None)
+    monkeypatch.setattr(AuthManager, "_shared_kis_token_expires_at", None)
+    monkeypatch.setattr(AuthManager, "_shared_kis_token_scope", None)
+
+    responses = [
+        {
+            "_status_code": 403,
+            "msg_cd": "EGW00133",
+            "msg1": "접근토큰 발급 잠시 후 다시 시도하세요(1분당 1회)",
+        },
+        {
+            "_status_code": 200,
+            "access_token": "token-after-wait",
+            "expires_in": 3600,
+        },
+    ]
+    manager = AuthManager()
+    manager.token_rate_limit_retry_sec = 0
+    post = MagicMock(side_effect=responses)
+    sleep = MagicMock()
+    monkeypatch.setattr(manager, "_http_post", post)
+    monkeypatch.setattr("src.utils.auth.time.sleep", sleep)
+
+    assert manager.get_kis_token() == "token-after-wait"
+    assert post.call_count == 2
+    sleep.assert_called_once_with(0)
+
+
 def test_kis_credentials_prefer_paper_env_in_virtual_mode(monkeypatch):
     """모의투자 모드에서는 KIS_PAPER_*를 generic KIS_*보다 우선한다."""
     monkeypatch.setenv("KIS_MODE", "virtual")

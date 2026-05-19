@@ -347,24 +347,37 @@ def _label_target_gate_state(backtest: dict[str, Any]) -> dict[str, Any]:
     """Deployable C12 evidence must match the current label target SSOT."""
     label_cfg = config_load("risk_config.yaml", "label") or {}
     required_target_col = str(label_cfg.get("target_col") or "").strip()
+    allowed_target_cols = _allowed_deploy_target_cols(label_cfg)
     metadata = _extract_model_metadata(backtest)
     observed_target_col = str(metadata.get("target_col") or "").strip()
     blockers: list[str] = []
-    if not required_target_col:
+    if not allowed_target_cols:
         blockers.append("label_target_config_missing")
     if not metadata:
         blockers.append("model_metadata_missing")
     elif not observed_target_col:
         blockers.append("model_target_col_missing")
-    elif required_target_col and observed_target_col != required_target_col:
+    elif observed_target_col not in allowed_target_cols:
         blockers.append("model_target_col_mismatch")
     return {
         "status": "PASS" if not blockers else "BLOCKED",
         "required": True,
         "blockers": blockers,
         "required_target_col": required_target_col or None,
+        "allowed_deploy_target_cols": allowed_target_cols,
         "observed_target_col": observed_target_col or None,
     }
+
+
+def _allowed_deploy_target_cols(label_cfg: dict[str, Any]) -> list[str]:
+    values = label_cfg.get("deploy_target_cols")
+    cols: list[str] = []
+    if isinstance(values, list):
+        cols.extend(str(value).strip() for value in values)
+    fallback = str(label_cfg.get("target_col") or "").strip()
+    if fallback:
+        cols.append(fallback)
+    return [col for col in dict.fromkeys(cols) if col]
 
 
 def _backtest_state_from_report(

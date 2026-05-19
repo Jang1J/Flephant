@@ -204,6 +204,20 @@ def test_business_start_date_counts_krx_trading_days():
     ]
 
 
+def test_parse_args_defaults_to_final_dataset_gate_date(monkeypatch):
+    gate = _load_script_module()
+    monkeypatch.setattr(
+        gate,
+        "_final_dataset_gate_cfg",
+        lambda: {"expected_end_date": "20260515"},
+    )
+    monkeypatch.setattr(gate, "_previous_business_day", lambda: date(2026, 5, 18))
+
+    args = gate._parse_args([])
+
+    assert args.end_date == "20260515"
+
+
 def test_80_day_artifact_gate_rejects_internal_date_mismatch(monkeypatch, tmp_path):
     gate = _load_script_module()
     monkeypatch.setattr(gate, "_DATA_ROOT", tmp_path)

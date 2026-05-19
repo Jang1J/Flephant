@@ -14,6 +14,7 @@ Audit Log: 모든 execute 호출 → JSONL 기록.
 from __future__ import annotations
 
 import inspect
+import math
 import random
 import time
 from datetime import datetime, timezone
@@ -91,6 +92,9 @@ class ExecutionGateway:
             for value in order_type_values
             if str(value).strip()
         } or {"00"}
+        self._price_tick_bands = self._load_price_tick_bands(
+            exec_cfg.get("price_tick_bands", [])
+        )
 
         self._kill_switch = kill_switch
         self._audit_logger = audit_logger
@@ -731,17 +735,80 @@ class ExecutionGateway:
                     "allowed": sorted(_ALLOWED_ORDER_DELTA_REASONS),
                 })
                 continue
+            normalized_price, tick_adjustment = self._normalize_limit_price(
+                side=side,
+                price=price,
+                order_type=order_type,
+            )
             normalized_od = dict(od)
             normalized_od.update({
                 "ticker": ticker,
                 "side": side,
                 "qty": qty,
-                "price": price,
+                "price": normalized_price,
                 "order_type": order_type,
                 "reason": reason,
             })
+            if tick_adjustment:
+                normalized_od["price_tick_adjustment"] = tick_adjustment
             normalized.append(normalized_od)
         return normalized, errors
+
+    @staticmethod
+    def _load_price_tick_bands(raw: Any) -> list[dict[str, int]]:
+        if not isinstance(raw, list):
+            raise ValueError("execution.price_tick_bands 설정 누락")
+        bands: list[dict[str, int]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            min_price = safe_lossless_int(item.get("min_price"), default=-1)
+            tick_size = safe_lossless_int(item.get("tick_size"), default=0)
+            if min_price < 0 or tick_size <= 0:
+                continue
+            bands.append({"min_price": min_price, "tick_size": tick_size})
+        bands.sort(key=lambda row: row["min_price"])
+        if not bands:
+            raise ValueError("execution.price_tick_bands 유효 항목 없음")
+        return bands
+
+    def _tick_size_for_price(self, price: float) -> int:
+        tick_size = self._price_tick_bands[0]["tick_size"]
+        for band in self._price_tick_bands:
+            if price >= float(band["min_price"]):
+                tick_size = band["tick_size"]
+            else:
+                break
+        return tick_size
+
+    def _normalize_limit_price(
+        self,
+        *,
+        side: str,
+        price: float,
+        order_type: str,
+    ) -> tuple[float, dict[str, Any] | None]:
+        if order_type == "01" or price <= 0:
+            return price, None
+
+        tick_size = self._tick_size_for_price(price)
+        if side == "buy":
+            normalized = math.ceil(price / tick_size) * tick_size
+        else:
+            normalized = math.floor(price / tick_size) * tick_size
+            if normalized <= 0:
+                normalized = tick_size
+
+        normalized_float = float(normalized)
+        if normalized_float == float(price):
+            return normalized_float, None
+        return normalized_float, {
+            "original_price": float(price),
+            "normalized_price": normalized_float,
+            "tick_size": tick_size,
+            "side": side,
+            "method": "ceil_for_buy_floor_for_sell",
+        }
 
     @staticmethod
     def _valid_order_delta(

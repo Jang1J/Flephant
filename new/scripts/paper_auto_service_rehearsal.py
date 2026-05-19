@@ -146,6 +146,50 @@ def _write_report(report: dict[str, Any]) -> Path:
     return path
 
 
+def _repo_relative(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _risk_warning_payloads_from_report(report_path: str) -> list[dict[str, Any]]:
+    raw_path = str(report_path).strip()
+    if not raw_path:
+        return []
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    with path.open("r", encoding="utf-8") as fh:
+        report = json.load(fh)
+
+    warnings: list[dict[str, Any]] = []
+    message_pool = report.get("message_pool") if isinstance(report, dict) else {}
+    for message in (message_pool or {}).get("risk_warning_messages", []) or []:
+        if not isinstance(message, dict):
+            continue
+        payload = message.get("payload")
+        if isinstance(payload, dict):
+            warnings.append(dict(payload))
+
+    fda = report.get("fda") if isinstance(report, dict) else {}
+    if isinstance(fda, dict) and fda.get("approved") is False:
+        reason_code = str(fda.get("reason_code") or "NEWS_COMMUNITY_DIVERGENCE")
+        warnings.insert(0, {
+            "source": "cold_path_fda_report",
+            "source_report_path_relative": _repo_relative(path),
+            "risk_level": "high",
+            "severity": "high",
+            "stance": "veto_recommendation",
+            "recommended_fda_reason_code": reason_code,
+            "reason_code": reason_code,
+            "reason": "cold_path_fda_veto",
+            "active_report_ids": fda.get("active_report_ids", []),
+            "stores_raw_content": False,
+        })
+    return warnings
+
+
 def _broker_evidence_from_preflight(preflight: dict[str, Any]) -> dict[str, Any]:
     """Extract the three KIS virtual evidence gates expected by service readiness."""
     stages = preflight.get("stages") if isinstance(preflight, dict) else {}
@@ -181,6 +225,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     run_cycle = bool(args.internal_fake_kis) or preflight.get("status") == "PASS"
     stages: dict[str, Any] = {"preflight": preflight}
     use_real_hot_runner = bool(getattr(args, "use_real_hot_runner", False))
+    risk_warnings = _risk_warning_payloads_from_report(
+        str(getattr(args, "cold_risk_report", "") or "")
+    )
 
     if run_cycle:
         kis_client = _FakeKIS() if args.internal_fake_kis else None
@@ -202,6 +249,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             cycles=int(args.cycles),
             interval_sec=float(args.interval_sec),
             confirm_phrase=args.confirm_phrase,
+            risk_warnings=risk_warnings,
             write_report=not bool(args.no_write_report),
         )
     else:
@@ -237,6 +285,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "external_kis_api": not bool(args.internal_fake_kis),
         "real_hot_runner": use_real_hot_runner,
         "live_trading_enabled": False,
+        "cold_risk_report_path": str(getattr(args, "cold_risk_report", "") or ""),
+        "cold_risk_warning_count": len(risk_warnings),
         "stage_statuses": _stage_statuses(stages, preflight),
         "broker_evidence": broker_evidence,
         "stages": stages,
@@ -251,6 +301,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-sec", type=float, default=0.0)
     parser.add_argument("--registry-dir", default=None)
     parser.add_argument("--confirm-phrase", default=None)
+    parser.add_argument(
+        "--cold-risk-report",
+        default="",
+        help="community/cold-path report JSON to forward risk warnings into paper-auto FDA.",
+    )
     parser.add_argument("--no-write-report", action="store_true")
     parser.add_argument(
         "--use-real-hot-runner",

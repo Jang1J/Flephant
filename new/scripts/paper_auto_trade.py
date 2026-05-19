@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "new"
@@ -39,6 +40,69 @@ def _parse_tickers(raw: str, max_tickers: int) -> list[str]:
     return _load_active_tickers(max_tickers)
 
 
+def _repo_relative(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _risk_warning_payloads_from_report(report_path: str) -> list[dict[str, Any]]:
+    raw_path = str(report_path).strip()
+    if not raw_path:
+        return []
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    with path.open("r", encoding="utf-8") as fh:
+        report = json.load(fh)
+
+    warnings: list[dict[str, Any]] = []
+    message_pool = report.get("message_pool") if isinstance(report, dict) else {}
+    for message in (message_pool or {}).get("risk_warning_messages", []) or []:
+        if not isinstance(message, dict):
+            continue
+        payload = message.get("payload")
+        if isinstance(payload, dict):
+            warnings.append(dict(payload))
+
+    fda = report.get("fda") if isinstance(report, dict) else {}
+    if isinstance(fda, dict) and fda.get("approved") is False:
+        reason_code = str(fda.get("reason_code") or "NEWS_COMMUNITY_DIVERGENCE")
+        warnings.insert(0, {
+            "source": "cold_path_fda_report",
+            "source_report_path_relative": _repo_relative(path),
+            "risk_level": "high",
+            "severity": "high",
+            "stance": "veto_recommendation",
+            "recommended_fda_reason_code": reason_code,
+            "reason_code": reason_code,
+            "reason": "cold_path_fda_veto",
+            "active_report_ids": fda.get("active_report_ids", []),
+            "stores_raw_content": False,
+        })
+    return warnings
+
+
+def _default_strict_end_date() -> str:
+    """Default paper-auto gate date to the audited final dataset SSOT.
+
+    Strict paper-auto validates a frozen candidate bundle. Using "previous
+    business day" by default can accidentally ask the gate for a date that has
+    not been backfilled into that bundle yet.
+    """
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    expected = prelive_gate._parse_dataset_date(gate_cfg.get("expected_end_date"))
+    if expected is not None:
+        return expected.strftime("%Y%m%d")
+    return prelive_gate._previous_business_day().strftime("%Y%m%d")
+
+
+def _default_strict_business_days() -> int:
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    return int(gate_cfg.get("rehearsal_business_days") or 80)
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = config_load("risk_config.yaml", "paper_auto_trading")
     parser = argparse.ArgumentParser(description="KIS virtual paper auto trading")
@@ -49,12 +113,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--confirm-phrase", default=None)
     parser.add_argument(
         "--end-date",
-        default=prelive_gate._previous_business_day().strftime("%Y%m%d"),
-        help="prelive gate end date YYYYMMDD",
+        default=_default_strict_end_date(),
+        help="prelive gate end date YYYYMMDD. Defaults to final_dataset_gate.expected_end_date.",
     )
-    parser.add_argument("--business-days", type=int, default=80)
+    parser.add_argument("--business-days", type=int, default=_default_strict_business_days())
     parser.add_argument("--registry-dir", default=None)
     parser.add_argument("--bundle-id", default="", help="strict prelive/paper auto 대상 bundle id")
+    parser.add_argument(
+        "--cold-risk-report",
+        default="",
+        help="community/cold-path report JSON. If FDA veto is present, paper-auto honors it as risk warning.",
+    )
     parser.add_argument(
         "--prelive-scope",
         choices=["strict", "paper-rehearsal"],
@@ -108,14 +177,19 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 1
 
+    risk_warnings = _risk_warning_payloads_from_report(args.cold_risk_report)
     trader = PaperAutoTrader(required_bundle_id=requested_bundle_id)
     report = trader.run(
         tickers=tickers,
         cycles=int(args.cycles),
         interval_sec=float(args.interval_sec),
         confirm_phrase=args.confirm_phrase,
+        risk_warnings=risk_warnings,
         write_report=not bool(args.no_write_report),
     )
+    if args.cold_risk_report:
+        report["cold_risk_report_path"] = args.cold_risk_report
+        report["cold_risk_warning_count"] = len(risk_warnings)
     if prelive is not None:
         report["prelive_gate_status"] = prelive.get("status")
         report["prelive_gate_blockers"] = prelive.get("blockers", [])

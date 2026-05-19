@@ -111,10 +111,15 @@ class PaperAutoTrader:
         cycles: int,
         interval_sec: float,
         confirm_phrase: str | None,
+        risk_warnings: list[dict[str, Any]] | None = None,
         write_report: bool = True,
     ) -> dict[str, Any]:
         """지정 ticker universe에 대해 paper auto cycle을 실행한다."""
         report = self._base_report(tickers=tickers, cycles=cycles, interval_sec=interval_sec)
+        external_risk_warnings = self._normalize_risk_warnings(risk_warnings)
+        report["stages"]["cold_path_risk_warnings"] = (
+            self._cold_path_risk_warning_stage(external_risk_warnings)
+        )
 
         start_guard = self._start_guard(confirm_phrase)
         report["stages"]["start_guard"] = start_guard
@@ -164,7 +169,11 @@ class PaperAutoTrader:
                 self._hot_runner.start()
 
             for idx in range(cycles_int):
-                cycle = self.run_once(tickers=tickers, cycle_index=idx)
+                cycle = self.run_once(
+                    tickers=tickers,
+                    cycle_index=idx,
+                    risk_warnings=external_risk_warnings,
+                )
                 cycle_reports.append(cycle)
                 if cycle.get("status") == "FAIL":
                     break
@@ -180,7 +189,13 @@ class PaperAutoTrader:
         report["status"] = self._overall_status(report)
         return self._finish_report(report, write_report)
 
-    def run_once(self, *, tickers: list[str], cycle_index: int = 0) -> dict[str, Any]:
+    def run_once(
+        self,
+        *,
+        tickers: list[str],
+        cycle_index: int = 0,
+        risk_warnings: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         started_at = datetime.now(_KST).isoformat()
         if not self._run_guard_passed:
             return {
@@ -214,6 +229,7 @@ class PaperAutoTrader:
             for ticker in padded
             for bar in bars_by_ticker.get(ticker, [])
         ]
+        external_risk_warnings = self._normalize_risk_warnings(risk_warnings)
         hot_result = self._hot_runner.run_once(
             tickers=padded,
             bars_batch=bars_batch,
@@ -222,6 +238,7 @@ class PaperAutoTrader:
             portfolio_value=portfolio_value,
             asof=started_at,
             recent_bars=bars_by_ticker,
+            risk_warnings=external_risk_warnings,
             dependency_status={
                 "news": "skipped",
                 "risk": "done",
@@ -243,13 +260,18 @@ class PaperAutoTrader:
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
         ]
+        order_count_caps_applied = self._cap_order_count(final_decision)
+        order_caps_applied = self._cap_order_quantities(final_decision)
         order_guard = self._order_guard(final_decision)
         if order_guard["status"] != "PASS":
             return {
                 "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
                 "cycle_index": cycle_index,
                 "started_at": started_at,
+                "cold_path_risk_warning_count": len(external_risk_warnings),
                 "order_guard": order_guard,
+                "order_count_caps_applied": order_count_caps_applied,
+                "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
                 "execution": None,
             }
@@ -274,9 +296,12 @@ class PaperAutoTrader:
             "status": status,
             "cycle_index": cycle_index,
             "started_at": started_at,
+            "cold_path_risk_warning_count": len(external_risk_warnings),
             "portfolio_value": portfolio_value,
             "n_bars": len(bars_batch),
             "order_guard": order_guard,
+            "order_count_caps_applied": order_count_caps_applied,
+            "order_caps_applied": order_caps_applied,
             "hot_result": hot_result,
             "execution": execution,
             "broker_blockers": broker_blockers,
@@ -432,6 +457,157 @@ class PaperAutoTrader:
             "model_version": (metadata or {}).get("version") if isinstance(metadata, dict) else None,
             "bundle_id": bundle_id,
             "required_bundle_id": self._required_bundle_id,
+        }
+
+    def _cap_order_count(self, final_decision: dict[str, Any]) -> list[dict[str, Any]]:
+        """Apply the paper-auto per-cycle order-count cap before broker submission."""
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return []
+        if len(raw_order_deltas) <= self._max_orders_per_cycle:
+            return []
+        if any(not isinstance(od, dict) for od in raw_order_deltas):
+            return []
+
+        ranked = sorted(
+            enumerate(raw_order_deltas),
+            key=self._order_count_cap_sort_key,
+        )
+        kept = ranked[: self._max_orders_per_cycle]
+        dropped = ranked[self._max_orders_per_cycle :]
+        kept_orders = [dict(od) for _, od in kept]
+        final_decision["order_deltas"] = kept_orders
+
+        cap_record = {
+            "original_count": len(raw_order_deltas),
+            "capped_count": len(kept_orders),
+            "max_orders_per_cycle": self._max_orders_per_cycle,
+            "selection_policy": (
+                "abs_delta_weight_desc_then_notional_desc_then_abs_score_desc_"
+                "then_ticker_asc"
+            ),
+            "kept": [
+                self._order_count_cap_item(index, od)
+                for index, od in kept
+            ],
+            "dropped": [
+                self._order_count_cap_item(index, od)
+                for index, od in dropped
+            ],
+        }
+        final_decision["paper_auto_order_count_caps_applied"] = [cap_record]
+        logger.warning("[paper_auto_trading] 주문 개수 cap 적용: %s", cap_record)
+        return [cap_record]
+
+    @staticmethod
+    def _order_count_cap_sort_key(item: tuple[int, dict[str, Any]]) -> tuple[float, float, float, str, int]:
+        index, od = item
+        ticker = pad_ticker(str(od.get("ticker", "")))
+        delta_weight = abs(safe_float(od.get("delta_weight", 0.0), default=0.0))
+        qty = safe_lossless_int(od.get("qty", 0), default=0, min_value=0)
+        price = safe_float(od.get("price", 0.0), default=0.0, min_value=0.0)
+        score = abs(
+            safe_float(
+                od.get("score", od.get("rank_score", 0.0)),
+                default=0.0,
+            )
+        )
+        notional = float(qty) * float(price)
+        return (-delta_weight, -notional, -score, ticker, index)
+
+    @staticmethod
+    def _order_count_cap_item(index: int, od: dict[str, Any]) -> dict[str, Any]:
+        ticker = pad_ticker(str(od.get("ticker", "")))
+        qty = safe_lossless_int(od.get("qty", 0), default=0, min_value=0)
+        price = safe_float(od.get("price", 0.0), default=0.0, min_value=0.0)
+        return {
+            "index": index,
+            "ticker": ticker,
+            "side": str(od.get("side", "")).lower(),
+            "qty": qty,
+            "notional": float(qty) * float(price),
+            "delta_weight": safe_float(od.get("delta_weight", 0.0), default=0.0),
+        }
+
+    def _cap_order_quantities(self, final_decision: dict[str, Any]) -> list[dict[str, Any]]:
+        """Apply the paper-auto per-order quantity cap before broker submission."""
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return []
+
+        caps_applied: list[dict[str, Any]] = []
+        for idx, od in enumerate(raw_order_deltas):
+            if not isinstance(od, dict):
+                continue
+            raw_qty = od.get("qty", 0)
+            qty = safe_lossless_int(raw_qty, default=0)
+            if qty <= self._max_order_qty_per_order:
+                continue
+            capped_qty = self._max_order_qty_per_order
+            od["qty"] = capped_qty
+            caps_applied.append({
+                "index": idx,
+                "ticker": pad_ticker(str(od.get("ticker", ""))),
+                "side": str(od.get("side", "")).lower(),
+                "original_qty": qty,
+                "capped_qty": capped_qty,
+                "max_order_qty_per_order": self._max_order_qty_per_order,
+            })
+
+        if caps_applied:
+            final_decision["paper_auto_order_caps_applied"] = caps_applied
+            logger.warning("[paper_auto_trading] 주문 수량 cap 적용: %s", caps_applied)
+        return caps_applied
+
+    @staticmethod
+    def _normalize_risk_warnings(
+        risk_warnings: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Cold Path sidecar 경고를 HotRunner/FDA 입력 형태로 정규화한다."""
+        normalized: list[dict[str, Any]] = []
+        for item in risk_warnings or []:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+            warning = dict(payload)
+            risk_level = str(warning.get("risk_level", "")).strip().lower()
+            severity = str(warning.get("severity", "")).strip().lower()
+            if severity not in {"low", "medium", "high", "critical"}:
+                severity = (
+                    risk_level
+                    if risk_level in {"low", "medium", "high", "critical"}
+                    else "low"
+                )
+            warning["severity"] = severity
+            normalized.append(warning)
+        return normalized
+
+    @staticmethod
+    def _cold_path_risk_warning_stage(
+        risk_warnings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        reason_codes: list[str] = []
+        severity_counts: dict[str, int] = {}
+        for warning in risk_warnings:
+            severity = str(warning.get("severity", "unknown")).lower()
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            reason_code = str(
+                warning.get("recommended_fda_reason_code")
+                or warning.get("reason_code")
+                or ""
+            ).strip()
+            if reason_code:
+                reason_codes.append(reason_code)
+        return {
+            "status": "PASS",
+            "count": len(risk_warnings),
+            "severity_counts": severity_counts,
+            "recommended_reason_codes": sorted(set(reason_codes)),
+            "hot_path_llm_call": False,
+            "note": (
+                "External Cold Path risk warnings are forwarded to HotRunner/FDA "
+                "without mutating weights."
+            ),
         }
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:

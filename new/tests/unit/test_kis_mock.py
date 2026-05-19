@@ -1,6 +1,8 @@
 """KIS Mock 모드 unit tests. Sprint 0 S0-2 완료 검증."""
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 
@@ -112,6 +114,63 @@ def test_kis_rest_virtual_minute_bar_normalizes_response(monkeypatch):
     assert bars[1]["change"] == 100.0
     assert bars[0]["ts_close"].startswith("2026-05-08T09:00:00")
     assert bars[0]["_mode"] == "virtual"
+
+
+def test_kis_rest_virtual_today_minute_date_query_after_snapshot(monkeypatch):
+    """당일 분봉 backfill은 18:00 KST snapshot 이후 허용한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    import src.connectors.kis_rest as kis_rest
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 5, 18, 18, 1, 0, tzinfo=tz)
+
+    monkeypatch.setattr(kis_rest, "datetime", FrozenDateTime)
+    client = kis_rest.KISRestClient()
+
+    def fake_call(path, tr_id, params):
+        assert path.endswith("/inquire-time-dailychartprice")
+        assert tr_id == "FHKST03010230"
+        assert params["FID_INPUT_DATE_1"] == "20260518"
+        assert params["FID_INPUT_HOUR_1"] == "153000"
+        return {
+            "rt_cd": "0",
+            "output2": [
+                {
+                    "stck_bsop_date": "20260518",
+                    "stck_cntg_hour": "153000",
+                    "stck_oprc": "70000",
+                    "stck_hgpr": "70200",
+                    "stck_lwpr": "69900",
+                    "stck_prpr": "70100",
+                    "cntg_vol": "1000",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(client, "_call_kis_get", fake_call)
+    bars = client.inquire_minute_bar("005930", n_bars=1, date="20260518")
+
+    assert len(bars) == 1
+    assert bars[0]["ts_close"].startswith("2026-05-18T15:30:00")
+
+
+def test_kis_rest_virtual_today_minute_date_query_before_snapshot_blocks(monkeypatch):
+    """당일 분봉 date 조회는 snapshot 전에는 fail-closed 한다."""
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    import src.connectors.kis_rest as kis_rest
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 5, 18, 17, 59, 0, tzinfo=tz)
+
+    monkeypatch.setattr(kis_rest, "datetime", FrozenDateTime)
+    client = kis_rest.KISRestClient()
+
+    with pytest.raises(kis_rest.PITViolationError):
+        client.inquire_minute_bar("005930", n_bars=1, date="20260518")
 
 
 def test_kis_rest_virtual_investor_daily_normalizes_response(monkeypatch):

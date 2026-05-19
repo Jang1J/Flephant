@@ -40,7 +40,15 @@ def _repo_rel(path: Path) -> str:
         return str(resolved)
 
 
-def _copy_source(source: Path, target: Path, force: bool) -> None:
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise TypeError(f"JSON root must be object: {path}")
+    return data
+
+
+def _copy_registry_source(source: Path, target: Path, force: bool) -> None:
     if not source.exists():
         raise FileNotFoundError(f"source registry dir not found: {source}")
     if source.resolve() == target.resolve():
@@ -51,6 +59,80 @@ def _copy_source(source: Path, target: Path, force: bool) -> None:
         )
     target.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target, dirs_exist_ok=True)
+
+
+def _copy_bundle_lgbm_source(
+    source: Path,
+    target: Path,
+    *,
+    candidate_version: str,
+    force: bool,
+) -> None:
+    """Build a paper-only registry from a staged bundle ``lgbm`` directory."""
+    if not source.exists():
+        raise FileNotFoundError(f"source bundle lgbm dir not found: {source}")
+    if source.resolve() == target.resolve():
+        raise ValueError("source-dir and target-dir must differ")
+    if target.exists() and not force:
+        raise FileExistsError(
+            f"target already exists: {target}. Use --force to overlay paper copy."
+        )
+
+    model_src = source / "latest_model.pkl"
+    metadata_src = source / "latest_model_metadata.json"
+    if not model_src.is_file() or not metadata_src.is_file():
+        raise FileNotFoundError(
+            "bundle lgbm source requires latest_model.pkl and latest_model_metadata.json"
+        )
+    metadata = _load_json(metadata_src)
+    if str(metadata.get("version", "")).strip() != candidate_version:
+        raise VersionNotFoundError(
+            f"candidate version mismatch in bundle metadata: {metadata.get('version')}"
+        )
+
+    target.mkdir(parents=True, exist_ok=True)
+    pkl_path = target / f"{candidate_version}.pkl"
+    meta_path = target / f"{candidate_version}_metadata.json"
+    shutil.copy2(model_src, pkl_path)
+
+    metadata.update({
+        "model_path": _repo_rel(pkl_path),
+        "metadata_path": _repo_rel(meta_path),
+    })
+    with meta_path.open("w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, ensure_ascii=False, indent=2)
+    registry = {
+        "schema_version": ModelRegistry(artifacts_dir=target)._schema_version,
+        "active_version": None,
+        "versions": [metadata],
+        "paper_only_registry": True,
+        "source_bundle_lgbm_dir": _repo_rel(source),
+    }
+    with (target / "registry.json").open("w", encoding="utf-8") as fh:
+        json.dump(registry, fh, ensure_ascii=False, indent=2)
+
+
+def _copy_source(
+    source: Path,
+    target: Path,
+    *,
+    candidate_version: str,
+    force: bool,
+) -> str:
+    if (source / "registry.json").is_file():
+        _copy_registry_source(source, target, force=force)
+        return "registry"
+    if (source / "latest_model.pkl").is_file() and (source / "latest_model_metadata.json").is_file():
+        _copy_bundle_lgbm_source(
+            source,
+            target,
+            candidate_version=candidate_version,
+            force=force,
+        )
+        return "bundle_lgbm"
+    raise FileNotFoundError(
+        "source-dir must contain registry.json or staged bundle latest_model artifacts"
+    )
 
 
 def prepare(
@@ -71,11 +153,20 @@ def prepare(
 
     source = _resolve_dir(source_dir)
     target = _resolve_dir(target_dir)
-    _copy_source(source, target, force=force)
+    source_kind = _copy_source(
+        source,
+        target,
+        candidate_version=candidate_version,
+        force=force,
+    )
 
     source_registry = ModelRegistry(artifacts_dir=source)
     target_registry = ModelRegistry(artifacts_dir=target)
-    source_before = source_registry._read_registry_index()
+    source_before = (
+        source_registry._read_registry_index()
+        if (source / "registry.json").is_file()
+        else None
+    )
     registry = target_registry._read_registry_index()
     versions = list(registry.get("versions", []))
 
@@ -123,12 +214,17 @@ def prepare(
         json.dump(metadata, fh, ensure_ascii=False, indent=2)
     target_registry._update_latest_pointer(pkl_path)
 
-    source_after = source_registry._read_registry_index()
+    source_after = (
+        source_registry._read_registry_index()
+        if (source / "registry.json").is_file()
+        else None
+    )
     return {
         "status": "PASS",
         "generated_at": datetime.now(_KST).isoformat(),
         "candidate_version": candidate_version,
         "source_dir": str(source),
+        "source_kind": source_kind,
         "target_dir": str(target),
         "paper_only_activation": True,
         "live_trading_allowed": False,

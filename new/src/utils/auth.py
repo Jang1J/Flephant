@@ -48,6 +48,9 @@ class AuthManager:
         _auth_cfg = config_load("risk_config.yaml", "auth_defaults")
         self.retry_delays: list[int] = list(_auth_cfg["retry_delays"])
         self.refresh_margin_sec: int = int(_auth_cfg["refresh_margin_sec"])
+        self.token_rate_limit_retry_sec: int = int(
+            _auth_cfg.get("token_rate_limit_retry_sec", 65)
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -225,9 +228,20 @@ class AuthManager:
                         f" msg_cd={msg_cd} msg={msg}"
                         if msg_cd or msg else ""
                     )
-                    raise AuthenticationError(
+                    error = AuthenticationError(
                         f"KIS 인증 실패 (HTTP {status}). appkey/appsecret 확인 필요.{detail}"
                     )
+                    if msg_cd == "EGW00133" and attempt < len(self.retry_delays):
+                        last_exc = error
+                        logger.warning(
+                            "KIS 토큰 발급 제한(EGW00133). 시도 %d/%d, %d초 후 재시도.",
+                            attempt,
+                            len(self.retry_delays),
+                            self.token_rate_limit_retry_sec,
+                        )
+                        time.sleep(self.token_rate_limit_retry_sec)
+                        continue
+                    raise error
                 if status != 200:
                     raise ConnectionError(f"KIS 토큰 API 오류 (HTTP {status})")
 

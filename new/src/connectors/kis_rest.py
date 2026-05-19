@@ -247,15 +247,43 @@ class KISRestClient(BaseConnector):
             self.rate_limiter.wait_and_acquire()
             return self._mock_inquire_minute_bar(ticker, n_bars)
 
-        # PIT-Safety guard: 미래 날짜 요청 차단 (불변 원칙 1)
-        if date and not is_pit_safe(
-            f"{date[:4]}-{date[4:6]}-{date[6:8]}T23:59:59+09:00"
-        ):
-            raise PITViolationError(
-                f"[kis_rest] 미래 날짜 요청 차단: date={date}"
-            )
+        # PIT-Safety guard: date 기반 과거/당일 분봉은 장마감 시각 기준으로
+        # 판단한다. 당일 date query는 18:00 KST snapshot 이후에만 허용한다.
+        if date:
+            self._assert_minute_date_pit_safe(date)
 
         return self._inquire_kis_minute_bar(ticker, n_bars=n_bars, date=date)
+
+    @staticmethod
+    def _minute_date_market_close_ts(date: str) -> datetime:
+        close_str = str(config_load("risk_config.yaml", "market_hours")["close"])
+        close_time = datetime.strptime(close_str, "%H:%M:%S").time()
+        target_day = datetime.strptime(date, "%Y%m%d").date()
+        return datetime.combine(target_day, close_time, tzinfo=_KST)
+
+    @classmethod
+    def _assert_minute_date_pit_safe(cls, date: str) -> None:
+        target_day = datetime.strptime(date, "%Y%m%d").date()
+        now = datetime.now(_KST)
+        today = now.date()
+        if target_day > today:
+            raise PITViolationError(f"[kis_rest] 미래 날짜 요청 차단: date={date}")
+        if target_day == today:
+            pit_cfg = config_load("risk_config.yaml", "pit_safety")
+            snapshot_hour = int(pit_cfg["snapshot_hour"])
+            snapshot_dt = datetime.combine(
+                today,
+                datetime.strptime(f"{snapshot_hour:02d}:00:00", "%H:%M:%S").time(),
+                tzinfo=_KST,
+            )
+            if now < snapshot_dt:
+                raise PITViolationError(
+                    f"[kis_rest] 당일 분봉 date 조회는 snapshot 이후만 허용: "
+                    f"date={date} now={now.isoformat()} snapshot={snapshot_dt.isoformat()}"
+                )
+        market_close_ts = cls._minute_date_market_close_ts(date)
+        if not is_pit_safe(market_close_ts):
+            raise PITViolationError(f"[kis_rest] 미래 날짜 요청 차단: date={date}")
 
     def inquire_investor(self, ticker: str) -> dict[str, Any] | None:
         """종목별 현재 투자자 수급 조회.
@@ -1004,12 +1032,14 @@ class KISRestClient(BaseConnector):
         return collected
 
     def _initial_minute_query_hour(self, target_date: str) -> str:
+        close_str = str(config_load("risk_config.yaml", "market_hours")["close"])
+        close_hhmmss = close_str.replace(":", "")
         today = datetime.now(_KST).strftime("%Y%m%d")
         if target_date == today:
             now = datetime.now(_KST)
-            return now.strftime("%H%M%S")
-        close_str = str(config_load("risk_config.yaml", "market_hours")["close"])
-        return close_str.replace(":", "")
+            now_hhmmss = now.strftime("%H%M%S")
+            return min(now_hhmmss, close_hhmmss)
+        return close_hhmmss
 
     def _normalize_minute_rows(
         self,
