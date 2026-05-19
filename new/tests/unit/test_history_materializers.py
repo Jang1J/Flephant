@@ -100,6 +100,126 @@ def test_dual_source_history_blocks_missing_deploy_quality_provenance(tmp_path):
     assert report["per_date"][0]["status"] == "NON_DEPLOY_QUALITY_RAW_EVENTS"
 
 
+def test_dual_source_history_writes_real_neutral_artifact_for_empty_archive(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    (raw_dir / "20260508.json").write_text(
+        json.dumps({
+            "provenance": {
+                "deploy_quality": True,
+                "source_apis": ["naver_news_v1", "dart_open_api"],
+                "zero_event_window": True,
+            },
+            "events": [],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class NeutralScorer:
+        def score_universe(self, rows, snapshot_ts=None):
+            return [
+                {
+                    "ticker": row["ticker"],
+                    "news_score_t": 0.0,
+                    "comm_score_t_1": 0.0,
+                    "comm_score_t_2": 0.0,
+                    "news_comm_divergence": 0.0,
+                    "community_noise_multiplier": 1.0,
+                }
+                for row in rows
+            ]
+
+        def score(self, **kwargs):
+            return {
+                "ticker": kwargs["ticker"],
+                "news_score_t": 0.0,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.0,
+                "community_noise_multiplier": 1.0,
+            }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml" and section == "phase2_feature_backfill":
+            return {"min_dual_source_non_neutral_date_coverage": 0.0}
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "_load_active_universe", lambda: [{"ticker": "005930"}])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+    monkeypatch.setattr(mod, "DualSourceScorer", lambda: NeutralScorer())
+
+    artifact_dir = tmp_path / "dual_source"
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=raw_dir,
+        artifact_dir=artifact_dir,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert report["per_date"][0]["status"] == "NEUTRAL_ONLY"
+    assert report["per_date"][0]["scores_written"] is True
+    assert report["coverage"]["written_date_count"] == 1
+    artifact = json.loads((artifact_dir / "20260508.json").read_text(encoding="utf-8"))
+    assert artifact["source_stats"]["input_mode"] == "archived_raw_events"
+    assert artifact["source_stats"]["neutral_rehearsal_file"] is False
+    assert artifact["scores"][0]["ticker"] == "005930"
+
+
+def test_build_news_dart_archive_writes_deploy_quality_zero_event_file(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("build_news_dart_archive")
+    corp_cache = tmp_path / "corp_cache.json"
+    corp_cache.write_text(
+        json.dumps({
+            "mapping": {
+                "005930": {
+                    "corp_code": "00126380",
+                    "name": "삼성전자",
+                    "aliases": [],
+                }
+            }
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class RealClient:
+        _is_mock = False
+
+    monkeypatch.setattr(mod, "DARTRestClient", lambda: RealClient())
+    monkeypatch.setattr(mod, "NaverNewsClient", lambda: RealClient())
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+    monkeypatch.setattr(mod, "_fetch_dart_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, "_fetch_naver_for_ticker", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, "_load_sector_to_tickers", lambda: {})
+    monkeypatch.setattr(mod, "_fetch_naver_broadcast", lambda *args, **kwargs: [])
+
+    output_dir = tmp_path / "raw" / "dual_source"
+    report = mod.build_archive(
+        end_date="20260508",
+        business_days=1,
+        corp_cache_path=corp_cache,
+        output_dir=output_dir,
+        report_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert report["zero_event_date_count"] == 1
+    assert report["per_date"][0]["status"] == "PASS_ZERO_EVENTS"
+    raw = json.loads((output_dir / "20260508.json").read_text(encoding="utf-8"))
+    assert raw["events"] == []
+    assert raw["provenance"]["deploy_quality"] is True
+    assert raw["provenance"]["zero_event_window"] is True
+
+
 def test_dual_source_history_blocks_missing_event_timestamp(monkeypatch, tmp_path):
     mod = _load_script("materialize_dual_source_history")
     raw_dir = tmp_path / "raw"
