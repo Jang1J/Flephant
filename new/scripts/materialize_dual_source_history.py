@@ -432,6 +432,29 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
+def _score_payload(
+    *,
+    snapshot: datetime,
+    raw_path: Path,
+    source_stats: dict[str, Any],
+    scores: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "batch_date": snapshot.date().isoformat(),
+        "snapshot_ts": snapshot.isoformat(),
+        "generated_at": datetime.now(_KST).isoformat(),
+        "ticker_count": len(scores),
+        "source_stats": {
+            **source_stats,
+            "input_mode": "archived_raw_events",
+            "raw_path": str(raw_path),
+            "neutral_rehearsal_file": False,
+            "external_live_search_api": False,
+        },
+        "scores": scores,
+    }
+
+
 def _repo_relative(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT))
@@ -490,29 +513,31 @@ def materialize_dual_source_history(
                 source_stats["market_backstop_rows"] = market_backstop_rows
             non_neutral = any(_is_non_neutral_score(row) for row in scores)
             if not non_neutral:
+                out_payload = _score_payload(
+                    snapshot=snapshot,
+                    raw_path=raw_path,
+                    source_stats=source_stats,
+                    scores=scores,
+                )
+                out_path = artifact_dir / f"{date_key}.json"
+                _write_json(out_path, out_payload)
+                written.append(_repo_relative(out_path))
                 per_date.append({
                     "date": date_key,
                     "status": "NEUTRAL_ONLY",
                     "raw_path": str(raw_path),
-                    "scores_written": False,
+                    "scores_written": True,
+                    "score_count": len(scores),
                     "non_neutral": False,
                     "source_stats": source_stats,
                 })
                 continue
-            out_payload = {
-                "batch_date": snapshot.date().isoformat(),
-                "snapshot_ts": snapshot.isoformat(),
-                "generated_at": datetime.now(_KST).isoformat(),
-                "ticker_count": len(scores),
-                "source_stats": {
-                    **source_stats,
-                    "input_mode": "archived_raw_events",
-                    "raw_path": str(raw_path),
-                    "neutral_rehearsal_file": False,
-                    "external_live_search_api": False,
-                },
-                "scores": scores,
-            }
+            out_payload = _score_payload(
+                snapshot=snapshot,
+                raw_path=raw_path,
+                source_stats=source_stats,
+                scores=scores,
+            )
             out_path = artifact_dir / f"{date_key}.json"
             _write_json(out_path, out_payload)
             written.append(_repo_relative(out_path))

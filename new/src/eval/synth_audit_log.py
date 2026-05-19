@@ -1,12 +1,16 @@
 """W2 P1 L1 (2026-05-09): 발표용 synthetic audit_log 생성기.
 
 KIS 키 미설정 상태에서 발표용 실수치 시뮬을 위한 합성 데이터.
-e2e_scenario_runner 의 NORMAL_APPROVE 단조 결과를 7종 reason_code 분포로 augment.
+e2e_scenario_runner 의 NORMAL_APPROVE 단조 결과를 11종 reason_code 분포로 augment.
 
 생성 규칙 (의도된 시뮬):
   - NORMAL_APPROVE        70 entry, 65% hit (label > 0)
   - RISK_FAST_TRIGGER     15 entry, 73% hit (veto 후 label < 0)
   - NEWS_DIVERGENCE        8 entry, 75% hit
+  - NEWS_COMMUNITY_DIVERGENCE 4 entry, 75% hit
+  - COMMUNITY_LIVE_PROXY_RISK 3 entry, 67% hit
+  - COMMUNITY_TIMESTAMP_WEAK 2 entry, label N/A (skip rule)
+  - COMMUNITY_MANIPULATION_FLAG 2 entry, label N/A (skip rule)
   - DEBATE_CONFLICT        5 entry, 60% hit
   - QUANT_ANOMALY          4 entry, 50% hit
   - TIMEOUT                3 entry, label N/A (skip rule)
@@ -40,6 +44,10 @@ DISTRIBUTION: list[tuple[str, str, int, float | None]] = [
     ("NORMAL_APPROVE",          "approve", 70, 0.65),
     ("RISK_FAST_TRIGGER",       "veto",    15, 0.73),
     ("NEWS_DIVERGENCE",         "veto",     8, 0.75),
+    ("NEWS_COMMUNITY_DIVERGENCE", "veto",    4, 0.75),
+    ("COMMUNITY_LIVE_PROXY_RISK", "veto",    3, 0.67),
+    ("COMMUNITY_TIMESTAMP_WEAK", "veto",     2, None),
+    ("COMMUNITY_MANIPULATION_FLAG", "veto",  2, None),
     ("DEBATE_CONFLICT",         "veto",     5, 0.60),
     ("QUANT_ANOMALY",           "veto",     4, 0.50),
     ("TIMEOUT",                 "veto",     3, None),  # skip rule
@@ -91,8 +99,21 @@ def generate(seed: int = 42, base_date: str = "2026-05-09") -> list[dict]:
                 "snapshot_vwap": None,
                 "slippage_bps": None,
                 "sector": None,
-                "llm_called": event_type == "veto" and reason_code in ("NEWS_DIVERGENCE", "DEBATE_CONFLICT"),
-                "llm_model": "kanana-o" if event_type == "veto" and reason_code in ("NEWS_DIVERGENCE", "DEBATE_CONFLICT") else None,
+                "llm_called": event_type == "veto" and reason_code in (
+                    "NEWS_DIVERGENCE",
+                    "NEWS_COMMUNITY_DIVERGENCE",
+                    "DEBATE_CONFLICT",
+                ),
+                "llm_model": (
+                    "kanana-o"
+                    if event_type == "veto"
+                    and reason_code in (
+                        "NEWS_DIVERGENCE",
+                        "NEWS_COMMUNITY_DIVERGENCE",
+                        "DEBATE_CONFLICT",
+                    )
+                    else None
+                ),
                 # 장중 기록 시점: label 은 None 유지 (C18 PIT 규칙).
                 "label_t5_ret": None,
                 "price_t5_snapshot": None,

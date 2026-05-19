@@ -52,9 +52,9 @@ _SOURCE_PREFIXES = (
     "scripts/",
     "AGENTS.md",
     "CLAUDE.md",
+    "Codex-progress.md",
     "README.md",
     ".gitignore",
-    ".env.example",
     "demo.sh",
     "eval.sh",
     "init.sh",
@@ -73,6 +73,8 @@ _MINIMAL_ARTIFACT_PATTERNS = (
     "artifacts/reports/service_policy_replay/*.json",
     "artifacts/reports/phase2_feature_backfill/*.json",
     "artifacts/reports/phase2_input_readiness/*.json",
+    "artifacts/reports/build_news_dart_archive/*.json",
+    "artifacts/reports/data_readiness/*.json",
     "artifacts/reports/dual_source_history/*.json",
     "artifacts/reports/exogenous_history/*.json",
     "artifacts/reports/c12_recheck/*.json",
@@ -82,6 +84,19 @@ _MINIMAL_ARTIFACT_PATTERNS = (
     "artifacts/reports/model_registry/*.json",
     "artifacts/reports/paper_trading/*.json",
     "artifacts/reports/paper_auto_trading/*.json",
+    "artifacts/reports/news_community_research/*.json",
+    "artifacts/reports/source_scope_summary/*.json",
+    "artifacts/reports/community_live_risk/*.json",
+    "artifacts/reports/community_source_health/*.json",
+    "artifacts/reports/cold_path_risk_e2e/*.json",
+    "artifacts/reports/naver_datalab_attention/*.json",
+    "artifacts/reports/llm_real_api_smoke/*.json",
+    "artifacts/reports/gpt_feedback_audit/*.json",
+    "artifacts/reports/gpt_pro_audit/*.json",
+    "artifacts/reports/research_threshold_sweep/*.json",
+    "artifacts/reports/performance_optimization/*.json",
+    "artifacts/reports/performance_optimization/*.md",
+    "artifacts/reports/cleanup/*.json",
 )
 
 
@@ -118,8 +133,6 @@ def _artifact_candidates() -> tuple[list[str], list[str]]:
 
 def _looks_like_secret_source(rel_path: str) -> bool:
     name = Path(rel_path).name
-    if name == ".env.example":
-        return False
     return name == ".env" or name.startswith(".env.") or "/.env" in rel_path
 
 
@@ -196,6 +209,8 @@ def build_release(output: Path, manifest_path: Path | None = None) -> dict[str, 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     candidates = _git_file_candidates()
+    if (ROOT / "Codex-progress.md").is_file():
+        candidates.append("Codex-progress.md")
     minimal_artifacts, skipped_invalid_json = _artifact_candidates()
     included, denied = _classify_entries(candidates, minimal_artifacts)
     secret_sources_excluded = [path for path in denied if _looks_like_secret_source(path)]

@@ -12,7 +12,9 @@ Cold Path mode='cold' (Kanana-o CoT, S2-9 실구현):
 
 reason_code enum (S2-9 완료, 최종 확정):
   NORMAL_APPROVE / TIMEOUT / RISK_FAST_TRIGGER / DEBATE_CONFLICT /
-  NEWS_DIVERGENCE / QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH
+  NEWS_DIVERGENCE / QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH /
+  COMMUNITY_LIVE_PROXY_RISK / NEWS_COMMUNITY_DIVERGENCE /
+  COMMUNITY_TIMESTAMP_WEAK / COMMUNITY_MANIPULATION_FLAG
 """
 from __future__ import annotations
 
@@ -40,7 +42,35 @@ _FDA_REQUIRED_REASON_CODES = frozenset({
     "NEWS_DIVERGENCE",
     "QUANT_ANOMALY",
     "MISSING_PORTFOLIO_PATCH",
+    "COMMUNITY_LIVE_PROXY_RISK",
+    "NEWS_COMMUNITY_DIVERGENCE",
+    "COMMUNITY_TIMESTAMP_WEAK",
+    "COMMUNITY_MANIPULATION_FLAG",
 })
+_FDA_COLD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "approved": {"type": "boolean"},
+        "reason_code": {
+            "type": "string",
+            "enum": [
+                "NORMAL_APPROVE",
+                "NEWS_DIVERGENCE",
+                "NEWS_COMMUNITY_DIVERGENCE",
+                "COMMUNITY_LIVE_PROXY_RISK",
+                "COMMUNITY_TIMESTAMP_WEAK",
+                "COMMUNITY_MANIPULATION_FLAG",
+                "RISK_FAST_TRIGGER",
+                "DEBATE_CONFLICT",
+                "QUANT_ANOMALY",
+            ],
+        },
+        "veto_reason": {"type": ["string", "null"]},
+        "confidence": {"type": "number"},
+    },
+    "required": ["approved", "reason_code", "veto_reason", "confidence"],
+}
 
 
 class MissingPortfolioPatchError(ValueError):
@@ -104,6 +134,11 @@ class FDAAgent(AgentBase):
         )
 
         self._valid_reason_codes = self._load_reason_code_catalog()
+        self._uncertainty_reason_code = self._require_reason_code_ref(
+            unc_cfg,
+            section="fda_uncertainty_link",
+            key="reason_code_on_boost",
+        )
 
         logger.info(
             "[fda] 초기화: CAN_CHANGE_WEIGHT=%s, reason_codes=%d종, cold_path=%s",
@@ -179,6 +214,21 @@ class FDAAgent(AgentBase):
                 f"{sorted(missing)}. FDA fail-closed."
             )
         return codes
+
+    def _require_reason_code_ref(
+        self,
+        cfg: dict[str, Any],
+        *,
+        section: str,
+        key: str,
+    ) -> str:
+        value = str(cfg.get(key, "")).strip()
+        if not value or value not in self._valid_reason_codes:
+            raise FDAConfigError(
+                f"[fda] risk_config.yaml {section}.{key} invalid: {value}. "
+                f"허용: {sorted(self._valid_reason_codes)}"
+            )
+        return value
 
     # ================================================================== #
     # Public API
@@ -319,7 +369,7 @@ class FDAAgent(AgentBase):
         if high_risks:
             tickers = [r.get("ticker", "") for r in high_risks]
             return self._build_veto_decision(
-                reason_code="RISK_FAST_TRIGGER",
+                reason_code=self._reason_code_from_risk_warnings(high_risks),
                 veto_reason=f"high-severity risk: tickers={tickers}",
                 target_weights=target_weights or {},
                 order_deltas=order_deltas or [],
@@ -491,7 +541,7 @@ class FDAAgent(AgentBase):
 
         불변 원칙 2 준수: weight 수정 없음. approve/veto + reason_code만 결정.
         """
-        # 0. uncertainty_score 임계값 초과 → NEWS_DIVERGENCE veto (Dual-Source 연계)
+        # 0. uncertainty_score 임계값 초과 → fda_uncertainty_link.reason_code_on_boost veto
         if uncertainty_score >= self._uncertainty_threshold:
             reason = (
                 f"uncertainty_score={uncertainty_score:.3f} >= "
@@ -499,7 +549,7 @@ class FDAAgent(AgentBase):
             )
             logger.warning("[fda] Cold Path uncertainty veto. %s", reason)
             return self._build_veto_decision(
-                reason_code="NEWS_DIVERGENCE",
+                reason_code=self._uncertainty_reason_code,
                 veto_reason=f"Dual-Source divergence 임계 초과. {reason}",
                 target_weights=target_weights,
                 order_deltas=order_deltas,
@@ -550,7 +600,7 @@ class FDAAgent(AgentBase):
         ]
         if veto_signals:
             return self._build_veto_decision(
-                reason_code="RISK_FAST_TRIGGER",
+                reason_code=self._reason_code_from_risk_warnings(veto_signals),
                 veto_reason=f"Cold Path risk_warning veto. count={len(veto_signals)}",
                 target_weights=target_weights,
                 order_deltas=order_deltas,
@@ -577,7 +627,10 @@ class FDAAgent(AgentBase):
             agent_signals, risk_warnings, debate_result
         )
         llm_result = self._llm_router.call(
-            prompt, mode="cold", caller=_FDA_COLD_CALLER
+            prompt,
+            mode="cold",
+            caller=_FDA_COLD_CALLER,
+            structured_schema=_FDA_COLD_SCHEMA,
         )
 
         if not llm_result.success:
@@ -694,7 +747,10 @@ class FDAAgent(AgentBase):
             f"{debate_str}\n\n"
             "규칙: 비중 변경 불가. approve 또는 veto만 결정.\n"
             "반환 가능 reason_code: "
-            "NORMAL_APPROVE / NEWS_DIVERGENCE / RISK_FAST_TRIGGER / DEBATE_CONFLICT / QUANT_ANOMALY (5종). "
+            "NORMAL_APPROVE / NEWS_DIVERGENCE / NEWS_COMMUNITY_DIVERGENCE / "
+            "COMMUNITY_LIVE_PROXY_RISK / COMMUNITY_TIMESTAMP_WEAK / "
+            "COMMUNITY_MANIPULATION_FLAG / RISK_FAST_TRIGGER / "
+            "DEBATE_CONFLICT / QUANT_ANOMALY. "
             "TIMEOUT과 MISSING_PORTFOLIO_PATCH는 LLM이 직접 반환하지 않음.\n\n"
             "JSON으로 응답: "
             '{"approved": true/false, "reason_code": "...", '
@@ -741,6 +797,29 @@ class FDAAgent(AgentBase):
                 "reason_code": "NEWS_DIVERGENCE",
                 "veto_reason": "Cold Path LLM 응답 파싱 실패. FDA fail-closed.",
             }
+
+    @staticmethod
+    def _reason_code_from_risk_warnings(risk_warnings: list[dict[str, Any]]) -> str:
+        """RiskFast payload가 추천한 community C9 reason_code가 있으면 우선한다."""
+        community_priority = (
+            "COMMUNITY_MANIPULATION_FLAG",
+            "NEWS_COMMUNITY_DIVERGENCE",
+            "COMMUNITY_TIMESTAMP_WEAK",
+            "COMMUNITY_LIVE_PROXY_RISK",
+        )
+        for desired in community_priority:
+            for warning in risk_warnings:
+                direct = str(
+                    warning.get("recommended_fda_reason_code")
+                    or warning.get("reason_code")
+                    or ""
+                ).strip()
+                if direct == desired:
+                    return desired
+                sidecar_codes = warning.get("sidecar_reason_codes")
+                if isinstance(sidecar_codes, list) and desired in sidecar_codes:
+                    return desired
+        return "RISK_FAST_TRIGGER"
 
     @staticmethod
     def _safe_bool(value: Any, default: bool | None = True) -> bool | None:

@@ -19,6 +19,10 @@ _VALID_REASON_CODES = [
     "TIMEOUT",
     "QUANT_ANOMALY",
     "MISSING_PORTFOLIO_PATCH",
+    "COMMUNITY_LIVE_PROXY_RISK",
+    "NEWS_COMMUNITY_DIVERGENCE",
+    "COMMUNITY_TIMESTAMP_WEAK",
+    "COMMUNITY_MANIPULATION_FLAG",
 ]
 
 
@@ -33,6 +37,7 @@ def _valid_fda_config() -> dict[str, dict]:
         "fda_uncertainty_link": {
             "uncertainty_threshold": 0.5,
             "veto_prior_boost": 0.15,
+            "reason_code_on_boost": "NEWS_COMMUNITY_DIVERGENCE",
         },
         "reason_code_catalog": {
             "status": "final",
@@ -194,6 +199,22 @@ def test_veto_risk_high_severity(fda: FDAAgent) -> None:
     fd = result["final_decision"]
     assert fd["approved"] is False
     assert fd["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_veto_high_community_risk_preserves_reason_code(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        risk_warnings=[
+            {
+                "ticker": "005930",
+                "severity": "high",
+                "recommended_fda_reason_code": "NEWS_COMMUNITY_DIVERGENCE",
+            }
+        ],
+    )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "NEWS_COMMUNITY_DIVERGENCE"
 
 
 def test_veto_quant_anomaly(fda: FDAAgent) -> None:

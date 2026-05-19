@@ -20,10 +20,11 @@ Dual-Source 커뮤니티 소스. 뉴스(NaverNewsClient) vs 커뮤니티 diverge
 2. manipulation_rules.yaml: 주가 조작 패턴 2차 필터 (noise reduction)
 3. sentiment_dict.yaml: 긍정/부정 단어 사전 기반 감성 점수
 
-## Mock 모드 (Sprint 2)
+## Mock/real 모드
 
-공식 API 없음. robots.txt 거부 정책. Sprint 2 는 **mock 기본**.
-실 스크래핑은 Sprint 4 S4-6 Paper Trading 정책 결정 후.
+네이버 종목토론방 직접 scraping은 공식 API가 아니므로 기본 경로가 아니다.
+real 모드는 공식 Naver Search cafearticle/blog API 기반 live community proxy만 사용한다.
+Sprint 2 는 **mock 기본**, `COMMUNITY_SCRAPE_ENABLED=1`일 때 real proxy 활성.
 
 SSOT: api_contracts.md v3.5 C2 EventNormalizeContract (source='community')
 """
@@ -99,6 +100,11 @@ class CommunityPost:
     url: str               # 원문 링크 (옵션)
     view_count: int = 0
     comment_count: int = 0
+    provider: str = "mock"
+    query: str = ""
+    timestamp_quality: str = "mock_generated"
+    timestamp_confidence: str = "mock"
+    collected_at: datetime | None = None
 
 
 @dataclass
@@ -171,6 +177,7 @@ class CommunityCrawler(BaseConnector):
         self._client_id: str | None = None
         self._client_secret: str | None = None
         self._ticker_name_map = self._load_ticker_name_map()
+        self._ticker_sector_map = self._load_ticker_sector_map()
         if not self._is_mock:
             self._client_id, self._client_secret = self._auth.get_naver_client()
 
@@ -269,18 +276,34 @@ class CommunityCrawler(BaseConnector):
         self._last_normalize_pit_fail_count = 0
         events: list[dict[str, Any]] = []
         for post in posts:
+            link_hash = (
+                hashlib.sha256(post.url.encode("utf-8")).hexdigest()[:16]
+                if post.url
+                else ""
+            )
             raw = {
-                "post_title": post.title,       # _normalize_community 필수 필드
+                "post_title": f"community_proxy_event:{post.ticker}:{post.provider}",
                 "posted_at": post.timestamp.isoformat(),  # _normalize_community 필수 필드
-                "body": post.content[:200] if post.content else "",
+                "body": "",
                 "ticker_mentioned": post.ticker,
                 "spam_flag": False,
-                # 추가 메타데이터 payload에 포함
+                # 추가 메타데이터 payload에 포함. 원문 title/body/link는 durable event로 저장하지 않는다.
                 "post_id": post.post_id,
                 "author_id_hash": post.author_id,
-                "url": post.url,
+                "source_link_hash": link_hash,
                 "view_count": post.view_count,
                 "comment_count": post.comment_count,
+                "provider": post.provider,
+                "query": post.query,
+                "timestamp_quality": post.timestamp_quality,
+                "timestamp_confidence": post.timestamp_confidence,
+                "content_retention_policy": "derived_signal_only",
+                "stores_raw_content": False,
+                "collected_at": (
+                    post.collected_at.isoformat()
+                    if isinstance(post.collected_at, datetime)
+                    else None
+                ),
             }
             try:
                 event = self._normalizer.normalize(raw, source="community")
@@ -343,6 +366,25 @@ class CommunityCrawler(BaseConnector):
                     mapping[ticker] = name
         return mapping
 
+    @staticmethod
+    def _load_ticker_sector_map() -> dict[str, str]:
+        """universe_config.yaml에서 ticker → sector 매핑 로드."""
+        path = _CONFIG_ROOT / "universe_config.yaml"
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception as e:
+            logger.warning("[community] universe_config sector 로드 실패: %s", e)
+            return {}
+
+        mapping: dict[str, str] = {}
+        for sector_name, sector in (data.get("sectors") or {}).items():
+            for stock in sector.get("stocks", []) or []:
+                ticker = str(stock.get("ticker", "")).zfill(6)
+                if ticker:
+                    mapping[ticker] = str(sector_name)
+        return mapping
+
     # ------------------------------------------------------------------ #
     # 내부 helper: 공식 Naver Search API 기반 community 대체 소스
     # ------------------------------------------------------------------ #
@@ -373,8 +415,40 @@ class CommunityCrawler(BaseConnector):
             raise ValueError("dual_source.community.naver_search_providers is empty")
 
         max_posts = int(self._community_cfg.get("max_posts_per_ticker", 3))
-        display = max(1, min(100, max_posts))
-        suffix = str(self._community_cfg.get("naver_query_suffix", "주식")).strip()
+        suffixes_raw = self._community_cfg.get("naver_query_suffixes")
+        if suffixes_raw is None:
+            suffixes = [str(self._community_cfg.get("naver_query_suffix", "주식")).strip()]
+        elif isinstance(suffixes_raw, list):
+            suffixes = [str(item).strip() for item in suffixes_raw if str(item).strip()]
+        else:
+            suffixes = [str(suffixes_raw).strip()]
+        if not suffixes:
+            suffixes = ["주식"]
+        include_ticker_queries = bool(
+            self._community_cfg.get("include_ticker_queries", False)
+        )
+        ticker_suffixes_raw = self._community_cfg.get(
+            "naver_ticker_query_suffixes", ["주식"]
+        )
+        if isinstance(ticker_suffixes_raw, list):
+            ticker_suffixes = [
+                str(item).strip()
+                for item in ticker_suffixes_raw
+                if str(item).strip()
+            ]
+        else:
+            ticker_suffixes = [str(ticker_suffixes_raw).strip()]
+        if not ticker_suffixes:
+            ticker_suffixes = ["주식"]
+        include_sector_queries = bool(
+            self._community_cfg.get("include_sector_queries", False)
+        )
+        sector_query_suffix = str(
+            self._community_cfg.get("sector_query_suffix", "관련주")
+        ).strip() or "관련주"
+        max_queries = int(self._community_cfg.get("max_queries_per_ticker", len(suffixes)))
+        display = int(self._community_cfg.get("display_per_query", max_posts))
+        display = max(1, min(100, display))
         sort = str(self._community_cfg.get("sort", "date"))
         if sort not in {"sim", "date"}:
             sort = "date"
@@ -387,28 +461,47 @@ class CommunityCrawler(BaseConnector):
 
         for ticker in tickers:
             query_name = self._ticker_name_map.get(ticker, ticker)
-            query = f"{query_name} {suffix}".strip()
+            queries: list[str] = []
+            queries.append(f"{query_name} {suffixes[0]}".strip())
+            if include_ticker_queries:
+                for suffix in ticker_suffixes:
+                    queries.append(f"{ticker} {suffix}".strip())
+            if include_sector_queries:
+                sector_name = self._ticker_sector_map.get(ticker, "")
+                if sector_name:
+                    queries.append(f"{sector_name} {sector_query_suffix}".strip())
+            for suffix in suffixes[1:]:
+                queries.append(f"{query_name} {suffix}".strip())
+            queries = list(dict.fromkeys(queries))[:max_queries]
             ticker_posts: list[CommunityPost] = []
+            seen_keys: set[str] = set()
 
-            for provider in providers:
+            for query in queries:
                 if len(ticker_posts) >= max_posts:
                     break
-                payload = self._http_get_json(
-                    _NAVER_COMMUNITY_URLS[provider],
-                    params={
-                        "query": query,
-                        "display": str(display),
-                        "start": "1",
-                        "sort": sort,
-                    },
-                    headers=headers,
-                )
-                for idx, raw in enumerate(payload.get("items", []) or []):
+                for provider in providers:
                     if len(ticker_posts) >= max_posts:
                         break
-                    ticker_posts.append(
-                        self._naver_item_to_post(provider, ticker, raw, idx)
+                    payload = self._http_get_json(
+                        _NAVER_COMMUNITY_URLS[provider],
+                        params={
+                            "query": query,
+                            "display": str(display),
+                            "start": "1",
+                            "sort": sort,
+                        },
+                        headers=headers,
                     )
+                    for idx, raw in enumerate(payload.get("items", []) or []):
+                        if len(ticker_posts) >= max_posts:
+                            break
+                        dedupe_key = self._dedupe_key(provider, ticker, raw)
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+                        ticker_posts.append(
+                            self._naver_item_to_post(provider, ticker, raw, idx, query)
+                        )
 
             posts.extend(ticker_posts)
 
@@ -420,18 +513,29 @@ class CommunityCrawler(BaseConnector):
         ticker: str,
         raw: dict[str, Any],
         idx: int,
+        query: str = "",
     ) -> CommunityPost:
         """Naver Search item → CommunityPost."""
         title = _strip_html(str(raw.get("title", "")))
         content = _strip_html(str(raw.get("description", "")))
         link = str(raw.get("link", ""))
+        collected_at = datetime.now(_KST)
 
         if provider == "blog":
-            timestamp = _parse_blog_postdate(str(raw.get("postdate", "")))
+            postdate = str(raw.get("postdate", ""))
+            timestamp = _parse_blog_postdate(postdate)
             author_basis = str(raw.get("bloggername", ""))
+            timestamp_quality = (
+                "official_postdate_date_only"
+                if len(postdate) == 8 and postdate.isdigit()
+                else "missing_collected_at"
+            )
+            timestamp_confidence = "medium_date_only" if timestamp_quality == "official_postdate_date_only" else "low"
         else:
-            timestamp = datetime.now(_KST)
+            timestamp = collected_at
             author_basis = str(raw.get("cafename", ""))
+            timestamp_quality = "missing_collected_at"
+            timestamp_confidence = "low"
 
         post_id = f"NAVER-{provider}-{ticker}-{_stable_author_hash(link, title)[:10]}-{idx}"
         return CommunityPost(
@@ -444,7 +548,24 @@ class CommunityCrawler(BaseConnector):
             url=link,
             view_count=0,
             comment_count=0,
+            provider=provider,
+            query=query,
+            timestamp_quality=timestamp_quality,
+            timestamp_confidence=timestamp_confidence,
+            collected_at=collected_at,
         )
+
+    @staticmethod
+    def _dedupe_key(provider: str, ticker: str, raw: dict[str, Any]) -> str:
+        """provider+link+ticker 기준 중복 제거 키."""
+        link = str(raw.get("link") or "").strip()
+        if link:
+            base = f"{provider}|{ticker}|{link}"
+        else:
+            title = _strip_html(str(raw.get("title", "")))
+            desc = _strip_html(str(raw.get("description", "")))
+            base = f"{provider}|{ticker}|{title}|{desc}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     # ------------------------------------------------------------------ #
     # 내부 helper: 필터 파이프라인

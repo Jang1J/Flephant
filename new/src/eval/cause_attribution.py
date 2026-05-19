@@ -22,6 +22,10 @@ PIT-Safety (SHIP-fix C-2 강화, GPT Pro 2026-05-09):
 reason_code 별 사후 검증 룰 (의도 vs 실제):
   RISK_FAST_TRIGGER  → veto 후 5분 수익률 하락 (label_t5_ret < 0)
   NEWS_DIVERGENCE    → veto 후 5분 수익률 하락 (label_t5_ret < 0)
+  NEWS_COMMUNITY_DIVERGENCE → veto 후 5분 수익률 하락 (label_t5_ret < 0)
+  COMMUNITY_LIVE_PROXY_RISK → veto 후 5분 수익률 하락 (label_t5_ret < 0)
+  COMMUNITY_TIMESTAMP_WEAK → veto. timestamp 품질 guard → skip
+  COMMUNITY_MANIPULATION_FLAG → veto. 조작/노이즈 guard → skip
   DEBATE_CONFLICT    → veto 후 5분 변동성 / 수익률 하락 (label_t5_ret < 0)
   QUANT_ANOMALY      → veto 후 5분 수익률 하락 (label_t5_ret < 0)
   TIMEOUT            → veto. 사후 검증 N/A (의도 자체가 안전 fallback) → skip
@@ -68,6 +72,10 @@ _DEFAULT_OUT_DIR = _PROJECT_ROOT / "artifacts" / "metrics"
 REASON_CODE_VERIFICATION: dict[str, dict[str, Any]] = {
     "RISK_FAST_TRIGGER":      {"event_type": "veto",    "expected_direction": "negative"},
     "NEWS_DIVERGENCE":        {"event_type": "veto",    "expected_direction": "negative"},
+    "NEWS_COMMUNITY_DIVERGENCE": {"event_type": "veto", "expected_direction": "negative"},
+    "COMMUNITY_LIVE_PROXY_RISK": {"event_type": "veto", "expected_direction": "negative"},
+    "COMMUNITY_TIMESTAMP_WEAK": {"event_type": "veto", "expected_direction": None},
+    "COMMUNITY_MANIPULATION_FLAG": {"event_type": "veto", "expected_direction": None},
     "DEBATE_CONFLICT":        {"event_type": "veto",    "expected_direction": "negative"},
     "QUANT_ANOMALY":          {"event_type": "veto",    "expected_direction": "negative"},
     "NORMAL_APPROVE":         {"event_type": "approve", "expected_direction": "positive"},

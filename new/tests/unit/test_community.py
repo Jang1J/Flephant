@@ -351,7 +351,11 @@ def test_poll_real_mode_uses_naver_search_api(mock_rate_limiter, mock_normalizer
     assert posts[0].ticker == "005930"
     assert posts[0].title == "삼성전자 커뮤니티 반응"
     assert posts[0].url == "https://example.com/community/1"
+    assert posts[0].timestamp_confidence == "low"
     assert calls[0][1]["query"].startswith("삼성전자")
+    queries = [params["query"] for _, params in calls]
+    assert "005930 주식" in queries
+    assert "반도체 관련주" in queries
 
 
 def test_poll_real_mode_requires_naver_credentials(

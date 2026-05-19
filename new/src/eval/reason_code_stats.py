@@ -7,9 +7,11 @@ evaluation_metrics.md L160 SSOT:
     period     : 일별
     threshold  : system_os_metrics.reason_code_top3_coverage_min: 0.80
 
-C9 reason_code 7종 (api_contracts.md SSOT):
+C9 reason_code 11종 (api_contracts.md SSOT):
   NORMAL_APPROVE / TIMEOUT / RISK_FAST_TRIGGER / DEBATE_CONFLICT
   NEWS_DIVERGENCE / QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH
+  COMMUNITY_LIVE_PROXY_RISK / NEWS_COMMUNITY_DIVERGENCE
+  COMMUNITY_TIMESTAMP_WEAK / COMMUNITY_MANIPULATION_FLAG
 
 Usage:
   python -m src.eval.reason_code_stats [--audit-log PATH] [--out-dir PATH] [--date YYYYMMDD]
@@ -42,7 +44,7 @@ _PROJECT_ROOT = _NEW_ROOT.parent
 _DEFAULT_AUDIT_LOG = _PROJECT_ROOT / "artifacts" / "audit_log.jsonl"
 _DEFAULT_OUT_DIR = _PROJECT_ROOT / "artifacts" / "metrics"
 
-# C9 reason_code 7종 SSOT (api_contracts.md C9 + fda.py:14-15)
+# C9 reason_code 11종 SSOT (api_contracts.md C9 + fda.py)
 REASON_CODE_CATALOG: tuple[str, ...] = (
     "NORMAL_APPROVE",
     "TIMEOUT",
@@ -51,6 +53,10 @@ REASON_CODE_CATALOG: tuple[str, ...] = (
     "NEWS_DIVERGENCE",
     "QUANT_ANOMALY",
     "MISSING_PORTFOLIO_PATCH",
+    "COMMUNITY_LIVE_PROXY_RISK",
+    "NEWS_COMMUNITY_DIVERGENCE",
+    "COMMUNITY_TIMESTAMP_WEAK",
+    "COMMUNITY_MANIPULATION_FLAG",
 )
 
 
@@ -120,7 +126,7 @@ def compute_distribution(entries: list[dict[str, Any]]) -> dict[str, Any]:
     top3_count = sum(c for _, c in top3)
     top3_coverage = (top3_count / total) if total > 0 else 0.0
 
-    # catalog 완전성: 7종 중 발생한 코드 수
+    # catalog 완전성: C9 enum 전체 중 발생한 코드 수
     catalog_seen = sum(1 for code in REASON_CODE_CATALOG if code in counter_obj)
     catalog_completeness = catalog_seen / len(REASON_CODE_CATALOG)
 

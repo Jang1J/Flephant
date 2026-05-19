@@ -502,7 +502,7 @@ def test_fda_cold_uses_uncertainty_signal_score_for_news_divergence_veto() -> No
 
     fd = _fd(result)
     assert fd["approved"] is False
-    assert fd["reason_code"] == "NEWS_DIVERGENCE"
+    assert fd["reason_code"] == "NEWS_COMMUNITY_DIVERGENCE"
     assert "uncertainty_score=0.800" in fd["veto_reason"]
 
 

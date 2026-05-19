@@ -11,7 +11,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import sys
 import time
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -29,6 +33,33 @@ from src.orchestration.llm_router import (
 # ====================================================================== #
 # Fixtures
 # ====================================================================== #
+
+
+def _install_fake_openai(monkeypatch, *, content: str = "ok") -> dict:
+    """OpenAI SDK compatible fake. Captures client/create kwargs."""
+    capture: dict = {}
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            capture["create_kwargs"] = kwargs
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content),
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=None),
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            capture["client_kwargs"] = kwargs
+            self.chat = SimpleNamespace(
+                completions=_FakeCompletions(),
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=_FakeOpenAI))
+    return capture
 
 
 @pytest.fixture
@@ -115,6 +146,21 @@ def test_router_requires_known_overflow_policy(minimal_config: dict) -> None:
     bad["llm_budget"]["overflow_to"] = "gpt-3"
     with pytest.raises(LLMRouterConfigError, match="overflow_to"):
         LLMRouter(config=bad)
+
+
+def test_real_risk_config_llm_budget_contract(monkeypatch) -> None:
+    """실제 risk_config.yaml의 LLM budget 계약을 router가 그대로 읽는다."""
+    monkeypatch.delenv("KANANA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    router = LLMRouter()
+
+    assert router.budget_remaining() == 100
+    assert router.budget_remaining("news_agent") == 30
+    assert router.budget_remaining("risk_agent") == 15
+    assert router.budget_remaining("debate_agent") == 5
+    assert {"backtest_reasoning", "factor_hypothesis", "factor_implementation", "factor_evaluation"}.issubset(
+        router._mode_b_allowed_callers
+    )
 
 
 def test_budget_tracker_caller_allocation_enforced() -> None:
@@ -507,33 +553,95 @@ def test_missing_openai_key_returns_failure(
     assert result.error == "OPENAI_API_KEY_MISSING"
 
 
-def test_kanana_malformed_tokens_out_does_not_fail_call(
+def test_kanana_uses_openai_compatible_chat_completions(
     minimal_config: dict,
     monkeypatch,
 ) -> None:
-    """Provider가 tokens_out을 비정상 문자열로 줘도 호출 자체는 성공 처리한다."""
-    import requests
-
-    class _Response:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {"content": "ok", "tokens_out": "many"}
-
+    """Kanana-o는 raw requests.post가 아니라 OpenAI-compatible chat completions로 호출한다."""
     monkeypatch.setenv("KANANA_API_KEY", "k")
-    monkeypatch.setenv("KANANA_API_URL", "https://kanana.example.invalid")
+    monkeypatch.setenv("KANANA_API_URL", "https://kanana.example.invalid/v1/")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
     minimal_config["llm_budget"]["allow_mock_provider"] = False
-    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Response())
+    capture = _install_fake_openai(monkeypatch, content="ok")
     router = LLMRouter(config=minimal_config)
 
     result = router.call("p", mode="cold", caller="news_analysis")
 
     assert result.success is True
+    assert result.model_used == LLMModel.KANANA_O.value
     assert result.tokens_out is None
     assert result.content == "ok"
+    assert capture["client_kwargs"]["base_url"] == "https://kanana.example.invalid/v1"
+    assert capture["client_kwargs"]["api_key"] == "k"
+    assert capture["create_kwargs"]["model"] == LLMModel.KANANA_O.value
+    assert capture["create_kwargs"]["messages"] == [{"role": "user", "content": "p"}]
+    assert capture["create_kwargs"]["temperature"] == 0
+    assert "response_format" not in capture["create_kwargs"]
+
+
+def test_kanana_accepts_legacy_base_url_alias(
+    minimal_config: dict,
+    monkeypatch,
+) -> None:
+    """운영 .env 호환: KANANA_API_URL이 없으면 KANANA_BASE_URL을 사용한다."""
+    monkeypatch.setenv("KANANA_API_KEY", "k")
+    monkeypatch.delenv("KANANA_API_URL", raising=False)
+    monkeypatch.setenv("KANANA_BASE_URL", "https://kanana.alias.invalid/v1/")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = False
+    capture = _install_fake_openai(monkeypatch, content="ok")
+    router = LLMRouter(config=minimal_config)
+
+    result = router.call("p", mode="cold", caller="news_analysis")
+
+    assert result.success is True
+    assert result.model_used == LLMModel.KANANA_O.value
+    assert capture["client_kwargs"]["base_url"] == "https://kanana.alias.invalid/v1"
+
+
+def test_gpt4o_uses_store_false_and_strict_json_schema(
+    minimal_config: dict,
+    monkeypatch,
+) -> None:
+    """GPT-4o는 store=False와 strict json_schema response_format을 명시한다."""
+    monkeypatch.setenv("OPENAI_API_KEY", "o")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("ELEPHANT_ALLOW_LLM_MOCK", raising=False)
+    minimal_config["llm_budget"]["allow_mock_provider"] = False
+    capture = _install_fake_openai(monkeypatch, content='{"signal":"neutral"}')
+    router = LLMRouter(config=minimal_config)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"signal": {"type": "string"}},
+        "required": ["signal"],
+    }
+
+    result = router._call_gpt4o(
+        "p",
+        caller="news_analysis",
+        schema=schema,
+        is_fallback=True,
+    )
+
+    assert result.success is True
+    assert result.model_used == LLMModel.GPT_4O.value
+    assert capture["client_kwargs"]["api_key"] == "o"
+    assert "base_url" not in capture["client_kwargs"]
+    create_kwargs = capture["create_kwargs"]
+    assert create_kwargs["model"] == LLMModel.GPT_4O.value
+    assert create_kwargs["store"] is False
+    assert create_kwargs["temperature"] == 0
+    assert create_kwargs["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "elephant_agent_report",
+            "strict": True,
+            "schema": schema,
+        },
+    }
 
 
 def test_budget_remaining_tracks_calls(router_with_keys: LLMRouter) -> None:
@@ -584,32 +692,45 @@ def test_mode_b_no_kanana_budget_consumed(router_with_keys: LLMRouter) -> None:
     assert router_with_keys.budget_remaining() == before
 
 
-def test_force_model_gpt4o_bypasses_kanana(
+def test_cold_path_cannot_force_gpt4o(
     minimal_config: dict, monkeypatch
 ) -> None:
-    """force_model='gpt-4o' 지정 시 Kanana 건너뛰고 GPT-4o 직접 호출."""
+    """Cold Path GPT-4o는 Kanana 실패/예산초과 fallback으로만 허용한다."""
     monkeypatch.setenv("KANANA_API_KEY", "k")
     monkeypatch.setenv("OPENAI_API_KEY", "o")
     router = LLMRouter(config=minimal_config)
 
     before = router.budget_remaining()
-    result = router.call(
-        "test", mode="cold", caller="news_analysis", force_model="gpt-4o"
-    )
+    with pytest.raises(RuntimeError, match="COLD_PATH_GPT_FORCE_FORBIDDEN"):
+        router.call("test", mode="cold", caller="news_analysis", force_model="gpt-4o")
 
-    assert result.success
-    assert result.model_used == LLMModel.GPT_4O.value
-    assert not result.fallback_used  # 강제 지정이므로 fallback 아님
-    # Kanana 예산 소모 없음
     assert router.budget_remaining() == before
+
+
+def test_rejects_unknown_or_noncanonical_modes(
+    router_with_keys: LLMRouter,
+) -> None:
+    """mode 값은 exact enum만 허용하고 나머지는 fail-closed."""
+    before = router_with_keys.budget_remaining()
+    for bad_mode in ["HOT", "hot ", "mode_a", "unknown", ""]:
+        with pytest.raises(RuntimeError, match="UNKNOWN_LLM_MODE"):
+            router_with_keys.call("test", mode=bad_mode, caller="news_analysis")
+    assert router_with_keys.budget_remaining() == before
 
 
 def test_allow_mock_provider_without_api_keys(monkeypatch, minimal_config: dict) -> None:
     """명시적 mock provider는 API key 없이도 cold/mode_b smoke를 허용한다."""
+    from src.orchestration import llm_router as llm_mod
+
     monkeypatch.delenv("KANANA_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("ELEPHANT_ALLOW_LLM_MOCK", "1")
+    monkeypatch.setattr(
+        llm_mod,
+        "now_kst",
+        lambda: datetime(2026, 5, 18, 19, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
     minimal_config["llm_budget"]["allow_mock_provider"] = True
 
     router = LLMRouter(config=minimal_config)
@@ -715,3 +836,53 @@ def test_mode_b_authorized_caller_passes(monkeypatch) -> None:
     result = router.call("test", mode="mode_b", caller="backtest_reasoning")
     assert result.success
     assert result.model_used == LLMModel.GPT_4O.value
+
+
+@pytest.mark.no_mode_b
+def test_mode_b_requires_elephant_mode_env(monkeypatch) -> None:
+    """Router level에서도 Mode B GPT 호출은 ELEPHANT_MODE=mode_b가 필요하다."""
+    _mock_env(monkeypatch)
+    monkeypatch.delenv("ELEPHANT_MODE", raising=False)
+    config = {
+        "llm_budget": {
+            "kanana_daily_limit": 10,
+            "overflow_to": "gpt-4o",
+            "budget_allocation": {},
+            "circuit_breaker": {"failure_threshold": 3, "open_duration_sec": 300},
+            "sla": {"timeout_sec": 30.0},
+            "allow_mock_provider": True,
+            "mode_b_allowed_callers": ["backtest_reasoning"],
+        }
+    }
+    router = LLMRouter(config=config)
+    with pytest.raises(RuntimeError, match="MODE_B_ENV_REQUIRED"):
+        router.call("test", mode="mode_b", caller="backtest_reasoning")
+
+
+def test_mode_b_requires_execution_window(monkeypatch) -> None:
+    """pytest bypass가 없으면 Mode B GPT 호출은 execution_window 안에서만 허용된다."""
+    from src.orchestration import llm_router as llm_mod
+
+    _mock_env(monkeypatch)
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    config = {
+        "llm_budget": {
+            "kanana_daily_limit": 10,
+            "overflow_to": "gpt-4o",
+            "budget_allocation": {},
+            "circuit_breaker": {"failure_threshold": 3, "open_duration_sec": 300},
+            "sla": {"timeout_sec": 30.0},
+            "allow_mock_provider": True,
+            "mode_b_allowed_callers": ["backtest_reasoning"],
+        }
+    }
+    router = LLMRouter(config=config)
+    monkeypatch.setattr(router, "_mode_b_window", lambda: (18, 22))
+    monkeypatch.setattr(
+        llm_mod,
+        "now_kst",
+        lambda: datetime(2026, 5, 18, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    with pytest.raises(RuntimeError, match="MODE_B_WINDOW_FORBIDDEN"):
+        router.call("test", mode="mode_b", caller="backtest_reasoning")

@@ -10,7 +10,7 @@ Kanana-o 100회/일 + GPT-4o fallback + circuit breaker.
 컴포넌트:
     _BudgetTracker: 일일 예산 + caller 별 allocation (KST 자정 리셋)
     _CircuitBreaker: 3회 연속 실패 → 5분 OPEN → HALF_OPEN → 성공 시 CLOSED
-    LLMRouter: 위 2개 + HTTP 호출 (Sprint 4 S4-6 실 API 교체)
+    LLMRouter: 위 2개 + OpenAI-compatible Chat Completions provider 호출
 
 SSOT: api_contracts.md v3.4 C5 (llm_budget.source: risk_config.yaml llm_budget)
 """
@@ -24,16 +24,15 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_int
+from src.utils.safe_cast import safe_bool
 from src.utils.time_utils import now_kst
 
 logger = get_logger("llm_router")
 
-_KST = ZoneInfo("Asia/Seoul")
+_MODE_B_ENV = "mode_b"
 
 
 class LLMRouterConfigError(ValueError):
@@ -317,7 +316,7 @@ class LLMRouter:
 
     Mode 별 동작:
       - 'cold': Kanana-o 우선. 예산 초과/circuit OPEN/API 오류 시 GPT-4o fallback.
-      - 'mode_b': GPT-4o 전용. Kanana-o 예산과 독립. Mode B 장마감 18:00~22:00 전용.
+      - 'mode_b': GPT-4o 전용. Kanana-o 예산과 독립. env + 장마감 시간창 강제.
       - 'hot': RuntimeError raise. Hot Path 동기 LLM 호출 금지.
 
     구성요소:
@@ -328,9 +327,11 @@ class LLMRouter:
     모든 임계값은 risk_config.yaml llm_budget 섹션에서 로드 (불변 원칙 5).
     API 키는 os.environ에서만 로드 (.env 직접 읽기 금지).
 
-    Sprint 2 구현 레벨:
-    실제 HTTP 호출은 mock (TODO: Sprint4-S4-6에서 실 API 교체).
-      인터페이스 + 예산/circuit/fallback 로직은 완전 구현.
+    Provider:
+      - mode는 exact enum만 허용. 비정규 문자열은 UNKNOWN_LLM_MODE fail-closed.
+      - Kanana-o: OpenAI-compatible Chat Completions. KANANA_API_URL은 /v1 base URL.
+      - GPT-4o: OpenAI Chat Completions, store=False, schema가 있으면 strict json_schema.
+      - Cold Path GPT-4o 직접 강제는 금지. fallback 또는 mode_b에서만 허용.
     """
 
     def __init__(self, config: dict | None = None) -> None:
@@ -378,7 +379,9 @@ class LLMRouter:
         # API 키 (environ에서만 로드, .env 직접 읽기 금지)
         self._kanana_key: str | None = os.environ.get("KANANA_API_KEY")
         self._openai_key: str | None = os.environ.get("OPENAI_API_KEY")
-        self._kanana_api_url: str | None = os.environ.get("KANANA_API_URL")
+        self._kanana_api_url: str | None = (
+            os.environ.get("KANANA_API_URL") or os.environ.get("KANANA_BASE_URL")
+        )
         self._allow_mock_provider: bool = (
             safe_bool(cfg.get("allow_mock_provider", False), default=False)
             or os.environ.get("ELEPHANT_ALLOW_LLM_MOCK") == "1"
@@ -389,6 +392,35 @@ class LLMRouter:
             f"circuit threshold={self._cb_failure_threshold}회, "
             f"timeout={self._timeout_sec}s"
         )
+
+    def _mode_b_window(self) -> tuple[int, int]:
+        """Mode B 실행 시간창. risk_config.yaml mode_b_scheduler.execution_window SSOT."""
+        try:
+            cfg = config_load("risk_config.yaml", "mode_b_scheduler") or {}
+            win = cfg.get("execution_window", {})
+            return int(win.get("start_hour", 18)), int(win.get("end_hour", 22))
+        except Exception as e:
+            logger.warning("[llm_router] mode_b execution_window 로드 실패. 기본값 사용: %s", e)
+            return 18, 22
+
+    def _ensure_mode_b_runtime_guard(self, caller: str) -> None:
+        """Mode B GPT 호출은 env + time window를 모두 만족해야 한다."""
+        current_mode = os.environ.get("ELEPHANT_MODE", "")
+        if current_mode != _MODE_B_ENV:
+            raise RuntimeError(
+                f"MODE_B_ENV_REQUIRED: caller={caller} requires ELEPHANT_MODE={_MODE_B_ENV!r}, "
+                f"current={current_mode!r}. 불변 원칙 3 (Backtest Agent Mode B 전용) 강제."
+            )
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return
+        start_hour, end_hour = self._mode_b_window()
+        now = now_kst()
+        if not (start_hour <= now.hour <= end_hour):
+            raise RuntimeError(
+                f"MODE_B_WINDOW_FORBIDDEN: caller={caller} now={now.isoformat()} "
+                f"window={start_hour:02d}:00-{end_hour:02d}:59 KST. "
+                "Mode B GPT 호출은 장마감 실행 창에서만 허용."
+            )
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -412,7 +444,7 @@ class LLMRouter:
               - 'hot': 즉시 RuntimeError (Hot Path 동기 LLM 금지, 불변 원칙 4)
             caller: budget_allocation 키 ('news_agent', 'fda_cold_path' 등)
             structured_schema: JSON schema (structured output 요청, 현재 mock)
-            force_model: 'kanana-o' | 'gpt-4o' 강제 지정 (mode='cold' 시만 유효)
+            force_model: 'kanana-o'만 허용. Cold Path GPT 강제 지정은 금지.
 
         Returns:
             LLMCallResult (성공 여부, 사용 모델, content, latency, 오류 등)
@@ -420,6 +452,17 @@ class LLMRouter:
         Raises:
             RuntimeError: mode='hot' (불변 원칙 4 위반 방지)
         """
+        if mode not in {"cold", "mode_b", "hot"}:
+            raise RuntimeError(
+                f"UNKNOWN_LLM_MODE: {mode!r}. 허용값은 'cold' | 'mode_b' | 'hot'. "
+                "LLMRouter mode는 fail-closed."
+            )
+
+        if force_model not in {None, LLMModel.KANANA_O.value, LLMModel.GPT_4O.value}:
+            raise RuntimeError(
+                f"UNKNOWN_FORCE_MODEL: {force_model!r}. 허용값은 kanana-o | gpt-4o."
+            )
+
         if mode == "hot":
             raise RuntimeError(
                 "HOT_PATH_LLM_FORBIDDEN: 불변 원칙 4 위반. "
@@ -427,6 +470,7 @@ class LLMRouter:
             )
 
         if mode == "mode_b":
+            self._ensure_mode_b_runtime_guard(caller)
             if self._mode_b_allowed_callers and caller not in self._mode_b_allowed_callers:
                 raise RuntimeError(
                     f"MODE_B_CALLER_FORBIDDEN: {caller} not in allowed list "
@@ -438,8 +482,10 @@ class LLMRouter:
 
         # mode='cold': Kanana-o 우선
         if force_model == LLMModel.GPT_4O.value:
-            logger.info(f"force_model=gpt-4o: GPT-4o 직접 호출, caller={caller}")
-            return self._call_gpt4o(prompt, caller, structured_schema, is_fallback=False)
+            raise RuntimeError(
+                "COLD_PATH_GPT_FORCE_FORBIDDEN: Cold Path GPT-4o는 "
+                "Kanana 실패/한도초과/circuit OPEN fallback으로만 허용."
+            )
 
         # 1) 예산 예약 (확인 + 차감 원자 처리)
         ok, reason = self._budget.try_reserve(caller)
@@ -549,10 +595,11 @@ class LLMRouter:
         caller: str,
         schema: dict | None,
     ) -> LLMCallResult:
-        """Kanana-o 호출.
+        """Kanana-o OpenAI-compatible Chat Completions 호출.
 
         예산은 LLMRouter.call()에서 선예약한다.
         API 키 누락 시 graceful failure (RuntimeError 미발생).
+        schema는 Kanana 호환성이 provider별로 다를 수 있어 prompt-level JSON 지시로만 둔다.
         """
         if self._allow_mock_provider:
             return self._mock_provider_result(
@@ -586,37 +633,39 @@ class LLMRouter:
 
         start = time.time()
         try:
-            import requests
+            from openai import OpenAI
 
-            response = requests.post(
-                self._kanana_api_url,
-                headers={
-                    "Authorization": f"Bearer {self._kanana_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": LLMModel.KANANA_O.value,
-                    "prompt": prompt,
-                    "schema": schema,
-                },
+            client = OpenAI(
+                base_url=self._kanana_api_url.rstrip("/"),
+                api_key=self._kanana_key,
                 timeout=self._timeout_sec,
             )
-            response.raise_for_status()
-            payload = response.json()
-            content = (
-                payload.get("content")
-                or payload.get("text")
-                or payload.get("message")
-                or json.dumps(payload, ensure_ascii=False)
+            kanana_prompt = prompt
+            if schema is not None:
+                kanana_prompt = (
+                    "반드시 유효한 JSON object 하나만 반환하세요. "
+                    "설명문, 마크다운, 코드펜스, 접두사/접미사를 출력하지 마세요.\n"
+                    f"JSON schema:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+                    f"{prompt}"
+                )
+            response = client.chat.completions.create(
+                model=LLMModel.KANANA_O.value,
+                messages=[{"role": "user", "content": kanana_prompt}],
+                temperature=0,
             )
+            content = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
             latency_ms = (time.time() - start) * 1000.0
             return LLMCallResult(
                 success=True,
                 model_used=LLMModel.KANANA_O.value,
                 content=str(content),
                 latency_ms=latency_ms,
-                tokens_in=max(1, len(prompt) // 4),
-                tokens_out=safe_int(payload.get("tokens_out"), default=0, min_value=0) or None,
+                tokens_in=(
+                    getattr(usage, "prompt_tokens", None)
+                    or max(1, len(prompt) // 4)
+                ),
+                tokens_out=getattr(usage, "completion_tokens", None),
                 cost_usd=self._kanana_cost_placeholder,
                 circuit_state=self._kanana_cb.state,
             )
@@ -681,9 +730,19 @@ class LLMRouter:
             from openai import OpenAI
 
             client = OpenAI(api_key=self._openai_key, timeout=self._timeout_sec)
-            kwargs: dict[str, Any] = {}
+            kwargs: dict[str, Any] = {
+                "temperature": 0,
+                "store": False,
+            }
             if schema is not None:
-                kwargs["response_format"] = {"type": "json_object"}
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "elephant_agent_report",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
             response = client.chat.completions.create(
                 model=LLMModel.GPT_4O.value,
                 messages=[{"role": "user", "content": prompt}],

@@ -4,7 +4,7 @@ evaluation_metrics.md SSOT 기준 검증:
   - reason_code_distribution Top-3 coverage 산출 정확성
   - Cause Attribution Accuracy 산출 정확성
   - PIT-Safety: label_t5_ret None entry 는 검증 skip
-  - 7 reason_code catalog 인식
+  - 11 reason_code catalog 인식
 """
 from __future__ import annotations
 
@@ -74,12 +74,12 @@ def test_reason_code_stats_filters_non_fda_entries():
 
 
 def test_reason_code_catalog_completeness():
-    """7 reason_code catalog 모두 발생 시 100%."""
+    """C9 reason_code catalog 모두 발생 시 100%."""
     entries = [_entry("approve" if rc == "NORMAL_APPROVE" else "veto", rc)
                for rc in REASON_CODE_CATALOG]
     result = compute_distribution(entries)
     assert result["catalog_completeness"] == 1.0
-    assert result["catalog_seen"] == 7
+    assert result["catalog_seen"] == len(REASON_CODE_CATALOG)
 
 
 def test_reason_code_stats_empty():
@@ -216,8 +216,8 @@ def test_is_hit_skip_when_direction_none():
     assert _is_hit(-0.01, None) is None
 
 
-def test_verification_rules_cover_all_7_reason_codes():
-    """REASON_CODE_VERIFICATION 이 7 reason_code 모두 정의."""
+def test_verification_rules_cover_all_reason_codes():
+    """REASON_CODE_VERIFICATION 이 C9 reason_code 모두 정의."""
     for rc in REASON_CODE_CATALOG:
         assert rc in REASON_CODE_VERIFICATION, f"{rc} missing in verification rules"
 

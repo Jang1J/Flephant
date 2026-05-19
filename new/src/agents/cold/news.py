@@ -405,7 +405,7 @@ class NewsAgent(AgentBase):
     def _parse_llm_content(self, content: str) -> dict:
         """LLM 응답 파싱. 1차 JSON parse → 2차 heuristic fallback.
 
-        1차 (JSON mode):
+        1차 (JSON object parse):
             json.loads() 성공 시 stance / narrative / impacted_tickers / impacted_sectors 직접 추출.
             stance 값이 VALID_STANCES 밖이면 "hold" → "neutral" 보정.
 

@@ -84,6 +84,13 @@ def _write_report(report_dir: Path, report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _repo_relative(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _parse_iso_kst(value: str, *, default: datetime | None = None) -> datetime:
     if not value:
         return default if default is not None else datetime.now(_KST)
@@ -475,13 +482,33 @@ def build_archive(
         window_start = _window_start(date_key)
         events_in_window = distributed[date_key]
         if not events_in_window:
+            archive_payload = {
+                "events": [],
+                "provenance": {
+                    "deploy_quality": True,
+                    "source_apis": ["naver_news_v1", "dart_open_api"],
+                    "window_start": window_start.isoformat(),
+                    "window_end": snapshot.isoformat(),
+                    "ticker_count": len(ticker_meta),
+                    "event_count": 0,
+                    "generated_at": datetime.now(_KST).isoformat(),
+                    "generator": "new/scripts/build_news_dart_archive.py",
+                    "zero_event_window": True,
+                },
+                "per_ticker_event_count": {},
+            }
+            out_path = output_dir / f"{date_key}.json"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with out_path.open("w", encoding="utf-8") as fh:
+                json.dump(archive_payload, fh, ensure_ascii=False, indent=2)
+            files_written.append(_repo_relative(out_path))
             zero_event_dates.append(date_key)
             per_date_report.append({
                 "date": date_key,
-                "status": "BLOCKED",
+                "status": "PASS_ZERO_EVENTS",
                 "reason": "no_events_in_window",
                 "event_count": 0,
-                "path": None,
+                "path": str(out_path),
             })
             continue
 
@@ -508,7 +535,7 @@ def build_archive(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w", encoding="utf-8") as fh:
             json.dump(archive_payload, fh, ensure_ascii=False, indent=2)
-        files_written.append(str(out_path.relative_to(ROOT)))
+        files_written.append(_repo_relative(out_path))
         total_events += len(events_in_window)
         per_date_report.append({
             "date": date_key,
@@ -520,8 +547,6 @@ def build_archive(
     blockers: list[str] = []
     if not files_written:
         blockers.append("no_archive_files_written")
-    if total_events <= 0:
-        blockers.append("no_events_archived")
     report: dict[str, Any] = {
         "status": "PASS" if not blockers else "BLOCKED",
         "generated_at": datetime.now(_KST).isoformat(),
