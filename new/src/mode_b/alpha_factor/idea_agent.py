@@ -33,6 +33,30 @@ OPERATOR_LIBRARY: list[str] = [
     "sector_mean", "sector_std",
 ]
 
+_HYPOTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "observation": {"type": "string"},
+        "knowledge": {"type": "string"},
+        "justification": {"type": "string"},
+        "specification": {"type": "string"},
+    },
+    "required": ["observation", "knowledge", "justification", "specification"],
+}
+
+
+def _llm_content(response: Any) -> str:
+    """LLMRouter의 LLMCallResult 또는 테스트용 str mock을 문자열로 정규화."""
+    if hasattr(response, "success") and hasattr(response, "content"):
+        if not bool(getattr(response, "success")):
+            raise RuntimeError(str(getattr(response, "error", "LLM_CALL_FAILED")))
+        content = getattr(response, "content", None)
+        if content is None:
+            raise RuntimeError("LLM_EMPTY_CONTENT")
+        return str(content)
+    return str(response)
+
 
 @dataclass
 class Hypothesis:
@@ -108,8 +132,13 @@ class IdeaAgent:
 
         if self._llm_router is not None:
             try:
-                raw_response = self._llm_router.call(
-                    prompt, mode="mode_b", caller="factor_hypothesis"
+                raw_response = _llm_content(
+                    self._llm_router.call(
+                        prompt,
+                        mode="mode_b",
+                        caller="factor_hypothesis",
+                        structured_schema=_HYPOTHESIS_SCHEMA,
+                    )
                 )
             except Exception as e:
                 logger.warning("[idea_agent] LLM 호출 실패: %s. fallback 사용", e)

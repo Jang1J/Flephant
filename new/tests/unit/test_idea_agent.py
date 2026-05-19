@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.orchestration.llm_router import LLMCallResult
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -177,6 +179,35 @@ def test_llm_router_called_with_mode_b(agent_with_router, market_ctx, mock_route
     assert kwargs.get("caller") == "factor_hypothesis" or (
         len(args) > 2 and args[2] == "factor_hypothesis"
     )
+    assert "structured_schema" in kwargs
+
+
+def test_generate_parses_llm_call_result_content(mock_cfg, market_ctx):
+    """실제 LLMRouter 반환 타입(LLMCallResult.content)을 파싱한다."""
+    from src.mode_b.alpha_factor.idea_agent import Hypothesis, IdeaAgent
+
+    router = MagicMock()
+    router.call.return_value = LLMCallResult(
+        success=True,
+        model_used="gpt-4o",
+        content=json.dumps(
+            {
+                "observation": "수급과 변동성 동시 상승",
+                "knowledge": "수급 충격은 단기 모멘텀을 만들 수 있다",
+                "justification": "거래량 확대와 위험 회피가 동시에 관측된다",
+                "specification": "ts_zscore(foreign_net_buy, 20)",
+            },
+            ensure_ascii=False,
+        ),
+        latency_ms=1.0,
+    )
+    with patch("src.mode_b.alpha_factor.idea_agent.config_load", return_value=mock_cfg):
+        agent = IdeaAgent(llm_router=router)
+
+    result = agent.generate(market_ctx)
+
+    assert isinstance(result, Hypothesis)
+    assert result.observation == "수급과 변동성 동시 상승"
 
 
 # ---------------------------------------------------------------------------

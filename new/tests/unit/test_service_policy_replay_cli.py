@@ -55,10 +55,22 @@ def test_policy_with_research_overrides_enables_trade_probability_gate() -> None
         _policy(),
         trade_probability_gate="enable",
         min_trade_probability=0.35,
+        no_trade_score_spread=0.2,
+        top_k_fraction=0.25,
+        max_orders_per_cycle=2,
+        decision_stride_bars=30,
+        min_holding_bars=195,
+        rebalance_cooldown_bars=195,
     )
 
     assert policy.trade_probability_gate_enabled is True
     assert policy.min_trade_probability == pytest.approx(0.35)
+    assert policy.no_trade_score_spread == pytest.approx(0.2)
+    assert policy.top_k_fraction == pytest.approx(0.25)
+    assert policy.max_orders_per_cycle == 2
+    assert policy.decision_stride_bars == 30
+    assert policy.min_holding_bars == 195
+    assert policy.rebalance_cooldown_bars == 195
 
 
 def test_policy_with_research_overrides_rejects_invalid_probability() -> None:
@@ -68,6 +80,12 @@ def test_policy_with_research_overrides_rejects_invalid_probability() -> None:
         mod._policy_with_research_overrides(
             _policy(),
             min_trade_probability=1.1,
+        )
+
+    with pytest.raises(ValueError, match="top_k_fraction"):
+        mod._policy_with_research_overrides(
+            _policy(),
+            top_k_fraction=0.0,
         )
 
 
@@ -90,6 +108,14 @@ def test_run_service_policy_replay_passes_cli_policy_override(monkeypatch) -> No
                         captured["policy"].trade_probability_gate_enabled
                     ),
                     "min_trade_probability": captured["policy"].min_trade_probability,
+                    "no_trade_score_spread": captured["policy"].no_trade_score_spread,
+                    "top_k_fraction": captured["policy"].top_k_fraction,
+                    "max_orders_per_cycle": captured["policy"].max_orders_per_cycle,
+                    "decision_stride_bars": captured["policy"].decision_stride_bars,
+                    "min_holding_bars": captured["policy"].min_holding_bars,
+                    "rebalance_cooldown_bars": (
+                        captured["policy"].rebalance_cooldown_bars
+                    ),
                 },
             }
 
@@ -104,8 +130,58 @@ def test_run_service_policy_replay_passes_cli_policy_override(monkeypatch) -> No
         tickers=["005930"],
         trade_probability_gate="enable",
         min_trade_probability=0.35,
+        no_trade_score_spread=0.2,
+        top_k_fraction=0.25,
+        max_orders_per_cycle=2,
+        decision_stride_bars=30,
+        min_holding_bars=195,
+        rebalance_cooldown_bars=195,
     )
 
     assert report["status"] == "PASS"
     assert report["policy"]["trade_probability_gate_enabled"] is True
     assert report["policy"]["min_trade_probability"] == pytest.approx(0.35)
+    assert report["policy"]["no_trade_score_spread"] == pytest.approx(0.2)
+    assert report["policy"]["top_k_fraction"] == pytest.approx(0.25)
+    assert report["policy"]["max_orders_per_cycle"] == 2
+    assert report["policy"]["decision_stride_bars"] == 30
+    assert report["policy"]["min_holding_bars"] == 195
+    assert report["policy"]["rebalance_cooldown_bars"] == 195
+
+
+def test_run_service_policy_replay_allows_shared_engine_with_overrides(monkeypatch) -> None:
+    mod = _load_cli_module()
+
+    class _FakeSharedEngine:
+        def __init__(self) -> None:
+            self.policies: list[ServicePolicyConfig] = []
+
+        def with_policy(self, policy: ServicePolicyConfig):
+            self.policies.append(policy)
+            return self
+
+        def run(self, bundle_id, *, start_date=None, end_date=None, universe=None):
+            return {
+                "status": "PASS",
+                "bundle_id": bundle_id,
+                "policy": {
+                    "no_trade_score_spread": self.policies[-1].no_trade_score_spread,
+                    "top_k_fraction": self.policies[-1].top_k_fraction,
+                },
+            }
+
+    shared = _FakeSharedEngine()
+    monkeypatch.setattr(mod.ServicePolicyConfig, "from_config", lambda: _policy())
+
+    report = mod.run_service_policy_replay(
+        "BUNDLE-TEST",
+        write_report=False,
+        engine=shared,
+        no_trade_score_spread=0.03,
+        top_k_fraction=0.25,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["policy"]["no_trade_score_spread"] == pytest.approx(0.03)
+    assert report["policy"]["top_k_fraction"] == pytest.approx(0.25)
+    assert len(shared.policies) == 1

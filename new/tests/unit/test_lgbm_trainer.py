@@ -163,6 +163,23 @@ def test_normalize_yyyymmdd_accepts_hyphen() -> None:
     assert LGBMTrainer._normalize_yyyymmdd("20260107") == "20260107"
 
 
+def test_load_feature_cols_can_exclude_dual_source_keep_exogenous() -> None:
+    cols = trainer_module._load_feature_cols(
+        include_dual_source=False,
+        include_exogenous=True,
+    )
+    preprocessor_cfg = trainer_module.config_load("risk_config.yaml", "preprocessor")
+
+    assert all(
+        col not in cols
+        for col in preprocessor_cfg.get("dual_source_feature_cols", [])
+    )
+    assert all(
+        col in cols
+        for col in preprocessor_cfg.get("exogenous_feature_cols", [])
+    )
+
+
 # ====================================================================== #
 # Integration: end-to-end train
 # ====================================================================== #
@@ -208,12 +225,61 @@ def test_train_end_to_end_creates_baseline_pkl(trainer_small: LGBMTrainer) -> No
     assert metadata["target_horizon_kind"] == "minute"
     assert metadata["data_source"] == "artifact_bars"
     assert metadata["synthetic_fallback"] is False
-    # S4-2: trainer_small은 enabled_for_lgbm=False → 4피처 경로
-    assert len(metadata["feature_cols"]) == 4
+    # S4-2/Phase 4: trainer_small은 Dual-Source 비활성 + base quant 피처 경로
+    base_cols = trainer_module.config_load("risk_config.yaml", "preprocessor")["feature_cols"]
+    assert len(metadata["feature_cols"]) == len(base_cols)
     assert "feat_1m_close_robust_z" in metadata["feature_cols"]
     assert "feat_5m_ret" in metadata["feature_cols"]
     assert "feat_30m_vol" in metadata["feature_cols"]
     assert "feat_60m_trend" in metadata["feature_cols"]
+
+
+def test_train_persists_research_hyperparameter_overrides(
+    synthetic_data: Path,
+) -> None:
+    builder = DatasetBuilder(artifacts_dir=synthetic_data)
+    builder._ds_enabled_for_lgbm = False
+    splitter = WalkForwardSplitter()
+    splitter.train_window_days = 3
+    splitter.test_window_days = 1
+    splitter.step_days = 1
+    splitter.n_splits = 2
+    splitter.purge_bars = 0
+    splitter.embargo_bars = 0
+    registry = ModelRegistry(artifacts_dir=synthetic_data / "lgbm_overrides")
+    trainer = LGBMTrainer(
+        dataset_builder=builder,
+        splitter=splitter,
+        registry=registry,
+        lgbm_param_overrides={
+            "learning_rate": 0.03,
+            "num_leaves": 15,
+            "min_child_samples": 5,
+        },
+        training_control_overrides={
+            "n_estimators": 20,
+            "early_stopping_rounds": 5,
+        },
+    )
+    from src.utils.config_loader import load as _cfg_load
+
+    trainer.feature_cols = list(
+        _cfg_load("risk_config.yaml", "preprocessor")["feature_cols"]
+    )
+
+    trainer.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="override-test",
+    )
+
+    _, metadata = trainer.registry.load_latest()
+    assert metadata["lgbm_params"]["learning_rate"] == pytest.approx(0.03)
+    assert metadata["lgbm_params"]["num_leaves"] == 15
+    assert metadata["lgbm_params"]["min_child_samples"] == 5
+    assert metadata["training_control"]["n_estimators"] == 20
+    assert metadata["training_control"]["early_stopping_rounds"] == 5
 
 
 def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:
@@ -227,8 +293,12 @@ def test_train_predict_with_loaded_model(trainer_small: LGBMTrainer) -> None:
 
     booster, _ = trainer_small.registry.load_latest()
 
-    # dummy 4-feature matrix
-    X = np.array([[0.1, 0.2, 0.3, 0.4], [-0.1, 0.0, 0.1, -0.2]], dtype=float)
+    _, metadata = trainer_small.registry.load_latest()
+    feature_width = len(metadata["feature_cols"])
+    X = np.resize(
+        np.array([0.1, 0.2, 0.3, 0.4, -0.1, 0.0, 0.1, -0.2], dtype=float),
+        (2, feature_width),
+    )
     pred = booster.predict(X)
     assert pred.shape == (2,)
     assert np.all(np.isfinite(pred))
@@ -280,9 +350,11 @@ def test_train_accepts_cost_aware_target_override(
     if classifier["status"] == "PASS":
         assert Path(classifier["model_path"]).exists()
         assert result["trade_no_trade_classifier"]["model_path"] == classifier["model_path"]
-        assert classifier["calibration_status"] == "UNAVAILABLE"
+        assert classifier["calibration_status"] == "PASS"
         assert classifier["calibration_required_for_service_gate"] is True
-        assert classifier["deploy_gate_eligible"] is False
+        assert classifier["deploy_gate_eligible"] is True
+        assert classifier["calibration"]["scope"] == "walk_forward_oof"
+        assert classifier["calibration"]["n_oof_rows"] > 0
 
 
 def test_train_blocks_production_active_write_without_explicit_approval(

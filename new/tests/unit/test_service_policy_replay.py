@@ -11,6 +11,7 @@ from src.mode_b.backtest_diagnostics import (
     load_service_policy_evidence,
 )
 from src.mode_b.service_policy_verifier import (
+    current_service_policy_snapshot,
     service_policy_universe_hash,
     verify_service_policy_evidence,
 )
@@ -121,12 +122,14 @@ def test_sell_reduces_existing_holding_only() -> None:
 def test_policy_config_maps_risk_config_values() -> None:
     policy = ServicePolicyConfig.from_config()
     assert policy.max_orders_per_cycle == 3
-    assert policy.max_order_qty_per_order == 1
+    assert policy.max_order_qty_per_order == 2
+    assert policy.top_k_fraction == pytest.approx(0.25)
     assert policy.total_cost_bps == 15.0
     assert policy.daily_turnover_cap == 0.30
-    assert policy.decision_stride_bars == 30
+    assert policy.decision_stride_bars == 15
     assert policy.min_holding_bars == 195
     assert policy.rebalance_cooldown_bars == 195
+    assert policy.no_trade_score_spread == pytest.approx(0.027)
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is True
     assert policy.min_service_policy_sharpe == 0.0
@@ -413,6 +416,31 @@ def test_trade_probability_gate_missing_classifier_fails_closed() -> None:
     assert "trade_probability_classifier_missing" in result["gate"]["blockers"]
 
 
+def test_desired_tickers_handles_empty_candidates() -> None:
+    assert ServicePolicyReplayEngine._desired_tickers([], _policy()) == set()
+
+
+def test_replay_uses_ticker_tiebreak_for_equal_scores() -> None:
+    engine = ServicePolicyReplayEngine(
+        policy=_policy(top_k_fraction=1.0, max_orders_per_cycle=2)
+    )
+    panel = _panel([
+        ("005930", "2026-05-01 09:00:00", 1.0, 0.001, 100.0),
+        ("000660", "2026-05-01 09:00:00", 1.0, 0.001, 100.0),
+        ("042700", "2026-05-01 09:00:00", 1.0, 0.001, 100.0),
+    ])
+
+    result = engine._simulate_panel(
+        panel=panel,
+        model_callable=_model,
+        feature_cols=["feature_score"],
+        target_col="label_5m_ret",
+        policy=_policy(top_k_fraction=1.0, max_orders_per_cycle=2),
+    )
+
+    assert [order["ticker"] for order in result["orders"]] == ["000660", "005930"]
+
+
 def test_trade_probability_gate_uncalibrated_classifier_blocks() -> None:
     model, reason = ServicePolicyReplayEngine._load_trade_probability_model_with_reason({
         "metadata": {
@@ -520,6 +548,12 @@ def test_run_uses_candidate_metadata_target_col(monkeypatch) -> None:
     assert builder_kwargs["artifacts_dir"] == repo_root / "artifacts" / "data"
     assert builder_kwargs["dual_source_artifact_dir"] == repo_root / "artifacts" / "dual_source"
     assert builder_kwargs["exogenous_artifact_dir"] == repo_root / "artifacts" / "exogenous"
+    assert builder_kwargs["dual_source_enabled_for_lgbm"] is False
+    assert builder_kwargs["exogenous_enabled_for_lgbm"] is False
+    assert result["feature_join_policy"] == {
+        "include_dual_source_features": False,
+        "include_exogenous_features": False,
+    }
 
 
 def test_run_materializes_neutral_alpha_factor_features(monkeypatch) -> None:
@@ -854,6 +888,42 @@ def test_service_policy_verifier_accepts_matching_universe(tmp_path: Path) -> No
     )
 
     assert verification.status == "PASS"
+
+
+def test_service_policy_verifier_blocks_stale_policy_snapshot(tmp_path: Path) -> None:
+    report_path = tmp_path / "service_policy_replay_BUNDLE-TEST_20260512_123000.json"
+    stale_policy = current_service_policy_snapshot()
+    stale_policy["top_k_fraction"] = 0.04
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "bundle_id": "BUNDLE-TEST",
+                "gate": {"status": "PASS", "blockers": []},
+                "policy": stale_policy,
+                "policy_checks": {
+                    "deploy_candidate_by_service_policy": True,
+                    "no_naked_short_exposure": True,
+                    "order_caps_respected": True,
+                    "cash_guard_respected": True,
+                },
+                "order_stats": {"naked_short_attempts": 0},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    evidence = load_service_policy_evidence("BUNDLE-TEST", reports_dir=tmp_path)
+
+    verification = verify_service_policy_evidence(
+        evidence,
+        bundle_id="BUNDLE-TEST",
+        repo_root=tmp_path,
+    )
+
+    assert verification.status == "BLOCKED"
+    assert "service_policy_policy_stale:top_k_fraction" in verification.blockers
 
 
 def test_backtest_diagnostics_treats_string_false_flags_as_false(tmp_path: Path) -> None:

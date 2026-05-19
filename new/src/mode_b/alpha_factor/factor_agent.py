@@ -31,6 +31,18 @@ from src.utils.mode_guard import mode_b_only
 logger = get_logger("factor_agent")
 _KST = ZoneInfo("Asia/Seoul")
 
+
+def _llm_content(response: Any) -> str:
+    """LLMRouter의 LLMCallResult 또는 테스트용 str mock을 문자열로 정규화."""
+    if hasattr(response, "success") and hasattr(response, "content"):
+        if not bool(getattr(response, "success")):
+            raise RuntimeError(str(getattr(response, "error", "LLM_CALL_FAILED")))
+        content = getattr(response, "content", None)
+        if content is None:
+            raise RuntimeError("LLM_EMPTY_CONTENT")
+        return str(content)
+    return str(response)
+
 # ------------------------------------------------------------------ #
 # FactorCandidate dataclass
 # ------------------------------------------------------------------ #
@@ -256,8 +268,10 @@ class FactorAgent:
 
         prompt = self._build_prompt(hypothesis, previous_error)
         try:
-            return self._llm_router.call(
-                prompt, mode="mode_b", caller="factor_implementation"
+            return _llm_content(
+                self._llm_router.call(
+                    prompt, mode="mode_b", caller="factor_implementation"
+                )
             )
         except Exception as e:
             logger.warning("[factor_agent] LLM 호출 실패: %s. fallback 사용", e)

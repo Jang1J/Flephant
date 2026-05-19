@@ -803,6 +803,9 @@ def test_build_training_frame_happy_path(tmp_path: Path) -> None:
     for col in (
         "open", "high", "low", "close", "volume",
         "feat_1m_close_robust_z", "feat_5m_ret", "feat_30m_vol", "feat_60m_trend",
+        "feat_30m_ret", "feat_60m_ret", "feat_120m_ret", "feat_195m_ret",
+        "feat_session_vwap_gap", "feat_open_to_now_ret", "feat_session_high_pos",
+        "feat_volume_30m_z", "feat_volume_195m_z",
         "label_5m_ret", "cs_rank", "relevance",
     ):
         assert col in panel.columns, f"missing column: {col}"

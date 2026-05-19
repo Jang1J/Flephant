@@ -195,11 +195,13 @@ def test_init_config_values(agent_passive: QuantAgent) -> None:
     assert agent_passive._latency_window == 1000
     assert agent_passive._investor_flow_stale_sec == 1800
     assert agent_passive._multi_scale_windows == [1, 5, 30, 60]
-    assert agent_passive._feature_cols == [
+    assert agent_passive._feature_cols[:4] == [
         "feat_1m_close_robust_z",
         "feat_5m_ret",
         "feat_30m_vol",
         "feat_60m_trend",
+    ]
+    assert agent_passive._feature_cols[4:] == [
         "news_score_t",
         "comm_score_t_1",
         "comm_score_t_2",
@@ -889,26 +891,8 @@ def test_compute_features_returns_feat_prefix(agent_active: QuantAgent) -> None:
     bars = _make_bars("005930", n=65)
     feats = agent_active._compute_features(bars)
     assert feats is not None
-    assert set(feats.keys()) == {
-        "feat_1m_close_robust_z",
-        "feat_5m_ret",
-        "feat_30m_vol",
-        "feat_60m_trend",
-        "news_score_t",
-        "comm_score_t_1",
-        "comm_score_t_2",
-        "news_comm_divergence",
-        "community_noise_multiplier",
-        "us_sp500_change",
-        "us_nasdaq_change",
-        "us_vix",
-        "us_soxx_change",
-        "foreign_net_buy",
-        "institutional_net_buy",
-        "retail_net_buy",
-        "interest_rate",
-        "usd_krw",
-    }
+    assert set(agent_active._feature_cols).issubset(feats.keys())
+    assert "feat_195m_ret" in feats
     for col in agent_active._dual_source_feature_cols:
         expected = 1.0 if col == "community_noise_multiplier" else 0.0
         assert feats[col] == pytest.approx(expected)
@@ -917,6 +901,18 @@ def test_compute_features_returns_feat_prefix(agent_active: QuantAgent) -> None:
     for v in feats.values():
         assert isinstance(v, float)
         assert np.isfinite(v)
+
+
+def test_feature_window_limit_uses_model_feature_cols(agent_active: QuantAgent) -> None:
+    assert agent_active._feature_window_limit() == 60
+
+    agent_active._inference_feature_cols = [
+        "feat_1m_close_robust_z",
+        "feat_195m_ret",
+        "feat_volume_195m_z",
+    ]
+
+    assert agent_active._feature_window_limit() == 195
 
 
 def test_compute_features_none_on_short_bars(agent_active: QuantAgent) -> None:

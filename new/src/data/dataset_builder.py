@@ -139,6 +139,8 @@ class DatasetBuilder:
         exogenous_artifact_dir: Path | None = None,
         allow_synthetic_fallback: bool = False,
         synthetic_seed: int | None = None,
+        dual_source_enabled_for_lgbm: bool | None = None,
+        exogenous_enabled_for_lgbm: bool | None = None,
     ) -> None:
         self._artifacts_dir = artifacts_dir or _ARTIFACTS_ROOT
         self._dual_source_artifact_dir = dual_source_artifact_dir
@@ -186,6 +188,16 @@ class DatasetBuilder:
         self._multi_scale_windows: list[int] = list(
             self._cfg_preprocessor["multi_scale_windows"]
         )
+        self._intraday_feature_windows: list[int] = [
+            int(value)
+            for value in self._cfg_preprocessor.get("intraday_feature_windows", [])
+            if int(value) > 0
+        ]
+        self._volume_z_windows: list[int] = [
+            int(value)
+            for value in self._cfg_preprocessor.get("volume_z_windows", [])
+            if int(value) > 0
+        ]
         self._mad_constant: float = float(self._cfg_preprocessor["mad_constant"])
         self._outlier_cap_z: float = float(self._cfg_preprocessor["outlier_cap_z"])
 
@@ -194,13 +206,21 @@ class DatasetBuilder:
         # S4-2: Dual-Source 피처 주입 설정 (risk_config.yaml dual_source 섹션)
         _cfg_ds: dict = config_load("risk_config.yaml", "dual_source") or {}
         self._ds_enabled_for_lgbm: bool = safe_bool(
-            _cfg_ds.get("enabled_for_lgbm", False),
+            (
+                _cfg_ds.get("enabled_for_lgbm", False)
+                if dual_source_enabled_for_lgbm is None
+                else dual_source_enabled_for_lgbm
+            ),
             default=False,
         )
         self._ds_feature_cols: list[str] = list(DUAL_SOURCE_FEATURES)
         _cfg_exog: dict = config_load("risk_config.yaml", "exogenous_features") or {}
         self._exog_enabled_for_lgbm: bool = safe_bool(
-            _cfg_exog.get("enabled_for_lgbm", False),
+            (
+                _cfg_exog.get("enabled_for_lgbm", False)
+                if exogenous_enabled_for_lgbm is None
+                else exogenous_enabled_for_lgbm
+            ),
             default=False,
         )
         self._exog_feature_cols: list[str] = list(
@@ -230,6 +250,18 @@ class DatasetBuilder:
     def horizon_bars(self) -> int:
         """Label horizon (bars). yaml label.horizon_bars 값."""
         return self._horizon
+
+    def set_lgbm_feature_inclusion(
+        self,
+        *,
+        include_dual_source: bool | None = None,
+        include_exogenous: bool | None = None,
+    ) -> None:
+        """Research-only feature inclusion override without editing risk_config.yaml."""
+        if include_dual_source is not None:
+            self._ds_enabled_for_lgbm = safe_bool(include_dual_source, default=False)
+        if include_exogenous is not None:
+            self._exog_enabled_for_lgbm = safe_bool(include_exogenous, default=False)
 
     @property
     def target_col(self) -> str:
@@ -719,13 +751,14 @@ class DatasetBuilder:
     # ================================================================== #
 
     def _compute_rolling_features(self, raw):
-        """단일 ticker raw OHLCV DataFrame → 4 피처 컬럼 추가.
+        """단일 ticker raw OHLCV DataFrame → PIT-safe quant 피처 컬럼 추가.
 
         feat_1m_close_robust_z: 60m rolling MAD robust Z of close
         feat_5m_ret: close_t / close_{t-5} - 1
         feat_30m_vol: rolling std(close_{t-29..t}) / rolling mean
         feat_60m_trend: rolling 60-bar linear slope / mean
         """
+        pd = _import_pandas()
         df = raw.copy()
         closes = df["close"].to_numpy(dtype=float)
         n = len(closes)
@@ -744,13 +777,27 @@ class DatasetBuilder:
             five_min_ret[w5:] = ratio
         df["feat_5m_ret"] = five_min_ret
 
+        for window in self._intraday_feature_windows:
+            col = f"feat_{window}m_ret"
+            ret_values = np.full(n, np.nan, dtype=float)
+            if n > window:
+                prev = closes[:-window]
+                curr = closes[window:]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = np.where(prev > 1e-8, curr / prev - 1.0, 0.0)
+                ret_values[window:] = ratio
+            df[col] = ret_values
+
         # feat_30m_vol (multi_scale_windows[2] = 30, rolling std normalized by mean).
         # min_periods는 risk_config.yaml preprocessor.rolling_min_periods 경유.
         min_periods = int(self._cfg_preprocessor.get("rolling_min_periods", 5))
         close_series = df["close"].astype(float)
-        roll_mean = close_series.rolling(window=w30, min_periods=min_periods).mean()
-        roll_std = close_series.rolling(window=w30, min_periods=min_periods).std(ddof=1)
-        df["feat_30m_vol"] = (roll_std / roll_mean.replace(0, np.nan)).to_numpy()
+        for window in sorted(set([w30, *self._intraday_feature_windows])):
+            roll_mean = close_series.rolling(window=window, min_periods=min_periods).mean()
+            roll_std = close_series.rolling(window=window, min_periods=min_periods).std(ddof=1)
+            df[f"feat_{window}m_vol"] = (
+                roll_std / roll_mean.replace(0, np.nan)
+            ).to_numpy()
 
         # feat_60m_trend (multi_scale_windows[3] = 60, rolling linear slope / mean)
         df["feat_60m_trend"] = self._rolling_trend(closes, window=w60).tolist()
@@ -759,6 +806,49 @@ class DatasetBuilder:
         df["feat_1m_close_robust_z"] = self._rolling_robust_z(
             closes, window=w60
         ).tolist()
+
+        volume_series = df["volume"].astype(float)
+        for window in self._volume_z_windows:
+            roll_mean = volume_series.rolling(window=window, min_periods=min_periods).mean()
+            roll_std = volume_series.rolling(window=window, min_periods=min_periods).std(ddof=1)
+            z_values = (volume_series - roll_mean) / roll_std.replace(0, np.nan)
+            df[f"feat_volume_{window}m_z"] = z_values.clip(
+                lower=-self._outlier_cap_z,
+                upper=self._outlier_cap_z,
+            ).to_numpy()
+
+        if "ts_close" in df.columns:
+            ts = pd.to_datetime(df["ts_close"])
+            session_key = ts.dt.strftime("%Y%m%d")
+            session_open_close = close_series.groupby(session_key).transform("first")
+            df["feat_open_to_now_ret"] = (
+                close_series / session_open_close.replace(0, np.nan) - 1.0
+            ).to_numpy()
+
+            pv = close_series * volume_series
+            cumulative_pv = pv.groupby(session_key).cumsum()
+            cumulative_volume = volume_series.groupby(session_key).cumsum()
+            session_vwap = cumulative_pv / cumulative_volume.replace(0, np.nan)
+            df["feat_session_vwap_gap"] = (
+                close_series / session_vwap.replace(0, np.nan) - 1.0
+            ).to_numpy()
+
+            cumulative_high = df["high"].astype(float).groupby(session_key).cummax()
+            cumulative_low = df["low"].astype(float).groupby(session_key).cummin()
+            session_range = (cumulative_high - cumulative_low).replace(0, np.nan)
+            high_pos = (close_series - cumulative_low) / session_range
+            df["feat_session_high_pos"] = high_pos.clip(lower=0.0, upper=1.0).to_numpy()
+        else:
+            df["feat_open_to_now_ret"] = np.nan
+            df["feat_session_vwap_gap"] = np.nan
+            df["feat_session_high_pos"] = np.nan
+
+        feature_cols = [
+            col for col in self._cfg_preprocessor.get("feature_cols", [])
+            if col in df.columns
+        ]
+        if feature_cols:
+            df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
 
         return df
 

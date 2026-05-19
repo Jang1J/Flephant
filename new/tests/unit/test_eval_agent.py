@@ -8,9 +8,11 @@ PIT-Safety: forward_returns = close.pct_change(1).shift(-1) 사용 확인.
 from __future__ import annotations
 
 from dataclasses import fields
+from unittest.mock import MagicMock
 
 import pytest
 
+from src.orchestration.llm_router import LLMCallResult
 from src.mode_b.alpha_factor.eval_agent import (
     EvalAgent,
     EvalResult,
@@ -315,6 +317,25 @@ def test_hypothesis_misalignment_failure(simple_hypothesis, monkeypatch):
         f"expected 'hypothesis_misalignment', got '{result.failure_category}'"
     )
     assert result.passed is False
+
+
+def test_llm_score_alignment_uses_mode_b_and_llm_call_result() -> None:
+    """EvalAgent alignment GPT 호출은 mode_b/factor_evaluation이며 content를 파싱한다."""
+    router = MagicMock()
+    router.call.return_value = LLMCallResult(
+        success=True,
+        model_used="gpt-4o",
+        content="0.25",
+        latency_ms=1.0,
+    )
+    agent = EvalAgent(llm_router=router)
+
+    score = agent._llm_score_alignment("hypothesis", "factor code", "C")
+
+    assert score == 0.25
+    _, kwargs = router.call.call_args
+    assert kwargs["mode"] == "mode_b"
+    assert kwargs["caller"] == "factor_evaluation"
 
 
 # ------------------------------------------------------------------ #

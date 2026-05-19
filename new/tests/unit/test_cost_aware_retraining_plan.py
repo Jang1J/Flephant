@@ -139,6 +139,18 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
         plan["recommended_experiment"]["target_col_override"]
         == "label_session_close_net_ret"
     )
+    assert plan["recommended_target"] == "label_session_close_net_ret"
+    assert plan["recommended_target_candidate"] == "label_session_close_net_ret"
+    assert plan["recommended_horizon"] == "session_close"
+    assert plan["feature_policy"]["dual_source_features_enabled"] is False
+    assert plan["feature_policy"]["exogenous_features_enabled"] is True
+    assert plan["model_parameter_optimization"]["status"] == "READY"
+    assert plan["model_parameter_optimization"]["production_registry_mutated"] is False
+    assert len(plan["model_parameter_optimization"]["candidates"]) == 3
+    first_param_command = plan["model_parameter_optimization"]["candidates"][0]["command"]
+    assert "--target-col-override label_session_close_net_ret" in first_param_command
+    assert "--disable-dual-source-features" in first_param_command
+    assert "--learning-rate 0.03" in first_param_command
     assert plan["recommended_experiment"]["active_horizon_mean_net_bps"] == -14.0
     assert "20260508" not in plan["next_commands"][0]
     assert plan["research_registry"] == {
@@ -153,11 +165,13 @@ def test_cost_aware_plan_uses_newer_phase2_backfill_over_stale_input(
     assert "python -m src.models.lgbm_trainer" in research_command
     assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in research_command
     assert "--target-col-override label_session_close_net_ret" in research_command
+    assert "--disable-dual-source-features" in research_command
     staged_command = plan["next_commands"][2]
     assert "new/scripts/post_backfill_prelive.py" in staged_command
     assert "--bundle-id BUNDLE-TEST" in staged_command
     assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in staged_command
     assert "--target-col-override label_session_close_net_ret" in staged_command
+    assert "--disable-dual-source-features" in staged_command
     assert "--run-paper-balance" in staged_command
     assert "--allow-production-candidate-write" not in staged_command
     assert plan["recommended_experiment"]["do_not_auto_deploy"] is True
@@ -548,6 +562,12 @@ def test_cost_aware_plan_allows_research_training_with_neutral_phase2_features(
     assert phase2_evidence["blocking"] is False
     assert phase2_evidence["predeploy_blocking"] is True
     assert plan["recommended_experiment"]["target_col_override"] == "label_30m_net_ret"
+    assert plan["recommended_target"] == "label_30m_net_ret"
+    assert plan["recommended_target_candidate"] == "label_30m_net_ret"
+    assert plan["recommended_horizon"] == "30"
+    assert plan["feature_policy"]["dual_source_features_enabled"] is False
+    assert plan["model_parameter_optimization"]["status"] == "READY"
+    assert len(plan["model_parameter_optimization"]["candidates"]) == 3
     assert "python -m src.models.lgbm_trainer" in plan["next_commands"][1]
     assert "--registry-dir artifacts/lgbm_research/BUNDLE-TEST" in plan["next_commands"][1]
     assert "--target-col-override label_30m_net_ret" in plan["next_commands"][1]

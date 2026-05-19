@@ -44,7 +44,19 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PRODUCTION_LGBM_DIR = _REPO_ROOT / "artifacts" / "lgbm"
 
 
-def _load_feature_cols() -> list[str]:
+def _feature_enabled(section: str, override: bool | None) -> bool:
+    cfg = config_load("risk_config.yaml", section) or {}
+    return safe_bool(
+        cfg.get("enabled_for_lgbm", False) if override is None else override,
+        default=False,
+    )
+
+
+def _load_feature_cols(
+    *,
+    include_dual_source: bool | None = None,
+    include_exogenous: bool | None = None,
+) -> list[str]:
     """risk_config.yaml preprocessor.feature_cols에서 로드 (불변 원칙 5).
 
     S4-2: dual_source.enabled_for_lgbm=true 시 dual_source_feature_cols도 병합.
@@ -55,16 +67,14 @@ def _load_feature_cols() -> list[str]:
     base_cols: list[str] = list(cfg["feature_cols"])
 
     # S4-2: Dual-Source 5피처 병합 (enabled_for_lgbm 플래그)
-    ds_cfg = config_load("risk_config.yaml", "dual_source") or {}
-    if safe_bool(ds_cfg.get("enabled_for_lgbm", False), default=False):
+    if _feature_enabled("dual_source", include_dual_source):
         ds_cols: list[str] = list(cfg.get("dual_source_feature_cols", []))
         # 중복 방지: base에 없는 피처만 추가
         for col in ds_cols:
             if col not in base_cols:
                 base_cols.append(col)
 
-    exog_cfg = config_load("risk_config.yaml", "exogenous_features") or {}
-    if safe_bool(exog_cfg.get("enabled_for_lgbm", False), default=False):
+    if _feature_enabled("exogenous_features", include_exogenous):
         exog_cols: list[str] = list(cfg.get("exogenous_feature_cols", []))
         for col in exog_cols:
             if col not in base_cols:
@@ -86,14 +96,45 @@ class LGBMTrainer:
         registry: ModelRegistry | None = None,
         allow_production_active_write: bool = False,
         allow_production_candidate_write: bool = False,
+        lgbm_param_overrides: dict[str, Any] | None = None,
+        training_control_overrides: dict[str, int] | None = None,
+        include_dual_source_features: bool | None = None,
+        include_exogenous_features: bool | None = None,
     ) -> None:
-        self.builder = dataset_builder or DatasetBuilder()
+        self.builder = dataset_builder or DatasetBuilder(
+            dual_source_enabled_for_lgbm=include_dual_source_features,
+            exogenous_enabled_for_lgbm=include_exogenous_features,
+        )
+        if dataset_builder is not None and (
+            include_dual_source_features is not None
+            or include_exogenous_features is not None
+        ):
+            self.builder.set_lgbm_feature_inclusion(
+                include_dual_source=include_dual_source_features,
+                include_exogenous=include_exogenous_features,
+            )
         self.splitter = splitter or WalkForwardSplitter()
         self.registry = registry or ModelRegistry()
         self._allow_production_active_write = bool(allow_production_active_write)
         self._allow_production_candidate_write = bool(allow_production_candidate_write)
+        self._include_dual_source_features = _feature_enabled(
+            "dual_source",
+            include_dual_source_features,
+        )
+        self._include_exogenous_features = _feature_enabled(
+            "exogenous_features",
+            include_exogenous_features,
+        )
+        self._lgbm_param_overrides: dict[str, Any] = dict(lgbm_param_overrides or {})
+        self._training_control_overrides: dict[str, int] = {
+            str(key): int(value)
+            for key, value in (training_control_overrides or {}).items()
+        }
 
-        self.feature_cols: list[str] = _load_feature_cols()
+        self.feature_cols: list[str] = _load_feature_cols(
+            include_dual_source=include_dual_source_features,
+            include_exogenous=include_exogenous_features,
+        )
         # target_col / top_k_fraction은 yaml 경유 (불변 원칙 5).
         self.target_col: str = str(config_load("risk_config.yaml", "label")["target_col"])
         self.top_k_fraction: float = float(
@@ -195,8 +236,8 @@ class LGBMTrainer:
         # 3. fold별 학습
         # lightgbm lazy import: 데이터/manifest/fold guard를 먼저 통과한 뒤 실제 학습 직전에만 로드.
         lgb = get_lightgbm()
-        params = build_lgbm_params()
-        tc = get_training_control()
+        params = build_lgbm_params(overrides=self._lgbm_param_overrides)
+        tc = self._training_control()
         fold_metrics: list[dict[str, float]] = []
         best_iterations: list[int] = []
         last_booster = None
@@ -243,8 +284,16 @@ class LGBMTrainer:
         # 5. Registry 저장
         if last_booster is None:
             raise RuntimeError("학습 실패: last_booster None")
-        final_train_panel = panel.sort_index(level="ts_close")
         final_num_boost_round = self._final_num_boost_round(best_iterations, tc)
+        trade_classifier_calibration = self._trade_classifier_oof_calibration(
+            panel,
+            folds,
+            params,
+            lgb,
+            target_col=effective_target_col,
+            num_boost_round=final_num_boost_round,
+        )
+        final_train_panel = panel.sort_index(level="ts_close")
         final_booster = self._train_final_model(
             final_train_panel,
             params,
@@ -258,6 +307,7 @@ class LGBMTrainer:
             version=version,
             target_col=effective_target_col,
             num_boost_round=final_num_boost_round,
+            calibration=trade_classifier_calibration,
         )
 
         preprocessor_cfg = config_load("risk_config.yaml", "preprocessor")
@@ -271,6 +321,8 @@ class LGBMTrainer:
             "feature_manifest": {
                 "feature_cols": list(self.feature_cols),
                 "panel_columns_checked": True,
+                "include_dual_source_features": self._include_dual_source_features,
+                "include_exogenous_features": self._include_exogenous_features,
                 "requires_dual_source": bool(
                     feature_set
                     & set(preprocessor_cfg.get("dual_source_feature_cols", []))
@@ -405,6 +457,7 @@ class LGBMTrainer:
         version: str,
         target_col: str,
         num_boost_round: int,
+        calibration: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         objective_cfg = (config_load("risk_config.yaml", "cost_aware_retraining") or {}).get(
             "objective",
@@ -466,19 +519,176 @@ class LGBMTrainer:
             model_path = str(classifier_path.resolve().relative_to(_REPO_ROOT))
         except ValueError:
             model_path = str(classifier_path)
+        calibration_evidence = calibration or {
+            "calibration_status": "UNAVAILABLE",
+            "calibration_reason": "oof_calibration_missing",
+        }
+        calibration_status = str(
+            calibration_evidence.get("calibration_status") or "UNAVAILABLE"
+        )
         return {
             **base,
             "status": "PASS",
             "model_path": model_path,
-            "calibration_status": "UNAVAILABLE",
+            "calibration_status": calibration_status,
             "calibration_required_for_service_gate": True,
-            "deploy_gate_eligible": False,
-            "calibration_reason": "full_train_classifier_without_oof_calibration",
+            "deploy_gate_eligible": calibration_status == "PASS",
+            "calibration_reason": calibration_evidence.get("calibration_reason"),
+            "calibration": calibration_evidence,
             "n_train_rows": int(len(y)),
             "positive_rate": positive_rate,
             "class_counts": class_counts,
             "params": binary_params,
         }
+
+    def _trade_classifier_oof_calibration(
+        self,
+        panel,
+        folds: list[tuple[Any, Any]],
+        params: dict[str, Any],
+        lgb,
+        *,
+        target_col: str,
+        num_boost_round: int,
+    ) -> dict[str, Any] | None:
+        objective_cfg = (config_load("risk_config.yaml", "cost_aware_retraining") or {}).get(
+            "objective",
+            {},
+        )
+        enabled = safe_bool(
+            (objective_cfg or {}).get("trade_no_trade_classifier"),
+            default=False,
+        )
+        if not enabled:
+            return None
+        tradeable_col = self._tradeable_col_for_target(target_col)
+        if tradeable_col is None:
+            return {
+                "calibration_status": "UNAVAILABLE",
+                "calibration_reason": "unsupported_target_col",
+            }
+        if tradeable_col not in panel.columns:
+            return {
+                "calibration_status": "UNAVAILABLE",
+                "calibration_reason": "tradeable_label_missing",
+            }
+
+        binary_params = self._binary_classifier_params(params)
+        y_true_all: list[int] = []
+        y_prob_all: list[float] = []
+        fold_summaries: list[dict[str, Any]] = []
+        skipped_folds = 0
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            train_panel = panel.iloc[train_idx].sort_index(level="ts_close")
+            val_panel = panel.iloc[val_idx].sort_index(level="ts_close")
+            train_work = train_panel[self.feature_cols + [tradeable_col]].replace(
+                [np.inf, -np.inf],
+                np.nan,
+            ).dropna(subset=self.feature_cols + [tradeable_col])
+            val_work = val_panel[self.feature_cols + [tradeable_col]].replace(
+                [np.inf, -np.inf],
+                np.nan,
+            ).dropna(subset=self.feature_cols + [tradeable_col])
+            if train_work.empty or val_work.empty:
+                skipped_folds += 1
+                continue
+            y_train = (
+                train_work[tradeable_col]
+                .astype(float)
+                .round()
+                .clip(0, 1)
+                .astype(int)
+            )
+            y_val = (
+                val_work[tradeable_col]
+                .astype(float)
+                .round()
+                .clip(0, 1)
+                .astype(int)
+            )
+            if y_train.nunique() < 2 or y_val.empty:
+                skipped_folds += 1
+                continue
+            ds = lgb.Dataset(
+                train_work[self.feature_cols].to_numpy(dtype=float),
+                label=y_train.to_numpy(dtype=int),
+                free_raw_data=False,
+            )
+            booster = lgb.train(
+                binary_params,
+                ds,
+                num_boost_round=max(1, int(num_boost_round)),
+            )
+            raw_prob = np.asarray(
+                booster.predict(val_work[self.feature_cols].to_numpy(dtype=float)),
+                dtype=float,
+            ).reshape(-1)
+            finite_mask = np.isfinite(raw_prob)
+            if not finite_mask.any():
+                skipped_folds += 1
+                continue
+            y_val_np = y_val.to_numpy(dtype=int)[finite_mask]
+            prob_np = np.clip(raw_prob[finite_mask], 0.0, 1.0)
+            y_true_all.extend(int(v) for v in y_val_np)
+            y_prob_all.extend(float(v) for v in prob_np)
+            fold_summaries.append({
+                "fold": fold_idx,
+                "n_val_rows": int(len(y_val_np)),
+                "positive_rate": float(np.mean(y_val_np)) if len(y_val_np) else 0.0,
+                "brier": float(np.mean((prob_np - y_val_np) ** 2)),
+            })
+
+        if not y_true_all:
+            return {
+                "calibration_status": "UNAVAILABLE",
+                "calibration_reason": "no_oof_classifier_rows",
+                "skipped_folds": skipped_folds,
+            }
+        y_true_arr = np.asarray(y_true_all, dtype=int)
+        y_prob_arr = np.asarray(y_prob_all, dtype=float)
+        class_counts = {
+            str(label): int(count)
+            for label, count in zip(
+                *np.unique(y_true_arr, return_counts=True),
+                strict=True,
+            )
+        }
+        if len(class_counts) < 2:
+            return {
+                "calibration_status": "UNAVAILABLE",
+                "calibration_reason": "single_class_oof_labels",
+                "n_oof_rows": int(len(y_true_arr)),
+                "class_counts": class_counts,
+                "skipped_folds": skipped_folds,
+            }
+        return {
+            "calibration_status": "PASS",
+            "calibration_reason": "walk_forward_oof_classifier",
+            "scope": "walk_forward_oof",
+            "n_oof_rows": int(len(y_true_arr)),
+            "n_oof_folds": len(fold_summaries),
+            "skipped_folds": skipped_folds,
+            "positive_rate": float(np.mean(y_true_arr)),
+            "class_counts": class_counts,
+            "brier": float(np.mean((y_prob_arr - y_true_arr) ** 2)),
+            "auc": self._binary_auc(y_true_arr, y_prob_arr),
+            "folds": fold_summaries,
+        }
+
+    @staticmethod
+    def _binary_auc(y_true: np.ndarray, y_score: np.ndarray) -> float | None:
+        positives = y_true == 1
+        negatives = y_true == 0
+        n_pos = int(np.sum(positives))
+        n_neg = int(np.sum(negatives))
+        if n_pos == 0 or n_neg == 0:
+            return None
+        import pandas as pd_
+
+        ranks = pd_.Series(y_score).rank(method="average").to_numpy(dtype=float)
+        rank_sum_pos = float(np.sum(ranks[positives]))
+        auc = (rank_sum_pos - n_pos * (n_pos + 1) / 2.0) / float(n_pos * n_neg)
+        return float(auc)
 
     def _uses_production_registry(self) -> bool:
         base_dir = Path(getattr(self.registry, "base_dir", ""))
@@ -537,6 +747,17 @@ class LGBMTrainer:
         if best_iterations:
             return max(1, int(np.median(best_iterations)))
         return max(1, int(tc["n_estimators"]))
+
+    def _training_control(self) -> dict[str, int]:
+        control = get_training_control()
+        for key, value in self._training_control_overrides.items():
+            if key not in control:
+                raise ValueError(f"unknown training control override: {key}")
+            parsed = int(value)
+            if parsed <= 0:
+                raise ValueError(f"training control override must be positive: {key}")
+            control[key] = parsed
+        return control
 
     def _train_final_model(
         self,
@@ -745,6 +966,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="bundle_id 없는 active/latest production 저장을 명시 허용",
     )
+    p.add_argument("--num-leaves", type=int, default=None)
+    p.add_argument("--learning-rate", type=float, default=None)
+    p.add_argument("--min-child-samples", type=int, default=None)
+    p.add_argument("--subsample", type=float, default=None)
+    p.add_argument("--colsample-bytree", type=float, default=None)
+    p.add_argument("--n-estimators", type=int, default=None)
+    p.add_argument("--early-stopping-rounds", type=int, default=None)
+    p.add_argument(
+        "--disable-dual-source-features",
+        action="store_true",
+        help="Research run only: exclude Dual-Source features without editing risk_config.yaml",
+    )
+    p.add_argument(
+        "--disable-exogenous-features",
+        action="store_true",
+        help="Research run only: exclude exogenous features without editing risk_config.yaml",
+    )
     return p.parse_args(argv)
 
 
@@ -762,6 +1000,33 @@ def _uses_production_registry(registry_dir: Path | None) -> bool:
         return registry_dir.resolve() == _PRODUCTION_LGBM_DIR.resolve()
     except OSError:
         return registry_dir == _PRODUCTION_LGBM_DIR
+
+
+def _collect_lgbm_param_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    for arg_name, param_name in (
+        ("num_leaves", "num_leaves"),
+        ("learning_rate", "learning_rate"),
+        ("min_child_samples", "min_child_samples"),
+        ("subsample", "subsample"),
+        ("colsample_bytree", "colsample_bytree"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            overrides[param_name] = value
+    return overrides
+
+
+def _collect_training_control_overrides(args: argparse.Namespace) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    for arg_name, control_name in (
+        ("n_estimators", "n_estimators"),
+        ("early_stopping_rounds", "early_stopping_rounds"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            overrides[control_name] = int(value)
+    return overrides
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -794,6 +1059,14 @@ def main(argv: list[str] | None = None) -> int:
         registry=registry,
         allow_production_active_write=bool(args.allow_production_active_write),
         allow_production_candidate_write=bool(args.allow_production_candidate_write),
+        lgbm_param_overrides=_collect_lgbm_param_overrides(args),
+        training_control_overrides=_collect_training_control_overrides(args),
+        include_dual_source_features=(
+            False if bool(args.disable_dual_source_features) else None
+        ),
+        include_exogenous_features=(
+            False if bool(args.disable_exogenous_features) else None
+        ),
     )
     try:
         result = trainer.train(

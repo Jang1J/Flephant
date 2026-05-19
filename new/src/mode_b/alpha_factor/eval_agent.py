@@ -38,6 +38,18 @@ from src.utils.mode_guard import mode_b_only
 
 logger = get_logger("eval_agent")
 
+
+def _llm_content(response: Any) -> str:
+    """LLMRouter의 LLMCallResult 또는 테스트용 str mock을 문자열로 정규화."""
+    if hasattr(response, "success") and hasattr(response, "content"):
+        if not bool(getattr(response, "success")):
+            raise RuntimeError(str(getattr(response, "error", "LLM_CALL_FAILED")))
+        content = getattr(response, "content", None)
+        if content is None:
+            raise RuntimeError("LLM_EMPTY_CONTENT")
+        return str(content)
+    return str(response)
+
 # ------------------------------------------------------------------ #
 # EvalResult dataclass
 # ------------------------------------------------------------------ #
@@ -313,7 +325,7 @@ class EvalAgent:
             response = self._llm_router.call(
                 prompt, mode="mode_b", caller="factor_evaluation"
             )
-            score = float(str(response).strip().split()[0])
+            score = float(_llm_content(response).strip().split()[0])
             return max(0.0, min(score, 1.0))
         except Exception as e:
             logger.warning("[eval_agent] alignment LLM 호출 실패: %s. fallback=0.5", e)

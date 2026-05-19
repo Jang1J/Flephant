@@ -14,6 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.orchestration.llm_router import LLMCallResult
+
 # ------------------------------------------------------------------ #
 # 경로 설정
 # ------------------------------------------------------------------ #
@@ -246,7 +248,32 @@ def test_llm_router_called_with_factor_implementation(
     calls = mock_router.call.call_args_list
     assert len(calls) >= 1
     _, kwargs = calls[0]
+    assert kwargs.get("mode") == "mode_b"
     assert kwargs.get("caller") == "factor_implementation"
+
+
+def test_implement_parses_llm_call_result_content(
+    tmp_factor_agent: FactorAgent, sample_hypothesis: Hypothesis
+):
+    """실제 LLMRouter 반환 타입(LLMCallResult.content)을 factor 코드로 사용한다."""
+    valid_code = (
+        "```python\n"
+        "def factor(df):\n"
+        "    return rank(df['close'])\n"
+        "```"
+    )
+    mock_router = MagicMock()
+    mock_router.call.return_value = LLMCallResult(
+        success=True,
+        model_used="gpt-4o",
+        content=valid_code,
+        latency_ms=1.0,
+    )
+    tmp_factor_agent._llm_router = mock_router
+
+    candidate = tmp_factor_agent.implement(sample_hypothesis)
+
+    assert candidate.status == "active"
 
 
 # ------------------------------------------------------------------ #

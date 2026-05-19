@@ -113,7 +113,9 @@ class ServicePolicyConfig:
 
         return cls(
             initial_capital=float(backtest_cfg.get("initial_capital", 100_000_000.0)),
-            top_k_fraction=float(eval_cfg.get("top_k_fraction", 0.25)),
+            top_k_fraction=float(
+                replay_cfg.get("top_k_fraction", eval_cfg.get("top_k_fraction", 0.25))
+            ),
             max_orders_per_cycle=int(paper_auto_cfg.get("max_orders_per_cycle", 3)),
             max_order_qty_per_order=int(paper_auto_cfg.get("max_order_qty_per_order", 1)),
             max_names=int(position_cfg.get("max_names", 10)),
@@ -159,6 +161,24 @@ class ServicePolicyConfig:
         )
 
 
+@dataclass(frozen=True)
+class _PreparedReplayContext:
+    """Policy-independent replay inputs that are safe to reuse in sweeps."""
+
+    replay_start: str
+    replay_end: str
+    active_universe: list[str]
+    model_callable: Any
+    candidate_artifact: dict[str, Any]
+    feature_cols: list[str]
+    target_col: str
+    panel: Any
+    include_dual_source: bool
+    include_exogenous: bool
+    trade_probability_model: Any | None
+    trade_probability_unavailable_reason: str | None
+
+
 class ServicePolicyReplayEngine:
     """Replay a candidate bundle under KIS paper cash-account constraints."""
 
@@ -168,10 +188,21 @@ class ServicePolicyReplayEngine:
         artifacts_root: Path | None = None,
         engine: BacktestEngine | None = None,
         policy: ServicePolicyConfig | None = None,
+        prepared_cache: dict[tuple[Any, ...], _PreparedReplayContext] | None = None,
     ) -> None:
         self._artifacts_root = artifacts_root or _ARTIFACTS_ROOT
         self._engine = engine or BacktestEngine(artifacts_root=self._artifacts_root)
         self._policy = policy or ServicePolicyConfig.from_config()
+        self._prepared_cache = prepared_cache if prepared_cache is not None else {}
+
+    def with_policy(self, policy: ServicePolicyConfig) -> "ServicePolicyReplayEngine":
+        """Return a policy variant that reuses loaded model/panel state."""
+        return ServicePolicyReplayEngine(
+            artifacts_root=self._artifacts_root,
+            engine=self._engine,
+            policy=policy,
+            prepared_cache=self._prepared_cache,
+        )
 
     def run(
         self,
@@ -196,17 +227,82 @@ class ServicePolicyReplayEngine:
         if not active_universe:
             raise DataUnavailable("active universe is empty")
 
+        context = self._prepare_context(
+            bundle_id=bundle_id,
+            replay_start=replay_start,
+            replay_end=replay_end,
+            active_universe=active_universe,
+        )
+        result = self._simulate_panel(
+            panel=context.panel,
+            model_callable=context.model_callable,
+            feature_cols=context.feature_cols,
+            target_col=context.target_col,
+            policy=self._policy,
+            trade_probability_model=context.trade_probability_model,
+            trade_probability_unavailable_reason=(
+                context.trade_probability_unavailable_reason
+            ),
+        )
+        result.update({
+            "schema_version": "1.0.0",
+            "kind": "service_policy_replay",
+            "bundle_id": bundle_id,
+            "model_version": self._model_version_from_artifact(context.candidate_artifact),
+            "candidate_artifact": context.candidate_artifact,
+            "date_range": {"start": replay_start, "end": replay_end},
+            "universe": active_universe,
+            "universe_count": len(active_universe),
+            "universe_hash": service_policy_universe_hash(active_universe),
+            "universe_policy": (
+                "operator_override" if universe is not None else "final_dataset_gate"
+            ),
+            "target_col": context.target_col,
+            "feature_join_policy": {
+                "include_dual_source_features": context.include_dual_source,
+                "include_exogenous_features": context.include_exogenous,
+            },
+            "valid_rows": int(len(context.panel)),
+            "external_kis_api": False,
+            "registry_mutated": False,
+            "generated_at": datetime.now(_KST).isoformat(),
+        })
+        return result
+
+    def _prepare_context(
+        self,
+        *,
+        bundle_id: str,
+        replay_start: str,
+        replay_end: str,
+        active_universe: list[str],
+    ) -> _PreparedReplayContext:
+        cache_key = (str(bundle_id), str(replay_start), str(replay_end), tuple(active_universe))
+        cached = self._prepared_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         model_callable, _, candidate_artifact = self._engine._resolve_candidate_model(bundle_id)
         feature_cols = [str(col) for col in candidate_artifact.get("feature_cols", []) or []]
         if not feature_cols:
             raise BundleLoadFailed("candidate feature_cols empty")
 
-        from src.data.dataset_builder import DatasetBuilder
+        from src.data.dataset_builder import (
+            DUAL_SOURCE_FEATURES,
+            EXOGENOUS_FEATURES,
+            DatasetBuilder,
+        )
+
+        feature_set = set(feature_cols)
+        include_dual_source = bool(feature_set & set(DUAL_SOURCE_FEATURES))
+        include_exogenous = bool(feature_set & set(EXOGENOUS_FEATURES))
 
         builder = DatasetBuilder(
             artifacts_dir=self._artifacts_root / "data",
             dual_source_artifact_dir=self._artifacts_root / "dual_source",
             exogenous_artifact_dir=self._artifacts_root / "exogenous",
+            dual_source_enabled_for_lgbm=include_dual_source,
+            exogenous_enabled_for_lgbm=include_exogenous,
         )
         add_neutral_candidate_alpha_features(builder, feature_cols)
         panel = self._engine._build_replay_panel(
@@ -234,35 +330,22 @@ class ServicePolicyReplayEngine:
         trade_probability_model, trade_probability_unavailable_reason = (
             self._load_trade_probability_model_with_reason(candidate_artifact)
         )
-        result = self._simulate_panel(
-            panel=panel,
+        context = _PreparedReplayContext(
+            replay_start=replay_start,
+            replay_end=replay_end,
+            active_universe=list(active_universe),
             model_callable=model_callable,
+            candidate_artifact=candidate_artifact,
             feature_cols=feature_cols,
             target_col=target_col,
-            policy=self._policy,
+            panel=panel,
+            include_dual_source=include_dual_source,
+            include_exogenous=include_exogenous,
             trade_probability_model=trade_probability_model,
             trade_probability_unavailable_reason=trade_probability_unavailable_reason,
         )
-        result.update({
-            "schema_version": "1.0.0",
-            "kind": "service_policy_replay",
-            "bundle_id": bundle_id,
-            "model_version": self._model_version_from_artifact(candidate_artifact),
-            "candidate_artifact": candidate_artifact,
-            "date_range": {"start": replay_start, "end": replay_end},
-            "universe": active_universe,
-            "universe_count": len(active_universe),
-            "universe_hash": service_policy_universe_hash(active_universe),
-            "universe_policy": (
-                "operator_override" if universe is not None else "final_dataset_gate"
-            ),
-            "target_col": target_col,
-            "valid_rows": int(len(panel)),
-            "external_kis_api": False,
-            "registry_mutated": False,
-            "generated_at": datetime.now(_KST).isoformat(),
-        })
-        return result
+        self._prepared_cache[cache_key] = context
+        return context
 
     def _resolve_replay_window(
         self,
@@ -606,7 +689,7 @@ class ServicePolicyReplayEngine:
                 ticker for ticker, qty in holdings.items()
                 if qty > 0 and ticker not in desired and ticker in price_by_ticker
             ]
-            held_not_desired.sort(key=lambda ticker: pred_by_ticker.get(ticker, 0.0))
+            held_not_desired.sort(key=lambda ticker: (pred_by_ticker.get(ticker, 0.0), ticker))
             for ticker in held_not_desired:
                 if orders_this_cycle >= policy.max_orders_per_cycle:
                     break
@@ -658,7 +741,7 @@ class ServicePolicyReplayEngine:
                 orders.append(order)
                 orders_this_cycle += 1
 
-            desired_sorted = sorted(desired, key=lambda ticker: pred_by_ticker[ticker], reverse=True)
+            desired_sorted = sorted(desired, key=lambda ticker: (-pred_by_ticker[ticker], ticker))
             for ticker in desired_sorted:
                 if orders_this_cycle >= policy.max_orders_per_cycle:
                     break
@@ -922,6 +1005,8 @@ class ServicePolicyReplayEngine:
         policy: ServicePolicyConfig,
     ) -> set[str]:
         n_assets = len(bar_preds)
+        if n_assets <= 0:
+            return set()
         k_by_fraction = max(1, int(n_assets * policy.top_k_fraction))
         k = max(1, min(policy.max_orders_per_cycle, k_by_fraction))
         if policy.no_trade_score_spread > 0:
@@ -950,7 +1035,7 @@ class ServicePolicyReplayEngine:
             if not eligible:
                 return set()
             bar_preds = eligible
-        top = sorted(bar_preds, key=lambda item: item[1], reverse=True)[:k]
+        top = sorted(bar_preds, key=lambda item: (-item[1], item[0]))[:k]
         return {ticker for ticker, _, _, _ in top}
 
     @staticmethod

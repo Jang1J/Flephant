@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from src.utils.safe_cast import safe_bool, safe_int
+from src.utils.config_loader import load as config_load
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 from src.utils.ticker_utils import pad_ticker
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -86,6 +87,8 @@ def verify_service_policy_evidence(
         )
         blockers.extend(universe_blockers)
 
+    blockers.extend(_verify_current_policy_binding(report))
+
     status = str(evidence.get("status") or report.get("status") or "")
     gate = _merge_mapping(report.get("gate"), evidence.get("gate"))
     checks = _merge_mapping(report.get("policy_checks"), evidence.get("policy_checks"))
@@ -151,6 +154,85 @@ def service_policy_universe_hash(tickers: list[str] | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def current_service_policy_snapshot() -> dict[str, Any]:
+    """Return the current SSOT service-policy knobs used by deploy gates.
+
+    This intentionally duplicates only the gate-relevant subset instead of
+    importing ``ServicePolicyConfig`` to avoid a circular dependency:
+    ``service_policy_replay`` imports universe helpers from this module.
+    """
+    replay_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
+    paper_auto_cfg = config_load("risk_config.yaml", "paper_auto_trading") or {}
+    eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
+    return {
+        "top_k_fraction": safe_float(
+            replay_cfg.get("top_k_fraction", eval_cfg.get("top_k_fraction", 0.25)),
+            default=0.25,
+            min_value=0.0,
+        ),
+        "max_orders_per_cycle": safe_int(
+            paper_auto_cfg.get("max_orders_per_cycle", 3),
+            default=3,
+            min_value=1,
+        ),
+        "max_order_qty_per_order": safe_int(
+            paper_auto_cfg.get("max_order_qty_per_order", 1),
+            default=1,
+            min_value=1,
+        ),
+        "decision_stride_bars": safe_int(
+            replay_cfg.get("decision_stride_bars", 1),
+            default=1,
+            min_value=1,
+        ),
+        "min_holding_bars": safe_int(
+            replay_cfg.get("min_holding_bars", 0),
+            default=0,
+            min_value=0,
+        ),
+        "rebalance_cooldown_bars": safe_int(
+            replay_cfg.get("rebalance_cooldown_bars", 0),
+            default=0,
+            min_value=0,
+        ),
+        "no_trade_score_spread": safe_float(
+            replay_cfg.get("no_trade_score_spread", 0.0),
+            default=0.0,
+            min_value=0.0,
+        ),
+        "allow_position_pyramiding": safe_bool(
+            replay_cfg.get("allow_position_pyramiding", False),
+            default=False,
+        ),
+        "turnover_budget_hard_stop": safe_bool(
+            replay_cfg.get("turnover_budget_hard_stop", True),
+            default=True,
+        ),
+        "min_expected_net_alpha_bps": safe_float(
+            replay_cfg.get("min_expected_net_alpha_bps", 0.0),
+            default=0.0,
+            min_value=0.0,
+        ),
+        "expected_net_alpha_source": str(
+            replay_cfg.get("expected_net_alpha_source", "rank_score")
+        ),
+        "min_service_policy_sharpe": safe_float(
+            replay_cfg.get("min_service_policy_sharpe", 0.0),
+            default=0.0,
+        ),
+        "trade_probability_gate_enabled": safe_bool(
+            replay_cfg.get("trade_probability_gate_enabled", False),
+            default=False,
+        ),
+        "min_trade_probability": safe_float(
+            replay_cfg.get("min_trade_probability", 0.5),
+            default=0.5,
+            min_value=0.0,
+            max_value=1.0,
+        ),
+    }
+
+
 def _resolve_report_path(evidence: dict[str, Any], root: Path) -> Path | None:
     """Resolve persisted service-policy report path with portable fallbacks.
 
@@ -177,6 +259,33 @@ def _resolve_report_path(evidence: dict[str, Any], root: Path) -> Path | None:
         if path.exists():
             return path
     return candidates[0] if candidates else None
+
+
+def _verify_current_policy_binding(report: dict[str, Any]) -> list[str]:
+    policy = report.get("policy") if isinstance(report, dict) else None
+    if not isinstance(policy, dict) or not policy:
+        return []
+
+    expected = current_service_policy_snapshot()
+    blockers: list[str] = []
+    for key, expected_value in expected.items():
+        if key not in policy:
+            blockers.append(f"service_policy_policy_key_missing:{key}")
+            continue
+        observed_value = policy.get(key)
+        if not _policy_values_equal(observed_value, expected_value):
+            blockers.append(f"service_policy_policy_stale:{key}")
+    return blockers
+
+
+def _policy_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(right, bool):
+        return safe_bool(left, default=not right) is right
+    if isinstance(right, int) and not isinstance(right, bool):
+        return safe_int(left, default=right - 1) == right
+    if isinstance(right, float):
+        return abs(safe_float(left, default=right + 1.0) - right) <= 1e-12
+    return str(left) == str(right)
 
 
 def _merge_mapping(primary: Any, fallback: Any) -> dict[str, Any]:

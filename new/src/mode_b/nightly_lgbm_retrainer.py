@@ -55,6 +55,8 @@ class NightlyLGBMRetrainer:
         *,
         registry_dir: str | Path | None = None,
         allow_production_candidate_write: bool = False,
+        include_dual_source_features: bool | None = None,
+        include_exogenous_features: bool | None = None,
     ) -> None:
         cfg = config_load("risk_config.yaml", "nightly_retrainer") or {}
         self._tickers: list[str] = list(cfg.get("tickers", []))
@@ -62,6 +64,8 @@ class NightlyLGBMRetrainer:
         self._max_alpha_factors: int = int(cfg.get("max_alpha_factors", 5))
         self._registry_dir = self._resolve_registry_dir(registry_dir)
         self._allow_production_candidate_write = bool(allow_production_candidate_write)
+        self._include_dual_source_features = include_dual_source_features
+        self._include_exogenous_features = include_exogenous_features
         self._synthetic_fallback_enabled: bool = safe_bool(
             cfg.get("synthetic_fallback_enabled", False),
             default=False,
@@ -221,9 +225,13 @@ class NightlyLGBMRetrainer:
             dataset_builder=DatasetBuilder(
                 allow_synthetic_fallback=self._synthetic_fallback_enabled,
                 synthetic_seed=self._synthetic_seed,
+                dual_source_enabled_for_lgbm=self._include_dual_source_features,
+                exogenous_enabled_for_lgbm=self._include_exogenous_features,
             ),
             registry=registry,
             allow_production_candidate_write=self._allow_production_candidate_write,
+            include_dual_source_features=self._include_dual_source_features,
+            include_exogenous_features=self._include_exogenous_features,
         )
 
     @staticmethod

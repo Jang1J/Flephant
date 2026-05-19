@@ -186,6 +186,7 @@ def _staged_retrain_gate_command(
     end_date: str | None,
     tickers: list[str],
     target_col_override: str | None,
+    disable_dual_source_features: bool = False,
 ) -> str:
     registry_dir = _research_registry_dir(bundle_id)
     business_days = _final_dataset_business_days()
@@ -204,6 +205,8 @@ def _staged_retrain_gate_command(
         parts.append(f"--max-tickers {max_tickers}")
     if target_col_override:
         parts.append(f"--target-col-override {target_col_override}")
+    if disable_dual_source_features:
+        parts.append("--disable-dual-source-features")
     return " ".join(parts)
 
 
@@ -214,11 +217,16 @@ def _research_training_command(
     end_date: str | None,
     tickers: list[str],
     target_col_override: str | None,
+    version_suffix: str | None = None,
+    lgbm_overrides: dict[str, object] | None = None,
+    disable_dual_source_features: bool = False,
 ) -> str:
     registry_dir = _research_registry_dir(bundle_id)
     version = "cost-aware-research"
     if target_col_override:
         version = target_col_override.replace("label_", "cost-aware-").replace("_net_ret", "")
+    if version_suffix:
+        version = f"{version}-{version_suffix}"
     parts = [
         "ELEPHANT_MODE=mode_b PYTHONPATH=new python -m src.models.lgbm_trainer",
         f"--tickers {','.join(tickers)}",
@@ -232,7 +240,75 @@ def _research_training_command(
         parts.append(f"--end {end_date}")
     if target_col_override:
         parts.append(f"--target-col-override {target_col_override}")
+    if disable_dual_source_features:
+        parts.append("--disable-dual-source-features")
+    for flag, value in (lgbm_overrides or {}).items():
+        parts.append(f"--{flag} {value}")
     return " ".join(parts)
+
+
+def _model_parameter_candidates(
+    *,
+    bundle_id: str,
+    start_date: str | None,
+    end_date: str | None,
+    tickers: list[str],
+    target_col_override: str | None,
+    disable_dual_source_features: bool = False,
+) -> list[dict[str, object]]:
+    if not target_col_override:
+        return []
+    candidates = [
+        {
+            "name": "lr003-leaves63-child50",
+            "params": {
+                "learning-rate": 0.03,
+                "num-leaves": 63,
+                "min-child-samples": 50,
+                "subsample": 0.8,
+                "colsample-bytree": 0.8,
+                "n-estimators": 800,
+                "early-stopping-rounds": 50,
+            },
+        },
+        {
+            "name": "lr005-leaves31-child50",
+            "params": {
+                "learning-rate": 0.05,
+                "num-leaves": 31,
+                "min-child-samples": 50,
+                "subsample": 0.8,
+                "colsample-bytree": 0.8,
+                "n-estimators": 600,
+                "early-stopping-rounds": 50,
+            },
+        },
+        {
+            "name": "lr002-leaves127-child100",
+            "params": {
+                "learning-rate": 0.02,
+                "num-leaves": 127,
+                "min-child-samples": 100,
+                "subsample": 0.7,
+                "colsample-bytree": 0.8,
+                "n-estimators": 1000,
+                "early-stopping-rounds": 80,
+            },
+        },
+    ]
+    for row in candidates:
+        params = dict(row["params"])
+        row["command"] = _research_training_command(
+            bundle_id=bundle_id,
+            start_date=start_date,
+            end_date=end_date,
+            tickers=tickers,
+            target_col_override=target_col_override,
+            version_suffix=str(row["name"]),
+            lgbm_overrides=params,
+            disable_dual_source_features=disable_dual_source_features,
+        )
+    return candidates
 
 
 def _horizon_report(label_scan: dict[str, Any] | None, horizon: object) -> dict[str, Any]:
@@ -475,6 +551,9 @@ def build_retraining_plan(
         "predeploy_status": predeploy_status,
         "deployment_status": deployment_status,
         "safe_to_auto_deploy": False,
+        "recommended_target": target_col_override,
+        "recommended_target_candidate": target_col_candidate,
+        "recommended_horizon": best_horizon,
         "generated_at": datetime.now(_KST).isoformat(),
         "bundle_id": bundle_id,
         "read_only": True,
@@ -500,6 +579,26 @@ def build_retraining_plan(
             "generation_version": label_cfg.get("generation_version"),
         },
         "candidate_horizons": cfg.get("horizon_candidates", []),
+        "feature_policy": {
+            "main_experiment": "ohlcv_exogenous",
+            "dual_source_features_enabled": False,
+            "exogenous_features_enabled": True,
+            "reason": "historical community coverage is neutral, so Dual-Source is reserved for later ablation.",
+        },
+        "model_parameter_optimization": {
+            "status": "READY" if pretraining_status == "READY" and target_col_override else "BLOCKED",
+            "scope": "research_registry_only",
+            "production_registry_mutated": False,
+            "selection_rule": "compare trainer proxy metrics first, then C12 real backtest in Mode B",
+            "candidates": _model_parameter_candidates(
+                bundle_id=bundle_id,
+                start_date=final_window["start_date"],
+                end_date=final_window["end_date"],
+                tickers=final_tickers,
+                target_col_override=target_col_override,
+                disable_dual_source_features=True,
+            ),
+        },
         "objective": {
             "net_of_cost_target": safe_bool(
                 objective_cfg.get("net_of_cost_target", True),
@@ -599,12 +698,14 @@ def build_retraining_plan(
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
                 target_col_override=target_col_override,
+                disable_dual_source_features=True,
             ),
             _staged_retrain_gate_command(
                 bundle_id=bundle_id,
                 end_date=final_window["end_date"],
                 tickers=final_tickers,
                 target_col_override=target_col_override,
+                disable_dual_source_features=True,
             ),
         ],
     }
