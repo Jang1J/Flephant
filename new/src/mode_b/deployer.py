@@ -137,6 +137,39 @@ _OPTIONAL_COMPONENT_PATH = {
     ),
 }
 
+def _active_service_policy_universe() -> list[str]:
+    cfg = config_load("risk_config.yaml", "backtest_agent") or {}
+    gate_cfg = cfg.get("deploy_decision_gate", {}).get("final_dataset_gate", {}) or {}
+    universe_cfg = config_load("universe_config.yaml") or {}
+    include_pending = bool(gate_cfg.get("include_pending_data_tickers", False))
+    allowed_stock = {"active"}
+    allowed_sector = {"confirmed"}
+    if include_pending:
+        allowed_stock = {
+            str(s)
+            for s in gate_cfg.get("allowed_stock_statuses", ["active", "pending_data"])
+        }
+        allowed_sector = {
+            str(s)
+            for s in gate_cfg.get(
+                "allowed_sector_statuses",
+                ["confirmed", "confirmed_pending_data"],
+            )
+        }
+    tickers: list[str] = []
+    for sector in (universe_cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict):
+            continue
+        if str(sector.get("status")) not in allowed_sector:
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict):
+                continue
+            if str(stock.get("status")) in allowed_stock:
+                ticker = str(stock.get("ticker", "")).zfill(6)
+                if ticker != "000000":
+                    tickers.append(ticker)
+    return sorted(dict.fromkeys(tickers))
 
 class ModeBDeployer:
     """C14 ModeBDeployer: 22:00 배포 게이트 실구현.
@@ -374,12 +407,18 @@ class ModeBDeployer:
                 ),
             )
 
+
     def _check_service_policy_gate(self, evidence: dict[str, Any], *, bundle_id: str) -> None:
         """Block production deploy unless service-policy replay is PASS."""
         verification = verify_service_policy_evidence(
             evidence,
             bundle_id=bundle_id,
             repo_root=self._repo_root_for_evidence(),
+            expected_date_range=(
+                evidence.get("service_policy_expected_date_range")
+                or evidence.get("date_range")
+            ),
+            expected_universe=_active_service_policy_universe(),
         )
         if not verification.passed:
             raise DeployBlocked(

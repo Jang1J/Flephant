@@ -5,6 +5,7 @@ Stage 내부 로직(Alpha Factor Engine, Co-STEER 등)은 Sprint 3 S3-1+ 에서 
 현재 각 stage는 기반 인프라(bundle_id, 상태 전이, audit_log, timeout)가 실동작.
 """
 from __future__ import annotations
+from src.mode_b.deployer import _active_service_policy_universe
 
 import concurrent.futures
 import json
@@ -887,6 +888,13 @@ class ModeBScheduler:
                 policy_verification = verify_service_policy_evidence(
                     self._current_service_policy_evidence,
                     bundle_id=self._bundle_id or "BUNDLE-UNKNOWN",
+                    expected_date_range=(
+                        (self._current_service_policy_evidence or {}).get(
+                            "service_policy_expected_date_range"
+                        )
+                        or (self._current_service_policy_evidence or {}).get("date_range")
+                    ),
+                    expected_universe=_active_service_policy_universe(),
                 )
                 if not policy_verification.passed:
                     return {

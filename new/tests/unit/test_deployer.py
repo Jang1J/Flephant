@@ -175,6 +175,11 @@ def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) ->
     """Production deploy용 service-policy hard gate PASS fixture."""
     import hashlib
 
+    from src.mode_b.deployer import _active_service_policy_universe
+    from src.mode_b.service_policy_verifier import service_policy_universe_hash
+
+    universe = _active_service_policy_universe()
+    universe_hash = service_policy_universe_hash(universe)
     report = {
         "status": "PASS",
         "bundle_id": bundle_id,
@@ -186,6 +191,10 @@ def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) ->
             "cash_guard_respected": True,
         },
         "order_stats": {"naked_short_attempts": 0},
+        "universe": list(universe),
+        "universe_count": len(universe),
+        "universe_hash": universe_hash,
+        "universe_policy": "final_dataset_gate",
     }
     path = root / "artifacts" / "reports" / "service_policy_replay" / "pass.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +208,10 @@ def _passing_service_policy_evidence(root: Path, bundle_id: str = _BUNDLE_ID) ->
         "gate": dict(report["gate"]),
         "policy_checks": dict(report["policy_checks"]),
         "order_stats": dict(report["order_stats"]),
+        "universe": list(universe),
+        "universe_count": len(universe),
+        "universe_hash": universe_hash,
+        "universe_policy": "final_dataset_gate",
     }
 
 
