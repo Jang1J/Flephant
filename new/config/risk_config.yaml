@@ -1032,7 +1032,7 @@ post_close_data_update:
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"
-    last_updated: "2026-05-19"
+    last_updated: "2026-05-21"
     updated_by: "codex_post_close_update_orchestrator"
     mode_b_editable: false
     human_approval_required: false
@@ -1106,14 +1106,15 @@ service_policy_replay:
     backup_retention_days: 365
     update_trigger: "manual_review_then_mode_b_replay"
     rationale: "KIS paper cash-account replay의 거래 빈도/회전율 제약. 변경 시 성과 비교 불가하므로 C12/service-policy 전체 재실행 필요."
-  # 2026-05-19 deterministic sweep (BUNDLE-20260518-195M0001, 20250917~20251021):
-  # top_k=0.25 kept order caps/cooldown intact while improving service-policy replay
-  # from +23.45bps/SR 5.19 to +47.31bps/SR 7.21. Re-run C12/C14 after changes.
-  top_k_fraction: 0.25
+  # 2026-05-21 deterministic sweep (BUNDLE-20260521-POSTCLOSE, 20250922~20251024):
+  # top_k=0.10 + spread=0.020 kept order caps/cooldown intact while improving
+  # service-policy replay from +34.35bps/SR 7.92 to +38.45bps/SR 8.54.
+  # Re-run C12/C14 after changes.
+  top_k_fraction: 0.10
   decision_stride_bars: 15
   min_holding_bars: 195
   rebalance_cooldown_bars: 195
-  no_trade_score_spread: 0.027
+  no_trade_score_spread: 0.020
   allow_position_pyramiding: false
   turnover_budget_hard_stop: true
   min_expected_net_alpha_bps: 15.0

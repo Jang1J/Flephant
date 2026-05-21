@@ -123,13 +123,13 @@ def test_policy_config_maps_risk_config_values() -> None:
     policy = ServicePolicyConfig.from_config()
     assert policy.max_orders_per_cycle == 3
     assert policy.max_order_qty_per_order == 2
-    assert policy.top_k_fraction == pytest.approx(0.25)
+    assert policy.top_k_fraction == pytest.approx(0.10)
     assert policy.total_cost_bps == 15.0
     assert policy.daily_turnover_cap == 0.30
     assert policy.decision_stride_bars == 15
     assert policy.min_holding_bars == 195
     assert policy.rebalance_cooldown_bars == 195
-    assert policy.no_trade_score_spread == pytest.approx(0.027)
+    assert policy.no_trade_score_spread == pytest.approx(0.020)
     assert policy.allow_position_pyramiding is False
     assert policy.turnover_budget_hard_stop is True
     assert policy.min_service_policy_sharpe == 0.0
