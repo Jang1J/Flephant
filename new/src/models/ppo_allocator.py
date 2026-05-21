@@ -148,8 +148,12 @@ class PPOAllocator:
                 trade_probability_gate=trade_gate,
             )
 
-        # 2. Cross-sectional confidence (softmax 기반, heuristic_v1)
-        confidence = self._compute_confidence(scores)
+        # 2. Cross-sectional confidence: Quant이 emit한 LightGBM tree variance 기반 값을
+        # 우선 사용 (C7 + architecture.md L1239 "LightGBM confidence" SSOT). 누락 시
+        # 기존 softmax(scores) fallback.
+        confidence = self._extract_confidence(quant_output, scores)
+        if confidence is None:
+            confidence = self._compute_confidence(scores)
 
         # 3. min_confidence 필터
         filtered, rejected = self._apply_min_confidence(scores, confidence)
@@ -253,6 +257,48 @@ class PPOAllocator:
     # ================================================================== #
     # Internal: confidence / filter / top-k / weights
     # ================================================================== #
+
+    @staticmethod
+    def _extract_confidence(
+        quant_output: dict[str, Any] | list[dict[str, Any]],
+        scores: dict[str, float],
+    ) -> dict[str, float] | None:
+        """Quant이 emit한 confidence를 그대로 읽음. 없으면 None.
+
+        지원 포맷:
+          - dict: quant_output["confidences"] = {ticker: float}
+          - list (C7): [{ticker, score, confidence}, ...]
+        scores에 등장한 ticker만 반환. 누락 ticker는 None 반환 사유로 간주하지 않고
+        0.0으로 채움 (PPO _apply_min_confidence에서 자연 reject).
+        """
+        if not scores:
+            return None
+
+        raw: dict[str, float] = {}
+        if isinstance(quant_output, dict):
+            conf_map = quant_output.get("confidences")
+            if isinstance(conf_map, dict):
+                for t, v in conf_map.items():
+                    if v is None:
+                        continue
+                    try:
+                        raw[pad_ticker(str(t))] = float(v)
+                    except (TypeError, ValueError):
+                        continue
+        elif isinstance(quant_output, list):
+            for item in quant_output:
+                if not isinstance(item, dict) or "ticker" not in item:
+                    continue
+                if "confidence" not in item or item["confidence"] is None:
+                    continue
+                try:
+                    raw[pad_ticker(str(item["ticker"]))] = float(item["confidence"])
+                except (TypeError, ValueError):
+                    continue
+
+        if not raw:
+            return None
+        return {t: raw.get(t, 0.0) for t in scores}
 
     @staticmethod
     def _compute_confidence(scores: dict[str, float]) -> dict[str, float]:

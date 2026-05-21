@@ -141,6 +141,38 @@ def test_allocate_all_below_min_confidence(allocator: PPOAllocator) -> None:
     assert result["metadata"]["reason"] == "all_below_min_confidence"
 
 
+def test_allocate_uses_quant_confidences_when_provided(allocator: PPOAllocator) -> None:
+    """Quant이 emit한 confidences를 PPO가 우선 사용한다 (architecture.md L1239 SSOT).
+
+    동일 score 3종목이지만 confidences가 다르면 min_confidence 필터가 다르게 동작.
+    softmax fallback이라면 3종 균등(0.333)이 되어 모두 통과되지만, Quant confidence
+    중 한 종목만 threshold 미달이면 그 종목만 reject된다.
+    """
+    scores = {"005930": 1.0, "000660": 1.0, "035420": 1.0}
+    qo = _quant_output(scores)
+    qo["confidences"] = {"005930": 0.5, "000660": 0.5, "035420": 0.001}
+
+    result = allocator.allocate(qo)
+    weights = result["allocation_plan"]["target_weights"]
+    rejected = result["metadata"]["rejected"]
+    assert "035420" not in weights
+    assert {item["ticker"]: item["reason"] for item in rejected
+            if item["reason"] == "below_min_confidence"} == {
+        "035420": "below_min_confidence",
+    }
+
+
+def test_allocate_falls_back_to_softmax_when_confidences_missing(
+    allocator: PPOAllocator,
+) -> None:
+    """quant_output에 confidences 키가 없으면 기존 softmax(scores) fallback 작동."""
+    scores = {"005930": 10.0, "000660": 10.0, "035420": 10.0}
+    qo = _quant_output(scores)  # confidences 미주입
+    result = allocator.allocate(qo)
+    # softmax 균등 ≈ 0.333 → min_confidence(0.03) 통과 → 3종목 전부 포함
+    assert set(result["allocation_plan"]["target_weights"].keys()) == set(scores.keys())
+
+
 def test_trade_probability_gate_filters_low_probability(allocator: PPOAllocator) -> None:
     allocator._trade_probability_gate_enabled = True
     allocator._min_trade_probability = 0.6
