@@ -45,6 +45,7 @@ def test_external_rehearsal_skips_cycle_when_preflight_blocked(monkeypatch) -> N
     )
     args = argparse.Namespace(
         internal_fake_kis=False,
+        bundle_id="BUNDLE-TEST",
         tickers="005930",
         cycles=1,
         interval_sec=0.0,
@@ -56,6 +57,8 @@ def test_external_rehearsal_skips_cycle_when_preflight_blocked(monkeypatch) -> N
     report = paper_auto_service_rehearsal.build_report(args)
 
     assert report["status"] == "BLOCKED"
+    assert report["bundle_id"] == "BUNDLE-TEST"
+    assert report["model_bundle_id"] is None
     assert report["stages"]["paper_auto_cycle"]["status"] == "SKIP"
 
 

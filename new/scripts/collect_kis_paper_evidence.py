@@ -145,6 +145,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
     rehearsal_args = Namespace(
         internal_fake_kis=False,
+        bundle_id=args.bundle_id,
         tickers=args.tickers,
         cycles=int(args.cycles),
         interval_sec=float(args.interval_sec),

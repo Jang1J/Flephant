@@ -69,6 +69,7 @@ def test_collect_kis_paper_evidence_forwards_cold_risk_report(monkeypatch) -> No
     def fake_service_rehearsal(args):
         calls["cold_risk_report"] = args.cold_risk_report
         calls["tickers"] = args.tickers
+        calls["bundle_id"] = args.bundle_id
         return {"status": "PASS"}
 
     monkeypatch.setattr(collect_kis_paper_evidence, "PaperTradingRunner", FakeRunner)
@@ -104,6 +105,7 @@ def test_collect_kis_paper_evidence_forwards_cold_risk_report(monkeypatch) -> No
     assert report["status"] == "PASS"
     assert calls["cold_risk_report"] == "artifacts/reports/community_live_risk/example.json"
     assert calls["tickers"] == "005930,000660"
+    assert calls["bundle_id"] == "BUNDLE-TEST"
 
 
 def test_collect_kis_paper_evidence_converts_service_exception_to_blocked(

@@ -97,11 +97,14 @@ class _FakeKIS:
 
 
 class _FakeHotRunner:
-    def __init__(self) -> None:
+    def __init__(self, bundle_id: str | None = None) -> None:
         self.state = SimpleNamespace(value="BOOTSTRAP")
         self._quant = SimpleNamespace(
             has_model=True,
-            model_metadata={"version": "paper_active", "bundle_id": "PAPER-REHEARSAL"},
+            model_metadata={
+                "version": "paper_active",
+                "bundle_id": str(bundle_id or "PAPER-REHEARSAL"),
+            },
         )
 
     def start(self) -> None:
@@ -231,6 +234,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     if args.registry_dir:
         os.environ["ELEPHANT_LGBM_REGISTRY_DIR"] = str(args.registry_dir)
 
+    requested_bundle_id = (
+        str(getattr(args, "bundle_id", "") or "").strip() or None
+    )
     preflight = paper_auto_preflight.build_report(registry_dir=args.registry_dir)
     run_cycle = bool(args.internal_fake_kis) or preflight.get("status") == "PASS"
     stages: dict[str, Any] = {"preflight": preflight}
@@ -244,11 +250,17 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         hot_runner = (
             None
             if use_real_hot_runner
-            else (_FakeHotRunner() if args.internal_fake_kis else None)
+            else (
+                _FakeHotRunner(bundle_id=requested_bundle_id)
+                if args.internal_fake_kis
+                else None
+            )
         )
         trader_kwargs: dict[str, Any] = {}
         if args.internal_fake_kis:
             trader_kwargs["now_fn"] = lambda: datetime(2026, 5, 12, 10, 0, 0, tzinfo=_KST)
+        if requested_bundle_id:
+            trader_kwargs["required_bundle_id"] = requested_bundle_id
         trader = PaperAutoTrader(
             kis_client=kis_client,
             hot_runner=hot_runner,
@@ -287,6 +299,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(active_model, dict)
         else None
     )
+    report_bundle_id = requested_bundle_id or bundle_id
     evidence_level = "external_kis_virtual"
     if args.internal_fake_kis and use_real_hot_runner:
         evidence_level = "internal_fake_kis_real_hot_runner"
@@ -296,7 +309,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "status": status,
         "action": "paper_auto_service_rehearsal",
         "generated_at": datetime.now(_KST).isoformat(),
-        "bundle_id": bundle_id,
+        "bundle_id": report_bundle_id,
+        "model_bundle_id": bundle_id,
         "evidence_level": evidence_level,
         "external_kis_api": not bool(args.internal_fake_kis),
         "real_hot_runner": use_real_hot_runner,
@@ -312,6 +326,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Paper-auto service rehearsal")
     parser.add_argument("--internal-fake-kis", action="store_true")
+    parser.add_argument("--bundle-id", default=None)
     parser.add_argument("--tickers", default="005930")
     parser.add_argument("--cycles", type=int, default=1)
     parser.add_argument("--interval-sec", type=float, default=0.0)
