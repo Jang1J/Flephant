@@ -192,6 +192,7 @@ def test_init_active_mode_loads_model(agent_active: QuantAgent) -> None:
 def test_init_config_values(agent_passive: QuantAgent) -> None:
     assert agent_passive._warmup_bars == 60
     assert agent_passive._anomaly_zscore_threshold == 3.0
+    assert agent_passive._volume_zscore_threshold == 3.5
     assert agent_passive._latency_window == 1000
     assert agent_passive._investor_flow_stale_sec == 1800
     assert agent_passive._multi_scale_windows == [1, 5, 30, 60]
@@ -1012,6 +1013,85 @@ def test_detect_anomalies_warmup_insufficient(agent_active: QuantAgent) -> None:
         agent_active.on_bar(bar)
     anomalies = agent_active.detect_anomalies(["005930"], asof="2026-04-20T09:29:00+09:00")
     assert anomalies == []
+
+
+def test_detect_anomalies_noisy_volume_detects_spike(agent_active: QuantAgent) -> None:
+    """noisy volume + config threshold 초과 spike → volume_spike anomaly 1건.
+
+    spike value는 config volume_zscore_threshold + 2.0 margin 기반으로 동적 계산한다.
+    config 값이 바뀌어도 테스트 robust. 가격은 변화 없게 두어 intraday_drop은 트리거 안 함.
+    """
+    threshold = agent_active._volume_zscore_threshold
+
+    rng = np.random.default_rng(11)
+    bars = _make_bars("005930", n=65, seed=11)
+    for b in bars:
+        b["volume"] = float(1000.0 + rng.normal(0, 100))
+    for bar in bars:
+        agent_active.on_bar(bar)
+
+    hist_volumes = np.array([b["volume"] for b in bars])
+    hist_mean = float(hist_volumes.mean())
+    hist_std = float(hist_volumes.std(ddof=0))
+    spike_volume = hist_mean + (threshold + 2.0) * hist_std
+
+    last_close = bars[-1]["close"]
+    spike_bar = {
+        "ticker": "005930",
+        "ts_close": "2026-04-20T10:05:00+09:00",
+        "open": last_close,
+        "high": last_close,
+        "low": last_close,
+        "close": last_close,
+        "volume": spike_volume,
+    }
+    agent_active.on_bar(spike_bar)
+
+    anomalies = agent_active.detect_anomalies(
+        ["005930"], asof="2026-04-20T10:05:00+09:00",
+    )
+    assert len(anomalies) == 1
+    assert anomalies[0]["ticker"] == "005930"
+    assert anomalies[0]["anomaly_type"] == "volume_spike"
+    assert anomalies[0]["z_score"] > threshold
+
+
+def test_detect_anomalies_can_return_drop_and_volume_spike(
+    agent_active: QuantAgent,
+) -> None:
+    """동일 ticker가 급락과 거래량 spike에 동시에 걸리면 2 entry를 반환한다."""
+    rng = np.random.default_rng(21)
+    bars = _make_bars("005930", n=65, seed=21)
+    for b in bars:
+        b["volume"] = float(1000.0 + rng.normal(0, 50))
+    for bar in bars:
+        agent_active.on_bar(bar)
+
+    hist_volumes = np.array([b["volume"] for b in bars])
+    spike_volume = float(
+        hist_volumes.mean()
+        + (agent_active._volume_zscore_threshold + 2.0) * hist_volumes.std(ddof=0)
+    )
+    last_close = bars[-1]["close"]
+    shock_bar = {
+        "ticker": "005930",
+        "ts_close": "2026-04-20T10:05:00+09:00",
+        "open": last_close,
+        "high": last_close,
+        "low": last_close * 0.88,
+        "close": last_close * 0.88,
+        "volume": spike_volume,
+    }
+    agent_active.on_bar(shock_bar)
+
+    anomalies = agent_active.detect_anomalies(
+        ["005930"], asof="2026-04-20T10:05:00+09:00",
+    )
+    assert {a["anomaly_type"] for a in anomalies} == {
+        "intraday_drop",
+        "volume_spike",
+    }
+    assert all(set(a) == {"ticker", "anomaly_type", "z_score", "ts"} for a in anomalies)
 
 
 # ====================================================================== #

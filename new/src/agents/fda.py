@@ -256,7 +256,7 @@ class FDAAgent(AgentBase):
           2. dependency_status 중 timeout → veto (TIMEOUT)
           3. risk_fast_eval risk_level=critical|high → veto (RISK_FAST_TRIGGER)
           4. risk_warnings severity=high → veto (RISK_FAST_TRIGGER)
-          5. anomalies (QuantAgent intraday_drop 등) → veto (QUANT_ANOMALY)
+          5. anomalies (QuantAgent intraday_drop / volume_spike) → veto (QUANT_ANOMALY)
           6. 그 외 → approve (NORMAL_APPROVE)
 
         Cold Path (mode='cold') Kanana-o CoT (S2-9 실구현):

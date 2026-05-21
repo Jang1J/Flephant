@@ -491,7 +491,7 @@ QuantAgent = {
     "goal": "1분봉 예측 시그널 생성 + 이상 탐지",
     "constraint": [
         "모델 추론만 수행, 정성적 판단은 다른 에이전트에 위임",
-        "이상 탐지(변동성 급증 등) 시 anomaly_detected publish",
+        "이상 탐지(intraday_drop, volume_spike) 시 anomaly_detected publish",
         "추론 속도 최우선 (밀리초 단위)"
     ],
     "subscribes_to": ["kis_1min_bar"],
@@ -553,7 +553,7 @@ FDA = {
         "target_weights": "{ticker: weight} — PPO Allocator가 결정한 비중 (FDA는 읽기만)",
         "order_deltas": "[{ticker, side, qty, reason}] — Portfolio Manager가 생성, FDA는 검토 후 approved 여부만 결정. FDA가 order_deltas를 직접 생성/수정하면 can_change_weight=false 원칙 위반.",
         "veto_reason": "string | null — 거부 시 CoT reasoning",
-        "reason_code": "string | null — cause 분류 코드 (approve/veto 양쪽 필수). S2-9 완료(2026-04-26) 7종 최종 확정: NEWS_DIVERGENCE/RISK_FAST_TRIGGER/DEBATE_CONFLICT/NORMAL_APPROVE/TIMEOUT/QUANT_ANOMALY/MISSING_PORTFOLIO_PATCH. SSOT: risk_config.yaml reason_code_catalog(status=final). veto_reason과 분리: reason_code = 원인 코드, veto_reason = 거부 사유 텍스트. 교수님 피드백 #5 cause 중심 대응 필드.",
+        "reason_code": "string | null — cause 분류 코드 (approve/veto 양쪽 필수). S2-9 완료(2026-04-26) 7종 최종 확정: NEWS_DIVERGENCE/RISK_FAST_TRIGGER/DEBATE_CONFLICT/NORMAL_APPROVE/TIMEOUT/QUANT_ANOMALY/MISSING_PORTFOLIO_PATCH. QUANT_ANOMALY는 QuantAgent anomaly_type intraday_drop 또는 volume_spike 감지 시 사용. SSOT: risk_config.yaml reason_code_catalog(status=final). veto_reason과 분리: reason_code = 원인 코드, veto_reason = 거부 사유 텍스트. 교수님 피드백 #5 cause 중심 대응 필드.",
         "risk_overrides": "[{rule, original, override, justification}] — audit metadata 전용. FDA가 실제 리스크 규칙을 변경하는 경로로 사용 금지. 승인/거부 근거 기록용.",
         "confidence": "float [0,1] — FDA 판단 확신도",
         "expiry": "ISO8601 — 이 판단의 유효 기한"

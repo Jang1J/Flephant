@@ -373,7 +373,7 @@ report_types:
   quant_signal:
     payload:
       scores: [{ticker: string, score: float, confidence: float}]
-      anomalies: [{ticker: string, anomaly_type: string, score: float}]
+      anomalies: [{ticker: string, anomaly_type: "intraday_drop|volume_spike", z_score: float, ts: ISO8601}]
       top10_candidates: [ticker]
       filter:
         min_confidence: "risk_config.yaml에서 로드. 미달 종목은 top10_candidates에서 제외"
@@ -712,7 +712,7 @@ output:
     target_weights: {ticker: float}   # read-only echo
     order_deltas: [{ticker: string, side: string, qty: int, reason: string}]  # read-only echo
     veto_reason: string|null
-    reason_code: string|null                # cause 분류 코드 (cause-centric 설계용). approve/veto 양쪽에서 항상 채움. S2-9 완료 (2026-04-26) + community risk sidecar 확장(2026-05-18) enum 11종: NEWS_DIVERGENCE / RISK_FAST_TRIGGER / COMMUNITY_LIVE_PROXY_RISK / NEWS_COMMUNITY_DIVERGENCE / COMMUNITY_TIMESTAMP_WEAK / COMMUNITY_MANIPULATION_FLAG / DEBATE_CONFLICT / NORMAL_APPROVE / TIMEOUT / QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH. SSOT: risk_config.yaml reason_code_catalog (status=final).
+    reason_code: string|null                # cause 분류 코드 (cause-centric 설계용). approve/veto 양쪽에서 항상 채움. S2-9 완료 (2026-04-26) + community risk sidecar 확장(2026-05-18) enum 11종: NEWS_DIVERGENCE / RISK_FAST_TRIGGER / COMMUNITY_LIVE_PROXY_RISK / NEWS_COMMUNITY_DIVERGENCE / COMMUNITY_TIMESTAMP_WEAK / COMMUNITY_MANIPULATION_FLAG / DEBATE_CONFLICT / NORMAL_APPROVE / TIMEOUT / QUANT_ANOMALY / MISSING_PORTFOLIO_PATCH. QUANT_ANOMALY는 QuantAgent anomaly_type intraday_drop 또는 volume_spike 감지 시 사용. SSOT: risk_config.yaml reason_code_catalog (status=final).
     risk_overrides: [{rule: string, original: string, override: string, justification: string}]
     confidence: float
     expiry: ISO8601
