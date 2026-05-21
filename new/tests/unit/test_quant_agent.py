@@ -342,6 +342,123 @@ def test_score_cross_section_happy_path(agent_active: QuantAgent) -> None:
     assert result["latency_ms"] > 0
 
 
+def test_score_cross_section_emits_confidences(agent_active: QuantAgent) -> None:
+    """C5 quant_signal scores[].confidence SSOT: Quant이 ticker별 confidence를 emit한다.
+
+    MockBooster는 dump_model 미지원 → softmax fallback 경로로 진입. 그래도 confidences
+    필드는 출력 dict에 반드시 존재하고 합 ≈ 1 정규화되어야 한다.
+    """
+    tickers = ["005930", "000660", "035420", "051910"]
+    for t in tickers:
+        for bar in _make_bars(t, n=65, start_price=50000 + int(t) % 1000, seed=int(t[-1])):
+            agent_active.on_bar(bar)
+    result = agent_active.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+    confidences = result["confidences"]
+    assert set(confidences.keys()) == set(result["scores"].keys())
+    for v in confidences.values():
+        assert isinstance(v, float)
+        assert np.isfinite(v)
+        assert v >= 0.0
+    assert sum(confidences.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+class MockBoosterWithDump(MockBooster):
+    """dump_model + pred_leaf 지원하는 booster. tree variance 경로 검증용."""
+
+    def __init__(self, scores=None, leaf_matrix=None, leaf_values=None):
+        super().__init__(scores=scores)
+        # leaf_matrix shape: (n_samples, n_trees). pred_leaf 호출 시 반환.
+        self._leaf_matrix = leaf_matrix
+        # leaf_values shape: (n_trees, n_leaves). dump_model이 이걸로 구성.
+        self._leaf_values = leaf_values
+
+    def predict(self, X, pred_leaf=False, **kwargs):
+        if pred_leaf:
+            return np.asarray(self._leaf_matrix, dtype=int)
+        return super().predict(X)
+
+    def dump_model(self):
+        tree_info = []
+        for tree_idx, row in enumerate(self._leaf_values):
+            # 트리 1개당 2개 leaf로 단순화 (depth=1 트리). leaf_index 0/1만 사용.
+            tree_info.append({
+                "tree_index": tree_idx,
+                "tree_structure": {
+                    "split_feature": 0,
+                    "threshold": 0.0,
+                    "left_child": {"leaf_index": 0, "leaf_value": float(row[0])},
+                    "right_child": {"leaf_index": 1, "leaf_value": float(row[1])},
+                },
+            })
+        return {"tree_info": tree_info}
+
+
+def test_score_cross_section_uses_tree_variance_when_dump_model_available(
+    tmp_path: Path,
+) -> None:
+    """B안 핵심: dump_model 지원 booster이면 tree variance 기반 confidence가 산출된다.
+
+    종목 A는 모든 트리가 동일 leaf로 합의 (variance=0 → high confidence),
+    종목 B는 트리들이 분산 (variance>0 → low confidence). softmax 정규화 결과
+    A의 confidence가 B보다 높아야 한다.
+    """
+    n_trees = 4
+    leaf_values = np.array([
+        [1.0, -1.0],   # tree 0: leaf0=1, leaf1=-1
+        [1.0, -1.0],   # tree 1
+        [1.0, -1.0],   # tree 2
+        [1.0, -1.0],   # tree 3
+    ])
+    # A: 모든 트리가 leaf 0 → variance 0
+    # B: 트리마다 leaf 교차 → variance 큼
+    leaf_matrix = np.array([
+        [0, 0, 0, 0],   # A
+        [0, 1, 0, 1],   # B
+    ])
+    booster = MockBoosterWithDump(
+        scores=[0.5, 0.5],
+        leaf_matrix=leaf_matrix,
+        leaf_values=leaf_values,
+    )
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_tv")
+    reg.save(
+        booster,
+        {
+            "version": "tree-var-v1",
+            "bundle_id": None,
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-19",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    tickers = ["005930", "000660"]
+    for t in tickers:
+        for bar in _make_bars(t, n=65):
+            agent.on_bar(bar)
+    result = agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+    confidences = result["confidences"]
+    assert confidences["005930"] > confidences["000660"]
+    assert sum(confidences.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_compute_confidences_empty_scores(agent_passive: QuantAgent) -> None:
+    """scores가 비면 confidences도 비어 있어야 한다."""
+    assert agent_passive._compute_confidences(np.empty((0, 0)), [], {}) == {}
+
+
 def test_score_cross_section_adds_trade_probs_from_classifier(tmp_path: Path) -> None:
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_trade")
     classifier_path = reg.base_dir / "baseline_trade_classifier.pkl"

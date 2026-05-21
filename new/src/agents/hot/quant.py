@@ -147,6 +147,7 @@ class QuantAgent(AgentBase):
         self._booster: Any = None
         self._trade_classifier: Any = None
         self._model_metadata: dict[str, Any] | None = None
+        self._leaf_value_cache: np.ndarray | None = None
         self._try_load_model()
 
         # --- 레이턴시 측정 ---
@@ -407,6 +408,7 @@ class QuantAgent(AgentBase):
             }
         scores = {t: float(s) for t, s in zip(valid_tickers, preds)}
         trade_probs, trade_classifier_error = self._predict_trade_probs(X, valid_tickers)
+        confidences = self._compute_confidences(X, valid_tickers, scores)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self._latency_records.append(elapsed_ms)
@@ -421,6 +423,7 @@ class QuantAgent(AgentBase):
         out = {
             "tickers": valid_tickers,
             "scores": scores,
+            "confidences": confidences,
             "ts": asof_str,
             "mode": "active",
             "latency_ms": elapsed_ms,
@@ -525,6 +528,7 @@ class QuantAgent(AgentBase):
             self._booster = None
             self._trade_classifier = None
             self._model_metadata = None
+            self._leaf_value_cache = None
             self._inference_feature_cols = list(self._feature_cols)
             return False
 
@@ -549,12 +553,14 @@ class QuantAgent(AgentBase):
                 self._booster = None
                 self._trade_classifier = None
                 self._model_metadata = None
+                self._leaf_value_cache = None
                 self._inference_feature_cols = list(self._feature_cols)
                 return False
             # serve 에 extra 만 있으면 추론 가능 (extra 무시) but warning
 
         self._booster = booster
         self._model_metadata = metadata
+        self._leaf_value_cache = None
         self._inference_feature_cols = (
             list(metadata.get("feature_cols") or self._feature_cols)
         )
@@ -609,6 +615,132 @@ class QuantAgent(AgentBase):
             ticker: float(np.clip(prob, 0.0, 1.0))
             for ticker, prob in zip(tickers, raw)
         }, None
+
+    # ================================================================== #
+    # Internal: Confidence (LightGBM tree variance, architecture.md L1239 SSOT)
+    # ================================================================== #
+
+    def _compute_confidences(
+        self,
+        X: np.ndarray,
+        valid_tickers: list[str],
+        scores: dict[str, float],
+    ) -> dict[str, float]:
+        """LightGBM tree variance 기반 cross-sectional confidence.
+
+        각 종목의 booster 트리 leaf value 분산을 측정해 합의 강도를 추정한다.
+        분산 낮음 → 트리 합의 강함 → confidence 높음. cross-section softmax로
+        정규화 (합=1) — min_confidence 0.03 threshold와 호환.
+        booster가 없거나 leaf cache 빌드 실패 시 softmax(scores) fallback.
+        """
+        if not scores:
+            return {}
+        if self._leaf_value_cache is None:
+            self._leaf_value_cache = self._build_leaf_value_cache()
+        if self._leaf_value_cache is None:
+            return self._softmax_confidences(scores)
+
+        try:
+            pred_leaf = np.asarray(
+                self._booster.predict(X, pred_leaf=True),
+                dtype=int,
+            )
+        except Exception as e:
+            logger.warning(
+                "[quant_agent] pred_leaf 실패: %s. softmax fallback.", e,
+            )
+            return self._softmax_confidences(scores)
+
+        if pred_leaf.ndim != 2 or pred_leaf.shape[0] != len(valid_tickers):
+            logger.warning(
+                "[quant_agent] pred_leaf shape 이상: %s (tickers=%d). softmax fallback.",
+                pred_leaf.shape, len(valid_tickers),
+            )
+            return self._softmax_confidences(scores)
+
+        n_trees = pred_leaf.shape[1]
+        if n_trees != self._leaf_value_cache.shape[0]:
+            logger.warning(
+                "[quant_agent] tree 수 불일치: pred=%d cache=%d. softmax fallback.",
+                n_trees, self._leaf_value_cache.shape[0],
+            )
+            return self._softmax_confidences(scores)
+
+        tree_indices = np.arange(n_trees)
+        leaf_values = self._leaf_value_cache[tree_indices, pred_leaf]
+        tree_std = leaf_values.std(axis=1, ddof=0)
+
+        neg_std = -tree_std
+        vmax = float(neg_std.max())
+        exp = np.exp(neg_std - vmax)
+        total = float(exp.sum())
+        if total < 1e-12:
+            uniform = 1.0 / len(valid_tickers)
+            return {t: uniform for t in valid_tickers}
+        probs = exp / total
+        return {t: float(p) for t, p in zip(valid_tickers, probs)}
+
+    @staticmethod
+    def _softmax_confidences(scores: dict[str, float]) -> dict[str, float]:
+        """booster 미가용 / tree variance 실패 시 fallback."""
+        if not scores:
+            return {}
+        tickers = list(scores.keys())
+        vals = np.array([scores[t] for t in tickers], dtype=float)
+        vmax = float(np.max(vals))
+        exp = np.exp(vals - vmax)
+        total = float(exp.sum())
+        if total < 1e-12:
+            uniform = 1.0 / len(tickers)
+            return {t: uniform for t in tickers}
+        probs = exp / total
+        return {t: float(p) for t, p in zip(tickers, probs)}
+
+    def _build_leaf_value_cache(self) -> np.ndarray | None:
+        """booster dump_model 1회 호출 → (n_trees, max_leaf+1) lookup table.
+
+        벡터화 fancy-indexing을 위해 2D ndarray로 캐싱. reload_model() 호출 시
+        booster가 바뀌므로 caller가 None으로 리셋해 다음 호출에서 lazy rebuild.
+        """
+        if self._booster is None:
+            return None
+        try:
+            model_dump = self._booster.dump_model()
+        except Exception as e:
+            logger.warning(
+                "[quant_agent] dump_model 실패: %s. tree variance 비활성.", e,
+            )
+            return None
+
+        trees = model_dump.get("tree_info") or []
+        if not trees:
+            return None
+
+        per_tree_maps: list[dict[int, float]] = []
+        max_leaf = 0
+        for tree_dict in trees:
+            leaf_map: dict[int, float] = {}
+            self._collect_leaves(tree_dict.get("tree_structure"), leaf_map)
+            if leaf_map:
+                max_leaf = max(max_leaf, max(leaf_map.keys()))
+            per_tree_maps.append(leaf_map)
+
+        lookup = np.zeros((len(per_tree_maps), max_leaf + 1), dtype=float)
+        for tree_idx, leaf_map in enumerate(per_tree_maps):
+            for leaf_idx, value in leaf_map.items():
+                lookup[tree_idx, leaf_idx] = value
+        return lookup
+
+    @staticmethod
+    def _collect_leaves(node: Any, leaf_map: dict[int, float]) -> None:
+        """재귀적으로 dump_model tree_structure 순회, leaf_index → leaf_value 수집."""
+        if not isinstance(node, dict):
+            return
+        if "leaf_index" in node and "leaf_value" in node:
+            leaf_map[int(node["leaf_index"])] = float(node["leaf_value"])
+            return
+        QuantAgent._collect_leaves(node.get("left_child"), leaf_map)
+        QuantAgent._collect_leaves(node.get("right_child"), leaf_map)
 
     # ================================================================== #
     # Internal: Feature 계산 (DatasetBuilder rolling feature 동일 규약)
