@@ -48,7 +48,7 @@ class PPOAllocator:
     """C7 PPOAllocatorContract 구현. quant_scores → target_weights.
 
     Sprint 1 MVP는 heuristic policy:
-      1. cross-sectional confidence = softmax(scores)
+      1. Quant confidence 우선, 없으면 softmax(scores) fallback
       2. min_confidence 필터
       3. Top-K (max_names) 선택
       4. weights = score / sum(score) × (1 - min_cash)
@@ -132,10 +132,6 @@ class PPOAllocator:
         if not scores:
             return self._empty_allocation(quant_output)
 
-        # PPO inference path: policy 로드 완료 시 PPO로 배분
-        if self._policy is not None:
-            return self._allocate_ppo(scores, current_positions, market_state, quant_output)
-
         scores, trade_rejected, trade_gate = self._apply_trade_probability_gate(
             scores,
             quant_output,
@@ -151,9 +147,20 @@ class PPOAllocator:
         # 2. Cross-sectional confidence: Quant이 emit한 LightGBM tree variance 기반 값을
         # 우선 사용 (C7 + architecture.md L1239 "LightGBM confidence" SSOT). 누락 시
         # 기존 softmax(scores) fallback.
-        confidence = self._extract_confidence(quant_output, scores)
-        if confidence is None:
-            confidence = self._compute_confidence(scores)
+        confidence = self._resolve_confidence(quant_output, scores)
+
+        # PPO policy는 고정 observation 차원을 요구하므로 원 universe로 추론한 뒤
+        # low-confidence ticker만 현금화한다.
+        if self._policy is not None:
+            return self._allocate_ppo(
+                scores,
+                current_positions,
+                market_state,
+                quant_output,
+                confidence=confidence,
+                rejected=trade_rejected,
+                trade_probability_gate=trade_gate,
+            )
 
         # 3. min_confidence 필터
         filtered, rejected = self._apply_min_confidence(scores, confidence)
@@ -258,6 +265,17 @@ class PPOAllocator:
     # Internal: confidence / filter / top-k / weights
     # ================================================================== #
 
+    def _resolve_confidence(
+        self,
+        quant_output: dict[str, Any] | list[dict[str, Any]],
+        scores: dict[str, float],
+    ) -> dict[str, float]:
+        """Quant confidence 우선, 전체 map이 없으면 기존 softmax fallback."""
+        confidence = self._extract_confidence(quant_output, scores)
+        if confidence is None:
+            return self._compute_confidence(scores)
+        return confidence
+
     @staticmethod
     def _extract_confidence(
         quant_output: dict[str, Any] | list[dict[str, Any]],
@@ -268,8 +286,8 @@ class PPOAllocator:
         지원 포맷:
           - dict: quant_output["confidences"] = {ticker: float}
           - list (C7): [{ticker, score, confidence}, ...]
-        scores에 등장한 ticker만 반환. 누락 ticker는 None 반환 사유로 간주하지 않고
-        0.0으로 채움 (PPO _apply_min_confidence에서 자연 reject).
+        scores의 모든 ticker에 finite confidence가 있어야 사용한다. 부분 map은
+        운영 중 silent reject를 만들 수 있어 softmax fallback(None 반환)으로 처리한다.
         """
         if not scores:
             return None
@@ -282,9 +300,11 @@ class PPOAllocator:
                     if v is None:
                         continue
                     try:
-                        raw[pad_ticker(str(t))] = float(v)
+                        value = float(v)
                     except (TypeError, ValueError):
                         continue
+                    if math.isfinite(value):
+                        raw[pad_ticker(str(t))] = value
         elif isinstance(quant_output, list):
             for item in quant_output:
                 if not isinstance(item, dict) or "ticker" not in item:
@@ -292,13 +312,23 @@ class PPOAllocator:
                 if "confidence" not in item or item["confidence"] is None:
                     continue
                 try:
-                    raw[pad_ticker(str(item["ticker"]))] = float(item["confidence"])
+                    value = float(item["confidence"])
                 except (TypeError, ValueError):
                     continue
+                if math.isfinite(value):
+                    raw[pad_ticker(str(item["ticker"]))] = value
 
         if not raw:
             return None
-        return {t: raw.get(t, 0.0) for t in scores}
+        missing = [ticker for ticker in scores if ticker not in raw]
+        if missing:
+            logger.warning(
+                "[ppo_allocator] confidence 일부 누락: missing=%d/%d. softmax fallback.",
+                len(missing),
+                len(scores),
+            )
+            return None
+        return {t: raw[t] for t in scores}
 
     @staticmethod
     def _compute_confidence(scores: dict[str, float]) -> dict[str, float]:
@@ -617,6 +647,9 @@ class PPOAllocator:
         current_positions: list[dict] | None,
         market_state: dict | None,
         quant_output: dict | list,
+        confidence: dict[str, float],
+        rejected: list[dict[str, Any]] | None = None,
+        trade_probability_gate: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """stable-baselines3 PPO policy로 target_weights 산출.
 
@@ -625,9 +658,11 @@ class PPOAllocator:
         """
         tickers = list(scores.keys())
         n = len(tickers)
+        rejected = rejected or []
+
         n_stocks: int = getattr(self, "_policy_n_stocks", 20)
         if n != n_stocks:
-            rejected = [
+            mismatch_rejected = [
                 {
                     "ticker": ticker,
                     "reason": "ppo_policy_universe_mismatch",
@@ -643,9 +678,24 @@ class PPOAllocator:
             )
             return self._empty_allocation(
                 quant_output,
-                rejected=rejected,
+                rejected=rejected + mismatch_rejected,
                 reason="ppo_policy_universe_mismatch",
+                trade_probability_gate=trade_probability_gate,
             )
+
+        confidence_filtered, confidence_rejected = self._apply_min_confidence(
+            scores,
+            confidence,
+        )
+        rejected = rejected + confidence_rejected
+        if not confidence_filtered:
+            return self._empty_allocation(
+                quant_output,
+                rejected=rejected,
+                reason="all_below_min_confidence",
+                trade_probability_gate=trade_probability_gate,
+            )
+        allowed_tickers = set(confidence_filtered)
 
         # scores 벡터 구성 (n_stocks 길이에 맞게 패드/자름)
         score_vals = np.array([scores[t] for t in tickers], dtype=np.float32)
@@ -687,6 +737,8 @@ class PPOAllocator:
         target_weights: dict[str, float] = {}
         for i in range(take):
             t = tickers[i]
+            if t not in allowed_tickers:
+                continue
             w = float(soft[i])
             if w > 1e-8:
                 target_weights[t] = w
@@ -711,9 +763,10 @@ class PPOAllocator:
             target_weights=scaled_weights,
             cash_weight=cash_weight,
             total_weight=total_weight,
-            rejected=[],
+            rejected=rejected or [],
             quant_output=quant_output,
             regime_multiplier=regime_multiplier,
+            trade_probability_gate=trade_probability_gate,
         )
 
     # ================================================================== #

@@ -32,6 +32,18 @@ def _quant_output(scores: dict[str, float], ts: str = "2026-04-20T10:00:00+09:00
     }
 
 
+class FakePolicy:
+    """stable-baselines3 PPO policy predict() 최소 대체."""
+
+    def __init__(self, action):
+        self._action = action
+        self.predict_calls = 0
+
+    def predict(self, obs, deterministic=True):
+        self.predict_calls += 1
+        return self._action, None
+
+
 # ====================================================================== #
 # 1. 초기화 + config 로드
 # ====================================================================== #
@@ -171,6 +183,23 @@ def test_allocate_falls_back_to_softmax_when_confidences_missing(
     result = allocator.allocate(qo)
     # softmax 균등 ≈ 0.333 → min_confidence(0.03) 통과 → 3종목 전부 포함
     assert set(result["allocation_plan"]["target_weights"].keys()) == set(scores.keys())
+
+
+def test_allocate_falls_back_to_softmax_when_confidences_partial(
+    allocator: PPOAllocator,
+) -> None:
+    """confidences가 부분 map이면 silent 0.0 reject 대신 softmax fallback."""
+    scores = {"005930": 10.0, "000660": 10.0, "035420": 10.0}
+    qo = _quant_output(scores)
+    qo["confidences"] = {"005930": 0.5}
+
+    result = allocator.allocate(qo)
+
+    assert set(result["allocation_plan"]["target_weights"].keys()) == set(scores.keys())
+    assert [
+        item for item in result["metadata"]["rejected"]
+        if item["reason"] == "below_min_confidence"
+    ] == []
 
 
 def test_trade_probability_gate_filters_low_probability(allocator: PPOAllocator) -> None:
@@ -397,3 +426,29 @@ def test_ppo_policy_rejects_smaller_dynamic_universe(allocator: PPOAllocator) ->
     assert result["allocation_plan"]["target_weights"] == {}
     assert result["metadata"]["reason"] == "ppo_policy_universe_mismatch"
     assert result["metadata"]["n_rejected"] == 19
+
+
+def test_ppo_policy_applies_quant_confidence_filter(allocator: PPOAllocator) -> None:
+    """PPO policy 로드 경로도 Quant confidence를 소비해 low-confidence 종목을 제외."""
+    allocator._policy = FakePolicy([0.0, 0.0, 0.0])
+    allocator._policy_n_stocks = 3
+    qo = _quant_output({
+        "005930": 1.0,
+        "000660": 1.0,
+        "035420": 1.0,
+    })
+    qo["confidences"] = {
+        "005930": 0.001,
+        "000660": 0.5,
+        "035420": 0.5,
+    }
+
+    result = allocator.allocate(qo)
+
+    assert "005930" not in result["allocation_plan"]["target_weights"]
+    assert set(result["allocation_plan"]["target_weights"]) == {"000660", "035420"}
+    assert {
+        item["ticker"]: item["reason"]
+        for item in result["metadata"]["rejected"]
+        if item["reason"] == "below_min_confidence"
+    } == {"005930": "below_min_confidence"}

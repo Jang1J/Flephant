@@ -393,6 +393,18 @@ class MockBoosterWithDump(MockBooster):
         return {"tree_info": tree_info}
 
 
+class MockBoosterDumpFails(MockBooster):
+    """dump_model 실패 시 캐시 재시도 억제를 검증하는 booster."""
+
+    def __init__(self, scores=None):
+        super().__init__(scores=scores)
+        self.dump_calls = 0
+
+    def dump_model(self):
+        self.dump_calls += 1
+        raise RuntimeError("dump unsupported")
+
+
 def test_score_cross_section_uses_tree_variance_when_dump_model_available(
     tmp_path: Path,
 ) -> None:
@@ -452,6 +464,96 @@ def test_score_cross_section_uses_tree_variance_when_dump_model_available(
     confidences = result["confidences"]
     assert confidences["005930"] > confidences["000660"]
     assert sum(confidences.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_score_cross_section_falls_back_when_leaf_index_invalid(
+    tmp_path: Path,
+) -> None:
+    """leaf lookup/indexing 오류가 Hot Path 예외로 전파되지 않고 softmax fallback된다."""
+    booster = MockBoosterWithDump(
+        scores=[0.5, 0.5],
+        leaf_matrix=np.array([
+            [0, 0],
+            [9, 9],  # dump_model leaf table 밖 index
+        ]),
+        leaf_values=np.array([
+            [1.0, -1.0],
+            [1.0, -1.0],
+        ]),
+    )
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_bad_leaf")
+    reg.save(
+        booster,
+        {
+            "version": "tree-var-bad-leaf",
+            "bundle_id": None,
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-19",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    tickers = ["005930", "000660"]
+    for t in tickers:
+        for bar in _make_bars(t, n=65):
+            agent.on_bar(bar)
+
+    result = agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "active"
+    assert result["confidences"] == {
+        "005930": pytest.approx(0.5),
+        "000660": pytest.approx(0.5),
+    }
+
+
+def test_dump_model_failure_is_not_retried_each_hot_call(tmp_path: Path) -> None:
+    """dump_model 미지원 booster는 모델 로드 시 1회만 확인하고 매분 재시도하지 않는다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_dump_fail")
+    reg.save(
+        MockBoosterDumpFails(scores=[0.5, 0.5]),
+        {
+            "version": "dump-fail-v1",
+            "bundle_id": None,
+            "train_start": "2026-01-01",
+            "train_end": "2026-04-19",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer())
+    tickers = ["005930", "000660"]
+    for t in tickers:
+        for bar in _make_bars(t, n=65):
+            agent.on_bar(bar)
+
+    agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+    agent.score_cross_section(tickers, asof="2026-04-20T10:04:00+09:00")
+
+    assert agent._booster.dump_calls == 1
 
 
 def test_compute_confidences_empty_scores(agent_passive: QuantAgent) -> None:

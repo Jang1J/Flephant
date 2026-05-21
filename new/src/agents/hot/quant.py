@@ -148,6 +148,7 @@ class QuantAgent(AgentBase):
         self._trade_classifier: Any = None
         self._model_metadata: dict[str, Any] | None = None
         self._leaf_value_cache: np.ndarray | None = None
+        self._leaf_value_cache_attempted: bool = False
         self._try_load_model()
 
         # --- 레이턴시 측정 ---
@@ -299,6 +300,7 @@ class QuantAgent(AgentBase):
             {
               "tickers": [padded ticker list, valid만],
               "scores": {ticker: ranking_score},
+              "confidences": {ticker: LightGBM confidence},
               "ts": asof,
               "mode": "active" | "passive" | "warmup",
               "latency_ms": float,
@@ -529,6 +531,7 @@ class QuantAgent(AgentBase):
             self._trade_classifier = None
             self._model_metadata = None
             self._leaf_value_cache = None
+            self._leaf_value_cache_attempted = False
             self._inference_feature_cols = list(self._feature_cols)
             return False
 
@@ -554,13 +557,15 @@ class QuantAgent(AgentBase):
                 self._trade_classifier = None
                 self._model_metadata = None
                 self._leaf_value_cache = None
+                self._leaf_value_cache_attempted = False
                 self._inference_feature_cols = list(self._feature_cols)
                 return False
             # serve 에 extra 만 있으면 추론 가능 (extra 무시) but warning
 
         self._booster = booster
         self._model_metadata = metadata
-        self._leaf_value_cache = None
+        self._leaf_value_cache = self._build_leaf_value_cache()
+        self._leaf_value_cache_attempted = True
         self._inference_feature_cols = (
             list(metadata.get("feature_cols") or self._feature_cols)
         )
@@ -635,8 +640,9 @@ class QuantAgent(AgentBase):
         """
         if not scores:
             return {}
-        if self._leaf_value_cache is None:
+        if self._leaf_value_cache is None and not self._leaf_value_cache_attempted:
             self._leaf_value_cache = self._build_leaf_value_cache()
+            self._leaf_value_cache_attempted = True
         if self._leaf_value_cache is None:
             return self._softmax_confidences(scores)
 
@@ -666,19 +672,27 @@ class QuantAgent(AgentBase):
             )
             return self._softmax_confidences(scores)
 
-        tree_indices = np.arange(n_trees)
-        leaf_values = self._leaf_value_cache[tree_indices, pred_leaf]
-        tree_std = leaf_values.std(axis=1, ddof=0)
+        try:
+            tree_indices = np.arange(n_trees)
+            leaf_values = self._leaf_value_cache[tree_indices, pred_leaf]
+            tree_std = leaf_values.std(axis=1, ddof=0)
+            if not np.all(np.isfinite(tree_std)):
+                raise ValueError("tree_std_non_finite")
 
-        neg_std = -tree_std
-        vmax = float(neg_std.max())
-        exp = np.exp(neg_std - vmax)
-        total = float(exp.sum())
-        if total < 1e-12:
-            uniform = 1.0 / len(valid_tickers)
-            return {t: uniform for t in valid_tickers}
-        probs = exp / total
-        return {t: float(p) for t, p in zip(valid_tickers, probs)}
+            neg_std = -tree_std
+            vmax = float(neg_std.max())
+            exp = np.exp(neg_std - vmax)
+            total = float(exp.sum())
+            if not math.isfinite(total) or total < 1e-12:
+                uniform = 1.0 / len(valid_tickers)
+                return {t: uniform for t in valid_tickers}
+            probs = exp / total
+            return {t: float(p) for t, p in zip(valid_tickers, probs, strict=True)}
+        except Exception as e:
+            logger.warning(
+                "[quant_agent] confidence 계산 실패: %s. softmax fallback.", e,
+            )
+            return self._softmax_confidences(scores)
 
     @staticmethod
     def _softmax_confidences(scores: dict[str, float]) -> dict[str, float]:
@@ -694,13 +708,13 @@ class QuantAgent(AgentBase):
             uniform = 1.0 / len(tickers)
             return {t: uniform for t in tickers}
         probs = exp / total
-        return {t: float(p) for t, p in zip(tickers, probs)}
+        return {t: float(p) for t, p in zip(tickers, probs, strict=True)}
 
     def _build_leaf_value_cache(self) -> np.ndarray | None:
         """booster dump_model 1회 호출 → (n_trees, max_leaf+1) lookup table.
 
-        벡터화 fancy-indexing을 위해 2D ndarray로 캐싱. reload_model() 호출 시
-        booster가 바뀌므로 caller가 None으로 리셋해 다음 호출에서 lazy rebuild.
+        벡터화 fancy-indexing을 위해 2D ndarray로 캐싱. 모델 로드 시 선빌드하고,
+        dump_model 미지원/실패 시 시도 여부를 기록해 Hot Path 반복 재시도를 막는다.
         """
         if self._booster is None:
             return None
