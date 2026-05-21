@@ -472,6 +472,37 @@ def build_archive(
 
     # Stage B: 각 date 24-hour window 적용 + archive 작성
     distributed = _distribute_into_dates(events_by_ticker, dates)
+    has_broadcast_scope = bool(sector_to_tickers) or bool(_MARKET_QUERIES)
+    if not any(distributed.get(date_key) for date_key in dates) and not has_broadcast_scope:
+        return _write_report(report_dir, {
+            "status": "BLOCKED",
+            "generated_at": datetime.now(_KST).isoformat(),
+            "end_date": end_date,
+            "business_days_requested": business_days,
+            "date_count": len(dates),
+            "ticker_count": len(ticker_meta),
+            "output_dir": str(output_dir),
+            "files_written": [],
+            "total_events": 0,
+            "provider_availability": provider_availability,
+            "fetch_stats": fetch_stats,
+            "sector_broadcast_stats": sector_broadcast_stats,
+            "market_broadcast_stats": market_broadcast_stats,
+            "zero_event_date_count": len(dates),
+            "zero_event_dates_sample": dates[:10],
+            "per_date": [
+                {
+                    "date": date_key,
+                    "status": "BLOCKED",
+                    "reason": "no_events_in_window",
+                    "event_count": 0,
+                    "path": None,
+                }
+                for date_key in dates
+            ],
+            "blockers": ["no_events_archived"],
+        })
+
     per_date_report: list[dict[str, Any]] = []
     files_written: list[str] = []
     total_events = 0
