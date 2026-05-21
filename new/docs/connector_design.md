@@ -28,13 +28,13 @@ class AuthManager:
         # 토큰 발급 1분당 1회 제한 준수
 
     def get_dart_key(self):
-        # .env에서 DART_API_KEY 로드 (40자리)
+        # 현재 프로세스 환경변수에서 DART_API_KEY 로드 (40자리)
 
     def get_naver_keys(self):
-        # .env에서 NAVER_CLIENT_ID + SECRET 로드
+        # 현재 프로세스 환경변수에서 NAVER_CLIENT_ID + SECRET 로드
 ```
 
-- API 키는 `.env`에서만 로드. 코드 하드코딩 금지.
+- API 키는 현재 프로세스 환경변수에서만 로드. `.env` 파일 직접 읽기와 코드 하드코딩 금지.
 - KIS 토큰은 메모리 보관 (파일 저장 금지, C1 auth 규칙).
 
 ## 방법론 2: REST/WebSocket 파일 분리
