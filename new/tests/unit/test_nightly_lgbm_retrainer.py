@@ -84,6 +84,46 @@ def test_synthetic_fallback_enabled_string_false() -> None:
     assert retrainer._synthetic_fallback_enabled is False
 
 
+def test_dual_source_feature_subset_filters_community_columns() -> None:
+    """Nightly path can keep News_DS while excluding historical community alpha."""
+    from src.mode_b.nightly_lgbm_retrainer import NightlyLGBMRetrainer
+
+    def fake_config_load(config_file="risk_config.yaml", key=None):
+        if key == "nightly_retrainer" or key is None:
+            return {
+                "lookback_days": 30,
+                "max_alpha_factors": 5,
+                "tickers": [],
+            }
+        if key == "preprocessor":
+            return {
+                "dual_source_feature_cols": [
+                    "news_score_t",
+                    "comm_score_t_1",
+                    "comm_score_t_2",
+                    "news_comm_divergence",
+                    "community_noise_multiplier",
+                ]
+            }
+        return {}
+
+    with patch("src.mode_b.nightly_lgbm_retrainer.config_load", side_effect=fake_config_load):
+        retrainer = NightlyLGBMRetrainer(dual_source_feature_cols=["news_score_t"])
+
+    trainer = MagicMock()
+    trainer.feature_cols = [
+        "feat_1m_return",
+        "news_score_t",
+        "comm_score_t_1",
+        "news_comm_divergence",
+        "us_spx_ret",
+    ]
+
+    retrainer._apply_dual_source_feature_subset(trainer)
+
+    assert trainer.feature_cols == ["feat_1m_return", "news_score_t", "us_spx_ret"]
+
+
 # ================================================================== #
 # 1. _next_version: 빈 registry → "v2"
 # ================================================================== #

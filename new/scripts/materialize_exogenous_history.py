@@ -301,6 +301,7 @@ def materialize_exogenous_history(
     business_days: int,
     artifact_dir: Path,
     output_dir: Path,
+    skip_existing: bool = False,
 ) -> dict[str, Any]:
     tickers = _active_tickers()
     dates = _business_dates(end_date, business_days)
@@ -321,6 +322,9 @@ def materialize_exogenous_history(
     written: list[str] = []
     blockers: list[str] = []
     non_neutral_dates = 0
+    skipped_existing_dates = 0
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     if missing_providers:
         blockers.append("required_real_provider_unavailable")
@@ -335,6 +339,18 @@ def materialize_exogenous_history(
             })
     else:
         for date_key in dates:
+            candidate_path = artifact_dir / f"{date_key}.json"
+            if skip_existing and candidate_path.exists():
+                skipped_existing_dates += 1
+                per_date.append({
+                    "date": date_key,
+                    "status": "SKIP_EXISTING",
+                    "artifact_written": False,
+                    "non_neutral": None,
+                    "path": str(candidate_path),
+                })
+                continue
+
             snapshot = _snapshot_ts(date_key)
             try:
                 global_features, global_stats = _collect_global_features(
@@ -440,10 +456,11 @@ def materialize_exogenous_history(
                 })
 
     min_coverage = _min_exogenous_non_neutral_date_coverage()
-    coverage = non_neutral_dates / max(len(dates), 1)
-    if coverage < min_coverage:
+    effective_dates = len(dates) - skipped_existing_dates
+    coverage = non_neutral_dates / max(effective_dates, 1)
+    if effective_dates > 0 and coverage < min_coverage:
         blockers.append("exogenous_non_neutral_coverage_below_threshold")
-    if not written:
+    if effective_dates > 0 and not written:
         blockers.append("no_exogenous_artifacts_written")
     report = {
         "status": "PASS" if not blockers else "BLOCKED",
@@ -451,6 +468,8 @@ def materialize_exogenous_history(
         "end_date": end_date,
         "business_days_requested": business_days,
         "date_count": len(dates),
+        "skip_existing": bool(skip_existing),
+        "skipped_existing_date_count": skipped_existing_dates,
         "ticker_count": len(tickers),
         "artifact_dir": str(artifact_dir),
         "provider_availability": availability,
@@ -477,12 +496,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--business-days", type=int, default=80)
     parser.add_argument("--artifact-dir", default=str(DEFAULT_EXOGENOUS_ARTIFACT_DIR))
     parser.add_argument("--output-dir", default=str(_REPORT_DIR))
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip dates whose exogenous artifact already exists (recommended for incremental updates).",
+    )
     args = parser.parse_args(argv)
     report = materialize_exogenous_history(
         end_date=str(args.end_date),
         business_days=int(args.business_days),
         artifact_dir=Path(str(args.artifact_dir)),
         output_dir=Path(str(args.output_dir)),
+        skip_existing=bool(args.skip_existing),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["status"] == "PASS" else 1

@@ -910,7 +910,10 @@ def test_smoke_blocks_mock_sources_without_allow_mock(monkeypatch):
 
     assert result["kis_investor_daily"]["status"] == "FAIL"
     assert result["kis_investor_daily"]["error_code"] == "MOCK_SOURCE_NOT_ALLOWED"
-    assert result["community"]["status"] == "FAIL"
+    # Community is mock-by-default (Sprint 2) and is treated as non-blocking for
+    # data readiness because dual-source archive/materialization does not depend
+    # on CommunityCrawler.
+    assert result["community"]["status"] == "PASS"
     assert result["ecos_macro"]["status"] == "FAIL"
     assert result["us_overnight"]["status"] == "FAIL"
     assert result["us_overnight"]["error_code"] == "MOCK_SOURCE_NOT_ALLOWED"

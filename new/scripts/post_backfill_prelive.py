@@ -178,6 +178,7 @@ def run_pipeline(
     allow_production_candidate_write: bool = False,
     disable_dual_source_features: bool = False,
     disable_exogenous_features: bool = False,
+    dual_source_feature_cols: list[str] | None = None,
 ) -> dict[str, Any]:
     end_dt = datetime.strptime(end_date, "%Y%m%d").date()
     start_date = _business_start_date(end_dt, business_days).strftime("%Y%m%d")
@@ -196,6 +197,8 @@ def run_pipeline(
         "feature_policy": {
             "dual_source_features_enabled": not bool(disable_dual_source_features),
             "exogenous_features_enabled": not bool(disable_exogenous_features),
+            "dual_source_feature_cols": dual_source_feature_cols,
+            "historical_community_alpha_claim": False,
         },
         "runtime": {
             "elephant_mode": os.environ.get("ELEPHANT_MODE"),
@@ -260,6 +263,7 @@ def run_pipeline(
             allow_production_candidate_write=allow_production_candidate_write,
             include_dual_source_features=False if disable_dual_source_features else None,
             include_exogenous_features=False if disable_exogenous_features else None,
+            dual_source_feature_cols=dual_source_feature_cols,
         ).retrain(
             bundle_id=resolved_bundle_id,
             tickers=training_tickers,
@@ -451,6 +455,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-production-candidate-write", action="store_true")
     parser.add_argument("--disable-dual-source-features", action="store_true")
     parser.add_argument("--disable-exogenous-features", action="store_true")
+    parser.add_argument(
+        "--dual-source-feature-cols",
+        default="",
+        help="Comma-separated Dual-Source feature subset for LGBM. Example: news_score_t",
+    )
     parser.add_argument("--no-write-report", action="store_true")
     return parser.parse_args(argv)
 
@@ -476,6 +485,11 @@ def main(argv: list[str] | None = None) -> int:
         allow_production_candidate_write=bool(args.allow_production_candidate_write),
         disable_dual_source_features=bool(args.disable_dual_source_features),
         disable_exogenous_features=bool(args.disable_exogenous_features),
+        dual_source_feature_cols=[
+            col.strip()
+            for col in str(args.dual_source_feature_cols).split(",")
+            if col.strip()
+        ] or None,
     )
     if not bool(args.no_write_report):
         _write_report(report)

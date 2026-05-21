@@ -62,6 +62,7 @@ except ImportError:
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
+from src.utils.safe_cast import safe_bool
 
 logger = get_logger("nightly_ppo_retrainer")
 _KST = ZoneInfo("Asia/Seoul")
@@ -201,6 +202,14 @@ class NightlyPPORetrainer:
         self._ppo_n_epochs: int = int(cfg.get("ppo_n_epochs", 10))
         self._ppo_seed: int = int(cfg.get("ppo_seed", 42))
         self._synthetic_seed: int = int(cfg.get("synthetic_seed", 42))
+        self._ppo_ortho_init: bool = safe_bool(
+            cfg.get("ppo_ortho_init", False),
+            default=False,
+        )
+        self._ppo_torch_num_threads: int = int(cfg.get("ppo_torch_num_threads", 1))
+        self._ppo_torch_num_interop_threads: int = int(
+            cfg.get("ppo_torch_num_interop_threads", 1)
+        )
 
         # position_limits에서 constraint 파라미터 로드
         pos_cfg = config_load("risk_config.yaml", "position_limits") or {}
@@ -248,6 +257,8 @@ class NightlyPPORetrainer:
                 }
             }
         """
+        self._configure_torch_runtime()
+
         from stable_baselines3 import PPO
 
         # 1. 다음 버전 결정
@@ -289,6 +300,7 @@ class NightlyPPORetrainer:
             batch_size=batch_size,
             n_epochs=self._ppo_n_epochs,
             seed=self._ppo_seed,
+            policy_kwargs={"ortho_init": self._ppo_ortho_init},
         )
         model.learn(total_timesteps=self._total_timesteps)
 
@@ -383,6 +395,28 @@ class NightlyPPORetrainer:
             n,
         )
         return scores, returns
+
+    def _configure_torch_runtime(self) -> None:
+        """Apply SSOT torch CPU settings before SB3 builds policy tensors."""
+        try:
+            import torch
+
+            if self._ppo_torch_num_threads > 0:
+                torch.set_num_threads(self._ppo_torch_num_threads)
+            if self._ppo_torch_num_interop_threads > 0:
+                torch.set_num_interop_threads(self._ppo_torch_num_interop_threads)
+            logger.info(
+                "[nightly_ppo_retrainer] torch runtime 설정: threads=%d interop=%d ortho_init=%s",
+                self._ppo_torch_num_threads,
+                self._ppo_torch_num_interop_threads,
+                self._ppo_ortho_init,
+            )
+        except ImportError:
+            logger.info("[nightly_ppo_retrainer] torch 미설치. runtime 설정 생략.")
+        except RuntimeError as e:
+            logger.warning("[nightly_ppo_retrainer] torch runtime 설정 실패: %s", e)
+        except Exception as e:
+            logger.warning("[nightly_ppo_retrainer] torch runtime 설정 중 예외: %s", e)
 
     def _stage_candidate_bundle(self, bundle_id: str, model_path: Path) -> Path:
         """C14 deployer가 참조하는 bundle/ppo/latest_policy.pkl에 후보 policy를 복사."""

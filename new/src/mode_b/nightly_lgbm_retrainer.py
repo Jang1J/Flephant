@@ -57,6 +57,7 @@ class NightlyLGBMRetrainer:
         allow_production_candidate_write: bool = False,
         include_dual_source_features: bool | None = None,
         include_exogenous_features: bool | None = None,
+        dual_source_feature_cols: list[str] | None = None,
     ) -> None:
         cfg = config_load("risk_config.yaml", "nightly_retrainer") or {}
         self._tickers: list[str] = list(cfg.get("tickers", []))
@@ -66,6 +67,11 @@ class NightlyLGBMRetrainer:
         self._allow_production_candidate_write = bool(allow_production_candidate_write)
         self._include_dual_source_features = include_dual_source_features
         self._include_exogenous_features = include_exogenous_features
+        self._dual_source_feature_cols = (
+            [str(col) for col in dual_source_feature_cols]
+            if dual_source_feature_cols is not None
+            else None
+        )
         self._synthetic_fallback_enabled: bool = safe_bool(
             cfg.get("synthetic_fallback_enabled", False),
             default=False,
@@ -143,6 +149,7 @@ class NightlyLGBMRetrainer:
 
         # 4. LGBMTrainer 구성 + alpha feature 추가
         trainer = self._make_trainer(registry=registry)
+        self._apply_dual_source_feature_subset(trainer)
         if alpha_feature_cols:
             if hasattr(trainer.builder, "add_neutral_feature_columns"):
                 trainer.builder.add_neutral_feature_columns(alpha_feature_cols)
@@ -175,6 +182,12 @@ class NightlyLGBMRetrainer:
         result["alpha_factors_used"] = len(alpha_feature_cols)
         result["bundle_id"] = bundle_id
         result["candidate_pending_deploy"] = bundle_id is not None
+        result["feature_policy"] = {
+            "include_dual_source_features": self._include_dual_source_features,
+            "include_exogenous_features": self._include_exogenous_features,
+            "dual_source_feature_cols": self._dual_source_feature_cols,
+            "historical_community_alpha_claim": False,
+        }
         if bundle_id is not None:
             synthetic_fallback = safe_bool(result.get("synthetic_fallback"), default=False)
             if synthetic_fallback or result.get("missing_tickers"):
@@ -233,6 +246,21 @@ class NightlyLGBMRetrainer:
             include_dual_source_features=self._include_dual_source_features,
             include_exogenous_features=self._include_exogenous_features,
         )
+
+    def _apply_dual_source_feature_subset(self, trainer: Any) -> None:
+        if self._dual_source_feature_cols is None:
+            return
+        cfg = config_load("risk_config.yaml", "preprocessor") or {}
+        all_ds = {str(col) for col in cfg.get("dual_source_feature_cols", []) or []}
+        allowed = {str(col) for col in self._dual_source_feature_cols}
+        unknown = sorted(allowed - all_ds)
+        if unknown:
+            raise ValueError(f"unknown_dual_source_feature_cols:{unknown}")
+        trainer.feature_cols = [
+            col
+            for col in trainer.feature_cols
+            if str(col) not in all_ds or str(col) in allowed
+        ]
 
     @staticmethod
     def _resolve_registry_dir(registry_dir: str | Path | None) -> Path | None:

@@ -214,6 +214,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         order_type="00",
         target_col_override="label_session_close_net_ret",
         registry_dir="artifacts/lgbm_research/BUNDLE-TEST",
+        dual_source_feature_cols=["news_score_t"],
     )
 
     assert report["status"] == "PASS"
@@ -228,6 +229,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     assert report["training_tickers"] == ["005930", "105560"]
     assert retrainer_init_kwargs["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
     assert retrainer_init_kwargs["allow_production_candidate_write"] is False
+    assert retrainer_init_kwargs["dual_source_feature_cols"] == ["news_score_t"]
     assert retrain_kwargs["tickers"] == ["005930", "105560"]
     assert retrain_kwargs["target_col_override"] == "label_session_close_net_ret"
     assert report["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"

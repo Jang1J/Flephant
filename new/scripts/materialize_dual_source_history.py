@@ -469,6 +469,7 @@ def materialize_dual_source_history(
     raw_events_dir: Path,
     artifact_dir: Path,
     output_dir: Path,
+    skip_existing: bool = False,
 ) -> dict[str, Any]:
     universe = _load_active_universe()
     dates = _business_dates(end_date, business_days)
@@ -477,8 +478,24 @@ def materialize_dual_source_history(
     written: list[str] = []
     blockers: list[str] = []
     non_neutral_dates = 0
+    skipped_existing_dates = 0
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     for date_key in dates:
+        out_path = artifact_dir / f"{date_key}.json"
+        if skip_existing and out_path.exists():
+            skipped_existing_dates += 1
+            per_date.append({
+                "date": date_key,
+                "status": "SKIP_EXISTING",
+                "raw_path": None,
+                "scores_written": False,
+                "non_neutral": None,
+                "artifact_path": str(out_path),
+            })
+            continue
+
         snapshot = _snapshot_ts(date_key)
         raw_path, payload = _read_raw_payload(raw_events_dir, date_key)
         if payload is None or raw_path is None:
@@ -519,7 +536,6 @@ def materialize_dual_source_history(
                     source_stats=source_stats,
                     scores=scores,
                 )
-                out_path = artifact_dir / f"{date_key}.json"
                 _write_json(out_path, out_payload)
                 written.append(_repo_relative(out_path))
                 per_date.append({
@@ -538,7 +554,6 @@ def materialize_dual_source_history(
                 source_stats=source_stats,
                 scores=scores,
             )
-            out_path = artifact_dir / f"{date_key}.json"
             _write_json(out_path, out_payload)
             written.append(_repo_relative(out_path))
             non_neutral_dates += 1
@@ -563,10 +578,11 @@ def materialize_dual_source_history(
             })
 
     min_coverage = _min_dual_source_non_neutral_date_coverage()
-    coverage = non_neutral_dates / max(len(dates), 1)
-    if coverage < min_coverage:
+    effective_dates = len(dates) - skipped_existing_dates
+    coverage = non_neutral_dates / max(effective_dates, 1)
+    if effective_dates > 0 and coverage < min_coverage:
         blockers.append("dual_source_non_neutral_coverage_below_threshold")
-    if not written:
+    if effective_dates > 0 and not written:
         blockers.append("no_dual_source_artifacts_written")
     report = {
         "status": "PASS" if not blockers else "BLOCKED",
@@ -574,6 +590,8 @@ def materialize_dual_source_history(
         "end_date": end_date,
         "business_days_requested": business_days,
         "date_count": len(dates),
+        "skip_existing": bool(skip_existing),
+        "skipped_existing_date_count": skipped_existing_dates,
         "raw_events_dir": str(raw_events_dir),
         "artifact_dir": str(artifact_dir),
         "coverage": {
@@ -600,6 +618,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-events-dir", required=True, help="Directory containing archived daily raw event JSON files.")
     parser.add_argument("--artifact-dir", default=str(_ARTIFACT_DIR))
     parser.add_argument("--output-dir", default=str(_REPORT_DIR))
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip dates whose dual_source artifact already exists (recommended for incremental updates).",
+    )
     args = parser.parse_args(argv)
     report = materialize_dual_source_history(
         end_date=str(args.end_date),
@@ -607,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         raw_events_dir=Path(str(args.raw_events_dir)),
         artifact_dir=Path(str(args.artifact_dir)),
         output_dir=Path(str(args.output_dir)),
+        skip_existing=bool(args.skip_existing),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["status"] == "PASS" else 1

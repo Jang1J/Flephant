@@ -62,6 +62,7 @@ class PaperAutoTrader:
         self._now = now_fn or (lambda: datetime.now(_KST))
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
         self._kill_switch = kill_switch or KillSwitch()
+        self._active_trade_universe: set[str] | None = None
 
         self._confirm_start_phrase = str(self._cfg["confirm_start_phrase"])
         self._enforce_market_session = safe_bool(
@@ -141,6 +142,12 @@ class PaperAutoTrader:
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
+        ticker_universe_guard = self._requested_ticker_universe_guard(tickers)
+        report["stages"]["requested_ticker_universe_guard"] = ticker_universe_guard
+        if ticker_universe_guard["status"] != "PASS":
+            report["status"] = "FAIL"
+            return self._finish_report(report, write_report)
+
         model_guard = self._active_model_check()
         report["stages"]["active_model_guard"] = model_guard
         if model_guard["status"] != "PASS":
@@ -169,16 +176,37 @@ class PaperAutoTrader:
                 self._hot_runner.start()
 
             for idx in range(cycles_int):
-                cycle = self.run_once(
-                    tickers=tickers,
-                    cycle_index=idx,
-                    risk_warnings=external_risk_warnings,
-                )
+                try:
+                    cycle = self.run_once(
+                        tickers=tickers,
+                        cycle_index=idx,
+                        risk_warnings=external_risk_warnings,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[paper_auto_trading] cycle 예외로 fail-closed 처리: cycle=%s error=%s",
+                        idx,
+                        e,
+                    )
+                    cycle = self._exception_cycle_report(
+                        cycle_index=idx,
+                        reason="paper_auto_cycle_exception",
+                        error=e,
+                    )
                 cycle_reports.append(cycle)
                 if cycle.get("status") == "FAIL":
                     break
                 if idx < cycles_int - 1:
                     self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        except Exception as e:
+            logger.warning("[paper_auto_trading] run 예외로 fail-closed 처리: %s", e)
+            cycle_reports.append(
+                self._exception_cycle_report(
+                    cycle_index=len(cycle_reports),
+                    reason="paper_auto_run_exception",
+                    error=e,
+                )
+            )
         finally:
             self._run_guard_passed = False
 
@@ -308,6 +336,24 @@ class PaperAutoTrader:
             "order_history_verification": order_history,
         }
 
+    @staticmethod
+    def _exception_cycle_report(
+        *,
+        cycle_index: int,
+        reason: str,
+        error: Exception,
+    ) -> dict[str, Any]:
+        return {
+            "status": "FAIL",
+            "cycle_index": int(cycle_index),
+            "started_at": datetime.now(_KST).isoformat(),
+            "reason": reason,
+            "exception_type": type(error).__name__,
+            "error": str(error),
+            "fail_closed": True,
+            "execution": None,
+        }
+
     def _make_ppo_allocator(self) -> PPOAllocator:
         if not safe_bool(
             self._cfg.get("use_latest_ppo_policy_if_available", True),
@@ -424,6 +470,89 @@ class PaperAutoTrader:
                 "current_mode": mode,
             }
         return {"status": "PASS", "current_mode": mode}
+
+    def _requested_ticker_universe_guard(self, tickers: list[str]) -> dict[str, Any]:
+        requested: list[str] = []
+        invalid: list[str] = []
+        for raw_ticker in tickers:
+            ticker = pad_ticker(str(raw_ticker).strip())
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                invalid.append(str(raw_ticker))
+                continue
+            requested.append(ticker)
+
+        if invalid:
+            return {
+                "status": "FAIL",
+                "reason": "invalid_requested_ticker",
+                "invalid_tickers": invalid,
+            }
+        if not requested:
+            return {
+                "status": "FAIL",
+                "reason": "requested_tickers_empty",
+            }
+
+        active_universe = self._get_active_trade_universe()
+        if not active_universe:
+            return {
+                "status": "FAIL",
+                "reason": "active_trade_universe_empty",
+            }
+
+        blocked = sorted({ticker for ticker in requested if ticker not in active_universe})
+        if blocked:
+            return {
+                "status": "FAIL",
+                "reason": "requested_ticker_not_active_universe",
+                "blocked_tickers": blocked,
+                "requested_tickers": requested,
+                "active_universe_count": len(active_universe),
+                "active_universe_sample": sorted(active_universe)[:10],
+            }
+
+        return {
+            "status": "PASS",
+            "requested_tickers": requested,
+            "active_universe_count": len(active_universe),
+        }
+
+    def _get_active_trade_universe(self) -> set[str]:
+        if self._active_trade_universe is None:
+            self._active_trade_universe = self._load_active_trade_universe()
+        return set(self._active_trade_universe)
+
+    @staticmethod
+    def _load_active_trade_universe() -> set[str]:
+        try:
+            universe_cfg = config_load("universe_config.yaml", None) or {}
+        except TypeError:
+            universe_cfg = config_load("universe_config.yaml") or {}
+        except Exception as e:
+            logger.warning("[paper_auto_trading] active universe 로드 실패: %s", e)
+            return set()
+
+        active: set[str] = set()
+        sectors = universe_cfg.get("sectors") or {}
+        if not isinstance(sectors, dict):
+            return active
+        for sector in sectors.values():
+            if not isinstance(sector, dict):
+                continue
+            if str(sector.get("status", "")).strip() != "confirmed":
+                continue
+            stocks = sector.get("stocks") or []
+            if not isinstance(stocks, list):
+                continue
+            for stock in stocks:
+                if not isinstance(stock, dict):
+                    continue
+                if str(stock.get("status", "")).strip() != "active":
+                    continue
+                ticker = pad_ticker(str(stock.get("ticker", "")))
+                if ticker != "000000" and is_valid_ticker(ticker):
+                    active.add(ticker)
+        return active
 
     def _active_model_check(self) -> dict[str, Any]:
         quant = getattr(self._hot_runner, "_quant", None)

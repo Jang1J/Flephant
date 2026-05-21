@@ -329,10 +329,32 @@ class KISRestClient(BaseConnector):
         """
         ticker = pad_ticker(ticker)
 
-        if not is_pit_safe(f"{date[:4]}-{date[4:6]}-{date[6:8]}T23:59:59+09:00"):
-            raise PITViolationError(
-                f"[kis_rest] 미래 날짜 수급 요청 차단: date={date}"
+        # PIT-Safety guard: 일별 수급은 "하루 전체" 집계이므로
+        # - 미래 날짜 차단
+        # - 당일(date==today)은 snapshot(기본 18:00 KST) 이후에만 허용
+        # - PIT 비교는 23:59가 아니라 market close timestamp 기준으로 수행
+        target_day = datetime.strptime(date, "%Y%m%d").date()
+        now = datetime.now(_KST)
+        today = now.date()
+        if target_day > today:
+            raise PITViolationError(f"[kis_rest] 미래 날짜 수급 요청 차단: date={date}")
+        if target_day == today:
+            pit_cfg = config_load("risk_config.yaml", "pit_safety")
+            snapshot_hour = int(pit_cfg["snapshot_hour"])
+            snapshot_dt = datetime.combine(
+                today,
+                datetime.strptime(f"{snapshot_hour:02d}:00:00", "%H:%M:%S").time(),
+                tzinfo=_KST,
             )
+            if now < snapshot_dt:
+                raise PITViolationError(
+                    f"[kis_rest] 당일 수급(date) 조회는 snapshot 이후만 허용: "
+                    f"date={date} now={now.isoformat()} snapshot={snapshot_dt.isoformat()}"
+                )
+
+        market_close_ts = self._minute_date_market_close_ts(date)
+        if not is_pit_safe(market_close_ts):
+            raise PITViolationError(f"[kis_rest] 미래 날짜 수급 요청 차단: date={date}")
 
         if self.mode == "mock":
             self.rate_limiter.wait_and_acquire()

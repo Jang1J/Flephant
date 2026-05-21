@@ -1,0 +1,24 @@
+[Unit]
+Description=Elephant Lab post-close Mode B data update worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/elephant/Elephant_Lab
+Environment=ELEPHANT_MODE=mode_b
+Environment=PYTHONPATH=/opt/elephant/Elephant_Lab/new
+# Put API keys in this server-only file. Do not commit it.
+EnvironmentFile=-/etc/elephant-lab/elephant.env
+ExecStart=/opt/anaconda3/envs/elephant/bin/python new/scripts/post_close_data_update_scheduler.py
+Restart=always
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+# Safety hardening. The worker writes artifacts/ and its SQLite job DB only.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트).
 장중 매 1분 퀀트 시그널 + 이벤트 시 LLM 에이전트 개입 + 장마감 후 자동 진화.
 
-현재 단계 (2026-05-18 10:15): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 첫 게이트 PASS. 249영업일/30종목 데이터 PASS (7470 parquet, 2.84M rows). 새 candidate **`BUNDLE-20260518-195M0001`** (cost-aware 195m, Dual-Source OFF + exogenous ON): service-policy replay **PASS 28.95bps SR 5.32 materiality 15bps 통과**. backup `BUNDLE-20260518-OPTB0002` PASS 17.14bps SR 5.83. KIS paper balance + probe 10:09 PASS. 남은 blocker: C12 real backtest (Mode B window 18:00~22:59 KST) + paper-auto rehearsal 재실행 (qty cap fix 후). production registry `active_version=null` + `live_trading_allowed=false` 유지.
+현재 단계 (2026-05-21 15:35): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 non-live/paper-safe 경로 진행 중. `BUNDLE-20260518-195M0001` 기준 C12/backtest + service-policy + deploy dry-run + service readiness PASS. 장중 KIS virtual paper-auto 최신 PASS evidence는 `paper_auto_service_rehearsal_20260521_135439.json` (cold-risk report `community_live_risk_smoke_20260521_133807.json` 주입, warning_count=50, balance/reconciliation/probe/order-history/paper_auto_cycle PASS). 이후 14시대 10-cycle rehearsal은 KIS virtual host DNS/네트워크 장애로 최종 report 작성 전 중단됐으므로 PASS evidence로 사용 금지. 15:25 balance-only recovery PASS: `paper_trading_balance_reconciliation_20260521_152551.json`, positions `000660=4`, `005930=83`, `042700=14`, `058470=18`, `403870=18`, KIS virtual + live_enabled=false. `BUNDLE-20260520-FW249NDS`는 C12/service-policy/deploy dry-run은 PASS지만 prelive target `20260520`에서 BLOCKED: staged model metadata `train_end=20260515`, broker evidence bundle mismatch. 즉 최신 post-close final bundle은 아직 미확정이다. 18:05 KST heartbeat `resume-post-close-gates`로 post-close 재개 예약됨. BE는 read-only + paper-safe 연결 시도 가능. latest/champion 표시, order action, live action은 금지. 운영 baseline은 `249d expanding/fixed-from-anchor + OHLCV+Exog+News_DS(news_score_t only)`, community는 live Cold Path risk sidecar로 유지한다. production registry `active_version=null` + `live_trading_allowed=false` 유지.
 
 ## 파이프라인 v3 (2모드 × 5레이어)
 
@@ -140,7 +140,7 @@ Pre-Live Gate (Phase 3, 진행 중):
 
 **Hand-off**: `/codex-{skill}` + [배경/발견/Fix 방향/제약/검증] 5 블록 (rules/cross-check.md §5 표준).
 
-**입증 누적**: 5/11 AI 파트 검증 31파일 +AI/Mode B 192 + 데이터 237 + LGBM 9 PASS + 76파일 subprocess / 5/12 성능 해석 3-agent + Deflated Sharpe + 5-stage / 5/14 Full pipeline (C12 deployable + C14 dry-run + KIS balance 5억원) / 5/15~16 Phase 2+3 (Dual-Source 80일 PASS, as-of drift 차단, safe_* 정규화, broker_evidence 선택 fix, **Full regression 1493 passed / 1 skipped**) / 5/17 Codex 36시간 (overnight 11 fix fail-closed + 249영업일/30종목 확장 + backfill 7470/7470 + cost-aware horizon scan best 195분/+121bps + **Full regression 1815 passed 기록상**) / 5/18 04:35 **Phase 4 첫 게이트 PASS** (`BUNDLE-20260518-195M0001` cost-aware 195m DS-off, service-policy +28.95bps SR 5.32 materiality 15bps 통과) + 5/18 10:15 KIS paper balance/probe PASS + paper-auto qty cap fix + AuthManager EGW00133 retry.
+**입증 누적**: 5/11 AI 파트 검증 31파일 +AI/Mode B 192 + 데이터 237 + LGBM 9 PASS + 76파일 subprocess / 5/12 성능 해석 3-agent + Deflated Sharpe + 5-stage / 5/14 Full pipeline (C12 deployable + C14 dry-run + KIS balance 5억원) / 5/15~16 Phase 2+3 (Dual-Source 80일 PASS, as-of drift 차단, safe_* 정규화, broker_evidence 선택 fix, **Full regression 1493 passed / 1 skipped**) / 5/17 Codex 36시간 (overnight 11 fix fail-closed + 249영업일/30종목 확장 + backfill 7470/7470 + cost-aware horizon scan best 195분/+121bps + **Full regression 1815 passed 기록상**) / 5/18 04:35 **Phase 4 첫 게이트 PASS** (`BUNDLE-20260518-195M0001` cost-aware 195m DS-off, service-policy +28.95bps SR 5.32 materiality 15bps 통과) + 5/18 10:15 KIS paper balance/probe PASS + paper-auto qty cap fix + AuthManager EGW00133 retry / 5/21 13:54 최신 cold-risk 주입 KIS virtual paper-auto PASS (`paper_auto_service_rehearsal_20260521_135439.json`, external_kis_virtual, order-history matched, live=false).
 
 **Fingerprint 통합**: Claude + Codex 양측 confirm → effective confidence +1 (cap 10), 한쪽만 → "single-source, verify" caveat.
 
@@ -154,9 +154,9 @@ Pre-Live Gate (Phase 3, 진행 중):
 |---|---|---|
 | 1 | Top-K long-only replay + regression_evidence 4 + trade_signal_threshold deprecated | 완료 (5/13) |
 | 2 | Dual-Source/exogenous 80영업일 historical + exogenous_feature_store + LightGBM 재학습 | 완료 (5/14~15, coverage 1.0) |
-| 3 | 실계좌 전환 직전 안전 가드 + paper evidence + 검증 흐름 + overnight 11 fix (fail-closed) | 진행 중 (5/15~18) |
-| 4 | cost-aware `label_195m_net_ret` research + 4 LGBM 파라미터 후보 + service-policy materiality 15bps 통과 | **첫 게이트 PASS (5/18 04:35, `195M0001` +28.95bps SR 5.32 / `OPTB0002` +17.14bps SR 5.83). C12 + paper-auto rehearsal 남음** |
-| 5 | 실계좌 전환 (사용자 승인 + 4 게이트 + 1주 paper 보고서) | 미진입 |
+| 3 | 실계좌 전환 직전 안전 가드 + paper evidence + 검증 흐름 + fail-closed gate | paper-safe path PASS 다수. 최신 KIS virtual evidence `paper_auto_service_rehearsal_20260521_135439.json` PASS. 실계좌/live는 금지 |
+| 4 | cost-aware `label_195m_net_ret` research + service-policy + expanding post-close 자동진화 | `BUNDLE-20260518-195M0001` C12/service-policy/deploy/readiness PASS. 20260520 data/features/sector readiness는 PASS지만 최신 post-close full candidate는 Mode B에서 재학습/C12/prelive 필요 |
+| 5 | 실계좌 전환 (사용자 승인 + 4 게이트 + 1주 paper 보고서) | 미진입. production registry `active_version=null`, live trading false 유지 |
 
 ## 세션 운영
 
@@ -165,6 +165,8 @@ Pre-Live Gate (Phase 3, 진행 중):
 - 세션 끝에 `claude-progress.md`에 done/next/blockers
 - 실데이터 smoke: `.env` 사용자 승인 후 서브셸에서만 source. 키 원문 출력/저장 금지
 - 4-yes check (`rules/cross-check.md §4`): "Critical 0건" 표기는 격리 / subprocess / canonical env Full PASS / 외부 cross-check 4개 모두 yes일 때만 허용
-- Canonical env: `/opt/anaconda3/envs/elephant/bin/python` (numpy 1.26.4 / lightgbm 4.6.0 / SB3). Full regression baseline: 1815 passed / 1 skipped (5/17 기록상). 5/18 focused 211+38+80 PASS.
-- ai-1 ↔ main divergence (5/18 기준): `main...HEAD=150/6`, `origin/main...HEAD=34/6`, `team/ai-1...HEAD=0/0`. main 5/17 overnight + 추가 fix 다수, ai-1 sync commit 2개로 일부만 흡수. 정리 사용자 결정.
-- 미커밋 32 파일 (Modified 26 + Untracked 6). Codex 5/16~5/18 누적 작업 commit 안 함. 사용자가 4 그룹(materialize / cost-aware research / service-policy research / LGBM staging+KIS paper evidence)으로 분리 commit 결정.
+- Canonical env: `/opt/anaconda3/envs/elephant/bin/python` (numpy 1.26.4 / lightgbm 4.6.0 / SB3). 최신 세션에서는 focused paper/service tests `35 passed`, 5/21 readiness/deploy no-write PASS. 더 큰 regression 기준은 `Codex-progress.md` 최신 헤더를 우선한다.
+- 현재 협업 기준 branch: `ai-1`. 최신 확인 head는 `b85e29c fix(mode-b): service-policy evidence gate hardening`.
+- PR #6 merge 반영 완료: `7372bf3 merge: PR #6 service-policy evidence gate 검증 추가`. deployer/scheduler service-policy evidence gate는 expected date range/universe binding 기준으로 hardening.
+- 개인 progress 파일(`Codex-progress.md`, `claude-progress.md`, `feature_list.json`)은 local handoff SSOT 성격이 강하다. 커밋/공유 여부는 사용자 지시에 따른다.
+- BE 연결은 read-only + paper-safe 범위만 허용. live trading enable, production registry mutation, 실계좌 주문 UI는 계속 금지.

@@ -55,10 +55,28 @@ def _sum_source_stats(per_date: list[Any]) -> dict[str, Any]:
     for item in per_date:
         if not isinstance(item, dict):
             continue
-        if item.get("non_neutral"):
+        artifact = {}
+        artifact_path = item.get("artifact_path")
+        if artifact_path:
+            path = Path(str(artifact_path))
+            artifact = _load_json(path if path.is_absolute() else ROOT / path)
+        scores = artifact.get("scores") if isinstance(artifact.get("scores"), list) else []
+        score_count = int(item.get("score_count") or len(scores) or 0)
+        non_neutral = item.get("non_neutral")
+        if non_neutral is None and scores:
+            non_neutral = any(
+                abs(float(score.get("news_score_t") or 0.0)) > 1e-12
+                or abs(float(score.get("comm_score_t_1") or 0.0)) > 1e-12
+                or abs(float(score.get("comm_score_t_2") or 0.0)) > 1e-12
+                for score in scores
+                if isinstance(score, dict)
+            )
+        if non_neutral:
             non_neutral_dates += 1
-        score_rows += int(item.get("score_count") or 0)
+        score_rows += score_count
         stats = item.get("source_stats") if isinstance(item.get("source_stats"), dict) else {}
+        if not stats and isinstance(artifact.get("source_stats"), dict):
+            stats = artifact["source_stats"]
         news_events += int(stats.get("news_event_count") or 0)
         community_events += int(stats.get("community_event_count") or 0)
         scopes = stats.get("fallback_scope_counts")
@@ -84,11 +102,19 @@ def _sum_source_stats(per_date: list[Any]) -> dict[str, Any]:
 def _model_feature_scope(bundle_id: str | None) -> dict[str, Any]:
     if not bundle_id:
         return {}
-    bundle_dir = ROOT / "artifacts" / "lgbm_paper_candidate" / bundle_id
-    registry = _load_json(bundle_dir / "registry.json")
-    active = registry.get("active_version")
-    metadata_path = bundle_dir / f"{active}_metadata.json" if active else None
+    active = None
+    metadata_path: Path | None = (
+        ROOT / "artifacts" / "bundles" / bundle_id / "lgbm" / "latest_model_metadata.json"
+    )
     metadata = _load_json(metadata_path)
+    if not metadata:
+        bundle_dir = ROOT / "artifacts" / "lgbm_paper_candidate" / bundle_id
+        registry = _load_json(bundle_dir / "registry.json")
+        active = registry.get("active_version")
+        metadata_path = bundle_dir / f"{active}_metadata.json" if active else None
+        metadata = _load_json(metadata_path)
+    else:
+        active = metadata.get("version")
     feature_cols = metadata.get("feature_cols") or []
     dual_features = {
         "news_score_t",
@@ -103,6 +129,18 @@ def _model_feature_scope(bundle_id: str | None) -> dict[str, Any]:
         "metadata_path": _repo_relative(metadata_path) if metadata_path else None,
         "feature_count": len(feature_cols) if isinstance(feature_cols, list) else 0,
         "feature_cols": feature_cols,
+        "uses_news_ds": bool(
+            isinstance(feature_cols, list) and "news_score_t" in feature_cols
+        ),
+        "uses_historical_community_alpha_features": bool(
+            isinstance(feature_cols, list)
+            and {
+                "comm_score_t_1",
+                "comm_score_t_2",
+                "news_comm_divergence",
+                "community_noise_multiplier",
+            }.intersection(feature_cols)
+        ),
         "uses_dual_source_features": bool(
             isinstance(feature_cols, list) and dual_features.intersection(feature_cols)
         ),
@@ -146,6 +184,16 @@ def build_source_scope_summary(
     source_totals = _sum_source_stats(dual_report.get("per_date") or [])
 
     coverage = dual_report.get("coverage") or {}
+    non_neutral_rate = coverage.get("dual_source_non_neutral_date_coverage")
+    if (
+        (not isinstance(non_neutral_rate, (int, float)) or float(non_neutral_rate) == 0.0)
+        and dual_report.get("date_count")
+        and source_totals.get("non_neutral_dates")
+    ):
+        non_neutral_rate = source_totals["non_neutral_dates"] / max(
+            int(dual_report.get("date_count") or 0),
+            1,
+        )
     community_smoke = (
         readiness_report.get("stages", {})
         .get("smoke", {})
@@ -156,6 +204,18 @@ def build_source_scope_summary(
         .get("smoke", {})
         .get("naver", {})
     )
+    selected_model = _model_feature_scope(bundle_id)
+    caveats = [
+        "Historical community_event_count is zero in the current deploy-quality archive.",
+        "Community should be described as live Cold Path risk proxy until PIT-safe historical source is available.",
+    ]
+    if selected_model.get("uses_news_ds"):
+        caveats.append(
+            "Selected model uses News_DS via news_score_t; this is not historical community alpha."
+        )
+    else:
+        caveats.append("Current selected candidate does not use News_DS directly.")
+
     report = {
         "status": "PASS" if news_report and dual_report else "BLOCKED",
         "action": "source_scope_summary",
@@ -178,7 +238,11 @@ def build_source_scope_summary(
             "status": dual_report.get("status"),
             "business_days": dual_report.get("date_count"),
             "files_written_count": len(dual_report.get("files_written") or []),
-            "dual_source_non_neutral_rate": coverage.get("dual_source_non_neutral_date_coverage"),
+            "files_available_count": (
+                int(dual_report.get("skipped_existing_date_count") or 0)
+                + len(dual_report.get("files_written") or [])
+            ),
+            "dual_source_non_neutral_rate": non_neutral_rate,
             "min_dual_source_non_neutral_date_coverage": coverage.get("min_dual_source_non_neutral_date_coverage"),
             "source_totals": source_totals,
             "community_non_neutral_rate": 0.0 if source_totals["community_event_count"] == 0 else None,
@@ -187,17 +251,13 @@ def build_source_scope_summary(
             "naver_news": naver_smoke,
             "community": community_smoke,
         },
-        "selected_model": _model_feature_scope(bundle_id),
+        "selected_model": selected_model,
         "cold_path": {
             "uses_community_risk": True,
             "implementation": "community_live_risk_smoke.py",
             "status": "implemented" if (ROOT / "new" / "scripts" / "community_live_risk_smoke.py").exists() else "missing",
         },
-        "caveats": [
-            "Historical community_event_count is zero in the current deploy-quality archive.",
-            "Current selected 195m candidate does not use Dual-Source features directly.",
-            "Community should be described as live Cold Path risk proxy until PIT-safe historical source is available.",
-        ],
+        "caveats": caveats,
     }
     if write_report:
         output_dir.mkdir(parents=True, exist_ok=True)

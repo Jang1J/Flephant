@@ -52,6 +52,26 @@ def _auto_price(ticker: str) -> float:
     return float(quote["current_price"])
 
 
+def _load_system_positions(
+    path: str | None,
+    *,
+    assume_empty: bool = False,
+) -> list[dict[str, Any]] | None:
+    if assume_empty and path:
+        raise ValueError("--system-positions-json and --assume-empty-system-positions are mutually exclusive")
+    if assume_empty:
+        return []
+    if not path:
+        return None
+    with Path(path).open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if isinstance(data, dict) and isinstance(data.get("positions"), list):
+        return list(data["positions"])
+    if isinstance(data, list):
+        return data
+    raise ValueError("system positions JSON must be a list or {'positions': [...]}")
+
+
 def _write_service_rehearsal_report(report: dict[str, Any]) -> dict[str, Any]:
     report_path = paper_auto_service_rehearsal._write_report(report)
     report["report_path"] = str(report_path)
@@ -62,13 +82,47 @@ def _write_service_rehearsal_report(report: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _blocked_service_rehearsal_report(
+    args: argparse.Namespace,
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "status": "BLOCKED",
+        "action": "paper_auto_service_rehearsal",
+        "generated_at": datetime.now(_KST).isoformat(),
+        "bundle_id": args.bundle_id,
+        "evidence_level": "external_kis_virtual",
+        "external_kis_api": True,
+        "real_hot_runner": bool(args.use_real_hot_runner),
+        "live_trading_enabled": False,
+        "cold_risk_report_path": str(args.cold_risk_report or ""),
+        "cold_risk_warning_count": 0,
+        "blockers": ["paper_auto_service_rehearsal_exception"],
+        "stage_statuses": {"paper_auto_cycle": "BLOCKED"},
+        "broker_evidence": {},
+        "stages": {
+            "paper_auto_cycle": {
+                "status": "BLOCKED",
+                "reason": "paper_auto_service_rehearsal_exception",
+                "exception_type": type(error).__name__,
+                "error": str(error),
+                "fail_closed": True,
+            },
+        },
+    }
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     runner = PaperTradingRunner()
     stages: dict[str, Any] = {}
 
+    system_positions = _load_system_positions(
+        args.system_positions_json,
+        assume_empty=bool(args.assume_empty_system_positions),
+    )
     stages["balance_reconciliation"] = _run_with_token_retry(
         lambda: runner.run_balance_reconciliation(
-            system_positions=[] if args.assume_empty_system_positions else None,
+            system_positions=system_positions,
             write_report=not bool(args.no_write_report),
         )
     )
@@ -96,12 +150,19 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         interval_sec=float(args.interval_sec),
         registry_dir=args.registry_dir,
         confirm_phrase=args.auto_confirm_phrase,
+        cold_risk_report=args.cold_risk_report,
         no_write_report=bool(args.no_write_report),
         use_real_hot_runner=bool(args.use_real_hot_runner),
     )
-    stages["paper_auto_service_rehearsal"] = _run_with_token_retry(
-        lambda: paper_auto_service_rehearsal.build_report(rehearsal_args)
-    )
+    try:
+        stages["paper_auto_service_rehearsal"] = _run_with_token_retry(
+            lambda: paper_auto_service_rehearsal.build_report(rehearsal_args)
+        )
+    except Exception as e:
+        stages["paper_auto_service_rehearsal"] = _blocked_service_rehearsal_report(
+            args,
+            e,
+        )
     if not bool(args.no_write_report):
         stages["paper_auto_service_rehearsal"] = _write_service_rehearsal_report(
             stages["paper_auto_service_rehearsal"]
@@ -143,9 +204,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--order-type", default="00")
     parser.add_argument("--cycles", type=int, default=1)
     parser.add_argument("--interval-sec", type=float, default=0.0)
+    parser.add_argument("--system-positions-json", default=None)
     parser.add_argument("--assume-empty-system-positions", action="store_true")
     parser.add_argument("--probe-confirm-phrase", default="PAPER_ORDER_OK")
     parser.add_argument("--auto-confirm-phrase", default="PAPER_AUTO_OK")
+    parser.add_argument(
+        "--cold-risk-report",
+        default="",
+        help="community/cold-path report JSON to forward into paper-auto FDA.",
+    )
     parser.add_argument("--use-real-hot-runner", action="store_true")
     parser.add_argument("--no-write-report", action="store_true")
     args = parser.parse_args(argv)

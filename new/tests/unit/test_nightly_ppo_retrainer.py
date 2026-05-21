@@ -289,6 +289,34 @@ def test_retrain_version_label_format(tmp_path: Path, monkeypatch):
 
 
 # ====================================================================== #
+# 13-B. retrain(): CPU-safe torch/SB3 runtime policy is config-driven
+# ====================================================================== #
+
+def test_retrain_applies_cpu_safe_policy_kwargs(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    retrainer = _make_retrainer(
+        tmp_path=tmp_path,
+        ppo_ortho_init="false",
+        ppo_torch_num_threads=1,
+        ppo_torch_num_interop_threads=1,
+    )
+    mock_model = MagicMock()
+    mock_ppo_ctor = MagicMock(return_value=mock_model)
+    mock_torch = MagicMock()
+
+    with patch.dict("sys.modules", {
+        "stable_baselines3": MagicMock(PPO=mock_ppo_ctor),
+        "torch": mock_torch,
+    }):
+        retrainer.retrain()
+
+    mock_torch.set_num_threads.assert_called_once_with(1)
+    mock_torch.set_num_interop_threads.assert_called_once_with(1)
+    _, kwargs = mock_ppo_ctor.call_args
+    assert kwargs["policy_kwargs"] == {"ortho_init": False}
+
+
+# ====================================================================== #
 # 14. _load_policy: 파일 없으면 PolicyNotLoadedError
 # ====================================================================== #
 

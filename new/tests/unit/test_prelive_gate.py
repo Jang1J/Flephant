@@ -1057,6 +1057,43 @@ def test_lgbm_real_train_enforces_final_dataset_gate(monkeypatch, tmp_path):
     assert "train_start_missing_or_invalid" in result["final_dataset_gate"]["blockers"]
 
 
+def test_lgbm_real_train_blocks_model_older_than_requested_prelive_end(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(repo_root, gate, "BUNDLE-REQUESTED")
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(
+        bundle_id="BUNDLE-REQUESTED",
+        target_end_date="20260520",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["prelive_target_end_gate"]["target_end_date"] == "20260520"
+    assert result["prelive_target_end_gate"]["train_end"] == "20260515"
+    assert (
+        "train_end_before_prelive_target_end"
+        in result["prelive_target_end_gate"]["blockers"]
+    )
+
+
+def test_target_end_gate_blocks_model_newer_than_requested_prelive_end():
+    gate = _load_script_module()
+
+    result = gate._target_end_gate(
+        {"train_end": "20260521"},
+        target_end_date="20260520",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["target_end_date"] == "20260520"
+    assert result["train_end"] == "20260521"
+    assert "train_end_after_prelive_target_end" in result["blockers"]
+
+
 def test_final_dataset_gate_blocks_wrong_ticker_set():
     gate = _load_script_module()
     metadata = _final_dataset_metadata()
@@ -1303,6 +1340,110 @@ def test_backtest_gate_passes_when_matching_report_exists(monkeypatch, tmp_path)
     assert result["bundle_id"] == "BUNDLE-TEST"
     assert result["report_path"].endswith(report_path.name)
     assert result["verdict"] == "pass"
+
+
+def test_backtest_gate_blocks_report_older_than_requested_prelive_end(
+    monkeypatch,
+    tmp_path,
+):
+    gate = _load_script_module()
+    report_dir = tmp_path / "backtest"
+    report_dir.mkdir(parents=True)
+    report_path = report_dir / "backtest_BUNDLE-TEST_20260511_010000.json"
+    service_policy = _service_policy_evidence(tmp_path)
+    report_path.write_text(
+        json.dumps(
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "backtest_id": "BT-TEST",
+                "generated_at": "2026-05-11T01:00:00+09:00",
+                "verdict": "pass",
+                "metrics": {"sr": 1.2},
+                "regression_risk": {"flagged": False, "severity": "low", "evidence": []},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_backtest_gate(
+        {
+            "status": "PASS",
+            "candidate_bundle_id": "BUNDLE-TEST",
+        },
+        target_end_date="20260520",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["latest_report_path"].endswith(report_path.name)
+    assert result["latest_prelive_target_end_gate"]["target_end_date"] == "20260520"
+    assert result["latest_prelive_target_end_gate"]["train_end"] == "20260515"
+    assert (
+        "train_end_before_prelive_target_end"
+        in result["latest_prelive_target_end_gate"]["blockers"]
+    )
+
+
+def test_backtest_gate_blocks_newer_failed_report_even_if_older_pass_exists(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    report_dir = tmp_path / "backtest"
+    report_dir.mkdir(parents=True)
+    service_policy = _service_policy_evidence(tmp_path)
+    older_pass = report_dir / "backtest_BUNDLE-TEST_20260511_010000.json"
+    older_pass.write_text(
+        json.dumps(
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "verdict": "pass",
+                "regression_risk": {"flagged": False, "severity": "low"},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+                "feature_quality": {
+                    "dual_source_rows": 100,
+                    "dual_source_non_neutral_rows": 90,
+                    "exogenous_rows": 100,
+                    "exogenous_non_neutral_rows": 90,
+                },
+                "service_policy_replay": service_policy,
+                "candidate_model_metadata": _final_dataset_metadata(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    newer_fail = report_dir / "backtest_BUNDLE-TEST_20260511_020000.json"
+    newer_fail.write_text(
+        json.dumps(
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "status": "FAIL",
+                "verdict": "fail",
+                "regression_risk": {"flagged": True, "severity": "high"},
+                "minute_bar_leakage_check": {"verdict": "pass"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    result = gate._check_backtest_gate({
+        "status": "PASS",
+        "candidate_bundle_id": "BUNDLE-TEST",
+    })
+
+    assert result["status"] == "BLOCKED"
+    assert result["latest_report_path"].endswith(newer_fail.name)
+    assert result["latest_verdict"] == "fail"
 
 
 def test_backtest_gate_blocks_service_policy_date_range_mismatch(monkeypatch, tmp_path):
@@ -1676,12 +1817,14 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
         lambda **kwargs: {"status": "PASS"},
     )
 
-    def fake_lgbm(bundle_id=None):
+    def fake_lgbm(bundle_id=None, *, target_end_date=None):
         calls["lgbm_bundle_id"] = bundle_id
+        calls["lgbm_target_end_date"] = target_end_date
         return {"status": "PASS", "candidate_bundle_id": bundle_id}
 
-    def fake_backtest(stage):
+    def fake_backtest(stage, *, target_end_date=None):
         calls["backtest_stage"] = stage
+        calls["backtest_target_end_date"] = target_end_date
         return {"status": "PASS", "bundle_id": stage["candidate_bundle_id"]}
 
     monkeypatch.setattr(gate, "_check_lgbm_real_train", fake_lgbm)
@@ -1705,10 +1848,12 @@ def test_build_report_passes_requested_bundle_to_lgbm_and_backtest(monkeypatch):
     assert report["status"] == "PASS"
     assert report["bundle_id"] == "BUNDLE-REQUESTED"
     assert calls["lgbm_bundle_id"] == "BUNDLE-REQUESTED"
+    assert calls["lgbm_target_end_date"] == "20260508"
     assert calls["backtest_stage"] == {
         "status": "PASS",
         "candidate_bundle_id": "BUNDLE-REQUESTED",
     }
+    assert calls["backtest_target_end_date"] == "20260508"
 
 
 def test_next_commands_keep_deploy_candidate_in_dry_run() -> None:

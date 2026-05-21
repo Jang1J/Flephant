@@ -255,6 +255,8 @@ def test_train_persists_research_hyperparameter_overrides(
             "learning_rate": 0.03,
             "num_leaves": 15,
             "min_child_samples": 5,
+            "lambda_l1": 0.1,
+            "lambda_l2": 1.0,
         },
         training_control_overrides={
             "n_estimators": 20,
@@ -278,6 +280,8 @@ def test_train_persists_research_hyperparameter_overrides(
     assert metadata["lgbm_params"]["learning_rate"] == pytest.approx(0.03)
     assert metadata["lgbm_params"]["num_leaves"] == 15
     assert metadata["lgbm_params"]["min_child_samples"] == 5
+    assert metadata["lgbm_params"]["lambda_l1"] == pytest.approx(0.1)
+    assert metadata["lgbm_params"]["lambda_l2"] == pytest.approx(1.0)
     assert metadata["training_control"]["n_estimators"] == 20
     assert metadata["training_control"]["early_stopping_rounds"] == 5
 

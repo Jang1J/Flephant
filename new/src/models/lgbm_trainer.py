@@ -971,6 +971,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--min-child-samples", type=int, default=None)
     p.add_argument("--subsample", type=float, default=None)
     p.add_argument("--colsample-bytree", type=float, default=None)
+    p.add_argument("--lambda-l1", type=float, default=None)
+    p.add_argument("--lambda-l2", type=float, default=None)
     p.add_argument("--n-estimators", type=int, default=None)
     p.add_argument("--early-stopping-rounds", type=int, default=None)
     p.add_argument(
@@ -1010,6 +1012,8 @@ def _collect_lgbm_param_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("min_child_samples", "min_child_samples"),
         ("subsample", "subsample"),
         ("colsample_bytree", "colsample_bytree"),
+        ("lambda_l1", "lambda_l1"),
+        ("lambda_l2", "lambda_l2"),
     ):
         value = getattr(args, arg_name)
         if value is not None:

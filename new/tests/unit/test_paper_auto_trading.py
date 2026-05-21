@@ -130,6 +130,11 @@ class FakePaperKISRejects(FakePaperKIS):
         }
 
 
+class FakePaperKISBalanceError(FakePaperKIS):
+    def get_balance(self) -> dict[str, Any]:
+        raise ConnectionError("dns failed")
+
+
 class FakePaperKISNoHistoryMatch(FakePaperKIS):
     def get_order_history(
         self,
@@ -422,6 +427,67 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
         "quant": "done",
         "debate": "skipped",
     }
+
+
+def test_paper_auto_fails_fast_when_requested_ticker_is_not_active(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKIS()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["035420"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    guard = report["stages"]["requested_ticker_universe_guard"]
+    assert guard["reason"] == "requested_ticker_not_active_universe"
+    assert guard["blocked_tickers"] == ["035420"]
+    assert hot_runner.state.value == "BOOTSTRAP"
+    assert hot_runner.calls == []
+    assert client.orders == []
+
+
+def test_paper_auto_records_fail_closed_report_when_kis_balance_raises(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKISBalanceError()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["status"] == "FAIL"
+    assert cycle["reason"] == "paper_auto_cycle_exception"
+    assert cycle["exception_type"] == "ConnectionError"
+    assert cycle["fail_closed"] is True
+    assert hot_runner.calls == []
+    assert client.orders == []
 
 
 def test_paper_auto_forwards_cold_path_risk_warnings_and_skips_order(
@@ -877,6 +943,13 @@ def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
         report_dir=tmp_path,
         now_fn=_paper_session_now,
     )
+    trader._active_trade_universe = {  # noqa: SLF001
+        "005930",
+        "000660",
+        "035420",
+        "042700",
+        "403870",
+    }
 
     report = trader.run(
         tickers=["005930", "000660", "035420", "042700", "403870"],
@@ -938,6 +1011,7 @@ def test_paper_auto_treats_string_false_market_order_as_disabled(
         report_dir=tmp_path,
         now_fn=_paper_session_now,
     )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
 
     report = trader.run(
         tickers=["005930"],

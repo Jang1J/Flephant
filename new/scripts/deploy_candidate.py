@@ -42,6 +42,16 @@ def _latest_any_backtest(bundle_id: str) -> tuple[Path | None, dict[str, Any] | 
     )
 
 
+def _latest_backtest_decision(bundle_id: str) -> tuple[Path | None, dict[str, Any] | None, bool]:
+    path, payload = _latest_any_backtest(bundle_id)
+    deployable = bool(
+        path is not None
+        and payload is not None
+        and prelive_gate._is_deployable_backtest_report(payload, bundle_id)
+    )
+    return path, payload, deployable
+
+
 def _deployability_payload(
     bundle_id: str,
     backtest_path: Path | None,
@@ -160,26 +170,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     bundle_id = str(args.bundle_id)
-    backtest_path, backtest = _latest_deployable_backtest(bundle_id)
+    backtest_path, backtest, latest_deployable = _latest_backtest_decision(bundle_id)
     dry_run = bool(args.dry_run)
     if dry_run:
-        latest_path, latest_backtest = (
-            (backtest_path, backtest)
-            if backtest_path and backtest
-            else _latest_any_backtest(bundle_id)
-        )
         deployability = _deployability_payload(
             bundle_id,
-            latest_path,
-            latest_backtest,
-            deployable=bool(backtest_path and backtest),
+            backtest_path,
+            backtest,
+            deployable=latest_deployable,
             dry_run=True,
         )
         report = {
-            "status": "PASS" if backtest_path and backtest else "BLOCKED",
+            "status": "PASS" if latest_deployable else "BLOCKED",
             "dry_run": True,
             "bundle_id": bundle_id,
-            "deployable": bool(deployability.get("deployable", False)),
+            "deployable": latest_deployable,
             "service_policy_gate_pass": bool(
                 deployability.get("service_policy_gate_pass", False)
             ),
@@ -187,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             "live_trading_allowed": False,
             "reason": (
                 "deployable_backtest_found"
-                if backtest_path and backtest
+                if latest_deployable
                 else "deployable_backtest_not_found"
             ),
             "deployability": deployability,
@@ -197,16 +202,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0 if report.get("status") == "PASS" else 1
 
-    if not backtest_path or not backtest:
-        latest_path, latest_backtest = _latest_any_backtest(bundle_id)
+    if not latest_deployable:
         report = {
             "status": "BLOCKED",
             "bundle_id": bundle_id,
             "reason": "deployable_backtest_not_found",
+            "registry_mutated": False,
+            "live_trading_allowed": False,
             "deployability": _deployability_payload(
                 bundle_id,
-                latest_path,
-                latest_backtest,
+                backtest_path,
+                backtest,
                 deployable=False,
                 dry_run=False,
             ),
@@ -262,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             "bundle_id": bundle_id,
             "backtest_report_path": prelive_gate._repo_relative(backtest_path),
             "deploy_result": deploy_result,
+            "registry_mutated": True,
+            "live_trading_allowed": False,
         }
     except Exception as e:
         report = {

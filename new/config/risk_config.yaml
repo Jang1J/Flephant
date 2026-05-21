@@ -286,7 +286,7 @@ backtest_agent:
       include_pending_data_tickers: false
       missing_final_dataset_action: "block_deploy"
       rehearsal_business_days: 80
-      rationale: "80거래일 수집은 paper/flow rehearsal 전용이다. v1 실계좌 직전 C12/C14/deploy_quality PASS는 KIS retention probe로 확인된 20250509~20260515 30종목 active 1분봉 학습 메타데이터가 있어야만 허용한다. 10년 벤더 데이터는 v2 research 목표로 분리한다."
+      rationale: "80거래일 수집은 paper/flow rehearsal 전용이다. v1 실계좌 직전 C12/C14/deploy_quality PASS는 KIS retention probe로 확인된 expected_start_date~expected_end_date 30종목 active 1분봉 학습 메타데이터가 있어야만 허용한다. 장마감 후 Mode B post-close evidence가 PASS할 때만 expected_end_date/min_business_days를 승격한다. 10년 벤더 데이터는 v2 research 목표로 분리한다."
     on_pass:
       human_approval_required: true
       action: "deploy"
@@ -312,10 +312,13 @@ backtest_agent:
     mode_b_editable: false
     human_approval_required: true
     backup_retention_days: 365
-    update_trigger: "manual_only"
+    update_trigger: "manual_except_post_close_final_dataset_promotion"
     rationale: |
       Backtest Agent 동작 설정. mode/llm/sla/forbidden_permissions/deploy_decision_gate 변경 시
       불변 원칙 3 (Backtest Agent Mode B 전용) + 불변 원칙 5 (하드코딩 금지) 위반 가능. 자동 변경 금지.
+      단, final_dataset_gate.expected_end_date/min_business_days 두 필드만
+      post_close_data_update.final_dataset_promotion의 Mode B + prelive evidence PASS 후 자동 승격을 허용한다.
+      production registry와 live trading flag는 이 경로에서 변경 금지.
 
 # v2.2 추가 — Validation Tools (C13 ValidationToolsContract)
 validation_tools:
@@ -399,6 +402,104 @@ validation_tools:
     rationale: |
       Validation Tools (BacktestEngine/ReplayRunner/PerformanceAnalyzer) 설정.
       purge_bars/embargo_bars/verdict 임계값 변경 시 C13 SLA 정합성 직결. 자동 변경 금지.
+
+# Read-only rolling-window IC research.
+# 운영/배포 registry를 수정하지 않고, feature group별 날짜 기반 rolling train window를
+# 비교한다. 장중 Hot Path, live trading, production registry와 무관하다.
+rolling_window_ic_experiment:
+  report_dir: "artifacts/reports/rolling_window_ic"
+  windows: [120, 150, 180]
+  n_folds: 5
+  min_validation_days: 5
+  embargo_days: 1
+  bar_stride: 15
+  target_col: "label_195m_net_ret"
+  lgbm_num_boost_round: 80
+  lgbm_num_threads: 2
+  groups:
+    OHLCV:
+      include_base: true
+      include_exogenous: false
+      dual_source_cols: []
+    OHLCV+Exog:
+      include_base: true
+      include_exogenous: true
+      dual_source_cols: []
+    OHLCV+News_DS:
+      include_base: true
+      include_exogenous: false
+      dual_source_cols: ["news_score_t"]
+    OHLCV+Exog+News_DS:
+      include_base: true
+      include_exogenous: true
+      dual_source_cols: ["news_score_t"]
+
+lgbm_hyperparam_sweep:
+  report_dir: "artifacts/reports/lgbm_hyperparam_sweep"
+  registry_root: "artifacts/lgbm_research/hyperparam_sweep"
+  default_preset: "compact"
+  default_windows: [249]
+  default_groups: ["OHLCV+Exog+News_DS"]
+  target_col: "label_195m_net_ret"
+  presets:
+    compact:
+      - name: "baseline_lr005_l31_c20"
+        lgbm_params:
+          num_leaves: 31
+          learning_rate: 0.05
+          min_child_samples: 20
+          subsample: 0.8
+          colsample_bytree: 0.8
+        training_control:
+          n_estimators: 500
+          early_stopping_rounds: 30
+      - name: "regularized_lr003_l31_c50"
+        lgbm_params:
+          num_leaves: 31
+          learning_rate: 0.03
+          min_child_samples: 50
+          subsample: 0.75
+          colsample_bytree: 0.75
+          lambda_l1: 0.1
+          lambda_l2: 1.0
+        training_control:
+          n_estimators: 700
+          early_stopping_rounds: 50
+      - name: "small_leaf_lr005_l15_c50"
+        lgbm_params:
+          num_leaves: 15
+          learning_rate: 0.05
+          min_child_samples: 50
+          subsample: 0.9
+          colsample_bytree: 0.9
+          lambda_l2: 1.0
+        training_control:
+          n_estimators: 500
+          early_stopping_rounds: 40
+      - name: "wide_regularized_lr003_l63_c80"
+        lgbm_params:
+          num_leaves: 63
+          learning_rate: 0.03
+          min_child_samples: 80
+          subsample: 0.8
+          colsample_bytree: 0.8
+          lambda_l1: 0.2
+          lambda_l2: 2.0
+        training_control:
+          n_estimators: 700
+          early_stopping_rounds: 60
+      - name: "slow_conservative_lr002_l31_c80"
+        lgbm_params:
+          num_leaves: 31
+          learning_rate: 0.02
+          min_child_samples: 80
+          subsample: 0.8
+          colsample_bytree: 0.7
+          lambda_l1: 0.2
+          lambda_l2: 3.0
+        training_control:
+          n_estimators: 900
+          early_stopping_rounds: 80
 
 # v2.2 추가 — BacktestEngine 거래비용 모델
 execution_cost_model:
@@ -878,6 +979,66 @@ live_data_readiness:
     backup_retention_days: 365
     update_trigger: "manual_only"
     rationale: "실데이터 backfill readiness와 LightGBM train gate. partial/stale artifact가 학습으로 넘어가는 것을 차단한다."
+
+# Post-close data update orchestrator. 장마감 후 PIT-safe target date를 선택해
+# live data readiness → news/DART archive → dual-source/exogenous materialize →
+# phase2 feature coverage를 한 번에 실행한다. .env 직접 접근/production registry mutation 금지.
+post_close_data_update:
+  enabled: true
+  target_date_policy: "latest_pit_safe_kospi_trading_day"
+  training_window_policy: "expanding_from_final_start"
+  trigger_after_snapshot_time: "pit_safety.snapshot_hour:snapshot_minute"
+  stage_timeout_sec: 3600
+  stop_on_stage_failure: true
+  skip_existing_backfill: true
+  raw_events_dir: "artifacts/raw/dual_source"
+  target_col_override: "label_195m_net_ret"
+  run_post_backfill_prelive_by_default: false
+  final_dataset_promotion:
+    enabled: true
+    update_risk_config: true
+    require_mode_b: true
+    require_post_backfill_prelive_pass: true
+    backup_dir: "artifacts/reports/post_close_data_update/config_backups"
+    allowed_fields:
+      - "backtest_agent.deploy_decision_gate.final_dataset_gate.expected_end_date"
+      - "backtest_agent.deploy_decision_gate.final_dataset_gate.min_business_days"
+    rationale: "데이터 수집만 PASS해도 deploy SSOT를 올리지 않는다. Mode B post_backfill_prelive까지 PASS한 뒤 배포용 final_dataset_gate 날짜/window만 승격한다. production registry와 live flag는 절대 변경하지 않는다."
+  post_backfill_prelive:
+    run_paper_balance: true
+    submit_probe: false
+    dual_source_feature_cols:
+      - "news_score_t"
+  scheduler:
+    enabled: true
+    run_time_kst: "18:05"
+    poll_interval_sec: 60
+    retry_failed_after_sec: 1800
+    state_path: "artifacts/reports/post_close_data_update_scheduler/state.json"
+    db:
+      enabled: true
+      path: "artifacts/db/post_close_jobs.sqlite3"
+    run_prelive: true
+    dry_run: false
+    bundle_id_template: "BUNDLE-{target_end_date}-POSTCLOSE"
+    mode_b_env_required: true
+  stages:
+    live_data_readiness: true
+    news_dart_archive: true
+    dual_source_materialize: true
+    exogenous_materialize: true
+    phase2_feature_backfill: true
+    post_backfill_prelive: true
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "1.0.0"
+    last_updated: "2026-05-19"
+    updated_by: "codex_post_close_update_orchestrator"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "operator_run_cli_after_18_00_kst"
+    rationale: "2026-05-18처럼 장마감 데이터가 final dataset 갱신 경로로 자동 유입되지 않는 공백을 닫는다. 실제 API credential은 프로세스 환경에서만 주입하며, 이 오케스트레이터와 scheduler는 .env/실계좌/production registry를 건드리지 않는다."
 
 # Label 생성 파라미터 (S1-0 Batch B dataset_builder.py 참조)
 # label = fwd_return_{horizon_bars}m. PIT-Safety 준수.
@@ -1476,6 +1637,9 @@ nightly_ppo_retrainer:
   ppo_n_epochs: 10               # PPO 업데이트 epoch 수
   ppo_seed: 42                   # PPO 학습 재현성 seed
   synthetic_seed: 42             # synthetic data 생성 seed
+  ppo_ortho_init: false          # CPU OpenMP QR 교착 방지. true면 SB3 기본 orthogonal init 사용.
+  ppo_torch_num_threads: 1       # Mode B PPO CPU 스레드 상한. 0 이하면 torch 기본값 유지.
+  ppo_torch_num_interop_threads: 1 # torch inter-op 스레드 상한. 0 이하면 torch 기본값 유지.
   mode_b_metadata:
     schema_version: "1.0.0"
     data_version: "1.0.0"

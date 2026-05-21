@@ -217,6 +217,16 @@ def _stage_statuses(stages: dict[str, dict[str, Any]], preflight: dict[str, Any]
     return statuses
 
 
+def _exception_stage(reason: str, error: Exception) -> dict[str, Any]:
+    return {
+        "status": "FAIL",
+        "reason": reason,
+        "exception_type": type(error).__name__,
+        "error": str(error),
+        "fail_closed": True,
+    }
+
+
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     if args.registry_dir:
         os.environ["ELEPHANT_LGBM_REGISTRY_DIR"] = str(args.registry_dir)
@@ -244,14 +254,20 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             hot_runner=hot_runner,
             **trader_kwargs,
         )
-        stages["paper_auto_cycle"] = trader.run(
-            tickers=[pad_ticker(t.strip()) for t in str(args.tickers).split(",") if t.strip()],
-            cycles=int(args.cycles),
-            interval_sec=float(args.interval_sec),
-            confirm_phrase=args.confirm_phrase,
-            risk_warnings=risk_warnings,
-            write_report=not bool(args.no_write_report),
-        )
+        try:
+            stages["paper_auto_cycle"] = trader.run(
+                tickers=[pad_ticker(t.strip()) for t in str(args.tickers).split(",") if t.strip()],
+                cycles=int(args.cycles),
+                interval_sec=float(args.interval_sec),
+                confirm_phrase=args.confirm_phrase,
+                risk_warnings=risk_warnings,
+                write_report=not bool(args.no_write_report),
+            )
+        except Exception as e:
+            stages["paper_auto_cycle"] = _exception_stage(
+                "paper_auto_cycle_exception",
+                e,
+            )
     else:
         stages["paper_auto_cycle"] = {
             "status": "SKIP",

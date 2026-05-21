@@ -11,12 +11,13 @@ Sprint 0 S0-3 실구현. 스텁에서 완전 동작 버전으로 교체.
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import date, datetime, time as dt_time
 from typing import Any
 
 from src.connectors.base import BaseConnector
 from src.data.event_normalizer import EventNormalizer
 from src.utils.auth import AuthManager
+from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
 from src.utils.rate_limiter import RateLimiter
@@ -111,9 +112,36 @@ class DARTRestClient(BaseConnector):
             return self._mock_list_disclosures(corp_code, page_count)
 
         # PIT-Safety guard: 미래 날짜 요청 차단 (불변 원칙 1)
+        current = now_kst()
+        today = current.date()
         for date_param, label in ((bgn_de, "bgn_de"), (end_de, "end_de")):
-            if date_param and not is_pit_safe(
-                f"{date_param[:4]}-{date_param[4:6]}-{date_param[6:8]}T23:59:59+09:00"
+            if not date_param:
+                continue
+
+            parsed = date(
+                int(date_param[0:4]),
+                int(date_param[4:6]),
+                int(date_param[6:8]),
+            )
+            if parsed == today:
+                pit_cfg = config_load("risk_config.yaml", "pit_safety")
+                snapshot_hour = int(pit_cfg["snapshot_hour"])
+                snapshot_dt = datetime.combine(
+                    today,
+                    dt_time(snapshot_hour, 0, 0),
+                    tzinfo=current.tzinfo,
+                )
+                if current < snapshot_dt:
+                    raise PITViolationError(
+                        f"[dart_rest] 당일 공시(date) 조회는 snapshot 이후만 허용: "
+                        f"{label}={date_param} now={current.isoformat()} snapshot={snapshot_dt.isoformat()}"
+                    )
+
+            if not is_pit_safe(
+                # DART list.json은 rcept_dt(일자)만 제공한다. 시각 정보가 없으므로
+                # PIT guard는 "해당 일자 시작(00:00 KST)" 기준으로만 미래 여부를 판단한다.
+                # (정밀한 시각 기반 PIT 차단은 상위 레이어의 window/snapshot 필터에서 수행)
+                f"{date_param[:4]}-{date_param[4:6]}-{date_param[6:8]}T00:00:00+09:00"
             ):
                 raise PITViolationError(
                     f"[dart_rest] 미래 날짜 요청 차단: {label}={date_param}"

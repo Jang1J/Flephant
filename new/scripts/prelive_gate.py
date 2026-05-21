@@ -290,6 +290,39 @@ def _final_dataset_gate_result(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _target_end_gate(
+    metadata: dict[str, Any],
+    *,
+    target_end_date: str | None,
+) -> dict[str, Any]:
+    if not target_end_date:
+        return {
+            "status": "PASS",
+            "required": False,
+            "blockers": [],
+        }
+    target_end = _parse_dataset_date(target_end_date)
+    train_end = _parse_dataset_date(metadata.get("train_end"))
+    blockers: list[str] = []
+    if target_end is None:
+        blockers.append("prelive_target_end_date_invalid")
+    if train_end is None:
+        blockers.append("train_end_missing_or_invalid")
+    elif target_end is not None and train_end != target_end:
+        blockers.append(
+            "train_end_before_prelive_target_end"
+            if train_end < target_end
+            else "train_end_after_prelive_target_end"
+        )
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "required": True,
+        "blockers": blockers,
+        "target_end_date": target_end.strftime("%Y%m%d") if target_end else None,
+        "train_end": train_end.strftime("%Y%m%d") if train_end else None,
+    }
+
+
 def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
     return _final_dataset_gate_result(payload).get("status") == "PASS"
 
@@ -653,7 +686,11 @@ def _staged_lgbm_metadata(
     return version, meta, metadata_path, model_path
 
 
-def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
+def _check_lgbm_real_train(
+    bundle_id: str | None = None,
+    *,
+    target_end_date: str | None = None,
+) -> dict[str, Any]:
     requested_bundle_id = str(bundle_id or "").strip()
     metadata_source = "production_registry"
     staged_metadata_path: Path | None = None
@@ -734,6 +771,8 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     target_col_ok = str(actual_target_col or "").strip() in allowed_target_cols
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
     final_dataset_gate_ok = final_dataset_gate.get("status") == "PASS"
+    target_end_gate = _target_end_gate(meta, target_end_date=target_end_date)
+    target_end_gate_ok = target_end_gate.get("status") == "PASS"
     status = (
         "PASS"
         if model_exists
@@ -743,6 +782,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
         and label_scope_ok
         and target_col_ok
         and final_dataset_gate_ok
+        and target_end_gate_ok
         and (bundle_id_matches_request is not False)
         else "BLOCKED"
     )
@@ -760,6 +800,9 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     elif not final_dataset_gate_ok:
         blockers = final_dataset_gate.get("blockers") or ["final_dataset_gate_blocked"]
         message = f"Latest LightGBM artifact failed final_dataset_gate: {blockers}"
+    elif not target_end_gate_ok:
+        blockers = target_end_gate.get("blockers") or ["prelive_target_end_gate_blocked"]
+        message = f"Latest LightGBM artifact failed prelive target end-date gate: {blockers}"
     elif not real_data_source:
         message = "Latest LightGBM artifact is not marked as artifact_bars real data."
     return _stage(
@@ -798,6 +841,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "missing_tickers": meta.get("missing_tickers"),
             "n_tickers": meta.get("n_tickers"),
             "final_dataset_gate": final_dataset_gate,
+            "prelive_target_end_gate": target_end_gate,
             "metrics": meta.get("metrics", {}),
             "metric_scope": meta.get(
                 "metric_scope",
@@ -869,7 +913,11 @@ def _service_policy_repo_root() -> Path:
     return _REPORT_ROOT
 
 
-def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
+def _check_backtest_gate(
+    lgbm_stage: dict[str, Any],
+    *,
+    target_end_date: str | None = None,
+) -> dict[str, Any]:
     cli_path = NEW_ROOT / "src" / "jobs" / "run_backtest.py"
     if lgbm_stage.get("status") != "PASS":
         return _stage(
@@ -901,12 +949,25 @@ def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
     path, data = _latest_matching_report(
         report_dir,
         prefix,
-        lambda payload: _is_deployable_backtest_report(payload, bundle_id),
+        lambda payload: payload.get("bundle_id") == bundle_id,
     )
-    if path and data:
+    latest_target_end_gate = (
+        _target_end_gate(
+            _extract_model_metadata(data),
+            target_end_date=target_end_date,
+        )
+        if data
+        else {"status": "BLOCKED", "blockers": ["backtest_report_missing"]}
+    )
+    if (
+        path
+        and data
+        and _is_deployable_backtest_report(data, bundle_id)
+        and latest_target_end_gate.get("status") == "PASS"
+    ):
         return _stage(
             "PASS",
-            "PASS real backtest report artifact was found for the candidate.",
+            "Latest real backtest report artifact is deployable for the candidate.",
             {
                 "bundle_id": bundle_id,
                 "report_path": _repo_relative(path),
@@ -917,32 +978,29 @@ def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
                 "regression_risk": data.get("regression_risk"),
                 "minute_bar_leakage_check": data.get("minute_bar_leakage_check"),
                 "final_dataset_gate": _final_dataset_gate_result(data),
+                "prelive_target_end_gate": latest_target_end_gate,
                 "cli_available": cli_path.exists(),
                 "cli_path": _repo_relative(cli_path),
             },
         )
 
-    latest_path, latest_data = _latest_matching_report(
-        report_dir,
-        prefix,
-        lambda payload: payload.get("bundle_id") == bundle_id,
-    )
     latest_detail: dict[str, Any] = {}
-    if latest_path and latest_data:
-        regression = latest_data.get("regression_risk") or {}
-        leakage = latest_data.get("minute_bar_leakage_check") or {}
-        service_policy = latest_data.get("service_policy_replay") or {}
+    if path and data:
+        regression = data.get("regression_risk") or {}
+        leakage = data.get("minute_bar_leakage_check") or {}
+        service_policy = data.get("service_policy_replay") or {}
         latest_detail = {
-            "latest_report_path": _repo_relative(latest_path),
-            "latest_verdict": latest_data.get("verdict"),
-            "latest_status": latest_data.get("status"),
+            "latest_report_path": _repo_relative(path),
+            "latest_verdict": data.get("verdict"),
+            "latest_status": data.get("status"),
             "latest_regression_flagged": regression.get("flagged"),
             "latest_leakage_verdict": leakage.get("verdict"),
-            "latest_feature_quality_gate_pass": _feature_quality_gate_pass(latest_data),
-            "latest_feature_quality": latest_data.get("feature_quality") or {},
-            "latest_final_dataset_gate": _final_dataset_gate_result(latest_data),
+            "latest_feature_quality_gate_pass": _feature_quality_gate_pass(data),
+            "latest_feature_quality": data.get("feature_quality") or {},
+            "latest_final_dataset_gate": _final_dataset_gate_result(data),
+            "latest_prelive_target_end_gate": latest_target_end_gate,
             "latest_service_policy_gate_pass": _service_policy_gate_pass(
-                latest_data,
+                data,
                 bundle_id,
             ),
             "latest_service_policy_replay_status": (
@@ -962,8 +1020,8 @@ def _check_backtest_gate(lgbm_stage: dict[str, Any]) -> dict[str, Any]:
                 else None
             ),
             "latest_service_policy_expected_date_range": (
-                latest_data.get("service_policy_expected_date_range")
-                or latest_data.get("date_range")
+                data.get("service_policy_expected_date_range")
+                or data.get("date_range")
             ),
         }
     return _stage(
@@ -1393,10 +1451,12 @@ def build_report(
     )
     requested_bundle_id = str(bundle_id or "").strip()
     stages["04_lgbm_real_train"] = _check_lgbm_real_train(
-        requested_bundle_id or None
+        requested_bundle_id or None,
+        target_end_date=end_date,
     )
     stages["05_backtest_real_candidate"] = _check_backtest_gate(
-        stages["04_lgbm_real_train"]
+        stages["04_lgbm_real_train"],
+        target_end_date=end_date,
     )
     stages["06_paper_balance"] = _check_paper_balance(
         requested_bundle_id or None

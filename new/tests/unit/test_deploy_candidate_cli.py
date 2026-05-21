@@ -83,11 +83,10 @@ def test_deploy_candidate_dry_run_blocks_without_deployable_backtest(
         "regression_risk": {"flagged": True, "severity": "high"},
         "minute_bar_leakage_check": {"verdict": "pass"},
     }
-    monkeypatch.setattr(deploy_candidate, "_latest_deployable_backtest", lambda _: (None, None))
     monkeypatch.setattr(
         deploy_candidate,
-        "_latest_any_backtest",
-        lambda _: (latest_path, latest_payload),
+        "_latest_backtest_decision",
+        lambda _: (latest_path, latest_payload, False),
     )
 
     rc = deploy_candidate.main([
@@ -133,8 +132,8 @@ def test_deploy_candidate_dry_run_passes_when_deployable_backtest_exists(
     }
     monkeypatch.setattr(
         deploy_candidate,
-        "_latest_deployable_backtest",
-        lambda _: (backtest_path, backtest_payload),
+        "_latest_backtest_decision",
+        lambda _: (backtest_path, backtest_payload, True),
     )
 
     rc = deploy_candidate.main([
@@ -181,8 +180,8 @@ def test_deploy_candidate_treats_string_false_regression_flag_as_false(
     }
     monkeypatch.setattr(
         deploy_candidate,
-        "_latest_deployable_backtest",
-        lambda _: (backtest_path, backtest_payload),
+        "_latest_backtest_decision",
+        lambda _: (backtest_path, backtest_payload, True),
     )
 
     captured = {}
@@ -235,8 +234,8 @@ def test_deploy_candidate_blocks_non_dry_run_without_confirm_phrase(
     }
     monkeypatch.setattr(
         deploy_candidate,
-        "_latest_deployable_backtest",
-        lambda _: (backtest_path, backtest_payload),
+        "_latest_backtest_decision",
+        lambda _: (backtest_path, backtest_payload, True),
     )
 
     class _FailIfCalled:
