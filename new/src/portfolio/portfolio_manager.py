@@ -227,11 +227,7 @@ class PortfolioManager:
                 continue
             current_weights[ticker] = parsed_weight
         current_qty = {
-            pad_ticker(str(p["ticker"])): safe_lossless_int(
-                p.get("qty", 0),
-                default=0,
-                min_value=0,
-            )
+            pad_ticker(str(p["ticker"])): self._sellable_qty(p)
             for p in current_positions
             if "ticker" in p
         }
@@ -358,6 +354,23 @@ class PortfolioManager:
                 "min_cash": self._min_cash,
             },
         }
+
+    @staticmethod
+    def _sellable_qty(position: dict[str, Any]) -> int:
+        """Broker 주문가능수량이 있으면 sell cap에 우선 사용한다."""
+        held_qty = safe_lossless_int(
+            position.get("qty", 0),
+            default=0,
+            min_value=0,
+        )
+        if "available_qty" not in position:
+            return held_qty
+        available_qty = safe_lossless_int(
+            position.get("available_qty"),
+            default=0,
+            min_value=0,
+        )
+        return min(available_qty, held_qty)
 
     # ================================================================== #
     # Internal

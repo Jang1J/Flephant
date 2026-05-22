@@ -232,6 +232,29 @@ def test_sell_qty_is_capped_to_current_position_qty(pm: PortfolioManager) -> Non
     }]
 
 
+def test_sell_qty_is_capped_to_available_qty_when_present(pm: PortfolioManager) -> None:
+    """KIS ord_psbl_qty가 0이면 보유수량이 남아도 중복 sell을 만들지 않는다."""
+    result = pm.plan(
+        target_weights={},
+        current_positions=[{
+            "ticker": "403870",
+            "qty": 2,
+            "available_qty": 0,
+            "weight": 0.01,
+        }],
+        latest_prices={"403870": 53600.0},
+        portfolio_value=10_000_000.0,
+    )
+
+    assert result["portfolio_patch"]["order_deltas"] == []
+    assert result["errors"][0]["error"] == "SELL_QTY_UNAVAILABLE"
+    assert result["sell_caps_applied"] == [{
+        "ticker": "403870",
+        "requested_qty": 1,
+        "capped_qty": 0,
+    }]
+
+
 def test_negative_target_weight_does_not_create_unheld_sell(pm: PortfolioManager) -> None:
     """malformed PPO 음수 weight는 미보유 종목 sell 주문으로 변환하지 않는다."""
     result = pm.plan(

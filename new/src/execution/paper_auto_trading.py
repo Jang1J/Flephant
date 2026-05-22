@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from src.connectors.kis_rest import KISRestClient
+from src.agents.hot.quant import QuantAgent
+from src.connectors.kis_rest import KISAPIError, KISRestClient
+from src.data.dual_source_runner import load_latest_scores
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.kill_switch import KillSwitch
 from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
@@ -99,6 +101,24 @@ class PaperAutoTrader:
             self._cfg.get("allow_market_order", False),
             default=False,
         )
+        self._max_consecutive_read_error_skips = safe_int(
+            self._cfg.get("max_consecutive_read_error_skips", 3),
+            default=3,
+            min_value=0,
+        )
+        self._require_serving_feature_readiness = safe_bool(
+            self._cfg.get("require_serving_feature_readiness", True),
+            default=True,
+        )
+        self._fail_on_quant_blocked = safe_bool(
+            self._cfg.get("fail_on_quant_blocked", True),
+            default=True,
+        )
+        self._require_active_scores_for_no_order_skip = safe_bool(
+            self._cfg.get("require_active_scores_for_no_order_skip", True),
+            default=True,
+        )
+        self._consecutive_read_errors = 0
         self._run_guard_passed = False
 
     @property
@@ -242,8 +262,33 @@ class PaperAutoTrader:
                 "execution": None,
             }
         padded = [pad_ticker(str(t)) for t in tickers]
-        balance = self._kis_client.get_balance()
-        bars_by_ticker = self._fetch_recent_bars(padded)
+        try:
+            balance = self._kis_client.get_balance()
+            bars_by_ticker = self._fetch_recent_bars(padded)
+        except Exception as e:
+            if self._is_transient_read_error(e):
+                self._consecutive_read_errors += 1
+                fail_closed = (
+                    self._consecutive_read_errors
+                    > self._max_consecutive_read_error_skips
+                )
+                logger.warning(
+                    "[paper_auto_trading] KIS read 오류. cycle=%s consecutive=%d/%d "
+                    "fail_closed=%s error=%s",
+                    cycle_index,
+                    self._consecutive_read_errors,
+                    self._max_consecutive_read_error_skips,
+                    fail_closed,
+                    e,
+                )
+                return self._read_error_cycle_report(
+                    cycle_index=cycle_index,
+                    error=e,
+                    consecutive_read_errors=self._consecutive_read_errors,
+                    fail_closed=fail_closed,
+                )
+            raise
+        self._consecutive_read_errors = 0
         latest_prices = self._latest_prices(bars_by_ticker)
         portfolio_value = self._portfolio_value(balance)
         current_positions = self._current_positions(
@@ -354,6 +399,56 @@ class PaperAutoTrader:
             "execution": None,
         }
 
+    def _read_error_cycle_report(
+        self,
+        *,
+        cycle_index: int,
+        error: Exception,
+        consecutive_read_errors: int,
+        fail_closed: bool,
+    ) -> dict[str, Any]:
+        return {
+            "status": "FAIL" if fail_closed else "SKIP",
+            "cycle_index": int(cycle_index),
+            "started_at": datetime.now(_KST).isoformat(),
+            "reason": (
+                "paper_auto_read_error_budget_exhausted"
+                if fail_closed
+                else "paper_auto_read_transient_error_skip"
+            ),
+            "safe_skip": not fail_closed,
+            "exception_type": type(error).__name__,
+            "error": str(error),
+            "consecutive_read_errors": int(consecutive_read_errors),
+            "max_consecutive_read_error_skips": self._max_consecutive_read_error_skips,
+            "fail_closed": fail_closed,
+            "execution": None,
+        }
+
+    @staticmethod
+    def _is_transient_read_error(error: Exception) -> bool:
+        text = str(error)
+        non_transient_markers = (
+            "msg_cd=OPSQ2000",
+            "msg_cd=40580000",
+            "KIS_MODE=real",
+            "PAPER_MODE_REQUIRED",
+        )
+        if any(marker in text for marker in non_transient_markers):
+            return False
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            return True
+        transient_kis_markers = (
+            "HTTP 429",
+            "Too Many Requests",
+            "circuit breaker OPEN",
+            "msg_cd=EGW00201",
+            "msg_cd=EGW00133",
+        )
+        return isinstance(error, KISAPIError) and any(
+            marker in text for marker in transient_kis_markers
+        )
+
     def _make_ppo_allocator(self) -> PPOAllocator:
         if not safe_bool(
             self._cfg.get("use_latest_ppo_policy_if_available", True),
@@ -410,12 +505,23 @@ class PaperAutoTrader:
             if ticker == "000000":
                 continue
             qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
+            available_qty = safe_lossless_int(
+                pos.get("available_qty", qty),
+                default=qty,
+                min_value=0,
+            )
+            available_qty = min(available_qty, qty)
             price = latest_prices.get(
                 ticker,
                 safe_float(pos.get("current_price", 0.0), default=0.0),
             )
             weight = (qty * price / portfolio_value) if portfolio_value > 0 and price > 0 else 0.0
-            out.append({"ticker": ticker, "qty": qty, "weight": float(weight)})
+            out.append({
+                "ticker": ticker,
+                "qty": qty,
+                "available_qty": available_qty,
+                "weight": float(weight),
+            })
         return out
 
     def _start_guard(self, confirm_phrase: str | None) -> dict[str, Any]:

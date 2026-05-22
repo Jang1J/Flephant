@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.connectors.kis_rest import KISAPIError
 from src.execution import paper_auto_trading as paper_auto_module
 from src.execution.kill_switch import KillSwitch
 from src.execution.paper_auto_trading import PaperAutoTrader
@@ -133,6 +134,26 @@ class FakePaperKISRejects(FakePaperKIS):
 class FakePaperKISBalanceError(FakePaperKIS):
     def get_balance(self) -> dict[str, Any]:
         raise ConnectionError("dns failed")
+
+
+class FakePaperKISBalanceTransientThenSuccess(FakePaperKIS):
+    def __init__(self, failures_before_success: int) -> None:
+        super().__init__()
+        self.failures_before_success = failures_before_success
+
+    def get_balance(self) -> dict[str, Any]:
+        if self.failures_before_success > 0:
+            self.failures_before_success -= 1
+            raise ConnectionError("HTTP timeout (10s): read timed out")
+        return super().get_balance()
+
+
+class FakePaperKISBalanceNonTransientError(FakePaperKIS):
+    def get_balance(self) -> dict[str, Any]:
+        raise KISAPIError(
+            "[kis_rest] KIS API 오류 path=/uapi/domestic-stock/v1/trading/"
+            "inquire-balance msg_cd=OPSQ2000 msg=계좌 확인 오류"
+        )
 
 
 class FakePaperKISNoHistoryMatch(FakePaperKIS):
@@ -459,10 +480,109 @@ def test_paper_auto_fails_fast_when_requested_ticker_is_not_active(
     assert client.orders == []
 
 
-def test_paper_auto_records_fail_closed_report_when_kis_balance_raises(
+def test_paper_auto_skips_single_transient_balance_error_without_order(
     tmp_path: Path,
 ) -> None:
     client = FakePaperKISBalanceError()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "PASS"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["status"] == "SKIP"
+    assert cycle["reason"] == "paper_auto_read_transient_error_skip"
+    assert cycle["exception_type"] == "ConnectionError"
+    assert cycle["safe_skip"] is True
+    assert cycle["fail_closed"] is False
+    assert hot_runner.calls == []
+    assert client.orders == []
+
+
+def test_paper_auto_fails_closed_after_consecutive_transient_read_errors(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKISBalanceError()
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=4,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    cycles = report["stages"]["cycles"]["items"]
+    assert [cycle["status"] for cycle in cycles] == ["SKIP", "SKIP", "SKIP", "FAIL"]
+    assert cycles[-1]["reason"] == "paper_auto_read_error_budget_exhausted"
+    assert cycles[-1]["consecutive_read_errors"] == 4
+    assert cycles[-1]["max_consecutive_read_error_skips"] == 3
+    assert cycles[-1]["fail_closed"] is True
+    assert hot_runner.calls == []
+    assert client.orders == []
+
+
+def test_paper_auto_continues_after_transient_read_error_recovers(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKISBalanceTransientThenSuccess(failures_before_success=1)
+    hot_runner = FakeHotRunner(qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=2,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycles = report["stages"]["cycles"]["items"]
+    assert report["status"] == "PASS"
+    assert [cycle["status"] for cycle in cycles] == ["SKIP", "PASS"]
+    assert cycles[0]["reason"] == "paper_auto_read_transient_error_skip"
+    assert len(hot_runner.calls) == 1
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
+
+
+def test_paper_auto_non_transient_balance_error_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKISBalanceNonTransientError()
     hot_runner = FakeHotRunner(qty=1)
     trader = PaperAutoTrader(
         kis_client=client,
@@ -484,7 +604,7 @@ def test_paper_auto_records_fail_closed_report_when_kis_balance_raises(
     cycle = report["stages"]["cycles"]["items"][0]
     assert cycle["status"] == "FAIL"
     assert cycle["reason"] == "paper_auto_cycle_exception"
-    assert cycle["exception_type"] == "ConnectionError"
+    assert cycle["exception_type"] == "KISAPIError"
     assert cycle["fail_closed"] is True
     assert hot_runner.calls == []
     assert client.orders == []
@@ -1083,7 +1203,32 @@ def test_paper_auto_current_positions_do_not_truncate_fractional_qty() -> None:
         portfolio_value=1_000_000.0,
     )
 
-    assert positions == [{"ticker": "005930", "qty": 0, "weight": 0.0}]
+    assert positions == [{
+        "ticker": "005930",
+        "qty": 0,
+        "available_qty": 0,
+        "weight": 0.0,
+    }]
+
+
+def test_paper_auto_current_positions_preserve_available_qty() -> None:
+    positions = PaperAutoTrader._current_positions(
+        [{
+            "ticker": "403870",
+            "qty": 2,
+            "available_qty": 0,
+            "current_price": 53600.0,
+        }],
+        latest_prices={"403870": 53600.0},
+        portfolio_value=10_720_000.0,
+    )
+
+    assert positions == [{
+        "ticker": "403870",
+        "qty": 2,
+        "available_qty": 0,
+        "weight": 0.01,
+    }]
 
 
 def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:
