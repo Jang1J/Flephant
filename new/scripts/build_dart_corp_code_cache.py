@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""Build DART corp_code mapping cache for active KOSPI 20 tickers.
+"""Build DART corp_code mapping cache for active KOSPI trade-universe tickers.
 
 DART Open API의 corpCode.xml endpoint (zip)에서 전체 회사 코드를 1회 다운로드한 후
-universe_config.yaml active 20 ticker만 추출해 캐시 JSON으로 저장한다.
+universe_config.yaml active ticker만 추출해 캐시 JSON으로 저장한다.
 한 번 실행 후 캐시 파일을 build_news_dart_archive.py가 참조한다.
 
 산출: artifacts/cache/dart_corp_code_kospi20.json
+주의: 파일명은 과거 20종목 시절 이름을 유지하지만, 내용은 현재 active universe
+전체를 반영해야 한다.
 """
 from __future__ import annotations
 
