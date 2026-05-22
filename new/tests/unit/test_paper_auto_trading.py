@@ -390,6 +390,76 @@ class FakeStringFalseModelHotRunner(FakeHotRunner):
         )
 
 
+class FakeZeroScoreHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "quant_output": {
+                "mode": "warmup",
+                "scores": {},
+                "n_tickers": 0,
+            },
+            "final_decision": {
+                "decision_id": "FDA-ZERO-SCORE",
+                "approved": True,
+                "reason_code": "NORMAL_APPROVE",
+                "order_deltas": [],
+            },
+            "latency_ms": 1.0,
+        }
+
+
+class FakeBlockedQuantHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "status": "FAIL",
+            "failure_stage": "quant_feature_readiness",
+            "quant_output": {
+                "mode": "blocked",
+                "blocker": "required_feature_missing",
+                "scores": {},
+                "n_tickers": 0,
+            },
+            "final_decision": {
+                "decision_id": "FDA-BLOCKED-QUANT",
+                "approved": False,
+                "reason_code": "QUANT_FEATURE_BLOCKED",
+                "order_deltas": [],
+            },
+            "latency_ms": 1.0,
+        }
+
+
+class FakeFeatureReadinessBlockedHotRunner(FakeHotRunner):
+    def __init__(self) -> None:
+        super().__init__(qty=1)
+        self.start_called = False
+
+        def readiness(_tickers, _asof):
+            return {
+                "status": "FAIL",
+                "error_code": "REQUIRED_DUAL_SOURCE_FEATURE_MISSING",
+                "reason": "required_dual_source_feature_missing",
+                "required_dual_source_cols": ["news_score_t"],
+            }
+
+        self._quant = SimpleNamespace(
+            has_model=True,
+            model_metadata={"version": "active_v1", "bundle_id": "BUNDLE-TEST"},
+            serving_feature_readiness=readiness,
+        )
+
+    def start(self) -> None:
+        self.start_called = True
+        super().start()
+
+
+class ExplodingReadKIS(FakePaperKIS):
+    def get_balance(self) -> dict[str, Any]:
+        raise AssertionError("broker read must not run when feature readiness fails")
+
+
 def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
@@ -410,6 +480,41 @@ def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     assert report["status"] == "SKIP"
     assert client.orders == []
     assert report["stages"]["start_guard"]["required_phrase"] == "PAPER_AUTO_OK"
+
+
+def test_paper_auto_default_hot_runner_injects_dual_source_loader(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def sentinel_loader(_date: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+    class FakeQuant:
+        has_model = False
+        model_metadata = None
+
+        def __init__(self, dual_source_loader=None) -> None:
+            captured["dual_source_loader"] = dual_source_loader
+
+    class FakeRunner:
+        def __init__(self, quant, ppo) -> None:
+            self._quant = quant
+            self._ppo = ppo
+
+    monkeypatch.setattr(paper_auto_module, "load_latest_scores", sentinel_loader)
+    monkeypatch.setattr(paper_auto_module, "QuantAgent", FakeQuant)
+    monkeypatch.setattr(paper_auto_module, "HotRunner", FakeRunner)
+
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKIS(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    assert captured["dual_source_loader"] is sentinel_loader
+    assert trader._hot_runner._quant.has_model is False  # noqa: SLF001
 
 
 def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
@@ -448,6 +553,80 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
         "quant": "done",
         "debate": "skipped",
     }
+
+
+def test_paper_auto_fails_zero_score_no_order_run(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeZeroScoreHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["order_guard"]["status"] == "FAIL"
+    assert cycle["order_guard"]["reason"] == "active_model_no_scores_no_order_deltas"
+    assert client.orders == []
+
+
+def test_paper_auto_fails_closed_when_quant_feature_blocked(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeBlockedQuantHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["reason"] == "quant_feature_readiness"
+    assert cycle["hot_result"]["quant_output"]["mode"] == "blocked"
+    assert client.orders == []
+
+
+def test_paper_auto_preflight_blocks_missing_feature_before_broker_read(
+    tmp_path: Path,
+) -> None:
+    hot_runner = FakeFeatureReadinessBlockedHotRunner()
+    trader = PaperAutoTrader(
+        kis_client=ExplodingReadKIS(),
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    guard = report["stages"]["serving_feature_readiness"]
+    assert guard["error_code"] == "REQUIRED_DUAL_SOURCE_FEATURE_MISSING"
+    assert "cycles" not in report["stages"]
+    assert hot_runner.start_called is False
 
 
 def test_paper_auto_fails_fast_when_requested_ticker_is_not_active(

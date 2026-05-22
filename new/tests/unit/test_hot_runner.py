@@ -128,6 +128,32 @@ def _deps_done() -> dict[str, str]:
     return {"news": "done", "risk": "done", "quant": "done", "debate": "skipped"}
 
 
+class _BlockedQuant:
+    has_model = True
+
+    def score_cross_section(self, tickers, asof):
+        return {
+            "tickers": [],
+            "scores": {},
+            "ts": asof,
+            "mode": "blocked",
+            "blocker": "required_feature_missing",
+            "missing_feature_cols": ["news_score_t"],
+            "n_tickers": 0,
+        }
+
+    def detect_anomalies(self, tickers, asof):
+        return []
+
+    def on_bar(self, bar):
+        return None
+
+
+class _ExplodingPM:
+    def plan(self, **kwargs):
+        raise AssertionError("PM must not run when Quant is feature-blocked")
+
+
 @pytest.fixture
 def runner(tmp_path) -> HotRunner:
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm")
@@ -221,6 +247,34 @@ def test_run_once_missing_dependency_status_vetoes(runner: HotRunner) -> None:
     assert result["final_decision"]["reason_code"] == "TIMEOUT"
     assert "news" in result["final_decision"]["veto_reason"]
     assert "risk" in result["final_decision"]["veto_reason"]
+
+
+def test_run_once_quant_blocked_does_not_generate_pm_exit_orders() -> None:
+    runner = HotRunner(
+        quant=_BlockedQuant(),
+        ppo=PPOAllocator(),
+        pm=_ExplodingPM(),
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+    runner.start()
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": 0.1}],
+        latest_prices={"005930": 70000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_feature_readiness"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "QUANT_FEATURE_BLOCKED"
+    assert result["final_decision"]["order_deltas"] == []
+    assert result["pm_result"] == {}
 
 
 def test_run_once_bar_batch_consumed(runner: HotRunner) -> None:

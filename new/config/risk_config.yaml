@@ -147,6 +147,10 @@ paper_auto_trading:
   max_order_qty_per_order_prelive_cap: 2
   allow_market_order: false
   use_latest_ppo_policy_if_available: true
+  max_consecutive_read_error_skips: 3  # balance/분봉 read-only transient 오류는 N회까지 주문 없이 skip
+  require_serving_feature_readiness: true  # active model 필수 serving feature 누락 시 broker 주문 전 fail-closed
+  fail_on_quant_blocked: true              # Quant feature blocker를 no-order PASS로 위장하지 않음
+  require_active_scores_for_no_order_skip: true  # score 없는 no_order_deltas는 운영 PASS 금지
 
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"

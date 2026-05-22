@@ -753,7 +753,8 @@ def test_score_cross_section_blocks_future_dual_source_scores(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "required_feature_missing"
     assert result["scores"] == {}
 
 
@@ -787,7 +788,8 @@ def test_dual_source_cache_rechecks_asof_on_each_lookup(
     earlier = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
     assert later["mode"] == "active"
-    assert earlier["mode"] == "warmup"
+    assert earlier["mode"] == "blocked"
+    assert earlier["blocker"] == "required_feature_missing"
     assert earlier["scores"] == {}
     assert loader_calls == ["20260420"]
 
@@ -817,7 +819,8 @@ def test_score_cross_section_blocks_invalid_model_predictions(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "model_prediction_invalid"
     assert result["scores"] == {}
     assert result["error"] == "model_prediction_invalid"
 
@@ -1018,9 +1021,11 @@ def test_score_cross_section_blocks_dual_source_model_when_scores_missing(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "required_feature_missing"
     assert result["scores"] == {}
     assert result["n_tickers"] == 0
+    assert result["missing_feature_cols"] == ["news_score_t"]
 
 
 def test_score_cross_section_default_does_not_load_dual_source_from_disk(
@@ -1048,7 +1053,8 @@ def test_score_cross_section_default_does_not_load_dual_source_from_disk(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "required_feature_missing"
     assert result["scores"] == {}
     assert calls == []
 
@@ -1070,7 +1076,8 @@ def test_score_cross_section_blocks_dual_source_model_when_loader_fails(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "required_feature_missing"
     assert result["scores"] == {}
 
 
@@ -1098,8 +1105,80 @@ def test_score_cross_section_blocks_dual_source_model_when_values_invalid(
 
     result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
 
-    assert result["mode"] == "warmup"
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "required_feature_missing"
     assert result["scores"] == {}
+
+
+def test_score_cross_section_requires_only_model_metadata_dual_source_cols(
+    tmp_path: Path,
+) -> None:
+    """metadata가 news_score_t만 요구하면 나머지 DS 컬럼 누락은 block하지 않는다."""
+    reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm_news_only")
+    mock = MockBooster(scores=None)
+    reg.save(
+        mock,
+        {
+            "version": "news-only-ds-v1",
+            "bundle_id": None,
+            "train_start": "20260101",
+            "train_end": "20260419",
+            "feature_cols": [
+                "feat_1m_close_robust_z",
+                "feat_5m_ret",
+                "feat_30m_vol",
+                "feat_60m_trend",
+                "news_score_t",
+            ],
+            "label_horizon_bars": 5,
+            "target_col": "label_5m_ret",
+            "label_generation_version": "session_local_v2",
+            "label_session_scope": "ticker_trading_day",
+            "metrics": {},
+            "data_version": "v1",
+        },
+        is_latest=True,
+    )
+
+    def loader(_date: str | None) -> list[dict[str, Any]]:
+        return [{"ticker": "005930", "news_score_t": 0.7}]
+
+    agent = QuantAgent(registry=reg, bar_buffer=BarBuffer(), dual_source_loader=loader)
+    for bar in _make_bars("005930", n=65):
+        agent.on_bar(bar)
+
+    result = agent.score_cross_section(["005930"], asof="2026-04-20T10:04:00+09:00")
+
+    assert result["mode"] == "active"
+    assert result["scores"]
+    assert agent._booster.last_X is not None
+    assert agent._booster.last_X.shape[1] == 5
+    assert agent._booster.last_X[0, 4] == pytest.approx(0.7)
+
+
+def test_serving_feature_readiness_blocks_missing_required_dual_source(
+    populated_dual_source_registry: ModelRegistry,
+) -> None:
+    agent = QuantAgent(
+        registry=populated_dual_source_registry,
+        bar_buffer=BarBuffer(),
+        dual_source_loader=lambda _date: [],
+    )
+
+    result = agent.serving_feature_readiness(
+        ["005930"],
+        "2026-04-20T10:04:00+09:00",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["error_code"] == "REQUIRED_DUAL_SOURCE_FEATURE_MISSING"
+    assert result["required_dual_source_cols"] == [
+        "news_score_t",
+        "comm_score_t_1",
+        "comm_score_t_2",
+        "news_comm_divergence",
+        "community_noise_multiplier",
+    ]
 
 
 # ====================================================================== #

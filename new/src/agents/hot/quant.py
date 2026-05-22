@@ -302,7 +302,7 @@ class QuantAgent(AgentBase):
               "scores": {ticker: ranking_score},
               "confidences": {ticker: LightGBM confidence},
               "ts": asof,
-              "mode": "active" | "passive" | "warmup",
+              "mode": "active" | "passive" | "warmup" | "blocked",
               "latency_ms": float,
               "n_tickers": int,
             }
@@ -345,18 +345,22 @@ class QuantAgent(AgentBase):
 
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
+        feature_blockers: list[dict[str, Any]] = []
+        warmup_tickers: list[str] = []
 
-        requires_dual_source = self._model_requires_dual_source()
+        required_dual_source_cols = set(self._required_dual_source_cols())
 
         for ticker in padded_all:
             bars = bars_batch.get(ticker, [])
             if len(bars) < self._warmup_bars:
+                warmup_tickers.append(ticker)
                 continue
             all_feats = self._compute_features(
                 bars,
                 ticker=ticker,
                 asof=asof_str,
-                require_dual_source=requires_dual_source,
+                required_dual_source_cols=required_dual_source_cols,
+                feature_blockers=feature_blockers,
             )
             if all_feats is None:
                 continue
@@ -368,6 +372,12 @@ class QuantAgent(AgentBase):
                 logger.warning(
                     "[quant_agent] %s feature 누락: %s. skip", ticker, e
                 )
+                feature_blockers.append({
+                    "ticker": ticker,
+                    "blocker": "inference_feature_missing",
+                    "missing_feature": str(e).strip("'\""),
+                    "required_feature_cols": list(self._inference_feature_cols),
+                })
                 continue
             feature_matrix.append(feature_vec)
             valid_tickers.append(ticker)
@@ -375,11 +385,31 @@ class QuantAgent(AgentBase):
         if not valid_tickers:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self._latency_records.append(elapsed_ms)
+            if feature_blockers:
+                missing_cols = sorted({
+                    str(blocker.get("missing_feature", ""))
+                    for blocker in feature_blockers
+                    if blocker.get("missing_feature")
+                })
+                return {
+                    "tickers": [],
+                    "scores": {},
+                    "ts": asof_str,
+                    "mode": "blocked",
+                    "blocker": "required_feature_missing",
+                    "blockers": feature_blockers,
+                    "missing_feature_cols": missing_cols,
+                    "required_dual_source_cols": sorted(required_dual_source_cols),
+                    "warmup_tickers": warmup_tickers,
+                    "latency_ms": elapsed_ms,
+                    "n_tickers": 0,
+                }
             return {
                 "tickers": [],
                 "scores": {},
                 "ts": asof_str,
                 "mode": "warmup",
+                "warmup_tickers": warmup_tickers,
                 "latency_ms": elapsed_ms,
                 "n_tickers": 0,
             }
@@ -403,7 +433,8 @@ class QuantAgent(AgentBase):
                 "tickers": [],
                 "scores": {},
                 "ts": asof_str,
-                "mode": "warmup",
+                "mode": "blocked",
+                "blocker": "model_prediction_invalid",
                 "latency_ms": elapsed_ms,
                 "n_tickers": 0,
                 "error": "model_prediction_invalid",
@@ -431,6 +462,8 @@ class QuantAgent(AgentBase):
             "latency_ms": elapsed_ms,
             "n_tickers": len(valid_tickers),
         }
+        if feature_blockers:
+            out["feature_blockers"] = feature_blockers
         if trade_probs:
             out["trade_probs"] = trade_probs
         if trade_classifier_error:
@@ -766,6 +799,8 @@ class QuantAgent(AgentBase):
         ticker: str | None = None,
         asof: str | None = None,
         require_dual_source: bool = False,
+        required_dual_source_cols: set[str] | None = None,
+        feature_blockers: list[dict[str, Any]] | None = None,
     ) -> dict[str, float] | None:
         """단일 ticker 최근 60 bars → LightGBM 추론 피처 dict.
 
@@ -920,16 +955,28 @@ class QuantAgent(AgentBase):
         if self._dual_source_feature_cols and ticker is not None and asof is not None:
             ds_values = self._load_dual_source_features(ticker=ticker, asof=asof)
 
+        required_ds = set(required_dual_source_cols or ())
+        if require_dual_source and not required_ds:
+            required_ds = set(self._required_dual_source_cols())
         for col in self._dual_source_feature_cols:
             if col in ds_values:
                 feats[col] = float(ds_values[col])
-            elif require_dual_source:
+            elif col in required_ds:
                 logger.warning(
                     "[quant_agent] %s Dual-Source feature 누락: %s. "
                     "active inference skip",
                     ticker,
                     col,
                 )
+                if feature_blockers is not None:
+                    feature_blockers.append({
+                        "ticker": ticker,
+                        "blocker": "required_dual_source_feature_missing",
+                        "missing_feature": col,
+                        "required_dual_source_cols": sorted(required_ds),
+                        "artifact_date": self._asof_to_yyyymmdd(asof or ""),
+                        "loader_configured": self._dual_source_loader is not None,
+                    })
                 return None
             else:
                 feats.setdefault(col, self._dual_source_defaults.get(col, 0.0))
@@ -1022,10 +1069,74 @@ class QuantAgent(AgentBase):
 
     def _model_requires_dual_source(self) -> bool:
         """로드된 모델 feature manifest가 Dual-Source 피처를 실제 입력으로 요구하는지."""
+        return bool(self._required_dual_source_cols())
+
+    def _required_dual_source_cols(self) -> list[str]:
+        """모델 metadata가 실제 inference 입력으로 요구하는 Dual-Source 컬럼."""
         if not self._dual_source_feature_cols:
-            return False
+            return []
         train_cols = set(self._inference_feature_cols)
-        return any(col in train_cols for col in self._dual_source_feature_cols)
+        return [col for col in self._dual_source_feature_cols if col in train_cols]
+
+    def required_dual_source_feature_cols(self) -> list[str]:
+        """Paper-auto preflight가 참조하는 필수 Dual-Source feature manifest."""
+        return list(self._required_dual_source_cols())
+
+    def serving_feature_readiness(
+        self,
+        tickers: list[str],
+        asof: str,
+    ) -> dict[str, Any]:
+        """현재 asof 기준 active model serving feature 준비 상태를 점검한다.
+
+        필수 Dual-Source feature가 없으면 broker 주문 전에 fail-closed 할 수 있도록
+        ticker별 누락을 구조화해 반환한다.
+        """
+        required_cols = self._required_dual_source_cols()
+        if not required_cols:
+            return {
+                "status": "PASS",
+                "required_dual_source_cols": [],
+                "loader_configured": self._dual_source_loader is not None,
+            }
+        date_key = self._asof_to_yyyymmdd(asof)
+        if self._dual_source_loader is None:
+            return {
+                "status": "FAIL",
+                "error_code": "DUAL_SOURCE_LOADER_MISSING",
+                "reason": "dual_source_loader_missing",
+                "artifact_date": date_key,
+                "required_dual_source_cols": required_cols,
+                "loader_configured": False,
+            }
+
+        requested = [pad_ticker(str(t)) for t in tickers]
+        missing: list[dict[str, Any]] = []
+        for ticker in requested:
+            values = self._load_dual_source_features(ticker=ticker, asof=asof)
+            missing_cols = [col for col in required_cols if col not in values]
+            if missing_cols:
+                missing.append({
+                    "ticker": ticker,
+                    "missing_feature_cols": missing_cols,
+                })
+        if missing:
+            return {
+                "status": "FAIL",
+                "error_code": "REQUIRED_DUAL_SOURCE_FEATURE_MISSING",
+                "reason": "required_dual_source_feature_missing",
+                "artifact_date": date_key,
+                "required_dual_source_cols": required_cols,
+                "missing": missing,
+                "loader_configured": True,
+            }
+        return {
+            "status": "PASS",
+            "artifact_date": date_key,
+            "required_dual_source_cols": required_cols,
+            "checked_tickers": requested,
+            "loader_configured": True,
+        }
 
     def _load_dual_source_features(self, ticker: str, asof: str) -> dict[str, float]:
         """장전 배치 C3A 점수를 date+ticker 기준으로 로드.

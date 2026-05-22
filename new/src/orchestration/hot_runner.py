@@ -345,6 +345,25 @@ class HotRunner:
                 stage_ms={"quant": quant_ms},
             )
         quant_ms = self._profiler.end_stage("quant", t_quant)
+        if quant_output.get("mode") == "blocked":
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="quant_feature_readiness",
+                error=RuntimeError(
+                    str(
+                        quant_output.get("blocker")
+                        or quant_output.get("error")
+                        or "quant_blocked"
+                    )
+                ),
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={"quant": quant_ms},
+                quant_output=quant_output,
+                anomalies=anomalies,
+                reason_code="QUANT_FEATURE_BLOCKED",
+            )
 
         # 3. PPOAllocator (S4-4 stage timer)
         t_ppo = self._profiler.start_stage("ppo")
@@ -603,6 +622,7 @@ class HotRunner:
         risk_eval: dict[str, Any] | None = None,
         ppo_guard_warnings: list[dict[str, Any]] | None = None,
         pm_guard_warnings: list[dict[str, Any]] | None = None,
+        reason_code: str = "TIMEOUT",
     ) -> dict[str, Any]:
         """Stage exception을 Hot Path 루프 crash 대신 structured veto로 닫는다."""
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -614,7 +634,7 @@ class HotRunner:
             "target_weights": {},
             "order_deltas": [],
             "veto_reason": reason,
-            "reason_code": "TIMEOUT",
+            "reason_code": reason_code,
             "risk_overrides": [
                 {
                     "rule": f"{stage}_stage",

@@ -54,7 +54,7 @@ class PaperAutoTrader:
             default_report_dir = _PROJECT_ROOT / default_report_dir
 
         self._kis_client = kis_client or KISRestClient()
-        self._hot_runner = hot_runner or HotRunner(ppo=self._make_ppo_allocator())
+        self._hot_runner = hot_runner or self._make_hot_runner()
         self._report_dir = Path(report_dir) if report_dir else default_report_dir
         self._report_dir.mkdir(parents=True, exist_ok=True)
         self._audit_logger = AuditLogger(
@@ -171,6 +171,12 @@ class PaperAutoTrader:
         model_guard = self._active_model_check()
         report["stages"]["active_model_guard"] = model_guard
         if model_guard["status"] != "PASS":
+            report["status"] = "FAIL"
+            return self._finish_report(report, write_report)
+
+        feature_guard = self._serving_feature_readiness_check(tickers)
+        report["stages"]["serving_feature_readiness"] = feature_guard
+        if feature_guard["status"] != "PASS":
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
@@ -328,6 +334,21 @@ class PaperAutoTrader:
                 "reason": hot_result.get("reason", "hot_runner_skipped"),
                 "hot_result": hot_result,
             }
+        if (
+            hot_result.get("status") == "FAIL"
+            and (
+                self._fail_on_quant_blocked
+                or hot_result.get("failure_stage") != "quant_feature_readiness"
+            )
+        ):
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": hot_result.get("failure_stage", "hot_runner_failed"),
+                "hot_result": hot_result,
+                "execution": None,
+            }
 
         final_decision = dict(hot_result.get("final_decision") or {})
         final_decision["order_deltas"] = [
@@ -335,7 +356,7 @@ class PaperAutoTrader:
         ]
         order_count_caps_applied = self._cap_order_count(final_decision)
         order_caps_applied = self._cap_order_quantities(final_decision)
-        order_guard = self._order_guard(final_decision)
+        order_guard = self._order_guard(final_decision, hot_result=hot_result)
         if order_guard["status"] != "PASS":
             return {
                 "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
@@ -467,6 +488,10 @@ class PaperAutoTrader:
         except PolicyNotLoadedError as e:
             logger.warning("[paper_auto_trading] PPO policy 로드 실패, heuristic 유지: %s", e)
             return PPOAllocator()
+
+    def _make_hot_runner(self) -> HotRunner:
+        quant = QuantAgent(dual_source_loader=load_latest_scores)
+        return HotRunner(quant=quant, ppo=self._make_ppo_allocator())
 
     def _fetch_recent_bars(self, tickers: list[str]) -> dict[str, list[dict[str, Any]]]:
         warmup = int(config_load("risk_config.yaml", "quant_agent")["warmup_bars"])
@@ -694,6 +719,47 @@ class PaperAutoTrader:
             "required_bundle_id": self._required_bundle_id,
         }
 
+    def _serving_feature_readiness_check(self, tickers: list[str]) -> dict[str, Any]:
+        if not self._require_serving_feature_readiness:
+            return {"status": "PASS", "required": False}
+        quant = getattr(self._hot_runner, "_quant", None)
+        checker = getattr(quant, "serving_feature_readiness", None)
+        if callable(checker):
+            asof = self._now().isoformat()
+            result = checker([pad_ticker(str(t)) for t in tickers], asof)
+            if not isinstance(result, dict):
+                return {
+                    "status": "FAIL",
+                    "error_code": "SERVING_FEATURE_READINESS_INVALID",
+                    "reason": "serving_feature_readiness_invalid",
+                    "type": type(result).__name__,
+                }
+            return result
+
+        metadata = getattr(quant, "model_metadata", None)
+        feature_cols = (
+            list(metadata.get("feature_cols") or [])
+            if isinstance(metadata, dict)
+            else []
+        )
+        pp_cfg = config_load("risk_config.yaml", "preprocessor")
+        configured_ds_cols = list(pp_cfg.get("dual_source_feature_cols", []))
+        required_ds_cols = [
+            col for col in configured_ds_cols if col in set(feature_cols)
+        ]
+        if required_ds_cols:
+            return {
+                "status": "FAIL",
+                "error_code": "SERVING_FEATURE_CHECKER_MISSING",
+                "reason": "serving_feature_checker_missing",
+                "required_dual_source_cols": required_ds_cols,
+            }
+        return {
+            "status": "PASS",
+            "required": True,
+            "required_dual_source_cols": [],
+        }
+
     def _cap_order_count(self, final_decision: dict[str, Any]) -> list[dict[str, Any]]:
         """Apply the paper-auto per-cycle order-count cap before broker submission."""
         raw_order_deltas = final_decision.get("order_deltas", [])
@@ -845,7 +911,12 @@ class PaperAutoTrader:
             ),
         }
 
-    def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
+    def _order_guard(
+        self,
+        final_decision: dict[str, Any],
+        *,
+        hot_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not safe_bool(final_decision.get("approved"), default=False):
             return {
                 "status": "SKIP",
@@ -862,6 +933,30 @@ class PaperAutoTrader:
             }
         order_deltas = list(raw_order_deltas)
         if not order_deltas:
+            if self._require_active_scores_for_no_order_skip:
+                quant_output = (
+                    hot_result.get("quant_output", {})
+                    if isinstance(hot_result, dict)
+                    else {}
+                )
+                scores = (
+                    quant_output.get("scores", {})
+                    if isinstance(quant_output, dict)
+                    else {}
+                )
+                mode = (
+                    str(quant_output.get("mode", "unknown"))
+                    if isinstance(quant_output, dict)
+                    else "unknown"
+                )
+                if mode != "active" or not isinstance(scores, dict) or not scores:
+                    return {
+                        "status": "FAIL",
+                        "reason": "active_model_no_scores_no_order_deltas",
+                        "quant_mode": mode,
+                        "score_count": len(scores) if isinstance(scores, dict) else 0,
+                        "require_active_scores_for_no_order_skip": True,
+                    }
             return {
                 "status": "SKIP",
                 "safe_skip": True,
