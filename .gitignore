@@ -16,6 +16,10 @@ __pycache__/
 *.pyo
 *.egg-info/
 
+# === Generated gRPC stubs ===
+new/src/integration/grpc/generated/*_pb2.py
+new/src/integration/grpc/generated/*_pb2_grpc.py
+
 # === IDE ===
 .idea/
 .vscode/

@@ -1,0 +1,175 @@
+syntax = "proto3";
+
+package elephant.ai.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "ElephantAiBridgeProto";
+option java_package = "com.elephant.ai.v1";
+
+// Elephant Lab AI <-> BE gRPC bridge.
+//
+// SSOT alignment:
+// - PortfolioPatchEnvelope mirrors api_contracts.md C8.
+// - FinalDecisionEnvelope mirrors api_contracts.md C9.
+// - ExecutionFeedbackEnvelope mirrors api_contracts.md C10.
+// - InternalMessageEnvelope / AgentReportEnvelope mirror C4/C5 transport needs.
+//
+// Safety:
+// - This contract does not authorize live trading.
+// - live_trading_allowed must stay false unless a separate explicit live gate is
+//   approved outside this gRPC transport layer.
+// - FDA can only approve/veto; target_weights and order_deltas remain read-only
+//   echoes in FinalDecisionEnvelope.
+service AiBeBridgeService {
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetServiceReadiness(ServiceReadinessRequest) returns (ServiceReadinessResponse);
+
+  // gRPC replacements for the reviewed HTTP/OpenAPI bridge endpoints.
+  rpc PublishPortfolioPatch(PortfolioPatchEnvelope) returns (Ack);
+  rpc PublishFinalDecision(FinalDecisionEnvelope) returns (Ack);
+  rpc PublishExecutionFeedback(ExecutionFeedbackEnvelope) returns (Ack);
+  rpc PublishInternalMessage(InternalMessageEnvelope) returns (Ack);
+  rpc PublishAgentReport(AgentReportEnvelope) returns (Ack);
+}
+
+message HealthCheckRequest {
+  string request_id = 1;
+  string bundle_id = 2;
+}
+
+message HealthCheckResponse {
+  string request_id = 1;
+  string status = 2;
+  string generated_at = 3;
+  string transport = 4;
+  string bundle_id = 5;
+  bool live_trading_allowed = 6;
+  bool production_registry_mutated = 7;
+  string production_active_version = 8;
+  string message = 9;
+}
+
+message ServiceReadinessRequest {
+  string request_id = 1;
+  string bundle_id = 2;
+  bool include_details = 3;
+}
+
+message ServiceReadinessResponse {
+  string request_id = 1;
+  string status = 2;
+  string generated_at = 3;
+  string bundle_id = 4;
+  string deploy_quality = 5;
+  string broker_evidence = 6;
+  bool live_trading_allowed = 7;
+  bool registry_mutated = 8;
+  bool safe_to_show_dashboard = 9;
+  bool safe_to_enable_order_actions = 10;
+  bool safe_to_enable_live_actions = 11;
+  string details_json = 12;
+}
+
+message Ack {
+  string request_id = 1;
+  bool accepted = 2;
+  string status = 3;
+  string reason = 4;
+  string received_at = 5;
+  string idempotency_key = 6;
+}
+
+message OrderDelta {
+  string ticker = 1;
+  string side = 2;
+  int64 qty = 3;
+  string reason = 4;
+  double price = 5;
+}
+
+message Fill {
+  string ticker = 1;
+  string side = 2;
+  int64 qty = 3;
+  double avg_fill_price = 4;
+  string fill_ts = 5;
+}
+
+message RiskOverride {
+  string rule = 1;
+  string original = 2;
+  string override = 3;
+  string justification = 4;
+}
+
+message PortfolioPatchEnvelope {
+  string request_id = 1;
+  string portfolio_patch_id = 2;
+  string based_on_ts = 3;
+  map<string, double> target_weights = 4;
+  repeated OrderDelta order_deltas = 5;
+  string source = 6;
+  string idempotency_key = 7;
+  string metadata_json = 8;
+}
+
+message FinalDecisionEnvelope {
+  string request_id = 1;
+  string decision_id = 2;
+  bool approved = 3;
+  map<string, double> target_weights = 4;
+  repeated OrderDelta order_deltas = 5;
+  string veto_reason = 6;
+  string reason_code = 7;
+  repeated RiskOverride risk_overrides = 8;
+  double confidence = 9;
+  string expiry = 10;
+  string portfolio_patch_ref = 11;
+  repeated string active_reports = 12;
+  string source = 13;
+  string idempotency_key = 14;
+  string metadata_json = 15;
+}
+
+message ExecutionFeedbackEnvelope {
+  string request_id = 1;
+  string final_decision_ref = 2;
+  bool approved = 3;
+  repeated OrderDelta order_deltas = 4;
+  string execution_mode = 5;
+  bool live_enabled = 6;
+  string order_plan_id = 7;
+  string submitted_at = 8;
+  string status = 9;
+  repeated Fill fills = 10;
+  double estimated_cost = 11;
+  double realized_slippage = 12;
+  string kb_message_id = 13;
+  double pnl_contribution = 14;
+  double execution_shortfall = 15;
+  string lesson_stub = 16;
+  string idempotency_key = 17;
+  string metadata_json = 18;
+}
+
+message InternalMessageEnvelope {
+  string request_id = 1;
+  string message_id = 2;
+  string channel = 3;
+  string publisher = 4;
+  string created_at = 5;
+  string expires_at = 6;
+  string payload_json = 7;
+  string idempotency_key = 8;
+}
+
+message AgentReportEnvelope {
+  string request_id = 1;
+  string report_id = 2;
+  string agent_name = 3;
+  string status = 4;
+  string generated_at = 5;
+  string summary = 6;
+  string payload_json = 7;
+  string idempotency_key = 8;
+}
