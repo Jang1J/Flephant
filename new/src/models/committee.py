@@ -151,8 +151,11 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
+        # NaN/inf 사전 처리: feature 계산 edge case (division by zero 등)에서 발생.
+        # StandardScaler 단독으론 NaN을 보존하므로 명시적 nan_to_num이 필요하다.
+        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         self._scaler = StandardScaler()
-        X_scaled = self._scaler.fit_transform(X).astype(np.float32)
+        X_scaled = self._scaler.fit_transform(X_clean).astype(np.float32)
 
         torch.manual_seed(self._seed)
         self._net = self._build_net()
@@ -193,7 +196,8 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
-        X_scaled = self._scaler.transform(X).astype(np.float32)
+        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_scaled = self._scaler.transform(X_clean).astype(np.float32)
         self._net.eval()
         with torch.no_grad():
             xt = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(1)  # (N, 1, n_features)
