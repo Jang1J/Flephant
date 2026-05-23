@@ -169,6 +169,111 @@ def test_cnn_branch_save_creates_file(tmp_path: Path):
 
 
 # ====================================================================== #
+# 4b. CNNBranch StandardScaler 입력 정규화 검증 (Exogenous 스케일 이질성 대응)
+# ====================================================================== #
+
+def test_cnn_branch_scaler_persists_after_fit():
+    """fit() 후 self._scaler가 fitted StandardScaler여야 한다 (mean_/scale_ 보유)."""
+    from src.models.committee import CNNBranch
+
+    branch = _make_cnn_branch(n_features=4)
+    rng = np.random.default_rng(0)
+    # Exogenous 모사: feature 스케일 이질적 (1e0, 1e2, 1e8 등)
+    X = np.column_stack([
+        rng.normal(0, 0.01, 30),    # feat_5m_ret 정도
+        rng.normal(20, 5, 30),      # us_vix 정도
+        rng.normal(1e8, 1e7, 30),   # foreign_net_buy 정도
+        rng.normal(0, 1, 30),       # 일반 feature
+    ]).astype(np.float32)
+    y = (rng.random(30) > 0.5).astype(np.float32)
+
+    mock_net = MagicMock()
+    mock_net.parameters.return_value = iter([])
+    branch._net = mock_net
+
+    # 학습 자체는 mock (torch.tensor / DataLoader 우회). scaler 동작만 검증.
+    with patch.object(branch, "_build_net", return_value=mock_net), \
+         patch("src.models.committee.StandardScaler") as MockScaler:
+        scaler_instance = MagicMock()
+        scaler_instance.fit_transform.return_value = X.astype(np.float32)
+        MockScaler.return_value = scaler_instance
+        mock_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": mock_torch, "torch.nn": mock_torch.nn,
+                                         "torch.utils.data": mock_torch.utils.data}):
+            try:
+                branch.fit(X, y)
+            except Exception:
+                pass
+
+    # scaler 인스턴스가 생성되고 fit_transform 호출됐는지 검증
+    assert branch._scaler is not None
+    scaler_instance.fit_transform.assert_called_once()
+
+
+def test_cnn_branch_predict_without_scaler_raises():
+    """fit() 없이 _net만 있고 _scaler가 None이면 predict_proba가 명확한 에러 발생."""
+    from src.models.committee import CNNBranch, CommitteeTrainError
+
+    branch = _make_cnn_branch(n_features=4)
+    # _net은 있지만 _scaler는 None인 비정상 상태
+    branch._net = MagicMock()
+    branch._scaler = None
+
+    with pytest.raises(CommitteeTrainError, match=r"scaler"):
+        branch.predict_proba(np.zeros((5, 4), dtype=np.float32))
+
+
+def test_cnn_branch_save_persists_scaler(tmp_path: Path):
+    """save() 후 cnn.pth 옆에 cnn_scaler.pkl 생성. 두 파일 다 있어야 운영 가능."""
+    import pickle
+
+    from src.models.committee import CNNBranch
+
+    branch = _make_cnn_branch(n_features=4)
+    mock_net = MagicMock()
+    mock_net.state_dict.return_value = {}
+    branch._net = mock_net
+
+    # 실제 StandardScaler 사용 (mock 아님) — pickle save/load 통과 확인
+    from sklearn.preprocessing import StandardScaler
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 1, (20, 4)).astype(np.float32)
+    branch._scaler = StandardScaler().fit(X)
+
+    pth_path = tmp_path / "cnn.pth"
+    mock_torch = MagicMock()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        branch.save(pth_path)
+
+    scaler_path = tmp_path / "cnn_scaler.pkl"
+    assert scaler_path.exists(), f"scaler 파일이 {scaler_path}에 저장되지 않음"
+    with scaler_path.open("rb") as f:
+        loaded = pickle.load(f)
+    assert hasattr(loaded, "mean_")
+    np.testing.assert_array_almost_equal(loaded.mean_, branch._scaler.mean_)
+
+
+def test_cnn_branch_load_raises_when_scaler_missing(tmp_path: Path):
+    """load() 시 cnn_scaler.pkl 없으면 명확한 CommitteeLoadError 발생."""
+    from src.models.committee import CNNBranch, CommitteeLoadError
+
+    branch = _make_cnn_branch(n_features=4)
+    pth_path = tmp_path / "cnn.pth"
+    pth_path.write_bytes(b"fake_state_dict")  # 파일은 있지만 scaler.pkl 없음
+
+    mock_torch = MagicMock()
+    mock_torch.load.return_value = {}
+    sys_mocks = {
+        "torch": mock_torch,
+        "torch.nn": mock_torch.nn,
+        "torch.utils.data": mock_torch.utils.data,
+    }
+    with patch.dict("sys.modules", sys_mocks):
+        with pytest.raises(CommitteeLoadError, match=r"scaler.*누락"):
+            branch.load(pth_path)
+
+
+# ====================================================================== #
 # 5. CommitteeResult.to_dict() 필드 확인
 # ====================================================================== #
 

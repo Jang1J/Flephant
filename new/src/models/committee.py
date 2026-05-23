@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 
 from src.models.metrics import sharpe_ratio
 from src.models.splitter import WalkForwardSplitter
@@ -87,8 +88,13 @@ class CommitteeResult:
 class CNNBranch:
     """1D CNN confirmatory branch. feature dim을 1D conv으로 처리.
 
-    Input: (batch, n_features) → (batch, 1, n_features) → Conv1d → score [0, 1]
+    Input: (batch, n_features) → StandardScaler → (batch, 1, n_features)
+        → Conv1d → score [0, 1]
     Architecture: Conv1d → ReLU → Conv1d → AdaptiveAvgPool → FC → Sigmoid
+
+    StandardScaler 사전 정규화 — feature 스케일 이질성으로 인한 gradient 폭발/NaN
+    방지. AlphaGAT 원본은 동질 OHLCV만 다뤘으나 본 구현은 Exogenous (us_vix,
+    foreign_net_buy 등 1e8 단위) 포함이라 입력 정규화 필수.
     """
 
     def __init__(
@@ -107,6 +113,7 @@ class CNNBranch:
         self._batch_size = batch_size
         self._seed = seed
         self._net: Any = None
+        self._scaler: StandardScaler | None = None
 
     def _build_net(self) -> Any:
         try:
@@ -134,6 +141,8 @@ class CNNBranch:
         """Binary cross-entropy 학습. X: (N, n_features), y: (N,) 0/1.
 
         PIT-Safety: caller가 train/val 분리를 보장해야 한다.
+        StandardScaler를 train fold에서 fit → 동일 scaler로 predict_proba에서
+        transform. fit/transform 분리로 train-test 일관성 보장.
         """
         try:
             import torch
@@ -142,12 +151,15 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
+        self._scaler = StandardScaler()
+        X_scaled = self._scaler.fit_transform(X).astype(np.float32)
+
         torch.manual_seed(self._seed)
         self._net = self._build_net()
         optimizer = torch.optim.Adam(self._net.parameters(), lr=self._lr)
         criterion = nn.BCELoss()
 
-        X_t = torch.tensor(X, dtype=torch.float32)
+        X_t = torch.tensor(X_scaled, dtype=torch.float32)
         y_t = torch.tensor(y, dtype=torch.float32)
         dataset = TensorDataset(X_t, y_t)
         loader = DataLoader(dataset, batch_size=self._batch_size, shuffle=True)
@@ -171,19 +183,29 @@ class CNNBranch:
         """ranking score [0, 1] 반환. X: (N, n_features)."""
         if self._net is None:
             raise CommitteeTrainError("CNNBranch.fit() 먼저 호출 필요")
+        if self._scaler is None:
+            raise CommitteeTrainError(
+                "CNNBranch.fit() 먼저 호출 필요 (scaler 없음). "
+                "load()로 불러왔다면 cnn_branch_scaler.pkl 파일이 같은 위치에 있어야 함."
+            )
         try:
             import torch
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
+        X_scaled = self._scaler.transform(X).astype(np.float32)
         self._net.eval()
         with torch.no_grad():
-            xt = torch.tensor(X, dtype=torch.float32).unsqueeze(1)  # (N, 1, n_features)
+            xt = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(1)  # (N, 1, n_features)
             scores = self._net(xt).squeeze(1).numpy()
         return scores.astype(np.float32)
 
     def save(self, path: Path) -> None:
-        """CNN 가중치 저장 (.pth)."""
+        """CNN 가중치 + StandardScaler 저장.
+
+        path.pth ← torch state_dict
+        path.parent/{path.stem}_scaler.pkl ← StandardScaler
+        """
         if self._net is None:
             return
         try:
@@ -192,10 +214,18 @@ class CNNBranch:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self._net.state_dict(), str(path))
-        logger.info("[committee.cnn] 가중치 저장: %s", path)
+        if self._scaler is not None:
+            scaler_path = path.parent / f"{path.stem}_scaler.pkl"
+            with scaler_path.open("wb") as f:
+                pickle.dump(self._scaler, f)
+            logger.info("[committee.cnn] 가중치+scaler 저장: %s", path)
+        else:
+            logger.warning(
+                "[committee.cnn] scaler=None인 채로 저장. load() 후 predict_proba 실패 위험."
+            )
 
     def load(self, path: Path) -> "CNNBranch":
-        """CNN 가중치 로드."""
+        """CNN 가중치 + StandardScaler 로드. scaler 누락 시 raise."""
         try:
             import torch
         except ImportError as e:
@@ -203,7 +233,15 @@ class CNNBranch:
         self._net = self._build_net()
         self._net.load_state_dict(torch.load(str(path), map_location="cpu", weights_only=True))
         self._net.eval()
-        logger.info("[committee.cnn] 가중치 로드: %s", path)
+        scaler_path = path.parent / f"{path.stem}_scaler.pkl"
+        if not scaler_path.exists():
+            raise CommitteeLoadError(
+                f"CNNBranch scaler 파일 누락: {scaler_path}. "
+                "정규화 없는 모델은 운영 부적합 (입력 스케일 이질성)."
+            )
+        with scaler_path.open("rb") as f:
+            self._scaler = pickle.load(f)
+        logger.info("[committee.cnn] 가중치+scaler 로드: %s", path)
         return self
 
 
