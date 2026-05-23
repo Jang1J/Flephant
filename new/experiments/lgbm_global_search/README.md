@@ -46,3 +46,16 @@ Proxy sweep 결과 상위 후보만 full 253일로 다시 실행합니다.
   --stage full \
   --max-runs 20
 ```
+
+## Validation Bundle Staging
+
+Full 검증에서 통과한 research candidate는 C12/service-policy replay 전에
+검증용 bundle layout으로만 stage합니다. Production registry는 변경하지 않습니다.
+
+```bash
+/opt/anaconda3/envs/elephant/bin/python new/experiments/lgbm_global_search/stage_research_bundle.py \
+  --source-registry-dir artifacts/lgbm_global_search/<full-run-id>/registry \
+  --candidate-version <version> \
+  --bundle-id <research-bundle-id> \
+  --confirm-phrase STAGE_RESEARCH_BUNDLE_OK
+```
