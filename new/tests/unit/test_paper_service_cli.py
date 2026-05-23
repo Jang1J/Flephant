@@ -47,6 +47,64 @@ def test_collect_kis_paper_evidence_rejects_ambiguous_system_positions(tmp_path:
         raise AssertionError("expected mutually exclusive ValueError")
 
 
+def test_collect_kis_paper_evidence_derives_registry_dir_from_bundle(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeRunner:
+        def run_balance_reconciliation(self, system_positions=None, write_report=True):
+            return {"status": "PASS"}
+
+        def submit_probe_order(
+            self,
+            ticker,
+            side,
+            qty,
+            price,
+            order_type,
+            confirm_phrase,
+            write_report=True,
+        ):
+            return {"status": "PASS"}
+
+    def fake_service_rehearsal(args):
+        calls["registry_dir"] = args.registry_dir
+        return {"status": "PASS"}
+
+    monkeypatch.setattr(collect_kis_paper_evidence, "PaperTradingRunner", FakeRunner)
+    monkeypatch.setattr(
+        collect_kis_paper_evidence.paper_auto_service_rehearsal,
+        "build_report",
+        fake_service_rehearsal,
+    )
+
+    report = collect_kis_paper_evidence.collect(
+        argparse.Namespace(
+            system_positions_json=None,
+            assume_empty_system_positions=True,
+            price=70000.0,
+            auto_price=False,
+            order_type="00",
+            ticker="005930",
+            side="buy",
+            qty=1,
+            probe_confirm_phrase="PAPER_ORDER_OK",
+            auto_confirm_phrase="PAPER_AUTO_OK",
+            tickers="005930",
+            cycles=1,
+            interval_sec=0.0,
+            registry_dir="",
+            cold_risk_report="",
+            no_write_report=True,
+            use_real_hot_runner=False,
+            bundle_id="BUNDLE-TEST",
+        )
+    )
+
+    assert report["status"] == "PASS"
+    assert report["registry_dir"] == "artifacts/lgbm_paper_candidate/BUNDLE-TEST"
+    assert calls["registry_dir"] == "artifacts/lgbm_paper_candidate/BUNDLE-TEST"
+
+
 def test_collect_kis_paper_evidence_forwards_cold_risk_report(monkeypatch) -> None:
     calls: dict[str, object] = {}
 

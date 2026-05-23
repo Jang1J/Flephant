@@ -505,6 +505,35 @@ lgbm_hyperparam_sweep:
           n_estimators: 900
           early_stopping_rounds: 80
 
+# Artifact root separation policy.
+# 배포/모의투자/실험 산출물 루트를 명시적으로 분리한다. 실험 스크립트가
+# production registry에 쓰는 것을 방지하기 위한 검증 SSOT다.
+artifact_root_policy:
+  production_model_registry: "artifacts/lgbm"
+  paper_model_registry: "artifacts/lgbm_paper"
+  paper_candidate_registry_root: "artifacts/lgbm_paper_candidate"
+  candidate_bundle_root: "artifacts/bundles"
+  research_model_registry_roots:
+    - "artifacts/lgbm_research"
+  experiment_report_roots:
+    - "artifacts/reports/rolling_window_ic"
+    - "artifacts/reports/lgbm_hyperparam_sweep"
+    - "artifacts/reports/feature_window_grid"
+    - "artifacts/reports/research_threshold_sweep"
+  production_mutation_entrypoints:
+    - "new/scripts/deploy_candidate.py"
+    - "new/src/mode_b/deployer.py"
+  paper_entrypoints:
+    - "new/scripts/collect_kis_paper_evidence.py"
+    - "new/scripts/paper_auto_trade.py"
+    - "new/scripts/paper_auto_service_rehearsal.py"
+  experiment_entrypoints:
+    - "new/scripts/rolling_window_ic_experiment.py"
+    - "new/scripts/feature_window_candidate_experiment.py"
+    - "new/scripts/lgbm_hyperparam_sweep.py"
+    - "new/scripts/cost_aware_label_horizon_scan.py"
+    - "new/src/jobs/run_dual_source_ablation.py"
+
 # v2.2 추가 — BacktestEngine 거래비용 모델
 execution_cost_model:
   name: "slippage_v1"                  # default. BacktestEngine.input.execution_cost_model 참조

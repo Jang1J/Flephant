@@ -13,6 +13,27 @@ trading stays blocked unless a separate operator gate changes the policy.
 - Do not edit `artifacts/lgbm/registry.json` manually. Active model promotion
   must go through C12 real backtest and C14 deploy.
 
+## Artifact Root Separation
+
+Keep deploy, paper, and research artifacts in separate roots. This is not just
+cleanup; it prevents research experiments from being mistaken for deployable
+evidence.
+
+| Purpose | Root | Rule |
+|---|---|---|
+| Production model registry | `artifacts/lgbm` | Only deploy-gated production promotion may mutate it. Current paper work must keep `active_version=null`. |
+| Paper model registry | `artifacts/lgbm_paper` | Paper-only registry mirror for virtual trading checks. |
+| Paper candidate registry | `artifacts/lgbm_paper_candidate/{bundle_id}` | Bundle-scoped paper-auto candidate path. Market-open runs should use this root explicitly. |
+| Candidate bundle | `artifacts/bundles/{bundle_id}` | Frozen candidate bytes used by C12, deploy dry-run, service readiness, and validation zip. |
+| Research model registry | `artifacts/lgbm_research/...` | Hyperparameter/feature/window experiments only. Never treat as deployable until staged into a bundle and re-gated. |
+| Research reports | `artifacts/reports/rolling_window_ic`, `artifacts/reports/lgbm_hyperparam_sweep`, `artifacts/reports/feature_window_grid`, `artifacts/reports/research_threshold_sweep` | Diagnostic evidence only. |
+
+Validate the separation before handoff or market-open operation:
+
+```bash
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/validate_artifact_roots.py
+```
+
 ## Environment
 
 Set these in the user terminal that owns the KIS paper credentials:
@@ -136,6 +157,14 @@ export PYTHONPATH=/Users/jangjaewon/Desktop/Elephant_Lab/new
   --end-date 20260526 \
   --business-days 1 \
   --raw-events-dir artifacts/raw/dual_source
+```
+
+Machine-check canonical forms:
+
+```text
+new/scripts/build_dart_corp_code_cache.py
+new/scripts/build_news_dart_archive.py --end-date 20260526 --business-days 1 --naver-max-pages 10
+new/scripts/materialize_dual_source_history.py --end-date 20260526 --business-days 1 --raw-events-dir artifacts/raw/dual_source
 ```
 
 Pre-open pass criteria:

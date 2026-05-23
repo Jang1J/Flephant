@@ -27,6 +27,11 @@ from src.utils.auth import AuthenticationError  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
+_DEFAULT_BUNDLE_ID = "BUNDLE-20260521-POSTCLOSE"
+
+
+def _default_registry_dir(bundle_id: str) -> str:
+    return f"artifacts/lgbm_paper_candidate/{bundle_id}"
 
 
 def _auth_retry_sec() -> int:
@@ -115,6 +120,9 @@ def _blocked_service_rehearsal_report(
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     runner = PaperTradingRunner()
     stages: dict[str, Any] = {}
+    registry_dir = str(getattr(args, "registry_dir", "") or "").strip()
+    if not registry_dir:
+        registry_dir = _default_registry_dir(str(args.bundle_id))
 
     system_positions = _load_system_positions(
         args.system_positions_json,
@@ -149,7 +157,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         tickers=args.tickers,
         cycles=int(args.cycles),
         interval_sec=float(args.interval_sec),
-        registry_dir=args.registry_dir,
+        registry_dir=registry_dir,
         confirm_phrase=args.auto_confirm_phrase,
         cold_risk_report=args.cold_risk_report,
         no_write_report=bool(args.no_write_report),
@@ -179,7 +187,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "generated_at": datetime.now(_KST).isoformat(),
         "action": "collect_kis_paper_evidence",
         "bundle_id": args.bundle_id,
-        "registry_dir": args.registry_dir,
+        "registry_dir": registry_dir,
         "blockers": blockers,
         "stage_statuses": {
             name: stage.get("status") if isinstance(stage, dict) else "UNKNOWN"
@@ -191,10 +199,11 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Collect KIS virtual paper evidence")
-    parser.add_argument("--bundle-id", default="BUNDLE-20260518-195M0001")
+    parser.add_argument("--bundle-id", default=_DEFAULT_BUNDLE_ID)
     parser.add_argument(
         "--registry-dir",
-        default="artifacts/lgbm_paper_candidate/BUNDLE-20260518-195M0001",
+        default="",
+        help="Paper candidate registry dir. Defaults to artifacts/lgbm_paper_candidate/{bundle_id}.",
     )
     parser.add_argument("--ticker", default="005930")
     parser.add_argument("--tickers", default="005930")
