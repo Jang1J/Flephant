@@ -29,6 +29,18 @@
 
 Proxy sweep 결과 상위 후보만 full 253일로 다시 실행합니다.
 
+먼저 proxy summary의 top-N을 full-stage one-candidate 설정으로 변환합니다.
+
+```bash
+/opt/anaconda3/envs/elephant/bin/python new/experiments/lgbm_global_search/prepare_full_configs.py \
+  --proxy-run-id GS-20260524-WEEKEND-PROXY-V2 \
+  --top-n 5 \
+  --with-trade-classifier
+```
+
+생성 위치는 `artifacts/lgbm_global_search/<proxy-run-id>/full_configs/`입니다.
+`full_config_plan.json` 안에 각 full run 명령이 함께 기록됩니다.
+
 ```bash
 /opt/anaconda3/envs/elephant/bin/python new/experiments/lgbm_global_search/run_global_search.py \
   --stage full \
