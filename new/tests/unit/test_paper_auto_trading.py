@@ -409,6 +409,34 @@ class FakeZeroScoreHotRunner(FakeHotRunner):
         }
 
 
+class FakeZeroScoreExitHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "quant_output": {
+                "mode": "warmup",
+                "scores": {},
+                "n_tickers": 0,
+            },
+            "final_decision": {
+                "decision_id": "FDA-ZERO-SCORE-EXIT",
+                "approved": True,
+                "reason_code": "NORMAL_APPROVE",
+                "order_deltas": [
+                    {
+                        "ticker": "005930",
+                        "side": "sell",
+                        "qty": 2,
+                        "price": 70000.0,
+                        "order_type": "00",
+                        "reason": "rebalance",
+                    }
+                ],
+            },
+            "latency_ms": 1.0,
+        }
+
+
 class FakeBlockedQuantHotRunner(FakeHotRunner):
     def run_once(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
@@ -574,8 +602,33 @@ def test_paper_auto_fails_zero_score_no_order_run(tmp_path: Path) -> None:
 
     assert report["status"] == "FAIL"
     cycle = report["stages"]["cycles"]["items"][0]
-    assert cycle["order_guard"]["status"] == "FAIL"
-    assert cycle["order_guard"]["reason"] == "active_model_no_scores_no_order_deltas"
+    assert cycle["quant_signal_guard"]["status"] == "FAIL"
+    assert cycle["quant_signal_guard"]["reason"] == "active_model_quant_scores_unavailable"
+    assert client.orders == []
+
+
+def test_paper_auto_fails_zero_score_even_if_exit_orders_present(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeZeroScoreExitHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "FAIL"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["reason"] == "quant_signal_readiness"
+    assert cycle["quant_signal_guard"]["quant_mode"] == "warmup"
+    assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["side"] == "sell"
     assert client.orders == []
 
 

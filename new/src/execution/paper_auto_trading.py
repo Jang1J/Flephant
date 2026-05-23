@@ -350,6 +350,18 @@ class PaperAutoTrader:
                 "execution": None,
             }
 
+        quant_signal_guard = self._quant_signal_guard(hot_result)
+        if quant_signal_guard["status"] != "PASS":
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "quant_signal_readiness",
+                "quant_signal_guard": quant_signal_guard,
+                "hot_result": hot_result,
+                "execution": None,
+            }
+
         final_decision = dict(hot_result.get("final_decision") or {})
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
@@ -1022,6 +1034,29 @@ class PaperAutoTrader:
         if violations:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
         return {"status": "PASS", "n_orders": len(order_deltas)}
+
+    @staticmethod
+    def _quant_signal_guard(hot_result: dict[str, Any]) -> dict[str, Any]:
+        """Block paper orders when Quant did not emit active, non-empty scores."""
+        quant_output = hot_result.get("quant_output") if isinstance(hot_result, dict) else None
+        if not isinstance(quant_output, dict):
+            return {"status": "PASS", "reason": "quant_output_not_reported"}
+        mode = str(quant_output.get("mode", "unknown"))
+        scores = quant_output.get("scores", {})
+        score_count = len(scores) if isinstance(scores, dict) else 0
+        if mode != "active" or not isinstance(scores, dict) or score_count == 0:
+            return {
+                "status": "FAIL",
+                "reason": "active_model_quant_scores_unavailable",
+                "quant_mode": mode,
+                "score_count": score_count,
+            }
+        return {
+            "status": "PASS",
+            "reason": "active_quant_scores_present",
+            "quant_mode": mode,
+            "score_count": score_count,
+        }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(self._kis_client, "get_order_history"):

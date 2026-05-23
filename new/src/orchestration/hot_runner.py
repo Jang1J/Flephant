@@ -364,6 +364,30 @@ class HotRunner:
                 anomalies=anomalies,
                 reason_code="QUANT_FEATURE_BLOCKED",
             )
+        quant_mode = str(quant_output.get("mode", "unknown"))
+        quant_scores = quant_output.get("scores", {})
+        signal_unavailable = (
+            (quant_mode == "active" and (not isinstance(quant_scores, dict) or not quant_scores))
+            or (quant_mode != "active" and bool(current_positions))
+        )
+        if signal_unavailable:
+            score_count = len(quant_scores) if isinstance(quant_scores, dict) else 0
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="quant_signal_readiness",
+                error=RuntimeError(
+                    "quant_signal_unavailable: "
+                    f"mode={quant_mode} score_count={score_count} "
+                    f"current_position_count={len(current_positions or [])}"
+                ),
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={"quant": quant_ms},
+                quant_output=quant_output,
+                anomalies=anomalies,
+                reason_code="QUANT_FEATURE_BLOCKED",
+            )
 
         # 3. PPOAllocator (S4-4 stage timer)
         t_ppo = self._profiler.start_stage("ppo")

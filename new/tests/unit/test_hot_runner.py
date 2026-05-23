@@ -149,9 +149,47 @@ class _BlockedQuant:
         return None
 
 
+class _WarmupQuant:
+    has_model = True
+
+    def score_cross_section(self, tickers, asof):
+        return {
+            "tickers": [],
+            "scores": {},
+            "ts": asof,
+            "mode": "warmup",
+            "n_tickers": 0,
+        }
+
+    def detect_anomalies(self, tickers, asof):
+        return []
+
+    def on_bar(self, bar):
+        return None
+
+
+class _ActiveEmptyQuant:
+    has_model = True
+
+    def score_cross_section(self, tickers, asof):
+        return {
+            "tickers": [],
+            "scores": {},
+            "ts": asof,
+            "mode": "active",
+            "n_tickers": 0,
+        }
+
+    def detect_anomalies(self, tickers, asof):
+        return []
+
+    def on_bar(self, bar):
+        return None
+
+
 class _ExplodingPM:
     def plan(self, **kwargs):
-        raise AssertionError("PM must not run when Quant is feature-blocked")
+        raise AssertionError("PM must not run when Quant signal is unavailable")
 
 
 @pytest.fixture
@@ -271,6 +309,35 @@ def test_run_once_quant_blocked_does_not_generate_pm_exit_orders() -> None:
 
     assert result["status"] == "FAIL"
     assert result["failure_stage"] == "quant_feature_readiness"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "QUANT_FEATURE_BLOCKED"
+    assert result["final_decision"]["order_deltas"] == []
+    assert result["pm_result"] == {}
+
+
+@pytest.mark.parametrize("quant", [_WarmupQuant(), _ActiveEmptyQuant()])
+def test_run_once_empty_quant_signal_does_not_generate_pm_exit_orders(quant) -> None:
+    runner = HotRunner(
+        quant=quant,
+        ppo=PPOAllocator(),
+        pm=_ExplodingPM(),
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+    runner.start()
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 10, "weight": 0.1}],
+        latest_prices={"005930": 70000.0},
+        portfolio_value=10_000_000.0,
+        asof="2026-04-20T10:00:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_signal_readiness"
     assert result["final_decision"]["approved"] is False
     assert result["final_decision"]["reason_code"] == "QUANT_FEATURE_BLOCKED"
     assert result["final_decision"]["order_deltas"] == []
@@ -635,7 +702,7 @@ def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> No
     runner.start()
 
     runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
-        "mode": "passive",
+        "mode": "active",
         "scores": {"005930": 0.9},
         "ranking": ["005930"],
     }
