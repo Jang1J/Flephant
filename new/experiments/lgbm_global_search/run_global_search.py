@@ -142,6 +142,7 @@ def _deadline_reached(deadline: datetime | None) -> bool:
 
 def _safe_research_root(path: Path) -> Path:
     resolved = path.resolve()
+    allowed_base = (REPO_ROOT / "artifacts" / "lgbm_global_search").resolve()
     forbidden = [
         PRODUCTION_REGISTRY.resolve(),
         PAPER_REGISTRY.resolve(),
@@ -149,9 +150,44 @@ def _safe_research_root(path: Path) -> Path:
     ]
     if any(resolved == item or item in resolved.parents for item in forbidden):
         raise RuntimeError(f"unsafe research_root: {resolved}")
-    if "lgbm_global_search" not in str(resolved):
-        raise RuntimeError(f"research_root must include lgbm_global_search: {resolved}")
+    if not (resolved == allowed_base or allowed_base in resolved.parents):
+        raise RuntimeError(f"research_root must be under {allowed_base}: {resolved}")
     return resolved
+
+
+def _research_safety_fields(
+    *,
+    registry_dir: Path | None = None,
+    research_registry_mutated: bool | None = None,
+) -> dict[str, Any]:
+    mutation_scope = "unknown"
+    if research_registry_mutated is True:
+        mutation_scope = "research_only"
+    elif research_registry_mutated is False:
+        mutation_scope = "none"
+    payload: dict[str, Any] = {
+        "research_only": True,
+        "external_kis_api": False,
+        "registry_mutated": bool(research_registry_mutated)
+        if research_registry_mutated is not None
+        else None,
+        "registry_mutation_scope": mutation_scope,
+        "research_registry_mutated": research_registry_mutated,
+        "production_registry_mutated": False,
+        "paper_registry_mutated": False,
+        "live_trading_allowed": False,
+        "deploy_quality": False,
+        "requires_c12": True,
+        "service_policy_replay_pass": False,
+    }
+    if registry_dir is not None:
+        payload["registry_dir"] = str(registry_dir)
+    return payload
+
+
+def _candidate_registry_write_observed(registry_dir: Path, candidate: Candidate) -> bool:
+    version = candidate.candidate_id[:180]
+    return any(registry_dir.glob(f"{version}*"))
 
 
 def _feature_cols(feature_policy: dict[str, Any]) -> list[str]:
@@ -324,12 +360,20 @@ def _run_candidate(
     scored = _score_result(result)
     finished = datetime.now(KST)
     return {
-        "status": "PASS",
+        "status": "RESEARCH_PASS",
         "candidate": asdict(candidate),
         "version": result.get("version"),
         "bundle_id": bundle_id,
         "model_path": result.get("model_path"),
         "metrics": result.get("metrics", {}),
+        "metric_scope": result.get(
+            "metric_scope",
+            {
+                "scope": "trainer_validation_proxy",
+                "deploy_quality": False,
+                "reason": "Trainer fold metrics are diagnostic only; C12 real backtest is required before deploy.",
+            },
+        ),
         "score": scored,
         "n_folds": result.get("n_folds"),
         "n_train_rows": result.get("n_train_rows"),
@@ -338,12 +382,10 @@ def _run_candidate(
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
         "elapsed_sec": round((finished - started).total_seconds(), 3),
-        "registry_dir": str(registry_dir),
-        "research_only": True,
-        "external_kis_api": False,
-        "registry_mutated": False,
-        "production_registry_mutated": False,
-        "live_trading_allowed": False,
+        **_research_safety_fields(
+            registry_dir=registry_dir,
+            research_registry_mutated=True,
+        ),
     }
 
 
@@ -353,16 +395,21 @@ def _write_summary(run_dir: Path, results: list[dict[str, Any]]) -> dict[str, An
         key=lambda row: float((row.get("score") or {}).get("selection_score", -999.0)),
         reverse=True,
     )
+    pass_count = sum(1 for r in results if r.get("status") in {"RESEARCH_PASS", "PASS"})
+    fail_count = sum(1 for r in results if r.get("status") in {"RESEARCH_FAIL", "FAIL"})
     summary = {
-        "status": "PASS" if any(r.get("status") == "PASS" for r in results) else "BLOCKED",
+        "status": "RESEARCH_PASS" if pass_count > 0 else "RESEARCH_BLOCKED",
         "generated_at": datetime.now(KST).isoformat(),
         "total_results": len(results),
-        "pass_count": sum(1 for r in results if r.get("status") == "PASS"),
-        "fail_count": sum(1 for r in results if r.get("status") == "FAIL"),
+        "pass_count": pass_count,
+        "fail_count": fail_count,
         "top_20": ranked[:20],
-        "research_only": True,
-        "production_registry_mutated": False,
-        "live_trading_allowed": False,
+        "metric_scope": {
+            "scope": "trainer_validation_proxy",
+            "deploy_quality": False,
+            "reason": "Global-search trainer metrics are research diagnostics; C12 backtest and service-policy replay are required before paper/default promotion.",
+        },
+        **_research_safety_fields(research_registry_mutated=True),
     }
     _json_dump(run_dir / "summary.json", summary)
     return summary
@@ -414,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run_dir = research_root / run_id
     plan = {
-        "status": "PASS",
+        "status": "RESEARCH_PLAN",
         "action": "lgbm_global_search_plan",
         "run_id": run_id,
         "stage": args.stage,
@@ -426,8 +473,7 @@ def main(argv: list[str] | None = None) -> int:
         "deadline_kst": args.deadline_kst or None,
         "research_root": str(research_root),
         "skip_trade_classifier": skip_trade_classifier,
-        "production_registry_mutated": False,
-        "live_trading_allowed": False,
+        **_research_safety_fields(research_registry_mutated=False),
         "candidates": [asdict(c) for c in candidates],
     }
     _json_dump(run_dir / "plan.json", plan)
@@ -465,15 +511,23 @@ def main(argv: list[str] | None = None) -> int:
                 skip_trade_classifier=skip_trade_classifier,
             )
         except Exception as e:
+            registry_dir = research_root / run_id / "registry"
+            observed_write = _candidate_registry_write_observed(registry_dir, candidate)
             result = {
-                "status": "FAIL",
+                "status": "RESEARCH_FAIL",
                 "candidate": asdict(candidate),
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "finished_at": datetime.now(KST).isoformat(),
-                "research_only": True,
-                "production_registry_mutated": False,
-                "live_trading_allowed": False,
+                "metric_scope": {
+                    "scope": "trainer_validation_proxy",
+                    "deploy_quality": False,
+                    "reason": "Failed research candidate; no deploy-quality inference.",
+                },
+                **_research_safety_fields(
+                    registry_dir=registry_dir,
+                    research_registry_mutated=observed_write,
+                ),
             }
         results.append(result)
         _jsonl_append(result_jsonl, result)
@@ -496,7 +550,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     summary = _write_summary(run_dir, results)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if summary.get("pass_count", 0) > 0 else 1
+    return 0 if int(summary.get("pass_count", 0) or 0) > 0 else 1
 
 
 if __name__ == "__main__":

@@ -384,7 +384,10 @@ class DatasetBuilder:
 
         group_sizes = frame.groupby("ts_close")["close"].transform("count")
         frame = frame[group_sizes >= self._n_relevance_grades].copy()
-        return frame.set_index(["ticker", "ts_close"]).sort_index()
+        relabeled = frame.set_index(["ticker", "ts_close"]).sort_index()
+        if self._leakage_guard:
+            self._assert_label_column_safe(relabeled, target)
+        return relabeled
 
     def _join_neutral_feature_columns(self, panel):
         panel = panel.copy()
@@ -1183,14 +1186,18 @@ class DatasetBuilder:
           3. 극단값: |label| > 1.0 (1분봉 5분 수익률 ≥ 100%는 비현실).
              Mock 데이터 또는 corrupt 입력 탐지.
         """
+        self._assert_label_column_safe(panel, self._target_col)
+
+    def _assert_label_column_safe(self, panel, label_col: str) -> None:
+        """특정 label 컬럼의 NaN/inf/extreme value를 검증한다."""
         for ticker, group in panel.groupby(level="ticker"):
-            label_vals = group[self._target_col].to_numpy()
+            label_vals = group[label_col].to_numpy()
             if label_vals.size == 0:
                 continue
             # (1) NaN 방어
             if np.isnan(label_vals).any():
                 raise LabelLeakageError(
-                    f"{ticker}: label {self._target_col}에 NaN 존재. "
+                    f"{ticker}: label {label_col}에 NaN 존재. "
                     "dropna 경로 회귀 의심. build_training_frame 재확인."
                 )
             # (2) inf
