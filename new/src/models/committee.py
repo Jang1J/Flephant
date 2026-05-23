@@ -60,8 +60,15 @@ class CommitteeLoadError(RuntimeError):
 
 
 _CNN_INPUT_NAN_FALLBACK: float = 0.0
-"""StandardScaler 정규화 후 평균값(0)으로 NaN/inf 대체. 학습에 bias 안 주는
-neutral design constant. tuning knob 아니므로 risk_config 분리 안 함."""
+"""StandardScaler transform 출력에 남은 NaN을 표준화된 평균(=0)으로 대체.
+
+처리 순서: inf → NaN → StandardScaler(NaN-aware fit, nanmean/nanvar 사용)
+→ 출력의 NaN → 본 fallback 값(0).
+
+raw 단계에서 0으로 치환하면 평균이 0이 아닌 feature에서 표준화 후 bias가
+생기므로, NaN 상태로 scaler에 통과시켜 통계량 계산에서 결측이 제외되도록 한다.
+출력 단계의 0은 표준화된 평균값이라 학습에 bias를 주지 않는 neutral 값.
+tuning knob 아니므로 risk_config 분리 안 함."""
 
 
 # ====================================================================== #
@@ -98,13 +105,18 @@ class CommitteeResult:
 class CNNBranch:
     """1D CNN confirmatory branch. feature dim을 1D conv으로 처리.
 
-    Input: (batch, n_features) → StandardScaler → (batch, 1, n_features)
-        → Conv1d → score [0, 1]
+    Input: (batch, n_features) → [inf→NaN] → StandardScaler(NaN-aware fit)
+        → [출력 NaN → 0] → (batch, 1, n_features) → Conv1d → score [0, 1]
     Architecture: Conv1d → ReLU → Conv1d → AdaptiveAvgPool → FC → Sigmoid
 
     StandardScaler 사전 정규화 — feature 스케일 이질성으로 인한 gradient 폭발/NaN
     방지. AlphaGAT 원본은 동질 OHLCV만 다뤘으나 본 구현은 Exogenous (us_vix,
     foreign_net_buy 등 1e8 단위) 포함이라 입력 정규화 필수.
+
+    NaN 처리 순서가 통계적으로 중요: NaN 상태로 scaler에 통과시키면 sklearn이
+    nanmean/nanvar로 통계량을 계산해 결측을 정확히 제외하고, 출력 단계에서 남는
+    NaN만 표준화 평균(=0)으로 imputation. raw 단계에서 0으로 치환하면 평균이
+    0이 아닌 feature에서 표준화 통계량 자체가 왜곡됨.
     """
 
     def __init__(
@@ -161,16 +173,22 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
-        # NaN/inf 사전 처리: feature 계산 edge case (division by zero 등)에서 발생.
-        # StandardScaler 단독으론 NaN을 보존하므로 명시적 nan_to_num이 필요하다.
-        X_clean = np.nan_to_num(
-            X,
+        # NaN/inf 처리 순서 (통계적 정확성 위해):
+        #   1. inf만 NaN으로 치환 (NaN은 그대로 유지)
+        #   2. StandardScaler.fit_transform: sklearn이 nanmean/nanvar로 통계량을
+        #      계산해 결측 제외. NaN은 transform 출력에서도 NaN으로 보존.
+        #   3. 출력에 남은 NaN을 표준화 평균(=0)으로 imputation.
+        # raw 단계에서 0으로 치환하지 않는 이유: 평균이 0이 아닌 feature에서
+        # 표준화 통계량 자체가 왜곡되어 bias 발생.
+        X_inf_to_nan = np.where(np.isinf(X), np.nan, X).astype(np.float64)
+        self._scaler = StandardScaler()
+        X_scaled_raw = self._scaler.fit_transform(X_inf_to_nan)
+        X_scaled = np.nan_to_num(
+            X_scaled_raw,
             nan=_CNN_INPUT_NAN_FALLBACK,
             posinf=_CNN_INPUT_NAN_FALLBACK,
             neginf=_CNN_INPUT_NAN_FALLBACK,
-        )
-        self._scaler = StandardScaler()
-        X_scaled = self._scaler.fit_transform(X_clean).astype(np.float32)
+        ).astype(np.float32)
 
         torch.manual_seed(self._seed)
         self._net = self._build_net()
@@ -211,13 +229,16 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
-        X_clean = np.nan_to_num(
-            X,
+        # fit()과 동일 순서: inf→NaN → scaler.transform(NaN 보존)
+        # → 출력 NaN → 표준화 평균(0).
+        X_inf_to_nan = np.where(np.isinf(X), np.nan, X).astype(np.float64)
+        X_scaled_raw = self._scaler.transform(X_inf_to_nan)
+        X_scaled = np.nan_to_num(
+            X_scaled_raw,
             nan=_CNN_INPUT_NAN_FALLBACK,
             posinf=_CNN_INPUT_NAN_FALLBACK,
             neginf=_CNN_INPUT_NAN_FALLBACK,
-        )
-        X_scaled = self._scaler.transform(X_clean).astype(np.float32)
+        ).astype(np.float32)
         self._net.eval()
         with torch.no_grad():
             xt = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(1)  # (N, 1, n_features)
@@ -225,28 +246,34 @@ class CNNBranch:
         return scores.astype(np.float32)
 
     def save(self, path: Path) -> None:
-        """CNN 가중치 + StandardScaler 저장.
+        """CNN 가중치 + StandardScaler 저장. fail-closed.
 
         path.pth ← torch state_dict
         path.parent/{path.stem}_scaler.pkl ← StandardScaler
+
+        _net 또는 _scaler가 None이면 즉시 CommitteeTrainError raise. 부분
+        저장(가중치만 또는 scaler 없이)은 load 시점에 predict_proba 실패로
+        이어지므로 학습 직후 시점에 문제를 노출하는 게 안전하다.
         """
         if self._net is None:
-            return
+            raise CommitteeTrainError(
+                "CNNBranch.save() 실패: _net=None. fit() 먼저 호출 필요."
+            )
+        if self._scaler is None:
+            raise CommitteeTrainError(
+                "CNNBranch.save() 실패: _scaler=None. fit() 먼저 호출 필요. "
+                "scaler 없는 가중치만 저장하면 load 후 predict_proba에서 실패함."
+            )
         try:
             import torch
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self._net.state_dict(), str(path))
-        if self._scaler is not None:
-            scaler_path = path.parent / f"{path.stem}_scaler.pkl"
-            with scaler_path.open("wb") as f:
-                pickle.dump(self._scaler, f)
-            logger.info("[committee.cnn] 가중치+scaler 저장: %s", path)
-        else:
-            logger.warning(
-                "[committee.cnn] scaler=None인 채로 저장. load() 후 predict_proba 실패 위험."
-            )
+        scaler_path = path.parent / f"{path.stem}_scaler.pkl"
+        with scaler_path.open("wb") as f:
+            pickle.dump(self._scaler, f)
+        logger.info("[committee.cnn] 가중치+scaler 저장: %s", path)
 
     def load(self, path: Path) -> "CNNBranch":
         """CNN 가중치 + StandardScaler 로드. scaler 누락 시 raise."""
