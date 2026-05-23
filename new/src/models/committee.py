@@ -55,6 +55,16 @@ class CommitteeLoadError(RuntimeError):
 
 
 # ====================================================================== #
+# Design constants (not tuning knobs — risk_config 분리 불필요)
+# ====================================================================== #
+
+
+_CNN_INPUT_NAN_FALLBACK: float = 0.0
+"""StandardScaler 정규화 후 평균값(0)으로 NaN/inf 대체. 학습에 bias 안 주는
+neutral design constant. tuning knob 아니므로 risk_config 분리 안 함."""
+
+
+# ====================================================================== #
 # Result dataclass
 # ====================================================================== #
 
@@ -153,7 +163,12 @@ class CNNBranch:
 
         # NaN/inf 사전 처리: feature 계산 edge case (division by zero 등)에서 발생.
         # StandardScaler 단독으론 NaN을 보존하므로 명시적 nan_to_num이 필요하다.
-        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_clean = np.nan_to_num(
+            X,
+            nan=_CNN_INPUT_NAN_FALLBACK,
+            posinf=_CNN_INPUT_NAN_FALLBACK,
+            neginf=_CNN_INPUT_NAN_FALLBACK,
+        )
         self._scaler = StandardScaler()
         X_scaled = self._scaler.fit_transform(X_clean).astype(np.float32)
 
@@ -196,7 +211,12 @@ class CNNBranch:
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
 
-        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        X_clean = np.nan_to_num(
+            X,
+            nan=_CNN_INPUT_NAN_FALLBACK,
+            posinf=_CNN_INPUT_NAN_FALLBACK,
+            neginf=_CNN_INPUT_NAN_FALLBACK,
+        )
         X_scaled = self._scaler.transform(X_clean).astype(np.float32)
         self._net.eval()
         with torch.no_grad():
