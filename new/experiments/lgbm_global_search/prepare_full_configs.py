@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     report = {
-        "status": "PASS",
+        "status": "RESEARCH_CONFIGS_PREPARED",
         "action": "prepare_lgbm_global_search_full_configs",
         "proxy_run_id": str(args.proxy_run_id),
         "summary_path": str(summary_path),
@@ -181,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         "live_trading_allowed": False,
         "deploy_quality": False,
         "requires_c12": True,
+        "service_policy_replay_pass": False,
     }
     _json_dump(output_dir / "full_config_plan.json", report)
     print(json.dumps(report, ensure_ascii=False, indent=2))

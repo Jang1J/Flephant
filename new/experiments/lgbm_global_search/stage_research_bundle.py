@@ -61,6 +61,8 @@ def _safe_bundle_dir(bundle_id: str) -> Path:
     clean = str(bundle_id).strip()
     if not clean or "/" in clean or "\\" in clean or clean in {".", ".."}:
         raise ValueError(f"invalid bundle_id: {bundle_id}")
+    if not clean.startswith("RESEARCH-"):
+        raise ValueError("research bundle_id must start with 'RESEARCH-'")
     resolved = (BUNDLE_ROOT / clean / "lgbm").resolve()
     if not (resolved == BUNDLE_ROOT or BUNDLE_ROOT in resolved.parents):
         raise RuntimeError(f"target bundle must be under {BUNDLE_ROOT}: {resolved}")
@@ -126,7 +128,7 @@ def stage_bundle(
     )
     _json_dump(target_metadata, metadata)
     report = {
-        "status": "PASS",
+        "status": "RESEARCH_BUNDLE_STAGED",
         "generated_at": datetime.now(KST).isoformat(),
         "action": "stage_research_lgbm_bundle",
         "bundle_id": str(bundle_id),
@@ -138,6 +140,7 @@ def stage_bundle(
         "research_only": True,
         "deploy_quality": False,
         "requires_c12": True,
+        "service_policy_replay_pass": False,
         "production_registry_mutated": False,
         "paper_registry_mutated": False,
         "live_trading_allowed": False,
@@ -154,15 +157,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--confirm-phrase", default=None)
     args = parser.parse_args(argv)
-    report = stage_bundle(
-        source_registry_dir=str(args.source_registry_dir),
-        candidate_version=str(args.candidate_version),
-        bundle_id=str(args.bundle_id),
-        force=bool(args.force),
-        confirm_phrase=args.confirm_phrase,
-    )
+    try:
+        report = stage_bundle(
+            source_registry_dir=str(args.source_registry_dir),
+            candidate_version=str(args.candidate_version),
+            bundle_id=str(args.bundle_id),
+            force=bool(args.force),
+            confirm_phrase=args.confirm_phrase,
+        )
+    except Exception as e:
+        report = {
+            "status": "RESEARCH_BLOCKED",
+            "reason": str(e),
+            "action": "stage_research_lgbm_bundle",
+            "bundle_id": str(args.bundle_id),
+            "candidate_version": str(args.candidate_version),
+            "research_only": True,
+            "deploy_quality": False,
+            "requires_c12": True,
+            "service_policy_replay_pass": False,
+            "production_registry_mutated": False,
+            "paper_registry_mutated": False,
+            "live_trading_allowed": False,
+        }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report.get("status") == "PASS" else 1
+    return 0 if report.get("status") == "RESEARCH_BUNDLE_STAGED" else 1
 
 
 if __name__ == "__main__":

@@ -373,6 +373,8 @@ class DatasetBuilder:
         target = str(target_col)
         if target not in panel.columns:
             raise KeyError(f"target_col='{target}' panel에 없음")
+        if not self._is_allowed_research_label_target(target):
+            raise ValueError(f"research relabel target must be a label column: {target}")
 
         frame = panel.reset_index() if "ticker" in (panel.index.names or []) else panel.copy()
         frame = frame.dropna(subset=[target]).copy()
@@ -388,6 +390,15 @@ class DatasetBuilder:
         if self._leakage_guard:
             self._assert_label_column_safe(relabeled, target)
         return relabeled
+
+    @staticmethod
+    def _is_allowed_research_label_target(target: str) -> bool:
+        if target.startswith("label_session_close_"):
+            return True
+        if not target.startswith("label_"):
+            return False
+        parts = target.split("_", 2)
+        return len(parts) == 3 and parts[1].endswith("m") and parts[1][:-1].isdigit()
 
     def _join_neutral_feature_columns(self, panel):
         panel = panel.copy()

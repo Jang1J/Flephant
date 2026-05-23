@@ -2,6 +2,8 @@
 
 개인 repo 실험용 bounded global search 하네스입니다. 목적은 2026-05-26 paper 운영 전후로 현재 후보 `BUNDLE-20260521-POSTCLOSE`를 건드리지 않고 더 좋은 research 후보가 있는지 확인하는 것입니다.
 
+> 개인 repo 전용입니다. `new/experiments/lgbm_global_search/`는 팀 `ai-1` 브랜치에 merge/cherry-pick/push하지 않습니다.
+
 ## 안전 원칙
 
 - production registry `artifacts/lgbm`를 쓰지 않습니다.
@@ -56,6 +58,6 @@ Full 검증에서 통과한 research candidate는 C12/service-policy replay 전�
 /opt/anaconda3/envs/elephant/bin/python new/experiments/lgbm_global_search/stage_research_bundle.py \
   --source-registry-dir artifacts/lgbm_global_search/<full-run-id>/registry \
   --candidate-version <version> \
-  --bundle-id <research-bundle-id> \
+  --bundle-id RESEARCH-<research-bundle-id> \
   --confirm-phrase STAGE_RESEARCH_BUNDLE_OK
 ```
