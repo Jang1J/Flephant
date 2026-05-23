@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Build deploy-quality dual-source raw archive from DART + Naver News.
 
-각 business day에 대해 [prev 08:30 KST, curr 08:30 KST] 24-hour window 안의
-events 만 추출해 ``artifacts/raw/dual_source/{date}.json`` 에 기록한다.
+각 business day에 대해 [prev trading-day 08:30 KST, curr 08:30 KST] window 안의
+events 만 추출해 ``artifacts/raw/dual_source/{date}.json`` 에 기록한다. 주말/휴일
+직후 window는 24시간보다 길 수 있다.
 materialize_dual_source_history.py 가 이 디렉토리를 ``--raw-events-dir`` 로 받아
 DualSourceScorer (FinBERT or sentiment_dict fallback) 로 5피처 점수를 자동 산출한다.
 
@@ -58,7 +59,7 @@ def _snapshot_ts(date_key: str) -> datetime:
 
 
 def _window_start(date_key: str) -> datetime:
-    """이전 영업일 08:30 KST (24-hour window 시작점, KOSPI 거래일 기준)."""
+    """이전 영업일 08:30 KST (KOSPI 거래일 기준 window 시작점)."""
     day = _parse_date(date_key).date()
     prev = previous_kospi_trading_day(day)
     return datetime.combine(prev, time(8, 30), tzinfo=_KST)
@@ -126,7 +127,7 @@ def _fetch_dart_window(
     oldest_yyyymmdd: str,
     latest_yyyymmdd: str,
 ) -> list[dict[str, Any]]:
-    """80-day DART 공시 list (한 ticker). page_no 페이지네이션 반복."""
+    """DART 공시 list (한 ticker). page_no 페이지네이션 반복."""
     if not corp_code:
         return []
     aggregated: list[dict[str, Any]] = []
@@ -373,6 +374,7 @@ def build_archive(
     latest_date = dates[-1]
     overall_window_start = _window_start(oldest_date)
     overall_window_end = _snapshot_ts(latest_date)
+    dart_oldest_date = overall_window_start.strftime("%Y%m%d")
 
     dart = DARTRestClient()
     naver = NaverNewsClient()
@@ -408,7 +410,7 @@ def build_archive(
             dart,
             corp_code=corp_code,
             ticker=ticker,
-            oldest_yyyymmdd=oldest_date,
+            oldest_yyyymmdd=dart_oldest_date,
             latest_yyyymmdd=latest_date,
         )
         naver_events = _fetch_naver_for_ticker(
@@ -470,7 +472,7 @@ def build_archive(
         for ev in market_events:
             events_by_ticker.setdefault(ev["ticker"], []).append(ev)
 
-    # Stage B: 각 date 24-hour window 적용 + archive 작성
+    # Stage B: 각 date window 적용 + archive 작성
     distributed = _distribute_into_dates(events_by_ticker, dates)
     has_broadcast_scope = bool(sector_to_tickers) or bool(_MARKET_QUERIES)
     if not any(distributed.get(date_key) for date_key in dates) and not has_broadcast_scope:

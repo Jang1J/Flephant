@@ -73,3 +73,43 @@ def test_build_news_dart_archive_does_not_write_empty_deploy_payload(monkeypatch
     assert report["total_events"] == 0
     assert "no_events_archived" in report["blockers"]
     assert not (tmp_path / "raw" / "20260508.json").exists()
+
+
+def test_build_news_dart_archive_fetches_dart_from_window_start(monkeypatch, tmp_path: Path):
+    mod = _load_script("build_news_dart_archive")
+    captured: dict[str, str] = {}
+
+    class DummyDART:
+        _is_mock = False
+
+    class DummyNaver:
+        _is_mock = False
+
+    def fake_dart_window(*args, **kwargs):
+        captured["oldest"] = kwargs["oldest_yyyymmdd"]
+        captured["latest"] = kwargs["latest_yyyymmdd"]
+        return []
+
+    monkeypatch.setattr(mod, "DARTRestClient", lambda: DummyDART())
+    monkeypatch.setattr(mod, "NaverNewsClient", lambda: DummyNaver())
+    monkeypatch.setattr(
+        mod,
+        "_load_ticker_meta",
+        lambda path: {"005930": {"corp_code": "001", "name": "삼성전자"}},
+    )
+    monkeypatch.setattr(mod, "_fetch_dart_window", fake_dart_window)
+    monkeypatch.setattr(mod, "_fetch_naver_for_ticker", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, "_fetch_naver_broadcast", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, "_load_sector_to_tickers", lambda: {})
+    monkeypatch.setattr(mod, "_MARKET_QUERIES", ())
+
+    report = mod.build_archive(
+        end_date="20260526",
+        business_days=1,
+        corp_cache_path=tmp_path / "corp.json",
+        output_dir=tmp_path / "raw",
+        report_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert captured == {"oldest": "20260522", "latest": "20260526"}
