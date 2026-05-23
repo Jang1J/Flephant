@@ -175,7 +175,7 @@ def test_cnn_branch_save_creates_file(tmp_path: Path):
     mock_torch.save.assert_called_once()
 
 
-def test_cnn_branch_save_raises_when_net_none():
+def test_cnn_branch_save_raises_when_net_none(tmp_path: Path):
     """fail-closed: _net=None인 상태에서 save() 호출 → CommitteeTrainError.
 
     이전 동작은 silent return이었어서 호출자가 저장 실패를 인지하지 못한 채
@@ -188,8 +188,10 @@ def test_cnn_branch_save_raises_when_net_none():
     branch._net = None
     branch._scaler = MagicMock()
 
+    pth_path = tmp_path / "should_not_be_created.pth"
     with pytest.raises(CommitteeTrainError, match=r"_net=None"):
-        branch.save(Path("/tmp/should_not_be_created.pth"))
+        branch.save(pth_path)
+    assert not pth_path.exists(), "fail-closed인데 .pth가 생성됨"
 
 
 def test_cnn_branch_save_raises_when_scaler_none(tmp_path: Path):
@@ -238,7 +240,7 @@ def test_cnn_branch_scaler_persists_after_fit():
 
     # 학습 자체는 mock (torch.tensor / DataLoader 우회). scaler 동작만 검증.
     with patch.object(branch, "_build_net", return_value=mock_net), \
-         patch("src.models.committee.StandardScaler") as MockScaler:
+         patch("sklearn.preprocessing.StandardScaler") as MockScaler:
         scaler_instance = MagicMock()
         scaler_instance.fit_transform.return_value = X.astype(np.float32)
         MockScaler.return_value = scaler_instance
@@ -247,7 +249,7 @@ def test_cnn_branch_scaler_persists_after_fit():
                                          "torch.utils.data": mock_torch.utils.data}):
             try:
                 branch.fit(X, y)
-            except Exception:
+            except (TypeError, AttributeError):
                 pass
 
     # scaler 인스턴스가 생성되고 fit_transform 호출됐는지 검증
@@ -285,7 +287,7 @@ def test_cnn_branch_fit_nan_aware_order():
     mock_net.parameters.return_value = iter([])
 
     with patch.object(branch, "_build_net", return_value=mock_net), \
-         patch("src.models.committee.StandardScaler") as MockScaler:
+         patch("sklearn.preprocessing.StandardScaler") as MockScaler:
         scaler_instance = MagicMock()
         scaler_instance.fit_transform.side_effect = capture_and_return_zeros
         MockScaler.return_value = scaler_instance
@@ -294,7 +296,7 @@ def test_cnn_branch_fit_nan_aware_order():
                                          "torch.utils.data": mock_torch.utils.data}):
             try:
                 branch.fit(X, y)
-            except Exception:
+            except (TypeError, AttributeError):
                 pass
 
     assert len(captured_inputs) == 1, "StandardScaler.fit_transform 한 번 호출 기대"

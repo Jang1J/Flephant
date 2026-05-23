@@ -27,10 +27,12 @@ import pickle
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+
+if TYPE_CHECKING:
+    from sklearn.preprocessing import StandardScaler
 
 from src.models.metrics import sharpe_ratio
 from src.models.splitter import WalkForwardSplitter
@@ -52,23 +54,6 @@ class CommitteeTrainError(RuntimeError):
 
 class CommitteeLoadError(RuntimeError):
     """Committee artifact 로드 실패."""
-
-
-# ====================================================================== #
-# Design constants (not tuning knobs — risk_config 분리 불필요)
-# ====================================================================== #
-
-
-_CNN_INPUT_NAN_FALLBACK: float = 0.0
-"""StandardScaler transform 출력에 남은 NaN을 표준화된 평균(=0)으로 대체.
-
-처리 순서: inf → NaN → StandardScaler(NaN-aware fit, nanmean/nanvar 사용)
-→ 출력의 NaN → 본 fallback 값(0).
-
-raw 단계에서 0으로 치환하면 평균이 0이 아닌 feature에서 표준화 후 bias가
-생기므로, NaN 상태로 scaler에 통과시켜 통계량 계산에서 결측이 제외되도록 한다.
-출력 단계의 0은 표준화된 평균값이라 학습에 bias를 주지 않는 neutral 값.
-tuning knob 아니므로 risk_config 분리 안 함."""
 
 
 # ====================================================================== #
@@ -127,6 +112,7 @@ class CNNBranch:
         epochs: int,
         batch_size: int,
         seed: int,
+        nan_fallback: float = 0.0,
     ) -> None:
         self._n_features = n_features
         self._hidden = hidden_channels
@@ -134,6 +120,7 @@ class CNNBranch:
         self._epochs = epochs
         self._batch_size = batch_size
         self._seed = seed
+        self._nan_fallback = nan_fallback
         self._net: Any = None
         self._scaler: StandardScaler | None = None
 
@@ -172,6 +159,7 @@ class CNNBranch:
             from torch.utils.data import DataLoader, TensorDataset
         except ImportError as e:
             raise CommitteeTrainError(f"torch 미설치: {e}") from e
+        from sklearn.preprocessing import StandardScaler
 
         # NaN/inf 처리 순서 (통계적 정확성 위해):
         #   1. inf만 NaN으로 치환 (NaN은 그대로 유지)
@@ -180,14 +168,12 @@ class CNNBranch:
         #   3. 출력에 남은 NaN을 표준화 평균(=0)으로 imputation.
         # raw 단계에서 0으로 치환하지 않는 이유: 평균이 0이 아닌 feature에서
         # 표준화 통계량 자체가 왜곡되어 bias 발생.
+        fb = self._nan_fallback
         X_inf_to_nan = np.where(np.isinf(X), np.nan, X).astype(np.float64)
         self._scaler = StandardScaler()
         X_scaled_raw = self._scaler.fit_transform(X_inf_to_nan)
         X_scaled = np.nan_to_num(
-            X_scaled_raw,
-            nan=_CNN_INPUT_NAN_FALLBACK,
-            posinf=_CNN_INPUT_NAN_FALLBACK,
-            neginf=_CNN_INPUT_NAN_FALLBACK,
+            X_scaled_raw, nan=fb, posinf=fb, neginf=fb,
         ).astype(np.float32)
 
         torch.manual_seed(self._seed)
@@ -231,13 +217,11 @@ class CNNBranch:
 
         # fit()과 동일 순서: inf→NaN → scaler.transform(NaN 보존)
         # → 출력 NaN → 표준화 평균(0).
+        fb = self._nan_fallback
         X_inf_to_nan = np.where(np.isinf(X), np.nan, X).astype(np.float64)
         X_scaled_raw = self._scaler.transform(X_inf_to_nan)
         X_scaled = np.nan_to_num(
-            X_scaled_raw,
-            nan=_CNN_INPUT_NAN_FALLBACK,
-            posinf=_CNN_INPUT_NAN_FALLBACK,
-            neginf=_CNN_INPUT_NAN_FALLBACK,
+            X_scaled_raw, nan=fb, posinf=fb, neginf=fb,
         ).astype(np.float32)
         self._net.eval()
         with torch.no_grad():
@@ -276,14 +260,18 @@ class CNNBranch:
         logger.info("[committee.cnn] 가중치+scaler 저장: %s", path)
 
     def load(self, path: Path) -> "CNNBranch":
-        """CNN 가중치 + StandardScaler 로드. scaler 누락 시 raise."""
+        """CNN 가중치 + StandardScaler 로드. scaler 누락 시 raise.
+
+        local 변수에 먼저 로드 후 성공 확인 시 self에 할당 (atomic).
+        중간 실패 시 self._net/_scaler가 불완전 상태로 남는 것을 방지.
+        """
         try:
             import torch
         except ImportError as e:
             raise CommitteeLoadError(f"torch 미설치: {e}") from e
-        self._net = self._build_net()
-        self._net.load_state_dict(torch.load(str(path), map_location="cpu", weights_only=True))
-        self._net.eval()
+        net = self._build_net()
+        net.load_state_dict(torch.load(str(path), map_location="cpu", weights_only=True))
+        net.eval()
         scaler_path = path.parent / f"{path.stem}_scaler.pkl"
         if not scaler_path.exists():
             raise CommitteeLoadError(
@@ -291,7 +279,9 @@ class CNNBranch:
                 "정규화 없는 모델은 운영 부적합 (입력 스케일 이질성)."
             )
         with scaler_path.open("rb") as f:
-            self._scaler = pickle.load(f)
+            scaler = pickle.load(f)
+        self._net = net
+        self._scaler = scaler
         logger.info("[committee.cnn] 가중치+scaler 로드: %s", path)
         return self
 
@@ -325,6 +315,7 @@ class CommitteeModel:
         self._meta_max_iter: int = int(cfg.get("meta_fuser_max_iter", 100))
         self._meta_C: float = float(cfg.get("meta_fuser_C", 1.0))
         self._sharpe_threshold: float = float(cfg.get("sharpe_improvement_threshold", 0.0))
+        self._cnn_nan_fallback: float = float(cfg.get("cnn_nan_fallback", 0.0))
         self._artifacts_path = Path(cfg.get("artifacts_path", "artifacts/committee"))
         self._artifacts_path.mkdir(parents=True, exist_ok=True)
 
@@ -511,6 +502,7 @@ class CommitteeModel:
             self._cnn_branch = CNNBranch(
                 n_features, self._cnn_hidden, self._cnn_lr,
                 self._cnn_epochs, self._cnn_batch, self._cnn_seed,
+                nan_fallback=self._cnn_nan_fallback,
             )
             self._cnn_branch.load(cnn_path)
 
@@ -599,6 +591,7 @@ class CommitteeModel:
                 epochs=self._cnn_epochs,
                 batch_size=self._cnn_batch,
                 seed=self._cnn_seed,
+                nan_fallback=self._cnn_nan_fallback,
             )
             try:
                 cnn.fit(X_train, y_train)
@@ -662,6 +655,7 @@ class CommitteeModel:
             epochs=self._cnn_epochs,
             batch_size=self._cnn_batch,
             seed=self._cnn_seed,
+            nan_fallback=self._cnn_nan_fallback,
         )
         try:
             self._cnn_branch.fit(X_all, y_binary)
