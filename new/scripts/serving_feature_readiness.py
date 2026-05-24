@@ -8,6 +8,7 @@ mutate registries.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -70,6 +71,14 @@ def _display_path(path: Path) -> str:
         return str(path.relative_to(ROOT))
     except ValueError:
         return str(path)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _parse_asof(raw: str) -> datetime:
@@ -192,6 +201,7 @@ def build_report(
         }
 
     rows = load_latest_scores(date_key, artifact_dir=_resolve_path(artifact_dir))
+    artifact_sha256 = _file_sha256(artifact_path)
     row_by_ticker = {
         pad_ticker(str(row.get("ticker", ""))): row
         for row in rows
@@ -210,7 +220,9 @@ def build_report(
             missing_tickers.append(ticker)
             continue
         batch_date = row.get("batch_date")
-        if batch_date not in (None, ""):
+        if batch_date in (None, ""):
+            missing_timestamp_tickers.append(ticker)
+        else:
             try:
                 batch_date_key = _feature_date_key(batch_date)
             except (TypeError, ValueError):
@@ -228,12 +240,12 @@ def build_report(
                         "value": str(batch_date),
                         "reason": "feature_artifact_date_mismatch",
                     })
-        has_timestamp = False
+        if row.get("snapshot_ts") in (None, ""):
+            missing_timestamp_tickers.append(ticker)
+        if row.get("generated_at") in (None, ""):
+            missing_timestamp_tickers.append(ticker)
         for key in ("snapshot_ts", "generated_at"):
             raw_ts = row.get(key)
-            if raw_ts in (None, ""):
-                continue
-            has_timestamp = True
             try:
                 ts = _parse_feature_ts(raw_ts)
             except (TypeError, ValueError):
@@ -258,8 +270,6 @@ def build_report(
                     "value": ts.isoformat(),
                     "reason": "future_feature_artifact",
                 })
-        if not has_timestamp:
-            missing_timestamp_tickers.append(ticker)
         for col in required_cols:
             if col not in row:
                 missing_cols.setdefault(ticker, []).append(col)
@@ -267,6 +277,7 @@ def build_report(
             if _float_or_none(row.get(col)) is None:
                 invalid_cols.setdefault(ticker, []).append(col)
 
+    missing_timestamp_tickers = sorted(set(missing_timestamp_tickers))
     blockers = []
     if missing_tickers:
         blockers.append("required_feature_ticker_missing")
@@ -286,6 +297,7 @@ def build_report(
         "status": "FAIL" if blockers else "PASS",
         "required": True,
         "artifact": artifact_label,
+        "artifact_sha256": artifact_sha256,
         "blockers": blockers,
         "missing_tickers": missing_tickers,
         "missing_feature_cols_by_ticker": missing_cols,

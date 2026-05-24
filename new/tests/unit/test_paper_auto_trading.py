@@ -111,6 +111,17 @@ class FakePaperKIS:
         return {"orders": orders, "summary": {}, "_mode": self.mode}
 
 
+class FakePaperKISWithZeroPosition(FakePaperKIS):
+    def get_balance(self) -> dict[str, Any]:
+        return {
+            "balance": {"cash": 1_000_000.0, "net_asset": 1_000_000.0},
+            "positions": [
+                {"ticker": "000660", "qty": 0, "current_price": 300000.0},
+            ],
+            "_mode": self.mode,
+        }
+
+
 class FakeRealKIS(FakePaperKIS):
     mode = "real"
 
@@ -293,6 +304,28 @@ class FakeAllZeroQuantHotRunner(FakeHotRunner):
         return result
 
 
+class FakeNonFiniteQuantHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        result = super().run_once(**kwargs)
+        result["quant_output"] = {
+            "mode": "active",
+            "tickers": ["005930", "000660"],
+            "scores": {"005930": 0.5, "000660": float("nan")},
+            "n_tickers": 2,
+        }
+        result["final_decision"]["order_deltas"] = [
+            {
+                "ticker": "000660",
+                "side": "sell",
+                "qty": 1,
+                "price": 300000.0,
+                "order_type": "00",
+                "reason": "exit",
+            }
+        ]
+        return result
+
+
 class FakeMissingModeQuantHotRunner(FakeHotRunner):
     def run_once(self, **kwargs: Any) -> dict[str, Any]:
         result = super().run_once(**kwargs)
@@ -412,15 +445,73 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
         "order_type": "00",
     }]
     cycle = report["stages"]["cycles"]["items"][0]
+    summary = report["stages"]["cycles"]["summary"]
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
     assert cycle["order_history_verification"]["status"] == "PASS"
     assert cycle["order_history_verification"]["queries"][0]["matched_order_count"] == 1
+    assert summary["cycle_count"] == 1
+    assert summary["score_nonempty_cycles"] == 1
+    assert summary["score_rankable_cycles"] == 1
+    assert summary["order_delta_count"] == 1
+    assert summary["execution_cycles"] == 1
+    assert summary["quant_guard_failures"] == {}
     assert hot_runner.calls[0]["dependency_status"] == {
         "news": "skipped",
         "risk": "done",
         "quant": "done",
         "debate": "skipped",
     }
+
+
+def test_paper_auto_preflight_includes_required_dual_source_artifact_hash(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = FakePaperKIS()
+    artifact_root = tmp_path / "dual_source"
+    artifact_root.mkdir(parents=True)
+    artifact_payload = [{
+        "ticker": "005930",
+        "news_score_t": 0.2,
+        "batch_date": "2026-05-12T00:00:00+09:00",
+        "snapshot_ts": "2026-05-12T08:30:00+09:00",
+        "generated_at": "2026-05-12T08:30:00+09:00",
+    }]
+    (artifact_root / "20260512.json").write_text(
+        json.dumps(artifact_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        paper_auto_module,
+        "DEFAULT_DUAL_SOURCE_ARTIFACT_DIR",
+        artifact_root,
+    )
+    monkeypatch.setattr(
+        paper_auto_module,
+        "load_latest_scores",
+        lambda *args, **kwargs: list(artifact_payload),
+    )
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeRequiredDSHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    guard = report["stages"]["serving_feature_readiness"]
+    assert report["status"] == "PASS"
+    assert guard["status"] == "PASS"
+    assert guard["artifact"].endswith("20260512.json")
+    assert len(guard["artifact_sha256"]) == 64
+    assert client.orders
 
 
 def test_paper_auto_preflight_blocks_missing_required_dual_source_artifact(
@@ -474,7 +565,7 @@ def test_paper_auto_preflight_blocks_required_dual_source_without_timestamp(
     monkeypatch.setattr(
         paper_auto_module,
         "load_latest_scores",
-        lambda _date: [{"ticker": "005930", "news_score_t": 0.2}],
+        lambda *args, **kwargs: [{"ticker": "005930", "news_score_t": 0.2}],
     )
     trader = PaperAutoTrader(
         kis_client=client,
@@ -515,10 +606,11 @@ def test_paper_auto_preflight_blocks_stale_required_dual_source_timestamp(
     monkeypatch.setattr(
         paper_auto_module,
         "load_latest_scores",
-        lambda _date: [{
+        lambda *args, **kwargs: [{
             "ticker": "005930",
             "news_score_t": 0.2,
             "batch_date": "2026-05-11T00:00:00+09:00",
+            "snapshot_ts": "2026-05-11T08:30:00+09:00",
             "generated_at": "2026-05-11T08:30:00+09:00",
         }],
     )
@@ -561,9 +653,10 @@ def test_paper_auto_preflight_blocks_stale_required_dual_source_snapshot_ts(
     monkeypatch.setattr(
         paper_auto_module,
         "load_latest_scores",
-        lambda _date: [{
+        lambda *args, **kwargs: [{
             "ticker": "005930",
             "news_score_t": 0.2,
+            "batch_date": "2026-05-12T00:00:00+09:00",
             "snapshot_ts": "2026-05-11T08:30:00+09:00",
             "generated_at": "2026-05-12T08:30:00+09:00",
         }],
@@ -612,6 +705,10 @@ def test_paper_auto_fails_closed_on_empty_quant_scores(tmp_path: Path) -> None:
     assert cycle["reason"] == "quant_output_not_actionable"
     assert cycle["quant_output_guard"]["reason"] == "quant_not_active"
     assert cycle["quant_output_guard"]["finite_score_count"] == 0
+    summary = report["stages"]["cycles"]["summary"]
+    assert summary["quant_guard_failures"] == {"quant_not_active": 1}
+    assert summary["score_nonempty_cycles"] == 0
+    assert summary["execution_cycles"] == 0
     assert cycle["execution"] is None
     assert client.orders == []
 
@@ -644,6 +741,65 @@ def test_paper_auto_fails_closed_when_quant_output_missing(tmp_path: Path) -> No
     assert cycle["quant_output_guard"]["reason"] == "quant_output_missing"
     assert cycle["execution"] is None
     assert client.orders == []
+
+
+def test_paper_auto_blocks_partial_nonfinite_quant_scores_no_order(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeNonFiniteQuantHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930", "000660"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["reason"] == "quant_output_not_actionable"
+    assert cycle["quant_output_guard"]["reason"] == "quant_scores_invalid"
+    assert cycle["quant_output_guard"]["invalid_score_tickers"] == ["000660"]
+    assert cycle["execution"] is None
+    assert client.orders == []
+
+
+def test_paper_auto_ignores_zero_qty_position_for_quant_coverage(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKISWithZeroPosition()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "PASS"
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert "quant_output_guard" not in cycle
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "buy",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
 
 
 def test_paper_auto_fails_closed_on_all_zero_quant_scores(tmp_path: Path) -> None:
@@ -740,6 +896,9 @@ def test_paper_auto_fails_closed_on_quant_blocker(tmp_path: Path) -> None:
     assert report["status"] == "FAIL"
     assert cycle["quant_output_guard"]["reason"] == "quant_blocked"
     assert cycle["quant_output_guard"]["blocker"] == "required_feature_missing"
+    summary = report["stages"]["cycles"]["summary"]
+    assert summary["quant_guard_failures"] == {"quant_blocked": 1}
+    assert summary["quant_blockers"] == {"required_feature_missing": 1}
     assert client.orders == []
 
 
@@ -1211,7 +1370,7 @@ def test_paper_auto_current_positions_do_not_truncate_fractional_qty() -> None:
         portfolio_value=1_000_000.0,
     )
 
-    assert positions == [{"ticker": "005930", "qty": 0, "weight": 0.0}]
+    assert positions == []
 
 
 def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:

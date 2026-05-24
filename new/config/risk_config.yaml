@@ -1063,6 +1063,9 @@ quant_agent:
   latency_window: 1000               # p50/p95/p99 측정 창 (최근 N개 기록)
   latency_p95_target_ms: 100         # Hot Path SLA (경고/로그용, enforcement는 S1-9 Monitor)
   investor_flow_stale_sec: 1800      # 수급 side-channel snapshot stale 기준
+  actionability:
+    score_epsilon: 1.0e-12           # score가 0/동률/비유한값인지 판별하는 수치 tolerance
+    position_weight_epsilon: 1.0e-12 # 실제 보유 exposure coverage 판별 tolerance
 
 # Model Registry 파라미터 (S1-0 Batch B registry.py 참조)
 # artifacts/lgbm/ 하위 파일 관리. S3-6 야간 재학습이 동일 registry 재사용.

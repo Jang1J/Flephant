@@ -104,6 +104,8 @@ def test_serving_feature_readiness_passes_current_day_required_news_score(
         return [{
             "ticker": "005930",
             "news_score_t": 0.42,
+            "batch_date": "2026-05-26T00:00:00+09:00",
+            "snapshot_ts": "2026-05-26T08:20:00+09:00",
             "generated_at": "2026-05-26T08:20:00+09:00",
         }]
 
@@ -119,6 +121,7 @@ def test_serving_feature_readiness_passes_current_day_required_news_score(
     assert report["status"] == "PASS"
     assert report["required"] is True
     assert report["matched_ticker_count"] == 1
+    assert len(report["artifact_sha256"]) == 64
     assert calls == [{"date_key": "20260526", "artifact_dir": artifact_dir}]
 
 
@@ -166,6 +169,8 @@ def test_serving_feature_readiness_blocks_future_timestamp(
         lambda *args, **kwargs: [{
             "ticker": "005930",
             "news_score_t": 0.42,
+            "batch_date": "2026-05-26T00:00:00+09:00",
+            "snapshot_ts": "2026-05-26T08:20:00+09:00",
             "generated_at": "2026-05-26T09:01:00+09:00",
         }],
     )
@@ -180,6 +185,39 @@ def test_serving_feature_readiness_blocks_future_timestamp(
     assert report["status"] == "FAIL"
     assert "required_feature_timestamp_not_pit_safe" in report["blockers"]
     assert report["future_rows"][0]["ticker"] == "005930"
+
+
+def test_serving_feature_readiness_blocks_missing_generated_at(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    script = _load_script()
+    _patch_root_and_config(monkeypatch, script, tmp_path)
+    _write_metadata(tmp_path, "BUNDLE-TEST", ["close", "news_score_t"])
+    artifact_dir = tmp_path / "artifacts" / "dual_source"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "20260526.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        script,
+        "load_latest_scores",
+        lambda *args, **kwargs: [{
+            "ticker": "005930",
+            "news_score_t": 0.42,
+            "batch_date": "2026-05-26T00:00:00+09:00",
+            "snapshot_ts": "2026-05-26T08:20:00+09:00",
+        }],
+    )
+
+    report = script.build_report(
+        bundle_id="BUNDLE-TEST",
+        tickers=["005930"],
+        asof="2026-05-26T08:30:00+09:00",
+        artifact_dir=artifact_dir,
+    )
+
+    assert report["status"] == "FAIL"
+    assert "required_feature_timestamp_missing" in report["blockers"]
+    assert report["missing_timestamp_tickers"] == ["005930"]
 
 
 def test_serving_feature_readiness_blocks_stale_timestamp(
@@ -199,6 +237,7 @@ def test_serving_feature_readiness_blocks_stale_timestamp(
             "ticker": "005930",
             "news_score_t": 0.42,
             "batch_date": "2026-05-22T00:00:00+09:00",
+            "snapshot_ts": "2026-05-22T08:30:00+09:00",
             "generated_at": "2026-05-22T08:30:00+09:00",
         }],
     )
@@ -231,6 +270,7 @@ def test_serving_feature_readiness_blocks_stale_snapshot_ts(
         lambda *args, **kwargs: [{
             "ticker": "005930",
             "news_score_t": 0.42,
+            "batch_date": "2026-05-26T00:00:00+09:00",
             "snapshot_ts": "2026-05-22T08:30:00+09:00",
             "generated_at": "2026-05-26T08:20:00+09:00",
         }],

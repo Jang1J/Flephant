@@ -40,9 +40,26 @@ from src.portfolio.portfolio_manager import PortfolioManager
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("hot_runner")
 _KST = ZoneInfo("Asia/Seoul")
+
+
+def _quant_actionability_float(key: str, default: float) -> float:
+    try:
+        cfg = config_load("risk_config.yaml", "quant_agent") or {}
+        actionability = cfg.get("actionability") if isinstance(cfg, dict) else {}
+        raw = actionability.get(key, default) if isinstance(actionability, dict) else default
+        parsed = float(raw)
+    except Exception as e:
+        logger.warning("[hot_runner] quant actionability 설정 로드 실패(%s): %s", key, e)
+        return default
+    return parsed if np.isfinite(parsed) and parsed >= 0.0 else default
+
+
+_SCORE_EPSILON = _quant_actionability_float("score_epsilon", 1e-12)
+_POSITION_WEIGHT_EPSILON = _quant_actionability_float("position_weight_epsilon", 1e-12)
 
 
 def _parse_hot_ts(value: Any) -> datetime:
@@ -346,7 +363,11 @@ class HotRunner:
                 stage_ms={"quant": quant_ms},
             )
         quant_ms = self._profiler.end_stage("quant", t_quant)
-        quant_blocker = self._quant_output_blocker(quant_output)
+        quant_blocker = self._quant_output_blocker(
+            quant_output,
+            requested_tickers=tickers,
+            current_positions=current_positions,
+        )
         if quant_blocker:
             return self._fail_closed_result(
                 asof=asof,
@@ -677,20 +698,117 @@ class HotRunner:
         }
 
     @staticmethod
-    def _quant_output_blocker(quant_output: dict[str, Any]) -> dict[str, Any] | None:
+    def _quant_output_blocker(
+        quant_output: dict[str, Any],
+        *,
+        requested_tickers: list[str] | None = None,
+        current_positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(quant_output, dict):
+            return {
+                "reason": "quant_output_missing",
+                "message": "Quant output missing before PPO/PM/FDA.",
+            }
         mode = str(quant_output.get("mode") or "").lower()
         blocker = quant_output.get("blocker")
-        if mode != "blocked" and not blocker:
+        stats = HotRunner._score_stats(quant_output.get("scores"))
+        requested = {
+            pad_ticker(str(ticker))
+            for ticker in (requested_tickers or [])
+            if str(ticker).strip()
+        }
+        held = {
+            pad_ticker(str(pos.get("ticker", "")))
+            for pos in (current_positions or [])
+            if isinstance(pos, dict)
+            and str(pos.get("ticker", "")).strip()
+            and pad_ticker(str(pos.get("ticker", ""))) != "000000"
+            and HotRunner._position_has_exposure(pos)
+        }
+        output_tickers = set(stats["finite_score_tickers"])
+        missing_requested = sorted(requested - output_tickers)
+        missing_held = sorted(held - output_tickers)
+
+        reason = ""
+        if mode == "blocked" or blocker:
+            reason = str(blocker or "quant_blocked")
+        elif mode != "active":
+            reason = "quant_not_active"
+        elif stats["finite_score_count"] < 1:
+            reason = "quant_scores_empty"
+        elif stats["invalid_score_tickers"]:
+            reason = "quant_scores_invalid"
+        elif stats["nonzero_score_count"] < 1:
+            reason = "quant_scores_all_zero"
+        elif not stats["rankable"]:
+            reason = "quant_scores_not_rankable"
+        elif missing_requested or missing_held:
+            reason = "quant_ticker_coverage_incomplete"
+        if not reason:
             return None
-        reason = str(blocker or "quant_blocked")
         return {
             "reason": reason,
             "message": (
-                "Quant output blocked before PPO/PM/FDA. "
-                f"mode={mode or 'unknown'} blocker={reason}"
+                "Quant output is not actionable before PPO/PM/FDA. "
+                f"mode={mode or 'unknown'} reason={reason}"
             ),
             "blocker_detail": quant_output.get("blocker_detail"),
+            "score_stats": stats,
+            "missing_requested_tickers": missing_requested,
+            "missing_held_tickers": missing_held,
         }
+
+    @staticmethod
+    def _score_stats(scores: Any) -> dict[str, Any]:
+        if not isinstance(scores, dict):
+            return {
+                "score_count": 0,
+                "finite_score_count": 0,
+                "nonzero_score_count": 0,
+                "score_std": 0.0,
+                "rankable": False,
+                "finite_score_tickers": [],
+                "invalid_score_tickers": [],
+            }
+        values: list[float] = []
+        finite_score_tickers: list[str] = []
+        invalid_score_tickers: list[str] = []
+        for ticker, value in scores.items():
+            padded = pad_ticker(str(ticker))
+            try:
+                parsed = float(value)
+            except Exception:
+                invalid_score_tickers.append(padded)
+                continue
+            if np.isfinite(parsed):
+                values.append(parsed)
+                finite_score_tickers.append(padded)
+            else:
+                invalid_score_tickers.append(padded)
+        nonzero = [value for value in values if abs(value) > _SCORE_EPSILON]
+        std = float(np.std(values)) if len(values) > 1 else 0.0
+        return {
+            "score_count": len(scores),
+            "finite_score_count": len(values),
+            "nonzero_score_count": len(nonzero),
+            "score_std": std,
+            "rankable": bool(len(values) == 1 and nonzero)
+            or bool(len(values) > 1 and std > _SCORE_EPSILON),
+            "finite_score_tickers": sorted(set(finite_score_tickers)),
+            "invalid_score_tickers": sorted(set(invalid_score_tickers)),
+        }
+
+    @staticmethod
+    def _position_has_exposure(position: dict[str, Any]) -> bool:
+        try:
+            qty = float(position.get("qty", 0.0))
+        except Exception:
+            qty = 0.0
+        try:
+            weight = float(position.get("weight", 0.0))
+        except Exception:
+            weight = 0.0
+        return qty > 0.0 or weight > _POSITION_WEIGHT_EPSILON
 
     @staticmethod
     def _portfolio_manager_guard_warnings(

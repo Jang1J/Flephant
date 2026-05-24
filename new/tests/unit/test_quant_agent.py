@@ -387,7 +387,7 @@ def test_score_cross_section_adds_trade_probs_from_classifier(tmp_path: Path) ->
 
 
 def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
-    # 일부 ticker만 warmup 달성
+    # 일부 ticker만 warmup이면 partial active 추론 대신 전체 fail-closed.
     for bar in _make_bars("005930", n=65):
         agent_active.on_bar(bar)
     for bar in _make_bars("000660", n=30):   # 부족
@@ -395,9 +395,12 @@ def test_score_cross_section_mixed_warmup(agent_active: QuantAgent) -> None:
     result = agent_active.score_cross_section(
         ["005930", "000660"], asof="2026-04-20T10:04:00+09:00"
     )
-    assert result["n_tickers"] == 1
-    assert "005930" in result["scores"]
-    assert "000660" not in result["scores"]
+    assert result["mode"] == "blocked"
+    assert result["blocker"] == "requested_ticker_coverage_incomplete"
+    assert result["scores"] == {}
+    assert result["n_tickers"] == 0
+    assert result["valid_ticker_count_before_block"] == 1
+    assert result["blockers"][0]["ticker"] == "000660"
 
 
 def test_score_cross_section_excludes_future_buffered_bars(
@@ -486,6 +489,8 @@ def test_score_cross_section_uses_dual_source_scores(
             "comm_score_t_2": 0.1,
             "news_comm_divergence": 0.4,
             "community_noise_multiplier": 0.8,
+            "batch_date": "2026-04-20T00:00:00+09:00",
+            "snapshot_ts": "2026-04-20T08:30:00+09:00",
             "generated_at": "2026-04-20T08:30:00+09:00",
         }]
 
@@ -543,6 +548,8 @@ def test_score_cross_section_requires_only_model_metadata_dual_source_cols(
         dual_source_loader=lambda _date: [{
             "ticker": "005930",
             "news_score_t": 0.7,
+            "batch_date": "2026-04-20T00:00:00+09:00",
+            "snapshot_ts": "2026-04-20T08:30:00+09:00",
             "generated_at": "2026-04-20T08:30:00+09:00",
         }],
     )
@@ -564,6 +571,7 @@ def test_score_cross_section_blocks_future_dual_source_scores(
     def loader(_date_str: str | None) -> list[dict[str, Any]]:
         return [{
             "ticker": "005930",
+            "batch_date": "2026-04-20T00:00:00+09:00",
             "snapshot_ts": "2026-04-20T10:30:00+09:00",
             "generated_at": "2026-04-20T10:31:00+09:00",
             "news_score_t": 0.7,
@@ -598,6 +606,8 @@ def test_dual_source_cache_rechecks_asof_on_each_lookup(
         loader_calls.append(date_str)
         return [{
             "ticker": "005930",
+            "batch_date": "2026-04-20T00:00:00+09:00",
+            "snapshot_ts": "2026-04-20T10:30:00+09:00",
             "generated_at": "2026-04-20T10:30:00+09:00",
             "news_score_t": 0.7,
             "comm_score_t_1": 0.3,
@@ -636,6 +646,8 @@ def test_score_cross_section_blocks_invalid_model_predictions(
             "comm_score_t_2": 0.1,
             "news_comm_divergence": 0.4,
             "community_noise_multiplier": 0.8,
+            "batch_date": "2026-04-20T00:00:00+09:00",
+            "snapshot_ts": "2026-04-20T08:30:00+09:00",
             "generated_at": "2026-04-20T08:30:00+09:00",
         }]
 
@@ -981,6 +993,8 @@ def test_score_cross_section_blocks_when_any_requested_required_dual_source_miss
             "comm_score_t_2": 0.1,
             "news_comm_divergence": 0.4,
             "community_noise_multiplier": 0.8,
+            "batch_date": "2026-04-20T00:00:00+09:00",
+            "snapshot_ts": "2026-04-20T08:30:00+09:00",
             "generated_at": "2026-04-20T08:30:00+09:00",
         }]
 
@@ -1019,6 +1033,7 @@ def test_score_cross_section_blocks_stale_dual_source_timestamp(
             "news_comm_divergence": 0.4,
             "community_noise_multiplier": 0.8,
             "batch_date": "2026-04-19T00:00:00+09:00",
+            "snapshot_ts": "2026-04-19T08:30:00+09:00",
             "generated_at": "2026-04-19T08:30:00+09:00",
         }]
 

@@ -6,6 +6,7 @@ Pre-live gate를 통과한 뒤 Hot Path 산출물을 ExecutionGateway(paper)에 
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 from datetime import datetime, time as dt_time
@@ -33,6 +34,22 @@ from src.utils.trading_calendar import is_kospi_trading_day
 logger = get_logger("paper_auto_trading")
 _KST = ZoneInfo("Asia/Seoul")
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _quant_actionability_float(key: str, default: float) -> float:
+    try:
+        cfg = config_load("risk_config.yaml", "quant_agent") or {}
+        actionability = cfg.get("actionability") if isinstance(cfg, dict) else {}
+        raw = actionability.get(key, default) if isinstance(actionability, dict) else default
+        parsed = float(raw)
+    except Exception as e:
+        logger.warning("[paper_auto_trading] quant actionability 설정 로드 실패(%s): %s", key, e)
+        return default
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else default
+
+
+_SCORE_EPSILON = _quant_actionability_float("score_epsilon", 1e-12)
+_POSITION_WEIGHT_EPSILON = _quant_actionability_float("position_weight_epsilon", 1e-12)
 
 
 class PaperAutoTradingError(RuntimeError):
@@ -191,6 +208,7 @@ class PaperAutoTrader:
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
             "items": cycle_reports,
+            "summary": self._cycle_summary(cycle_reports),
         }
         report["status"] = self._overall_status(report)
         return self._finish_report(report, write_report)
@@ -254,7 +272,11 @@ class PaperAutoTrader:
                 "hot_result": hot_result,
             }
 
-        quant_guard = self._quant_output_guard(hot_result)
+        quant_guard = self._quant_output_guard(
+            hot_result,
+            requested_tickers=padded,
+            current_positions=current_positions,
+        )
         if quant_guard.get("status") != "PASS":
             return {
                 "status": "FAIL",
@@ -366,6 +388,8 @@ class PaperAutoTrader:
             if ticker == "000000":
                 continue
             qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
+            if qty <= 0:
+                continue
             price = latest_prices.get(
                 ticker,
                 safe_float(pos.get("current_price", 0.0), default=0.0),
@@ -490,8 +514,12 @@ class PaperAutoTrader:
                 "required_feature_cols": required_cols,
                 "missing_artifacts": [artifact_label],
             }
+        artifact_sha256 = self._file_sha256(artifact_path)
 
-        rows = load_latest_scores(date_key)
+        rows = load_latest_scores(
+            date_key,
+            artifact_dir=DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+        )
         row_by_ticker = {
             pad_ticker(str(row.get("ticker", ""))): row
             for row in rows
@@ -510,7 +538,9 @@ class PaperAutoTrader:
                 missing_tickers.append(ticker)
                 continue
             batch_date = row.get("batch_date")
-            if batch_date not in (None, ""):
+            if batch_date in (None, ""):
+                missing_timestamp_tickers.append(ticker)
+            else:
                 try:
                     batch_date_key = self._feature_date_key(batch_date)
                 except (TypeError, ValueError):
@@ -528,12 +558,12 @@ class PaperAutoTrader:
                             "value": str(batch_date),
                             "reason": "feature_artifact_date_mismatch",
                         })
-            has_timestamp = False
+            if row.get("snapshot_ts") in (None, ""):
+                missing_timestamp_tickers.append(ticker)
+            if row.get("generated_at") in (None, ""):
+                missing_timestamp_tickers.append(ticker)
             for key in ("snapshot_ts", "generated_at"):
                 raw_ts = row.get(key)
-                if raw_ts in (None, ""):
-                    continue
-                has_timestamp = True
                 try:
                     ts = self._parse_feature_ts(raw_ts)
                 except (TypeError, ValueError):
@@ -558,8 +588,6 @@ class PaperAutoTrader:
                         "value": ts.isoformat(),
                         "reason": "future_feature_artifact",
                     })
-            if not has_timestamp:
-                missing_timestamp_tickers.append(ticker)
             for col in required_cols:
                 if col not in row:
                     missing_cols.setdefault(ticker, []).append(col)
@@ -567,6 +595,8 @@ class PaperAutoTrader:
                 value = self._float_or_none(row.get(col))
                 if value is None:
                     invalid_cols.setdefault(ticker, []).append(col)
+
+        missing_timestamp_tickers = sorted(set(missing_timestamp_tickers))
 
         if (
             missing_tickers
@@ -581,6 +611,7 @@ class PaperAutoTrader:
                 "reason": "required_feature_artifact_not_ready",
                 "date_key": date_key,
                 "artifact": artifact_label,
+                "artifact_sha256": artifact_sha256,
                 "required_feature_cols": required_cols,
                 "missing_tickers": missing_tickers,
                 "missing_feature_cols_by_ticker": missing_cols,
@@ -595,6 +626,7 @@ class PaperAutoTrader:
             "required": True,
             "date_key": date_key,
             "artifact": artifact_label,
+            "artifact_sha256": artifact_sha256,
             "required_feature_cols": required_cols,
             "ticker_count": len(padded),
             "matched_ticker_count": len(padded) - len(missing_tickers),
@@ -645,6 +677,14 @@ class PaperAutoTrader:
         if not math.isfinite(parsed):
             return None
         return parsed
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
         if not safe_bool(final_decision.get("approved"), default=False):
@@ -730,18 +770,41 @@ class PaperAutoTrader:
         return {"status": "PASS", "n_orders": len(order_deltas)}
 
     @staticmethod
-    def _quant_output_guard(hot_result: dict[str, Any]) -> dict[str, Any]:
+    def _quant_output_guard(
+        hot_result: dict[str, Any],
+        *,
+        requested_tickers: list[str] | None = None,
+        current_positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         quant_output = hot_result.get("quant_output")
         if not isinstance(quant_output, dict):
             return {"status": "FAIL", "checked": False, "reason": "quant_output_missing"}
         mode = str(quant_output.get("mode") or "").lower()
         scores = quant_output.get("scores")
         score_stats = PaperAutoTrader._score_stats(scores)
+        requested = {
+            pad_ticker(str(ticker))
+            for ticker in (requested_tickers or [])
+            if str(ticker).strip()
+        }
+        held = {
+            pad_ticker(str(pos.get("ticker", "")))
+            for pos in (current_positions or [])
+            if isinstance(pos, dict)
+            and str(pos.get("ticker", "")).strip()
+            and pad_ticker(str(pos.get("ticker", ""))) != "000000"
+            and PaperAutoTrader._position_has_exposure(pos)
+        }
+        output_tickers = set(score_stats["finite_score_tickers"])
+        missing_requested = sorted(requested - output_tickers)
+        missing_held = sorted(held - output_tickers)
         base = {
             "checked": True,
             "mode": mode,
             **score_stats,
             "blocker": quant_output.get("blocker"),
+            "missing_requested_tickers": missing_requested,
+            "missing_held_tickers": missing_held,
         }
         if mode == "blocked" or quant_output.get("blocker"):
             return {
@@ -761,6 +824,12 @@ class PaperAutoTrader:
                 "reason": "quant_scores_empty",
                 **base,
             }
+        if score_stats["invalid_score_tickers"]:
+            return {
+                "status": "FAIL",
+                "reason": "quant_scores_invalid",
+                **base,
+            }
         if score_stats["nonzero_score_count"] < 1:
             return {
                 "status": "FAIL",
@@ -771,6 +840,12 @@ class PaperAutoTrader:
             return {
                 "status": "FAIL",
                 "reason": "quant_scores_not_rankable",
+                **base,
+            }
+        if missing_requested or missing_held:
+            return {
+                "status": "FAIL",
+                "reason": "quant_ticker_coverage_incomplete",
                 **base,
             }
         return {"status": "PASS", **base}
@@ -785,16 +860,25 @@ class PaperAutoTrader:
                 "score_abs_sum": 0.0,
                 "score_std": 0.0,
                 "rankable": False,
+                "finite_score_tickers": [],
+                "invalid_score_tickers": [],
             }
         values: list[float] = []
-        for value in scores.values():
+        finite_score_tickers: list[str] = []
+        invalid_score_tickers: list[str] = []
+        for ticker, value in scores.items():
+            padded = pad_ticker(str(ticker))
             try:
                 parsed = float(value)
             except Exception:
+                invalid_score_tickers.append(padded)
                 continue
             if math.isfinite(parsed):
                 values.append(parsed)
-        nonzero = [value for value in values if abs(value) > 1e-12]
+                finite_score_tickers.append(padded)
+            else:
+                invalid_score_tickers.append(padded)
+        nonzero = [value for value in values if abs(value) > _SCORE_EPSILON]
         if len(values) > 1:
             mean = sum(values) / len(values)
             variance = sum((value - mean) ** 2 for value in values) / len(values)
@@ -808,7 +892,100 @@ class PaperAutoTrader:
             "score_abs_sum": float(sum(abs(value) for value in values)),
             "score_std": float(std),
             "rankable": bool(len(values) == 1 and nonzero)
-            or bool(len(values) > 1 and std > 1e-12),
+            or bool(len(values) > 1 and std > _SCORE_EPSILON),
+            "finite_score_tickers": sorted(set(finite_score_tickers)),
+            "invalid_score_tickers": sorted(set(invalid_score_tickers)),
+        }
+
+    @staticmethod
+    def _position_has_exposure(position: dict[str, Any]) -> bool:
+        try:
+            qty = float(position.get("qty", 0.0))
+        except Exception:
+            qty = 0.0
+        try:
+            weight = float(position.get("weight", 0.0))
+        except Exception:
+            weight = 0.0
+        return qty > 0.0 or weight > _POSITION_WEIGHT_EPSILON
+
+    @staticmethod
+    def _cycle_summary(cycles: list[dict[str, Any]]) -> dict[str, Any]:
+        status_counts: dict[str, int] = {}
+        quant_guard_failures: dict[str, int] = {}
+        quant_blockers: dict[str, int] = {}
+        quant_modes: dict[str, int] = {}
+        score_nonempty_cycles = 0
+        score_rankable_cycles = 0
+        order_delta_count = 0
+        execution_cycles = 0
+        broker_rejection_count = 0
+        fill_count = 0
+
+        for cycle in cycles:
+            status = str(cycle.get("status") or "UNKNOWN")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            cycle_blockers: set[str] = set()
+
+            hot_result = cycle.get("hot_result") if isinstance(cycle.get("hot_result"), dict) else {}
+            quant_output = hot_result.get("quant_output") if isinstance(hot_result, dict) else {}
+            if isinstance(quant_output, dict):
+                mode = str(quant_output.get("mode") or "unknown").lower()
+                quant_modes[mode] = quant_modes.get(mode, 0) + 1
+                stats = PaperAutoTrader._score_stats(quant_output.get("scores"))
+                if stats["finite_score_count"] > 0:
+                    score_nonempty_cycles += 1
+                if stats["rankable"]:
+                    score_rankable_cycles += 1
+                blocker = quant_output.get("blocker")
+                if blocker:
+                    cycle_blockers.add(str(blocker))
+
+            quant_guard = (
+                cycle.get("quant_output_guard")
+                if isinstance(cycle.get("quant_output_guard"), dict)
+                else {}
+            )
+            if quant_guard and quant_guard.get("status") != "PASS":
+                reason = str(quant_guard.get("reason") or "unknown")
+                quant_guard_failures[reason] = quant_guard_failures.get(reason, 0) + 1
+                blocker = quant_guard.get("blocker")
+                if blocker:
+                    cycle_blockers.add(str(blocker))
+
+            for key in cycle_blockers:
+                quant_blockers[key] = quant_blockers.get(key, 0) + 1
+
+            decision = hot_result.get("final_decision") if isinstance(hot_result, dict) else {}
+            deltas = decision.get("order_deltas") if isinstance(decision, dict) else []
+            if isinstance(deltas, list):
+                order_delta_count += len([item for item in deltas if isinstance(item, dict)])
+
+            execution = cycle.get("execution") if isinstance(cycle.get("execution"), dict) else {}
+            if execution:
+                execution_cycles += 1
+                execution_report = (
+                    execution.get("execution_report")
+                    if isinstance(execution.get("execution_report"), dict)
+                    else {}
+                )
+                rejections = execution_report.get("rejections")
+                fills = execution_report.get("fills")
+                broker_rejection_count += len(rejections) if isinstance(rejections, list) else 0
+                fill_count += len(fills) if isinstance(fills, list) else 0
+
+        return {
+            "cycle_count": len(cycles),
+            "status_counts": status_counts,
+            "quant_modes": quant_modes,
+            "quant_guard_failures": quant_guard_failures,
+            "quant_blockers": quant_blockers,
+            "score_nonempty_cycles": score_nonempty_cycles,
+            "score_rankable_cycles": score_rankable_cycles,
+            "order_delta_count": order_delta_count,
+            "execution_cycles": execution_cycles,
+            "broker_rejection_count": broker_rejection_count,
+            "fill_count": fill_count,
         }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:

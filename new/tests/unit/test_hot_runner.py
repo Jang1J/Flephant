@@ -129,6 +129,28 @@ def _deps_done() -> dict[str, str]:
     return {"news": "done", "risk": "done", "quant": "done", "debate": "skipped"}
 
 
+def _patch_active_quant(
+    runner: HotRunner,
+    tickers: list[str],
+    *,
+    anomalies: list[dict[str, Any]] | None = None,
+) -> None:
+    """Non-quant tests need an actionable quant output to reach PPO/PM/FDA."""
+    padded = [str(ticker).zfill(6) for ticker in tickers]
+    scores = {ticker: float(i + 1) / 10.0 for i, ticker in enumerate(padded)}
+
+    runner._quant.score_cross_section = lambda _tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "tickers": padded,
+        "scores": scores,
+        "ranking": sorted(scores, key=scores.get, reverse=True),
+        "ts": asof,
+        "n_tickers": len(padded),
+    }
+    if anomalies is not None:
+        runner._quant.detect_anomalies = lambda _tickers, _asof: anomalies  # type: ignore[method-assign]
+
+
 class FakeBlockedQuant:
     has_model = True
 
@@ -221,8 +243,10 @@ def test_run_once_skipped_when_not_hot_running(runner: HotRunner) -> None:
     assert result["pipeline_state"] == "BOOTSTRAP"
 
 
-def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
-    """QuantAgent가 passive mode (모델 없음)여도 오케스트레이션 완료."""
+def test_run_once_passive_no_model_fails_closed_before_ppo_pm(
+    runner: HotRunner,
+) -> None:
+    """모델 없는 passive quant는 empty target liquidation으로 흐르지 않는다."""
     runner.start()
     tickers = ["005930", "000660", "035420", "051910"]
     _prime_buffer(runner, tickers, n=65)
@@ -237,12 +261,97 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
         dependency_status=_deps_done(),
     )
 
-    # QuantAgent passive → 비중 전무 → PM 주문 없음 → FDA approve (empty)
     assert result["pipeline_state"] == "HOT_RUNNING"
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_feature_readiness"
     assert result["quant_output"]["mode"] == "passive"
-    assert result["final_decision"]["approved"] is True
-    assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["order_deltas"] == []
     assert "latency_ms" in result
+
+
+def test_run_once_all_zero_quant_scores_fail_closed_before_ppo_pm() -> None:
+    """all-zero active score도 rankable 신호가 아니므로 주문 경로를 열지 않는다."""
+    fake_ppo = FakePPO()
+    fake_pm = FakePM()
+
+    class FakeZeroQuant(FakeBlockedQuant):
+        def score_cross_section(self, _tickers: list[str], asof: str) -> dict[str, Any]:
+            return {
+                "mode": "active",
+                "tickers": ["005930", "000660"],
+                "scores": {"005930": 0.0, "000660": 0.0},
+                "ts": asof,
+                "n_tickers": 2,
+            }
+
+    runner = HotRunner(
+        quant=FakeZeroQuant(),  # type: ignore[arg-type]
+        ppo=fake_ppo,  # type: ignore[arg-type]
+        pm=fake_pm,  # type: ignore[arg-type]
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+    runner.start()
+
+    result = runner.run_once(
+        tickers=["005930", "000660"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 1, "weight": 0.1}],
+        latest_prices={"005930": 70000.0, "000660": 300000.0},
+        portfolio_value=1000000.0,
+        asof="2026-04-20T10:04:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_feature_readiness"
+    assert "quant_scores_all_zero" in result["error"]
+    assert result["final_decision"]["order_deltas"] == []
+    assert fake_ppo.called is False
+    assert fake_pm.called is False
+
+
+def test_run_once_blocks_partial_nonfinite_scores_before_ppo_pm() -> None:
+    """일부 ticker score가 NaN이면 coverage 통과 후 청산으로 새지 않는다."""
+    fake_ppo = FakePPO()
+    fake_pm = FakePM()
+
+    class FakeNonFiniteQuant(FakeBlockedQuant):
+        def score_cross_section(self, _tickers: list[str], asof: str) -> dict[str, Any]:
+            return {
+                "mode": "active",
+                "tickers": ["005930", "000660"],
+                "scores": {"005930": 0.5, "000660": np.nan},
+                "ts": asof,
+                "n_tickers": 2,
+            }
+
+    runner = HotRunner(
+        quant=FakeNonFiniteQuant(),  # type: ignore[arg-type]
+        ppo=fake_ppo,  # type: ignore[arg-type]
+        pm=fake_pm,  # type: ignore[arg-type]
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+    runner.start()
+
+    result = runner.run_once(
+        tickers=["005930", "000660"],
+        bars_batch=[],
+        current_positions=[{"ticker": "000660", "qty": 1, "weight": 0.1}],
+        latest_prices={"005930": 70000.0, "000660": 300000.0},
+        portfolio_value=1000000.0,
+        asof="2026-04-20T10:04:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_feature_readiness"
+    assert "quant_scores_invalid" in result["error"]
+    assert result["final_decision"]["order_deltas"] == []
+    assert fake_ppo.called is False
+    assert fake_pm.called is False
 
 
 def test_run_once_quant_blocked_stops_before_ppo_pm() -> None:
@@ -281,6 +390,7 @@ def test_run_once_missing_dependency_status_vetoes(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930", "000660"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(runner, tickers, anomalies=[])
 
     result = runner.run_once(
         tickers=tickers,
@@ -332,6 +442,7 @@ def test_run_once_rejects_future_bar_before_quant_buffer(runner: HotRunner) -> N
 def test_run_once_asof_timezone_converted_to_utc(runner: HotRunner) -> None:
     """timezone-aware KST asof를 UTC로 변환하고 replace로 덮어쓰지 않는다."""
     runner.start()
+    _patch_active_quant(runner, ["005930"], anomalies=[])
     captured: dict[str, object] = {}
 
     def fake_evaluate(snapshot, ts):
@@ -359,6 +470,7 @@ def test_run_once_filters_future_recent_bars_before_risk_fast(
 ) -> None:
     """RiskFast sidecar도 asof 이후 recent_bars를 보지 않는다."""
     runner.start()
+    _patch_active_quant(runner, ["005930"], anomalies=[])
     captured: dict[str, object] = {}
 
     def fake_evaluate(snapshot, ts):
@@ -404,6 +516,7 @@ def test_run_once_risk_fast_exception_degrades_nonblocking(
     runner.start()
     tickers = ["005930", "000660"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(runner, tickers, anomalies=[])
 
     def failing_evaluate(snapshot, ts):
         raise RuntimeError("risk sidecar unavailable")
@@ -438,6 +551,7 @@ def test_run_once_risk_fast_timeout_degrades_nonblocking(
     runner.start()
     tickers = ["005930", "000660"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(runner, tickers, anomalies=[])
     runner._risk_fast._sla_ms = 5.0
 
     def slow_evaluate(snapshot, ts):
@@ -579,6 +693,7 @@ def test_run_once_handles_invalid_ppo_allocation(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(runner, tickers, anomalies=[])
 
     runner._ppo.allocate = lambda **_: {}  # type: ignore[method-assign]
     result = runner.run_once(
@@ -599,6 +714,7 @@ def test_run_once_vetoes_ppo_policy_universe_mismatch(runner: HotRunner) -> None
     runner.start()
     tickers = ["005930"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(runner, tickers, anomalies=[])
     runner._ppo.allocate = lambda **_: {  # type: ignore[method-assign]
         "allocation_plan": {"target_weights": {}},
         "status": "BLOCKED",
@@ -628,6 +744,11 @@ def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930"]
     _prime_buffer(runner, tickers, n=65)
+    _patch_active_quant(
+        runner,
+        tickers,
+        anomalies=[{"ticker": "005930", "reason": "forced_drop"}],
+    )
     # 급락 bar 추가 (last close의 -10%)
     last_close = 50000.0
     drop_bar = {
@@ -645,10 +766,9 @@ def test_run_once_veto_on_anomaly(runner: HotRunner) -> None:
         asof="2026-04-20T10:05:00+09:00",
         dependency_status=_deps_done(),
     )
-    # Anomaly는 상황에 따라 감지될 수도 안 될 수도 (random seed). 양쪽 허용.
-    if result["anomalies"]:
-        assert result["final_decision"]["reason_code"] == "QUANT_ANOMALY"
-        assert result["final_decision"]["approved"] is False
+    assert result["anomalies"]
+    assert result["final_decision"]["reason_code"] == "QUANT_ANOMALY"
+    assert result["final_decision"]["approved"] is False
 
 
 def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> None:
@@ -656,9 +776,12 @@ def test_run_once_fda_echoes_pm_adjusted_target_weights(runner: HotRunner) -> No
     runner.start()
 
     runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
-        "mode": "passive",
+        "mode": "active",
+        "tickers": ["005930"],
         "scores": {"005930": 0.9},
         "ranking": ["005930"],
+        "ts": asof,
+        "n_tickers": 1,
     }
     runner._quant.detect_anomalies = lambda tickers, asof: [  # type: ignore[method-assign]
         {"ticker": "005930", "reason": "forced_exit"}
@@ -758,6 +881,7 @@ def test_run_once_high_risk_warning_veto(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930"]
     _prime_buffer(runner, tickers)
+    _patch_active_quant(runner, tickers, anomalies=[])
     result = runner.run_once(
         tickers=tickers,
         bars_batch=[],
@@ -774,6 +898,7 @@ def test_latency_stats(runner: HotRunner) -> None:
     runner.start()
     tickers = ["005930", "000660"]
     _prime_buffer(runner, tickers)
+    _patch_active_quant(runner, tickers, anomalies=[])
     for _ in range(3):
         runner.run_once(
             tickers=tickers,

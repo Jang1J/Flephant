@@ -331,6 +331,7 @@ class QuantAgent(AgentBase):
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
         feature_blockers: list[dict[str, Any]] = []
+        warmup_tickers: list[str] = []
 
         requires_dual_source = self._model_requires_dual_source()
         required_dual_source_cols = set(self._required_dual_source_cols())
@@ -338,6 +339,7 @@ class QuantAgent(AgentBase):
         for ticker in padded_all:
             bars = bars_batch.get(ticker, [])
             if len(bars) < self._warmup_bars:
+                warmup_tickers.append(ticker)
                 continue
             all_feats = self._compute_features(
                 bars,
@@ -367,9 +369,18 @@ class QuantAgent(AgentBase):
             feature_matrix.append(feature_vec)
             valid_tickers.append(ticker)
 
-        if feature_blockers:
+        if feature_blockers or (valid_tickers and warmup_tickers):
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self._latency_records.append(elapsed_ms)
+            had_feature_blockers = bool(feature_blockers)
+            if warmup_tickers:
+                for ticker in warmup_tickers:
+                    feature_blockers.append({
+                        "ticker": ticker,
+                        "reason": "requested_ticker_warmup_incomplete",
+                        "missing_feature_cols": [],
+                        "required_feature_cols": list(self._inference_feature_cols),
+                    })
             blocker_detail = self._feature_blocker_detail(
                 feature_blockers,
                 asof_str,
@@ -380,7 +391,9 @@ class QuantAgent(AgentBase):
                 "scores": {},
                 "ts": asof_str,
                 "mode": "blocked",
-                "blocker": "required_feature_missing",
+                "blocker": "required_feature_missing"
+                if had_feature_blockers
+                else "requested_ticker_coverage_incomplete",
                 "blocker_detail": blocker_detail,
                 "blockers": feature_blockers,
                 "latency_ms": elapsed_ms,
@@ -862,28 +875,41 @@ class QuantAgent(AgentBase):
         asof_dt = self._parse_snapshot_dt(asof)
         date_key = asof_dt.strftime("%Y%m%d")
         batch_date = item.get("batch_date")
-        if batch_date not in (None, ""):
-            try:
-                batch_dt = self._parse_snapshot_dt(batch_date)
-            except (TypeError, ValueError) as e:
-                logger.warning(
-                    "[quant_agent] Dual-Source batch_date 파싱 실패: %s. record skip",
-                    e,
-                )
-                return False
-            if batch_dt.strftime("%Y%m%d") != date_key:
-                logger.warning(
-                    "[quant_agent] Dual-Source batch_date mismatch=%s expected=%s. record skip",
-                    batch_dt.strftime("%Y%m%d"),
-                    date_key,
-                )
-                return False
-        has_timestamp = False
+        if batch_date in (None, ""):
+            logger.warning(
+                "[quant_agent] Dual-Source batch_date missing. record skip",
+            )
+            return False
+        try:
+            batch_dt = self._parse_snapshot_dt(batch_date)
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "[quant_agent] Dual-Source batch_date 파싱 실패: %s. record skip",
+                e,
+            )
+            return False
+        if batch_dt.strftime("%Y%m%d") != date_key:
+            logger.warning(
+                "[quant_agent] Dual-Source batch_date mismatch=%s expected=%s. record skip",
+                batch_dt.strftime("%Y%m%d"),
+                date_key,
+            )
+            return False
+
+        snapshot_ts = item.get("snapshot_ts")
+        if snapshot_ts in (None, ""):
+            logger.warning(
+                "[quant_agent] Dual-Source snapshot_ts missing. record skip",
+            )
+            return False
+        generated_at = item.get("generated_at")
+        if generated_at in (None, ""):
+            logger.warning(
+                "[quant_agent] Dual-Source generated_at missing. record skip",
+            )
+            return False
         for key in ("snapshot_ts", "generated_at"):
             raw = item.get(key)
-            if raw in (None, ""):
-                continue
-            has_timestamp = True
             try:
                 ts = self._parse_snapshot_dt(raw)
             except (TypeError, ValueError) as e:
@@ -909,11 +935,6 @@ class QuantAgent(AgentBase):
                     asof_dt.isoformat(),
                 )
                 return False
-        if not has_timestamp:
-            logger.warning(
-                "[quant_agent] Dual-Source timestamp provenance missing. record skip",
-            )
-            return False
         return True
 
     @staticmethod
