@@ -318,9 +318,13 @@ class CommitteeModel:
         if "cnn_nan_fallback" not in cfg:
             raise CommitteeTrainError("committee.cnn_nan_fallback 설정 누락")
         self._cnn_nan_fallback: float = float(cfg["cnn_nan_fallback"])
-        self._sharpe_label_col: str = str(cfg.get("sharpe_label_col", "label_5m_net_ret"))
+        if "sharpe_label_col" not in cfg:
+            raise CommitteeTrainError("committee.sharpe_label_col 설정 누락")
+        self._sharpe_label_col: str = str(cfg["sharpe_label_col"])
         eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
-        self._top_k_fraction: float = float(eval_cfg.get("top_k_fraction", 0.25))
+        if "top_k_fraction" not in eval_cfg:
+            raise CommitteeTrainError("evaluation.top_k_fraction 설정 누락")
+        self._top_k_fraction: float = float(eval_cfg["top_k_fraction"])
         self._artifacts_path = Path(cfg.get("artifacts_path", "artifacts/committee"))
         self._artifacts_path.mkdir(parents=True, exist_ok=True)
 

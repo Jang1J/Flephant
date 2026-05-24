@@ -46,6 +46,8 @@ def _make_committee(tmp_path: Path | None = None, **overrides):
         "meta_fuser_C": 1.0,
         "sharpe_improvement_threshold": 0.0,
         "cnn_nan_fallback": 0.0,
+        "sharpe_label_col": "label_5m_ret",
+        "top_k_fraction": 0.25,
         "artifacts_path": str(tmp_path / "committee") if tmp_path else "artifacts/committee",
     }
     cfg.update(overrides)
