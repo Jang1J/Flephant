@@ -613,15 +613,29 @@ def test_committee_next_version_increment(tmp_path: Path):
 # ====================================================================== #
 
 def test_committee_oof_sharpe_positive(tmp_path: Path):
-    """scores가 labels와 양의 상관인 경우 SR > 0."""
+    """cross-sectional top-K: scores가 label과 양의 상관이면 SR > 0.
 
+    여러 날(day_key)에 걸친 panel이 필요. 단일 날이면 daily_pnl 1개 → SR=0.
+    """
     model = _make_committee(tmp_path=tmp_path)
     rng = np.random.default_rng(42)
-    labels = rng.normal(0.001, 0.002, 100).astype(np.float32)  # 양의 기댓값
-    scores = labels + rng.normal(0, 0.001, 100)  # labels와 강한 상관
 
-    sr = model._compute_oof_sharpe(scores.astype(np.float64), labels.astype(np.float64))
-    # top 20% 종목은 평균 수익률 > 0 → SR > 0
+    n_days, n_ts_per_day, n_tickers = 10, 20, 5
+    rows = []
+    for d in range(n_days):
+        base = pd.Timestamp("2026-01-01") + pd.Timedelta(days=d)
+        for t in range(n_ts_per_day):
+            ts = base + pd.Timedelta(hours=9, minutes=t + 1)
+            for tk in range(n_tickers):
+                rows.append((ts, f"{tk:06d}", rng.normal(0, 0.002)))
+
+    df = pd.DataFrame(rows, columns=["ts_close", "ticker", "label_5m_ret"])
+    df = df.set_index(["ts_close", "ticker"])
+
+    labels = df["label_5m_ret"].to_numpy(dtype=np.float64)
+    scores = labels + rng.normal(0, 0.0005, len(df))
+
+    sr = model._compute_oof_sharpe(scores, df)
     assert sr > 0.0, f"SR 기대 > 0, 실제 {sr:.4f}"
 
 

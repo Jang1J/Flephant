@@ -318,6 +318,9 @@ class CommitteeModel:
         if "cnn_nan_fallback" not in cfg:
             raise CommitteeTrainError("committee.cnn_nan_fallback 설정 누락")
         self._cnn_nan_fallback: float = float(cfg["cnn_nan_fallback"])
+        self._sharpe_label_col: str = str(cfg.get("sharpe_label_col", "label_5m_net_ret"))
+        eval_cfg = config_load("risk_config.yaml", "evaluation") or {}
+        self._top_k_fraction: float = float(eval_cfg.get("top_k_fraction", 0.25))
         self._artifacts_path = Path(cfg.get("artifacts_path", "artifacts/committee"))
         self._artifacts_path.mkdir(parents=True, exist_ok=True)
 
@@ -390,8 +393,16 @@ class CommitteeModel:
         # CNN OOF
         cnn_oof = self._compute_cnn_oof(X_all, y_all, folds, n_features)
 
-        # tree_only Sharpe (OOF 기반 일별 PnL 근사)
-        tree_only_sr = self._compute_oof_sharpe(lgbm_oof, y_all)
+        # OOF mask: train-only 기간(score=0) 제외. val indices만 Sharpe 평가.
+        all_val_indices: set[int] = set()
+        for _, val_idx in folds:
+            all_val_indices.update(val_idx)
+        oof_mask = np.zeros(len(panel), dtype=bool)
+        oof_mask[sorted(all_val_indices)] = True
+        panel_oof = panel.iloc[oof_mask]
+
+        # tree_only Sharpe (cross-sectional top-K daily PnL)
+        tree_only_sr = self._compute_oof_sharpe(lgbm_oof[oof_mask], panel_oof)
 
         # MetaFuser 학습
         meta_X = np.column_stack([lgbm_oof, cnn_oof])
@@ -413,7 +424,7 @@ class CommitteeModel:
 
         # committee score = MetaFuser probability of top class
         committee_scores = self._meta_fuser.predict_proba(meta_X)[:, 1]
-        committee_sr = self._compute_oof_sharpe(committee_scores, y_all)
+        committee_sr = self._compute_oof_sharpe(committee_scores[oof_mask], panel_oof)
 
         delta_sharpe = float(committee_sr - tree_only_sr)
         improved = delta_sharpe > self._sharpe_threshold
@@ -603,16 +614,51 @@ class CommitteeModel:
 
         return oof
 
-    def _compute_oof_sharpe(self, scores: np.ndarray, labels: np.ndarray) -> float:
-        """OOF score 기반 일별 top-quintile PnL 합산 → Sharpe 근사."""
-        if len(scores) == 0:
+    def _compute_oof_sharpe(
+        self,
+        scores: np.ndarray,
+        panel: Any,
+    ) -> float:
+        """OOF score 기반 cross-sectional top-K daily PnL → Sharpe.
+
+        운영 모델(LGBMTrainer._group_for_metrics)과 동일 로직:
+          1. ts_close별 groupby (cross-sectional)
+          2. 각 timestamp에서 score 상위 top_k_fraction 종목 선택
+          3. 해당 종목의 수익률 label(sharpe_label_col) 평균 = pnl_at_ts
+          4. 일별(day_key) 평균 → daily_pnl
+          5. sharpe_ratio(daily_pnl)
+        """
+        import pandas as pd
+
+        label_col = self._sharpe_label_col
+        if label_col not in panel.columns:
+            label_col = "label_5m_ret"
+        if label_col not in panel.columns:
+            logger.warning("[committee] Sharpe label '%s' 없음. 0.0 반환.", label_col)
             return 0.0
-        # top 20% 종목 선택 → 해당 일의 레이블(수익률) 평균이 daily PnL 근사
-        threshold = np.percentile(scores, 80)
-        top_mask = scores >= threshold
-        if top_mask.sum() == 0:
+
+        ts_level = panel.index.get_level_values("ts_close")
+        df = pd.DataFrame({
+            "ts_close": ts_level,
+            "label": panel[label_col].to_numpy(dtype=float),
+            "pred": scores,
+        })
+
+        daily_pnl_records: dict[Any, list[float]] = {}
+        for ts, group in df.groupby("ts_close"):
+            n = len(group)
+            k = max(1, int(n * self._top_k_fraction))
+            top_labels = group.nlargest(k, "pred")["label"]
+            pnl_at_ts = float(top_labels.mean())
+            day_key = ts.date() if hasattr(ts, "date") else ts
+            daily_pnl_records.setdefault(day_key, []).append(pnl_at_ts)
+
+        daily_pnl = np.asarray(
+            [float(np.mean(v)) for v in daily_pnl_records.values()],
+            dtype=float,
+        )
+        if len(daily_pnl) == 0:
             return 0.0
-        daily_pnl = labels[top_mask]
         return float(sharpe_ratio(daily_pnl))
 
     def _fit_final_models(

@@ -1704,6 +1704,7 @@ committee:
   cnn_batch_size: 64             # CNN mini-batch 크기
   cnn_seed: 42                   # CNN 학습 재현성 seed
   cnn_nan_fallback: 0.0           # StandardScaler 출력 NaN imputation 값. 표준화 평균(=0)이 수학적 중립. 변경 시 학습 bias 발생.
+  sharpe_label_col: "label_5m_net_ret"  # OOF Sharpe 산출에 사용할 수익률 label. 학습 label(relevance)과 분리.
   # MetaFuser
   meta_fuser_max_iter: 100       # LogisticRegression max_iter
   meta_fuser_C: 1.0              # LogisticRegression regularization C
