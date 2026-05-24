@@ -152,12 +152,19 @@ def test_cnn_branch_predict_before_fit_raises():
 # ====================================================================== #
 
 def test_cnn_branch_save_creates_file(tmp_path: Path):
-    """CNNBranch.save() 호출 시 torch.save 호출 확인 (sys.modules mock)."""
+    """CNNBranch.save() 호출 시 torch.save 호출 확인 (sys.modules mock).
+
+    fail-closed save()는 _net + _scaler 둘 다 있어야 통과하므로
+    정상 시나리오 검증용으로 두 필드 모두 설정한다.
+    """
+    from sklearn.preprocessing import StandardScaler
 
     branch = _make_cnn_branch(n_features=6)
     mock_net = MagicMock()
     mock_net.state_dict.return_value = {}
     branch._net = mock_net
+    rng = np.random.default_rng(0)
+    branch._scaler = StandardScaler().fit(rng.normal(0, 1, (20, 6)))
 
     pth_path = tmp_path / "cnn.pth"
 
@@ -166,6 +173,210 @@ def test_cnn_branch_save_creates_file(tmp_path: Path):
         branch.save(pth_path)
 
     mock_torch.save.assert_called_once()
+
+
+def test_cnn_branch_save_raises_when_net_none(tmp_path: Path):
+    """fail-closed: _net=None인 상태에서 save() 호출 → CommitteeTrainError.
+
+    이전 동작은 silent return이었어서 호출자가 저장 실패를 인지하지 못한 채
+    artifact를 비워두고 진행할 수 있었다. 학습 직후 시점에 문제를 노출하기 위해
+    raise로 변경.
+    """
+    from src.models.committee import CommitteeTrainError
+
+    branch = _make_cnn_branch(n_features=4)
+    branch._net = None
+    branch._scaler = MagicMock()
+
+    pth_path = tmp_path / "should_not_be_created.pth"
+    with pytest.raises(CommitteeTrainError, match=r"_net=None"):
+        branch.save(pth_path)
+    assert not pth_path.exists(), "fail-closed인데 .pth가 생성됨"
+
+
+def test_cnn_branch_save_raises_when_scaler_none(tmp_path: Path):
+    """fail-closed: _net은 있지만 _scaler=None인 상태에서 save() 호출 → CommitteeTrainError.
+
+    이전 동작은 warning만 찍고 .pth 저장. load 시점에 scaler 누락으로 raise되어
+    실패가 늦게 노출됐다. 학습 직후 시점에 막도록 변경.
+    """
+    from src.models.committee import CommitteeTrainError
+
+    branch = _make_cnn_branch(n_features=4)
+    mock_net = MagicMock()
+    mock_net.state_dict.return_value = {}
+    branch._net = mock_net
+    branch._scaler = None
+
+    pth_path = tmp_path / "cnn.pth"
+    with pytest.raises(CommitteeTrainError, match=r"_scaler=None"):
+        branch.save(pth_path)
+    # .pth도 생성되지 않아야 한다 (부분 저장 금지)
+    assert not pth_path.exists(), "fail-closed인데 .pth가 생성됨 (부분 저장 발생)"
+
+
+# ====================================================================== #
+# 4b. CNNBranch StandardScaler 입력 정규화 검증 (Exogenous 스케일 이질성 대응)
+# ====================================================================== #
+
+def test_cnn_branch_scaler_persists_after_fit():
+    """fit() 후 self._scaler가 fitted StandardScaler여야 한다 (mean_/scale_ 보유)."""
+    from src.models.committee import CNNBranch
+
+    branch = _make_cnn_branch(n_features=4)
+    rng = np.random.default_rng(0)
+    # Exogenous 모사: feature 스케일 이질적 (1e0, 1e2, 1e8 등)
+    X = np.column_stack([
+        rng.normal(0, 0.01, 30),    # feat_5m_ret 정도
+        rng.normal(20, 5, 30),      # us_vix 정도
+        rng.normal(1e8, 1e7, 30),   # foreign_net_buy 정도
+        rng.normal(0, 1, 30),       # 일반 feature
+    ]).astype(np.float32)
+    y = (rng.random(30) > 0.5).astype(np.float32)
+
+    mock_net = MagicMock()
+    mock_net.parameters.return_value = iter([])
+    branch._net = mock_net
+
+    # 학습 자체는 mock (torch.tensor / DataLoader 우회). scaler 동작만 검증.
+    with patch.object(branch, "_build_net", return_value=mock_net), \
+         patch("sklearn.preprocessing.StandardScaler") as MockScaler:
+        scaler_instance = MagicMock()
+        scaler_instance.fit_transform.return_value = X.astype(np.float32)
+        MockScaler.return_value = scaler_instance
+        mock_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": mock_torch, "torch.nn": mock_torch.nn,
+                                         "torch.utils.data": mock_torch.utils.data}):
+            try:
+                branch.fit(X, y)
+            except (TypeError, AttributeError):
+                pass
+
+    # scaler 인스턴스가 생성되고 fit_transform 호출됐는지 검증
+    assert branch._scaler is not None
+    scaler_instance.fit_transform.assert_called_once()
+
+
+def test_cnn_branch_fit_nan_aware_order():
+    """fit()의 NaN/inf 처리 순서 검증:
+      1. inf만 NaN으로 치환 (NaN은 그대로 유지)
+      2. StandardScaler.fit_transform에 NaN 포함 상태로 전달 (sklearn nanmean/nanvar 활용)
+      3. 출력의 NaN을 0으로 치환
+
+    raw 단계에서 0으로 치환하지 않아야 통계량 왜곡이 없다 (팀원 리뷰 반영).
+    """
+    from src.models.committee import CNNBranch
+
+    branch = _make_cnn_branch(n_features=3)
+    X = np.array([
+        [1.0, 2.0, 3.0],
+        [np.nan, 2.0, 3.0],      # NaN: 그대로 보존되어야 함
+        [1.0, np.inf, 3.0],       # +inf: NaN으로 치환되어야 함
+        [1.0, 2.0, -np.inf],      # -inf: NaN으로 치환되어야 함
+        [1.0, 2.0, 3.0],
+    ], dtype=np.float32)
+    y = np.array([0, 1, 0, 1, 0], dtype=np.float32)
+
+    captured_inputs: list[np.ndarray] = []
+
+    def capture_and_return_zeros(X_input):
+        captured_inputs.append(X_input.copy())
+        return np.zeros_like(X_input, dtype=np.float64)
+
+    mock_net = MagicMock()
+    mock_net.parameters.return_value = iter([])
+
+    with patch.object(branch, "_build_net", return_value=mock_net), \
+         patch("sklearn.preprocessing.StandardScaler") as MockScaler:
+        scaler_instance = MagicMock()
+        scaler_instance.fit_transform.side_effect = capture_and_return_zeros
+        MockScaler.return_value = scaler_instance
+        mock_torch = MagicMock()
+        with patch.dict("sys.modules", {"torch": mock_torch, "torch.nn": mock_torch.nn,
+                                         "torch.utils.data": mock_torch.utils.data}):
+            try:
+                branch.fit(X, y)
+            except (TypeError, AttributeError):
+                pass
+
+    assert len(captured_inputs) == 1, "StandardScaler.fit_transform 한 번 호출 기대"
+    X_to_scaler = captured_inputs[0]
+
+    # inf가 모두 NaN으로 치환됐는지 (raw 0이 아니라)
+    assert not np.isinf(X_to_scaler).any(), \
+        "scaler 전달 직전에 inf는 NaN으로 치환되어야 함 (raw 0 아님)"
+
+    # 원본의 NaN/inf 위치 모두 NaN으로
+    assert np.isnan(X_to_scaler[1, 0]), "원본 NaN은 보존되어야 함"
+    assert np.isnan(X_to_scaler[2, 1]), "원본 +inf는 NaN으로 치환되어야 함"
+    assert np.isnan(X_to_scaler[3, 2]), "원본 -inf는 NaN으로 치환되어야 함"
+
+    # 원본의 정상 값은 보존
+    assert X_to_scaler[0, 0] == pytest.approx(1.0)
+    assert X_to_scaler[4, 2] == pytest.approx(3.0)
+
+
+def test_cnn_branch_predict_without_scaler_raises():
+    """fit() 없이 _net만 있고 _scaler가 None이면 predict_proba가 명확한 에러 발생."""
+    from src.models.committee import CNNBranch, CommitteeTrainError
+
+    branch = _make_cnn_branch(n_features=4)
+    # _net은 있지만 _scaler는 None인 비정상 상태
+    branch._net = MagicMock()
+    branch._scaler = None
+
+    with pytest.raises(CommitteeTrainError, match=r"scaler"):
+        branch.predict_proba(np.zeros((5, 4), dtype=np.float32))
+
+
+def test_cnn_branch_save_persists_scaler(tmp_path: Path):
+    """save() 후 cnn.pth 옆에 cnn_scaler.pkl 생성. 두 파일 다 있어야 운영 가능."""
+    import pickle
+
+    from src.models.committee import CNNBranch
+
+    branch = _make_cnn_branch(n_features=4)
+    mock_net = MagicMock()
+    mock_net.state_dict.return_value = {}
+    branch._net = mock_net
+
+    # 실제 StandardScaler 사용 (mock 아님) — pickle save/load 통과 확인
+    from sklearn.preprocessing import StandardScaler
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 1, (20, 4)).astype(np.float32)
+    branch._scaler = StandardScaler().fit(X)
+
+    pth_path = tmp_path / "cnn.pth"
+    mock_torch = MagicMock()
+    with patch.dict("sys.modules", {"torch": mock_torch}):
+        branch.save(pth_path)
+
+    scaler_path = tmp_path / "cnn_scaler.pkl"
+    assert scaler_path.exists(), f"scaler 파일이 {scaler_path}에 저장되지 않음"
+    with scaler_path.open("rb") as f:
+        loaded = pickle.load(f)
+    assert hasattr(loaded, "mean_")
+    np.testing.assert_array_almost_equal(loaded.mean_, branch._scaler.mean_)
+
+
+def test_cnn_branch_load_raises_when_scaler_missing(tmp_path: Path):
+    """load() 시 cnn_scaler.pkl 없으면 명확한 CommitteeLoadError 발생."""
+    from src.models.committee import CNNBranch, CommitteeLoadError
+
+    branch = _make_cnn_branch(n_features=4)
+    pth_path = tmp_path / "cnn.pth"
+    pth_path.write_bytes(b"fake_state_dict")  # 파일은 있지만 scaler.pkl 없음
+
+    mock_torch = MagicMock()
+    mock_torch.load.return_value = {}
+    sys_mocks = {
+        "torch": mock_torch,
+        "torch.nn": mock_torch.nn,
+        "torch.utils.data": mock_torch.utils.data,
+    }
+    with patch.dict("sys.modules", sys_mocks):
+        with pytest.raises(CommitteeLoadError, match=r"scaler.*누락"):
+            branch.load(pth_path)
 
 
 # ====================================================================== #
