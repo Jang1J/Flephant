@@ -221,8 +221,48 @@ def test_backtest_state_blocks_label_target_mismatch(
     assert state["deployable"] is False
     assert state["label_target_gate_pass"] is False
     assert state["label_target_gate"]["required_target_col"] == "label_5m_ret"
+    assert "label_5m_ret" in state["label_target_gate"]["allowed_deploy_target_cols"]
     assert state["label_target_gate"]["observed_target_col"] == "label_30m_net_ret"
     assert "model_target_col_mismatch" in state["label_target_gate"]["blockers"]
+
+
+def test_backtest_state_allows_configured_deploy_target_col(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    monkeypatch.setattr(
+        service_readiness_status,
+        "_service_policy_gate_pass",
+        lambda backtest, bundle_id, **kwargs: True,
+    )
+    metadata = _final_dataset_metadata()
+    metadata["target_col"] = "label_195m_net_ret"
+    backtest = {
+        "bundle_id": bundle_id,
+        "verdict": "pass",
+        "regression_risk": {"flagged": False, "severity": "low"},
+        "minute_bar_leakage_check": {"verdict": "pass"},
+        "feature_quality": {
+            "dual_source_rows": 10,
+            "dual_source_non_neutral_rows": 10,
+            "exogenous_rows": 10,
+            "exogenous_non_neutral_rows": 10,
+        },
+        "service_policy_replay": {"status": "PASS"},
+        "candidate_model_metadata": metadata,
+    }
+
+    state = service_readiness_status._backtest_state_from_report(
+        tmp_path,
+        bundle_id,
+        tmp_path / "artifacts/reports/backtest/backtest_BUNDLE-TEST.json",
+        backtest,
+    )
+
+    assert state["label_target_gate"]["status"] == "PASS"
+    assert state["label_target_gate_pass"] is True
+    assert "label_195m_net_ret" in state["label_target_gate"]["allowed_deploy_target_cols"]
 
 
 def test_service_status_passes_with_external_broker_evidence(

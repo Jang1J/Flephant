@@ -297,11 +297,23 @@ def _final_dataset_gate_pass(payload: dict[str, Any]) -> bool:
 def _label_target_gate_pass(payload: dict[str, Any]) -> bool:
     """Deployable C12 evidence must match the current label target SSOT."""
     cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
-    required_target_col = str((cfg.get("label") or {}).get("target_col") or "").strip()
-    if not required_target_col:
+    allowed_target_cols = _allowed_deploy_target_cols(cfg)
+    if not allowed_target_cols:
         return False
     metadata = _extract_model_metadata(payload)
-    return str(metadata.get("target_col") or "").strip() == required_target_col
+    return str(metadata.get("target_col") or "").strip() in allowed_target_cols
+
+
+def _allowed_deploy_target_cols(risk_cfg: dict[str, Any]) -> list[str]:
+    label_cfg = risk_cfg.get("label") or {}
+    values = label_cfg.get("deploy_target_cols")
+    cols: list[str] = []
+    if isinstance(values, list):
+        cols.extend(str(value).strip() for value in values)
+    fallback = str(label_cfg.get("target_col") or "").strip()
+    if fallback:
+        cols.append(fallback)
+    return [col for col in dict.fromkeys(cols) if col]
 
 
 def _final_gate_min_business_days(default: int = 80) -> int:
@@ -683,6 +695,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     required_label_version = label_cfg.get("generation_version")
     required_label_scope = label_cfg.get("session_scope")
     required_target_col = label_cfg.get("target_col")
+    allowed_target_cols = _allowed_deploy_target_cols(risk_cfg)
     if not required_label_version:
         return _stage(
             "BLOCKED",
@@ -693,10 +706,10 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "BLOCKED",
             "risk_config.yaml label.session_scope is required for real LightGBM gate.",
         )
-    if not required_target_col:
+    if not allowed_target_cols:
         return _stage(
             "BLOCKED",
-            "risk_config.yaml label.target_col is required for real LightGBM gate.",
+            "risk_config.yaml label.deploy_target_cols or label.target_col is required for real LightGBM gate.",
         )
     if staged_model_path is not None:
         model_path = str(staged_model_path.relative_to(REPO_ROOT))
@@ -716,7 +729,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     actual_target_col = meta.get("target_col")
     label_version_ok = actual_label_version == required_label_version
     label_scope_ok = actual_label_scope == required_label_scope
-    target_col_ok = actual_target_col == required_target_col
+    target_col_ok = str(actual_target_col or "").strip() in allowed_target_cols
     final_dataset_gate = _final_dataset_gate_result({"model_metadata": meta})
     final_dataset_gate_ok = final_dataset_gate.get("status") == "PASS"
     status = (
@@ -741,7 +754,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
     elif not label_scope_ok:
         message = "Latest LightGBM artifact has stale or missing label session scope metadata."
     elif not target_col_ok:
-        message = "Latest LightGBM artifact target_col does not match risk_config.yaml label.target_col."
+        message = "Latest LightGBM artifact target_col is not in risk_config.yaml deploy target columns."
     elif not final_dataset_gate_ok:
         blockers = final_dataset_gate.get("blockers") or ["final_dataset_gate_blocked"]
         message = f"Latest LightGBM artifact failed final_dataset_gate: {blockers}"
@@ -774,6 +787,7 @@ def _check_lgbm_real_train(bundle_id: str | None = None) -> dict[str, Any]:
             "required_label_session_scope": required_label_scope,
             "target_col": actual_target_col,
             "required_target_col": required_target_col,
+            "allowed_deploy_target_cols": allowed_target_cols,
             "n_train_rows": meta.get("n_train_rows"),
             "train_start": meta.get("train_start"),
             "train_end": meta.get("train_end"),

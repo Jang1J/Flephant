@@ -1017,6 +1017,25 @@ def test_lgbm_real_train_blocks_target_col_override_candidate(monkeypatch, tmp_p
     assert result["status"] == "BLOCKED"
     assert result["target_col"] == "label_session_close_net_ret"
     assert result["required_target_col"] == _required_target_col(gate)
+    assert "label_session_close_net_ret" not in result["allowed_deploy_target_cols"]
+
+
+def test_lgbm_real_train_allows_configured_deploy_target_col(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    repo_root = tmp_path
+    _write_staged_lgbm_bundle(
+        repo_root,
+        gate,
+        "BUNDLE-REQUESTED",
+        metadata={"target_col": "label_195m_net_ret"},
+    )
+    monkeypatch.setattr(gate, "REPO_ROOT", repo_root)
+
+    result = gate._check_lgbm_real_train(bundle_id="BUNDLE-REQUESTED")
+
+    assert result["status"] == "PASS"
+    assert result["target_col"] == "label_195m_net_ret"
+    assert "label_195m_net_ret" in result["allowed_deploy_target_cols"]
 
 
 def test_lgbm_real_train_enforces_final_dataset_gate(monkeypatch, tmp_path):
