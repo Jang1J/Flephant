@@ -120,6 +120,7 @@ class QuantAgent(AgentBase):
         self._inference_feature_cols: list[str] = list(self._feature_cols)
         self._dual_source_loader = dual_source_loader
         self._dual_source_cache: dict[str, list[dict[str, Any]]] = {}
+        self._dual_source_load_errors: dict[str, str] = {}
         self._investor_flow_snapshot: dict[str, dict[str, Any]] = {}
         self._exogenous_snapshot: dict[str, dict[str, float]] = {}
         self._exogenous_snapshot_meta: dict[str, dict[str, Any]] = {}
@@ -286,7 +287,7 @@ class QuantAgent(AgentBase):
               "tickers": [padded ticker list, valid만],
               "scores": {ticker: ranking_score},
               "ts": asof,
-              "mode": "active" | "passive" | "warmup",
+              "mode": "active" | "passive" | "warmup" | "blocked",
               "latency_ms": float,
               "n_tickers": int,
             }
@@ -329,8 +330,10 @@ class QuantAgent(AgentBase):
 
         feature_matrix: list[list[float]] = []
         valid_tickers: list[str] = []
+        feature_blockers: list[dict[str, Any]] = []
 
         requires_dual_source = self._model_requires_dual_source()
+        required_dual_source_cols = set(self._required_dual_source_cols())
 
         for ticker in padded_all:
             bars = bars_batch.get(ticker, [])
@@ -341,6 +344,8 @@ class QuantAgent(AgentBase):
                 ticker=ticker,
                 asof=asof_str,
                 require_dual_source=requires_dual_source,
+                required_dual_source_cols=required_dual_source_cols,
+                feature_blockers=feature_blockers,
             )
             if all_feats is None:
                 continue
@@ -352,9 +357,36 @@ class QuantAgent(AgentBase):
                 logger.warning(
                     "[quant_agent] %s feature 누락: %s. skip", ticker, e
                 )
+                feature_blockers.append({
+                    "ticker": ticker,
+                    "reason": "required_feature_missing",
+                    "missing_feature_cols": [str(e).strip("'")],
+                    "required_feature_cols": list(self._inference_feature_cols),
+                })
                 continue
             feature_matrix.append(feature_vec)
             valid_tickers.append(ticker)
+
+        if feature_blockers:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self._latency_records.append(elapsed_ms)
+            blocker_detail = self._feature_blocker_detail(
+                feature_blockers,
+                asof_str,
+                required_dual_source_cols=required_dual_source_cols,
+            )
+            return {
+                "tickers": [],
+                "scores": {},
+                "ts": asof_str,
+                "mode": "blocked",
+                "blocker": "required_feature_missing",
+                "blocker_detail": blocker_detail,
+                "blockers": feature_blockers,
+                "latency_ms": elapsed_ms,
+                "n_tickers": 0,
+                "valid_ticker_count_before_block": len(valid_tickers),
+            }
 
         if not valid_tickers:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -387,7 +419,8 @@ class QuantAgent(AgentBase):
                 "tickers": [],
                 "scores": {},
                 "ts": asof_str,
-                "mode": "warmup",
+                "mode": "blocked",
+                "blocker": "model_prediction_invalid",
                 "latency_ms": elapsed_ms,
                 "n_tickers": 0,
                 "error": "model_prediction_invalid",
@@ -597,6 +630,8 @@ class QuantAgent(AgentBase):
         ticker: str | None = None,
         asof: str | None = None,
         require_dual_source: bool = False,
+        required_dual_source_cols: set[str] | None = None,
+        feature_blockers: list[dict[str, Any]] | None = None,
     ) -> dict[str, float] | None:
         """단일 ticker 최근 60 bars → LightGBM 추론 피처 dict.
 
@@ -681,16 +716,33 @@ class QuantAgent(AgentBase):
         if self._dual_source_feature_cols and ticker is not None and asof is not None:
             ds_values = self._load_dual_source_features(ticker=ticker, asof=asof)
 
+        required_ds = required_dual_source_cols or set()
         for col in self._dual_source_feature_cols:
             if col in ds_values:
                 feats[col] = float(ds_values[col])
-            elif require_dual_source:
+            elif require_dual_source and col in required_ds:
+                date_key = self._asof_to_yyyymmdd(asof or "")
+                artifact_path = (
+                    f"artifacts/dual_source/{date_key}.json"
+                    if date_key
+                    else "artifacts/dual_source/YYYYMMDD.json"
+                )
                 logger.warning(
                     "[quant_agent] %s Dual-Source feature 누락: %s. "
                     "active inference skip",
                     ticker,
                     col,
                 )
+                if feature_blockers is not None:
+                    feature_blockers.append({
+                        "ticker": ticker,
+                        "reason": "required_feature_missing",
+                        "missing_feature_cols": [col],
+                        "required_feature_cols": sorted(required_ds),
+                        "required_artifacts": [artifact_path],
+                        "missing_artifacts": [artifact_path],
+                        "loader_error": self._dual_source_load_errors.get(date_key),
+                    })
                 return None
             else:
                 feats.setdefault(col, self._dual_source_defaults.get(col, 0.0))
@@ -743,10 +795,17 @@ class QuantAgent(AgentBase):
 
     def _model_requires_dual_source(self) -> bool:
         """로드된 모델 feature manifest가 Dual-Source 피처를 실제 입력으로 요구하는지."""
+        return bool(self._required_dual_source_cols())
+
+    def _required_dual_source_cols(self) -> list[str]:
+        """모델 metadata feature manifest 기준으로 실제 blocking 대상 DS 피처만 반환."""
         if not self._dual_source_feature_cols:
-            return False
+            return []
         train_cols = set(self._inference_feature_cols)
-        return any(col in train_cols for col in self._dual_source_feature_cols)
+        return [
+            col for col in self._dual_source_feature_cols
+            if col in train_cols
+        ]
 
     def _load_dual_source_features(self, ticker: str, asof: str) -> dict[str, float]:
         """장전 배치 C3A 점수를 date+ticker 기준으로 로드.
@@ -759,6 +818,7 @@ class QuantAgent(AgentBase):
             loader = self._dual_source_loader
             if loader is None:
                 records = []
+                self._dual_source_load_errors[date_key] = "dual_source_loader_missing"
             else:
                 try:
                     records = loader(date_key)
@@ -769,6 +829,9 @@ class QuantAgent(AgentBase):
                         e,
                     )
                     records = []
+                    self._dual_source_load_errors[date_key] = str(e)
+                else:
+                    self._dual_source_load_errors.pop(date_key, None)
             self._dual_source_cache[date_key] = [
                 item for item in records if isinstance(item, dict)
             ]
@@ -791,12 +854,36 @@ class QuantAgent(AgentBase):
         return ticker_map.get(pad_ticker(ticker), {})
 
     def _dual_source_record_usable(self, item: dict[str, Any], asof: str) -> bool:
-        """Dual-Source score metadata must not be newer than Hot Path asof."""
+        """Dual-Source score metadata must match the Hot Path serving date.
+
+        File existence alone is not enough: a stale row copied into today's
+        artifact must not be treated as current-day evidence.
+        """
         asof_dt = self._parse_snapshot_dt(asof)
+        date_key = asof_dt.strftime("%Y%m%d")
+        batch_date = item.get("batch_date")
+        if batch_date not in (None, ""):
+            try:
+                batch_dt = self._parse_snapshot_dt(batch_date)
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "[quant_agent] Dual-Source batch_date 파싱 실패: %s. record skip",
+                    e,
+                )
+                return False
+            if batch_dt.strftime("%Y%m%d") != date_key:
+                logger.warning(
+                    "[quant_agent] Dual-Source batch_date mismatch=%s expected=%s. record skip",
+                    batch_dt.strftime("%Y%m%d"),
+                    date_key,
+                )
+                return False
+        has_timestamp = False
         for key in ("snapshot_ts", "generated_at"):
             raw = item.get(key)
             if raw in (None, ""):
                 continue
+            has_timestamp = True
             try:
                 ts = self._parse_snapshot_dt(raw)
             except (TypeError, ValueError) as e:
@@ -804,6 +891,14 @@ class QuantAgent(AgentBase):
                     "[quant_agent] Dual-Source %s 파싱 실패: %s. record skip",
                     key,
                     e,
+                )
+                return False
+            if ts.strftime("%Y%m%d") != date_key:
+                logger.warning(
+                    "[quant_agent] Dual-Source %s date mismatch=%s expected=%s. record skip",
+                    key,
+                    ts.strftime("%Y%m%d"),
+                    date_key,
                 )
                 return False
             if ts > asof_dt:
@@ -814,6 +909,11 @@ class QuantAgent(AgentBase):
                     asof_dt.isoformat(),
                 )
                 return False
+        if not has_timestamp:
+            logger.warning(
+                "[quant_agent] Dual-Source timestamp provenance missing. record skip",
+            )
+            return False
         return True
 
     @staticmethod
@@ -829,6 +929,49 @@ class QuantAgent(AgentBase):
             if len(digits) >= 8:
                 return digits[:8]
             return datetime.now(_KST).strftime("%Y%m%d")
+
+    @staticmethod
+    def _feature_blocker_detail(
+        blockers: list[dict[str, Any]],
+        asof: str,
+        *,
+        required_dual_source_cols: set[str],
+    ) -> dict[str, Any]:
+        missing_cols = sorted({
+            str(col)
+            for blocker in blockers
+            for col in blocker.get("missing_feature_cols", [])
+        })
+        required_artifacts = sorted({
+            str(path)
+            for blocker in blockers
+            for path in blocker.get("required_artifacts", [])
+        })
+        missing_artifacts = sorted({
+            str(path)
+            for blocker in blockers
+            for path in blocker.get("missing_artifacts", [])
+        })
+        loader_errors = sorted({
+            str(blocker["loader_error"])
+            for blocker in blockers
+            if blocker.get("loader_error")
+        })
+        blocked_tickers = sorted({
+            str(blocker.get("ticker"))
+            for blocker in blockers
+            if blocker.get("ticker")
+        })
+        return {
+            "asof": asof,
+            "required_feature_cols": sorted(required_dual_source_cols),
+            "missing_feature_cols": missing_cols,
+            "required_artifacts": required_artifacts,
+            "missing_artifacts": missing_artifacts,
+            "loader_errors": loader_errors,
+            "blocked_tickers": blocked_tickers,
+            "blocked_ticker_count": len(blocked_tickers),
+        }
 
     @staticmethod
     def _parse_snapshot_dt(value: datetime | str | None) -> datetime:

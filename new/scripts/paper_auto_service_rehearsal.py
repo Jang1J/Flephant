@@ -112,6 +112,14 @@ class _FakeHotRunner:
         ticker = pad_ticker(str((kwargs.get("tickers") or ["005930"])[0]))
         price = safe_float(latest_prices.get(ticker), default=70000.0, min_value=1.0)
         return {
+            "quant_output": {
+                "mode": "active",
+                "scores": {
+                    ticker: 0.2,
+                    "000660": 0.1 if ticker != "000660" else 0.3,
+                },
+                "n_tickers": 2,
+            },
             "final_decision": {
                 "decision_id": "FDA-PAPER-AUTO-REHEARSAL",
                 "approved": True,

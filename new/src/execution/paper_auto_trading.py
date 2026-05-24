@@ -6,6 +6,7 @@ Pre-live gate를 통과한 뒤 Hot Path 산출물을 ExecutionGateway(paper)에 
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime, time as dt_time
 from pathlib import Path
@@ -13,6 +14,11 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from src.connectors.kis_rest import KISRestClient
+from src.agents.hot.quant import QuantAgent
+from src.data.dual_source_runner import (
+    DEFAULT_DUAL_SOURCE_ARTIFACT_DIR,
+    load_latest_scores,
+)
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.kill_switch import KillSwitch
 from src.models.ppo_allocator import PPOAllocator, PolicyNotLoadedError
@@ -52,7 +58,10 @@ class PaperAutoTrader:
             default_report_dir = _PROJECT_ROOT / default_report_dir
 
         self._kis_client = kis_client or KISRestClient()
-        self._hot_runner = hot_runner or HotRunner(ppo=self._make_ppo_allocator())
+        self._hot_runner = hot_runner or HotRunner(
+            quant=QuantAgent(dual_source_loader=load_latest_scores),
+            ppo=self._make_ppo_allocator(),
+        )
         self._report_dir = Path(report_dir) if report_dir else default_report_dir
         self._report_dir.mkdir(parents=True, exist_ok=True)
         self._audit_logger = AuditLogger(
@@ -139,6 +148,12 @@ class PaperAutoTrader:
         model_guard = self._active_model_check()
         report["stages"]["active_model_guard"] = model_guard
         if model_guard["status"] != "PASS":
+            report["status"] = "FAIL"
+            return self._finish_report(report, write_report)
+
+        feature_guard = self._serving_feature_readiness_check(tickers)
+        report["stages"]["serving_feature_readiness"] = feature_guard
+        if feature_guard["status"] != "PASS":
             report["status"] = "FAIL"
             return self._finish_report(report, write_report)
 
@@ -237,6 +252,18 @@ class PaperAutoTrader:
                 "started_at": started_at,
                 "reason": hot_result.get("reason", "hot_runner_skipped"),
                 "hot_result": hot_result,
+            }
+
+        quant_guard = self._quant_output_guard(hot_result)
+        if quant_guard.get("status") != "PASS":
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "quant_output_not_actionable",
+                "quant_output_guard": quant_guard,
+                "hot_result": hot_result,
+                "execution": None,
             }
 
         final_decision = dict(hot_result.get("final_decision") or {})
@@ -434,6 +461,191 @@ class PaperAutoTrader:
             "required_bundle_id": self._required_bundle_id,
         }
 
+    def _serving_feature_readiness_check(self, tickers: list[str]) -> dict[str, Any]:
+        quant = getattr(self._hot_runner, "_quant", None)
+        required_cols = self._required_dual_source_cols_for_quant(quant)
+        padded = [pad_ticker(str(t)) for t in tickers]
+        if not required_cols:
+            return {
+                "status": "PASS",
+                "required": False,
+                "required_feature_cols": [],
+            }
+
+        now = self._now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_KST)
+        else:
+            now = now.astimezone(_KST)
+        date_key = now.strftime("%Y%m%d")
+
+        artifact_path = DEFAULT_DUAL_SOURCE_ARTIFACT_DIR / f"{date_key}.json"
+        artifact_label = self._display_path(artifact_path)
+        if not artifact_path.exists():
+            return {
+                "status": "FAIL",
+                "reason": "required_feature_artifact_missing",
+                "date_key": date_key,
+                "artifact": artifact_label,
+                "required_feature_cols": required_cols,
+                "missing_artifacts": [artifact_label],
+            }
+
+        rows = load_latest_scores(date_key)
+        row_by_ticker = {
+            pad_ticker(str(row.get("ticker", ""))): row
+            for row in rows
+            if isinstance(row, dict)
+        }
+        missing_tickers: list[str] = []
+        missing_cols: dict[str, list[str]] = {}
+        future_rows: list[dict[str, str]] = []
+        invalid_cols: dict[str, list[str]] = {}
+        missing_timestamp_tickers: list[str] = []
+        date_mismatch_rows: list[dict[str, str]] = []
+
+        for ticker in padded:
+            row = row_by_ticker.get(ticker)
+            if not row:
+                missing_tickers.append(ticker)
+                continue
+            batch_date = row.get("batch_date")
+            if batch_date not in (None, ""):
+                try:
+                    batch_date_key = self._feature_date_key(batch_date)
+                except (TypeError, ValueError):
+                    date_mismatch_rows.append({
+                        "ticker": ticker,
+                        "field": "batch_date",
+                        "value": str(batch_date),
+                        "reason": "batch_date_parse_failed",
+                    })
+                else:
+                    if batch_date_key != date_key:
+                        date_mismatch_rows.append({
+                            "ticker": ticker,
+                            "field": "batch_date",
+                            "value": str(batch_date),
+                            "reason": "feature_artifact_date_mismatch",
+                        })
+            has_timestamp = False
+            for key in ("snapshot_ts", "generated_at"):
+                raw_ts = row.get(key)
+                if raw_ts in (None, ""):
+                    continue
+                has_timestamp = True
+                try:
+                    ts = self._parse_feature_ts(raw_ts)
+                except (TypeError, ValueError):
+                    future_rows.append({
+                        "ticker": ticker,
+                        "field": key,
+                        "value": str(raw_ts),
+                        "reason": "timestamp_parse_failed",
+                    })
+                    continue
+                if ts.strftime("%Y%m%d") != date_key:
+                    date_mismatch_rows.append({
+                        "ticker": ticker,
+                        "field": key,
+                        "value": ts.isoformat(),
+                        "reason": "feature_artifact_date_mismatch",
+                    })
+                if ts > now:
+                    future_rows.append({
+                        "ticker": ticker,
+                        "field": key,
+                        "value": ts.isoformat(),
+                        "reason": "future_feature_artifact",
+                    })
+            if not has_timestamp:
+                missing_timestamp_tickers.append(ticker)
+            for col in required_cols:
+                if col not in row:
+                    missing_cols.setdefault(ticker, []).append(col)
+                    continue
+                value = self._float_or_none(row.get(col))
+                if value is None:
+                    invalid_cols.setdefault(ticker, []).append(col)
+
+        if (
+            missing_tickers
+            or missing_cols
+            or future_rows
+            or invalid_cols
+            or missing_timestamp_tickers
+            or date_mismatch_rows
+        ):
+            return {
+                "status": "FAIL",
+                "reason": "required_feature_artifact_not_ready",
+                "date_key": date_key,
+                "artifact": artifact_label,
+                "required_feature_cols": required_cols,
+                "missing_tickers": missing_tickers,
+                "missing_feature_cols_by_ticker": missing_cols,
+                "invalid_feature_cols_by_ticker": invalid_cols,
+                "missing_timestamp_tickers": missing_timestamp_tickers,
+                "future_rows": future_rows,
+                "date_mismatch_rows": date_mismatch_rows,
+            }
+
+        return {
+            "status": "PASS",
+            "required": True,
+            "date_key": date_key,
+            "artifact": artifact_label,
+            "required_feature_cols": required_cols,
+            "ticker_count": len(padded),
+            "matched_ticker_count": len(padded) - len(missing_tickers),
+        }
+
+    @staticmethod
+    def _required_dual_source_cols_for_quant(quant: Any) -> list[str]:
+        method = getattr(quant, "_required_dual_source_cols", None)
+        if callable(method):
+            return sorted(str(col) for col in method())
+        metadata = getattr(quant, "model_metadata", None)
+        feature_cols = (
+            metadata.get("feature_cols", [])
+            if isinstance(metadata, dict)
+            else []
+        )
+        pp_cfg = config_load("risk_config.yaml", "preprocessor")
+        dual_source_cols = set(pp_cfg.get("dual_source_feature_cols", []))
+        return sorted(str(col) for col in feature_cols if col in dual_source_cols)
+
+    @staticmethod
+    def _parse_feature_ts(value: Any) -> datetime:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_KST)
+        return dt.astimezone(_KST)
+
+    @staticmethod
+    def _feature_date_key(value: Any) -> str:
+        dt = PaperAutoTrader._parse_feature_ts(value)
+        return dt.strftime("%Y%m%d")
+
+    @staticmethod
+    def _display_path(path: Path) -> str:
+        try:
+            return str(path.relative_to(_PROJECT_ROOT))
+        except ValueError:
+            return str(path)
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
+
     def _order_guard(self, final_decision: dict[str, Any]) -> dict[str, Any]:
         if not safe_bool(final_decision.get("approved"), default=False):
             return {
@@ -516,6 +728,88 @@ class PaperAutoTrader:
         if violations:
             return {"status": "FAIL", "reason": "order_guard_violations", "violations": violations}
         return {"status": "PASS", "n_orders": len(order_deltas)}
+
+    @staticmethod
+    def _quant_output_guard(hot_result: dict[str, Any]) -> dict[str, Any]:
+        quant_output = hot_result.get("quant_output")
+        if not isinstance(quant_output, dict):
+            return {"status": "FAIL", "checked": False, "reason": "quant_output_missing"}
+        mode = str(quant_output.get("mode") or "").lower()
+        scores = quant_output.get("scores")
+        score_stats = PaperAutoTrader._score_stats(scores)
+        base = {
+            "checked": True,
+            "mode": mode,
+            **score_stats,
+            "blocker": quant_output.get("blocker"),
+        }
+        if mode == "blocked" or quant_output.get("blocker"):
+            return {
+                "status": "FAIL",
+                "reason": "quant_blocked",
+                **base,
+            }
+        if mode != "active":
+            return {
+                "status": "FAIL",
+                "reason": "quant_not_active",
+                **base,
+            }
+        if score_stats["finite_score_count"] < 1:
+            return {
+                "status": "FAIL",
+                "reason": "quant_scores_empty",
+                **base,
+            }
+        if score_stats["nonzero_score_count"] < 1:
+            return {
+                "status": "FAIL",
+                "reason": "quant_scores_all_zero",
+                **base,
+            }
+        if not score_stats["rankable"]:
+            return {
+                "status": "FAIL",
+                "reason": "quant_scores_not_rankable",
+                **base,
+            }
+        return {"status": "PASS", **base}
+
+    @staticmethod
+    def _score_stats(scores: Any) -> dict[str, Any]:
+        if not isinstance(scores, dict):
+            return {
+                "score_count": 0,
+                "finite_score_count": 0,
+                "nonzero_score_count": 0,
+                "score_abs_sum": 0.0,
+                "score_std": 0.0,
+                "rankable": False,
+            }
+        values: list[float] = []
+        for value in scores.values():
+            try:
+                parsed = float(value)
+            except Exception:
+                continue
+            if math.isfinite(parsed):
+                values.append(parsed)
+        nonzero = [value for value in values if abs(value) > 1e-12]
+        if len(values) > 1:
+            mean = sum(values) / len(values)
+            variance = sum((value - mean) ** 2 for value in values) / len(values)
+            std = math.sqrt(variance)
+        else:
+            std = 0.0
+        return {
+            "score_count": len(scores),
+            "finite_score_count": len(values),
+            "nonzero_score_count": len(nonzero),
+            "score_abs_sum": float(sum(abs(value) for value in values)),
+            "score_std": float(std),
+            "rankable": bool(len(values) == 1 and nonzero)
+            or bool(len(values) > 1 and std > 1e-12),
+        }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
         if not hasattr(self._kis_client, "get_order_history"):

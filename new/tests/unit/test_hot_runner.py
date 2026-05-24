@@ -6,6 +6,7 @@ from __future__ import annotations
 
 
 import time
+from typing import Any
 
 import numpy as np
 import pytest
@@ -128,6 +129,48 @@ def _deps_done() -> dict[str, str]:
     return {"news": "done", "risk": "done", "quant": "done", "debate": "skipped"}
 
 
+class FakeBlockedQuant:
+    has_model = True
+
+    def on_bar(self, _bar: dict[str, Any]) -> None:
+        return None
+
+    def score_cross_section(self, _tickers: list[str], asof: str) -> dict[str, Any]:
+        return {
+            "tickers": [],
+            "scores": {},
+            "ts": asof,
+            "mode": "blocked",
+            "blocker": "required_feature_missing",
+            "blocker_detail": {
+                "missing_feature_cols": ["news_score_t"],
+                "missing_artifacts": ["artifacts/dual_source/20260420.json"],
+            },
+            "n_tickers": 0,
+        }
+
+    def detect_anomalies(self, _tickers: list[str], _asof: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+
+class FakePPO:
+    def __init__(self) -> None:
+        self.called = False
+
+    def allocate(self, **_: Any) -> dict[str, Any]:
+        self.called = True
+        return {"allocation_plan": {"target_weights": {"005930": 0.1}}}
+
+
+class FakePM:
+    def __init__(self) -> None:
+        self.called = False
+
+    def plan(self, **_: Any) -> dict[str, Any]:
+        self.called = True
+        return {"portfolio_patch": {"target_weights": {}, "order_deltas": []}}
+
+
 @pytest.fixture
 def runner(tmp_path) -> HotRunner:
     reg = ModelRegistry(artifacts_dir=tmp_path / "lgbm")
@@ -200,6 +243,38 @@ def test_run_once_passive_no_model_still_runs(runner: HotRunner) -> None:
     assert result["final_decision"]["approved"] is True
     assert result["final_decision"]["reason_code"] == "NORMAL_APPROVE"
     assert "latency_ms" in result
+
+
+def test_run_once_quant_blocked_stops_before_ppo_pm() -> None:
+    """feature blocked quant output은 empty target liquidation으로 흐르지 않는다."""
+    fake_ppo = FakePPO()
+    fake_pm = FakePM()
+    runner = HotRunner(
+        quant=FakeBlockedQuant(),  # type: ignore[arg-type]
+        ppo=fake_ppo,  # type: ignore[arg-type]
+        pm=fake_pm,  # type: ignore[arg-type]
+        fda=FDAAgent(),
+        state_machine=StateMachine(),
+    )
+    runner.start()
+
+    result = runner.run_once(
+        tickers=["005930"],
+        bars_batch=[],
+        current_positions=[{"ticker": "005930", "qty": 1, "weight": 0.1}],
+        latest_prices={"005930": 70000.0},
+        portfolio_value=1000000.0,
+        asof="2026-04-20T10:04:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["failure_stage"] == "quant_feature_readiness"
+    assert result["quant_output"]["blocker"] == "required_feature_missing"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["order_deltas"] == []
+    assert fake_ppo.called is False
+    assert fake_pm.called is False
 
 
 def test_run_once_missing_dependency_status_vetoes(runner: HotRunner) -> None:

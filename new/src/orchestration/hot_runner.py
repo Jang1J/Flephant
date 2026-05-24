@@ -31,6 +31,7 @@ from src.agents.fda import FDAAgent
 from src.agents.hot.quant import QuantAgent
 from src.agents.hot.risk_fast import RiskFastAgent
 from src.agents.memory_restorer import AgentMemoryRestorer
+from src.data.dual_source_runner import load_latest_scores
 from src.knowledge.kb import KnowledgeBase
 from src.models.ppo_allocator import PPOAllocator
 from src.ops.profiler import HotPathProfiler
@@ -115,7 +116,7 @@ class HotRunner:
         kb: KnowledgeBase | None = None,
         profiler: HotPathProfiler | None = None,
     ) -> None:
-        self._quant = quant or QuantAgent()
+        self._quant = quant or QuantAgent(dual_source_loader=load_latest_scores)
         self._ppo = ppo or PPOAllocator()
         self._pm = pm or PortfolioManager()
         self._fda = fda or FDAAgent()
@@ -345,6 +346,19 @@ class HotRunner:
                 stage_ms={"quant": quant_ms},
             )
         quant_ms = self._profiler.end_stage("quant", t_quant)
+        quant_blocker = self._quant_output_blocker(quant_output)
+        if quant_blocker:
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="quant_feature_readiness",
+                error=RuntimeError(quant_blocker["message"]),
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={"quant": quant_ms},
+                quant_output=quant_output,
+                anomalies=anomalies,
+            )
 
         # 3. PPOAllocator (S4-4 stage timer)
         t_ppo = self._profiler.start_stage("ppo")
@@ -660,6 +674,22 @@ class HotRunner:
             "final_decision": final_decision,
             "latency_ms": elapsed_ms,
             "stage_ms": stage_ms or {},
+        }
+
+    @staticmethod
+    def _quant_output_blocker(quant_output: dict[str, Any]) -> dict[str, Any] | None:
+        mode = str(quant_output.get("mode") or "").lower()
+        blocker = quant_output.get("blocker")
+        if mode != "blocked" and not blocker:
+            return None
+        reason = str(blocker or "quant_blocked")
+        return {
+            "reason": reason,
+            "message": (
+                "Quant output blocked before PPO/PM/FDA. "
+                f"mode={mode or 'unknown'} blocker={reason}"
+            ),
+            "blocker_detail": quant_output.get("blocker_detail"),
         }
 
     @staticmethod
