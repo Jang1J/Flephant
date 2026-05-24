@@ -1,0 +1,191 @@
+run_defaults:
+  python: /opt/anaconda3/envs/elephant/bin/python
+  repo_root: /Users/jangjaewon/Desktop/Elephant_Lab
+  research_root: artifacts/lgbm_global_search
+  bundle_prefix: RESEARCH-REFINED-5M
+  start_80d: "20260108"
+  start_full: "20250509"
+  end_date: "20260521"
+  max_tickers: 30
+  max_runs: 36
+  skip_trade_classifier: true
+
+targets:
+  - label_5m_ret
+
+feature_policies:
+  - id: ohlcv
+    include_dual_source: false
+    include_exogenous: false
+    dual_source_cols: []
+    exogenous: false
+
+  - id: ohlcv_exog
+    include_dual_source: false
+    include_exogenous: true
+    dual_source_cols: []
+    exogenous: true
+
+  - id: ohlcv_exog_news
+    include_dual_source: true
+    include_exogenous: true
+    dual_source_cols:
+      - news_score_t
+    exogenous: true
+
+hyperparams:
+  - id: baseline_lr005_l31_c20
+    params:
+      learning_rate: 0.05
+      num_leaves: 31
+      min_child_samples: 20
+      subsample: 0.8
+      colsample_bytree: 0.8
+      lambda_l1: 0.0
+      lambda_l2: 0.0
+    training_control:
+      n_estimators: 600
+      early_stopping_rounds: 50
+
+  - id: small_leaf_lr005_l15_c50
+    params:
+      learning_rate: 0.05
+      num_leaves: 15
+      min_child_samples: 50
+      subsample: 0.8
+      colsample_bytree: 0.8
+      lambda_l1: 0.2
+      lambda_l2: 1.0
+    training_control:
+      n_estimators: 700
+      early_stopping_rounds: 50
+
+  - id: shallow_fast_lr005_l7_c80
+    params:
+      learning_rate: 0.05
+      num_leaves: 7
+      min_child_samples: 80
+      subsample: 0.8
+      colsample_bytree: 0.8
+      lambda_l1: 0.2
+      lambda_l2: 2.0
+    training_control:
+      n_estimators: 700
+      early_stopping_rounds: 50
+
+  - id: shallow_slow_lr003_l7_c80
+    params:
+      learning_rate: 0.03
+      num_leaves: 7
+      min_child_samples: 80
+      subsample: 0.8
+      colsample_bytree: 0.75
+      lambda_l1: 0.3
+      lambda_l2: 3.0
+    training_control:
+      n_estimators: 900
+      early_stopping_rounds: 80
+
+  - id: small_regularized_lr003_l15_c80
+    params:
+      learning_rate: 0.03
+      num_leaves: 15
+      min_child_samples: 80
+      subsample: 0.75
+      colsample_bytree: 0.75
+      lambda_l1: 0.3
+      lambda_l2: 3.0
+    training_control:
+      n_estimators: 900
+      early_stopping_rounds: 80
+
+  - id: small_conservative_lr002_l15_c100
+    params:
+      learning_rate: 0.02
+      num_leaves: 15
+      min_child_samples: 100
+      subsample: 0.75
+      colsample_bytree: 0.7
+      lambda_l1: 0.5
+      lambda_l2: 5.0
+    training_control:
+      n_estimators: 1000
+      early_stopping_rounds: 100
+
+  - id: l31_regularized_lr003_c50
+    params:
+      learning_rate: 0.03
+      num_leaves: 31
+      min_child_samples: 50
+      subsample: 0.8
+      colsample_bytree: 0.75
+      lambda_l1: 0.2
+      lambda_l2: 2.0
+    training_control:
+      n_estimators: 900
+      early_stopping_rounds: 80
+
+  - id: l31_cost_aware_lr002_c80
+    params:
+      learning_rate: 0.02
+      num_leaves: 31
+      min_child_samples: 80
+      subsample: 0.75
+      colsample_bytree: 0.7
+      lambda_l1: 0.5
+      lambda_l2: 6.0
+    training_control:
+      n_estimators: 1100
+      early_stopping_rounds: 100
+
+  - id: l63_regularized_lr002_c100
+    params:
+      learning_rate: 0.02
+      num_leaves: 63
+      min_child_samples: 100
+      subsample: 0.7
+      colsample_bytree: 0.7
+      lambda_l1: 0.8
+      lambda_l2: 8.0
+    training_control:
+      n_estimators: 1100
+      early_stopping_rounds: 100
+
+  - id: l31_sparse_lr005_c50
+    params:
+      learning_rate: 0.05
+      num_leaves: 31
+      min_child_samples: 50
+      subsample: 0.7
+      colsample_bytree: 0.65
+      lambda_l1: 0.5
+      lambda_l2: 4.0
+    training_control:
+      n_estimators: 800
+      early_stopping_rounds: 60
+
+  - id: l15_sparse_lr005_c80
+    params:
+      learning_rate: 0.05
+      num_leaves: 15
+      min_child_samples: 80
+      subsample: 0.7
+      colsample_bytree: 0.65
+      lambda_l1: 0.5
+      lambda_l2: 4.0
+    training_control:
+      n_estimators: 800
+      early_stopping_rounds: 60
+
+  - id: l31_fast_l2_lr004_c30
+    params:
+      learning_rate: 0.04
+      num_leaves: 31
+      min_child_samples: 30
+      subsample: 0.8
+      colsample_bytree: 0.8
+      lambda_l1: 0.1
+      lambda_l2: 1.0
+    training_control:
+      n_estimators: 800
+      early_stopping_rounds: 60
