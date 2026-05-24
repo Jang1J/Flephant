@@ -72,9 +72,9 @@ policies:
 
   - id: STRICT_GATE
     label: 엄격 게이트 정책
-    mode: paper
+    mode: shadow
     profile_prefix: KIS_STRICT
-    description: 더 강한 confidence/trade-probability gate로 실제 paper 주문을 비교하는 정책입니다.
+    description: 더 강한 confidence/trade-probability gate를 shadow로 진단합니다. 2026-05-24 replay에서 0.35는 후보 22%를 거르고 주문이 남았지만 pass 1/8에 그쳐 첫날 paper 주문 트랙에서는 제외합니다.
     overrides:
       max_orders_per_cycle: 2
       max_order_qty_per_order: 1
@@ -83,4 +83,4 @@ policies:
       ppo_min_confidence: 0.06
       ppo_weighting: score
       trade_probability_gate_enabled: true
-      min_trade_probability: 0.55
+      min_trade_probability: 0.35

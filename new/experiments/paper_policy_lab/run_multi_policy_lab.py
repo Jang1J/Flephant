@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -26,6 +27,60 @@ SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_REPO_ROOT = SCRIPT_PATH.parents[3]
 DEFAULT_CONFIG = SCRIPT_PATH.with_name("policies_5track.yaml")
 RUNS_DIR = SCRIPT_PATH.with_name("runs")
+
+RUNTIME_OVERRIDE_KEYS = {
+    "max_orders_per_cycle",
+    "max_order_qty_per_order",
+    "allow_market_order",
+    "ppo_max_names",
+    "ppo_min_cash",
+    "ppo_min_confidence",
+    "trade_probability_gate_enabled",
+    "min_trade_probability",
+    "ppo_weighting",
+}
+
+PPO_WEIGHTING_VALUES = {"score", "equal"}
+
+RUN_DEFAULT_KEYS = {
+    "python",
+    "repo_root",
+    "bundle_id",
+    "registry_dir",
+    "tickers",
+    "cycles",
+    "interval_sec",
+    "end_date",
+    "business_days",
+    "confirm_phrase",
+    "prelive_required",
+    "max_tickers",
+    "max_parallel",
+}
+
+SERVICE_REPLAY_ONLY_KEYS = {
+    "top_k_fraction",
+    "decision_stride_bars",
+    "min_holding_bars",
+    "rebalance_cooldown_bars",
+    "no_trade_score_spread",
+    "min_cash",
+}
+
+_TRUE_VALUES = {"true", "yes", "y", "1", "approve", "approved", "승인"}
+_FALSE_VALUES = {"false", "no", "n", "0", "veto", "reject", "rejected", "거부", "없음", "아님"}
+
+
+def _safety_flags(*, external_kis_api: bool = False) -> dict[str, bool | str]:
+    return {
+        "scope": "personal_research_policy_lab",
+        "research_only": True,
+        "external_kis_api": external_kis_api,
+        "production_registry_mutated": False,
+        "paper_registry_mutated": False,
+        "live_trading_allowed": False,
+        "deploy_quality": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -52,6 +107,89 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _safe_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_VALUES:
+            return True
+        if normalized in _FALSE_VALUES:
+            return False
+    return default
+
+
+def _require_bool_like(policy_id: str, key: str, value: Any) -> None:
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return
+    if isinstance(value, str) and value.strip().lower() in (_TRUE_VALUES | _FALSE_VALUES):
+        return
+    raise ValueError(f"{policy_id} contains unsupported boolean value for {key}: {value}")
+
+
+def _require_int_min(policy_id: str, key: str, value: Any, *, min_value: int) -> None:
+    if isinstance(value, bool):
+        raise ValueError(f"{policy_id} contains invalid integer value for {key}: {value}")
+    try:
+        parsed = float(str(value).strip())
+    except Exception as e:
+        raise ValueError(f"{policy_id} contains invalid integer value for {key}: {value}") from e
+    if not parsed.is_integer() or int(parsed) < min_value:
+        raise ValueError(
+            f"{policy_id} requires {key} to be an integer >= {min_value}: {value}"
+        )
+
+
+def _require_float_range(
+    policy_id: str,
+    key: str,
+    value: Any,
+    *,
+    min_value: float,
+    max_value: float,
+    max_inclusive: bool = True,
+) -> None:
+    if isinstance(value, bool):
+        raise ValueError(f"{policy_id} contains invalid float value for {key}: {value}")
+    try:
+        parsed = float(str(value).strip())
+    except Exception as e:
+        raise ValueError(f"{policy_id} contains invalid float value for {key}: {value}") from e
+    upper_ok = parsed <= max_value if max_inclusive else parsed < max_value
+    if parsed < min_value or not upper_ok:
+        op = "<=" if max_inclusive else "<"
+        raise ValueError(
+            f"{policy_id} requires {min_value} <= {key} {op} {max_value}: {value}"
+        )
+
+
+def _validate_config(config: dict[str, Any]) -> None:
+    defaults = config.get("run_defaults") or {}
+    if not isinstance(defaults, dict):
+        raise ValueError("run_defaults must be a mapping")
+    _validate_run_defaults(defaults)
+    _load_policies(config)
+
+
+def _validate_run_defaults(defaults: dict[str, Any]) -> None:
+    keys = set(defaults)
+    replay_only = sorted(keys & SERVICE_REPLAY_ONLY_KEYS)
+    if replay_only:
+        raise ValueError(
+            "run_defaults contains service-policy replay-only keys that "
+            f"the paper runtime does not enforce: {replay_only}"
+        )
+    unsupported = sorted(keys - RUN_DEFAULT_KEYS)
+    if unsupported:
+        raise ValueError(f"run_defaults contains unsupported keys: {unsupported}")
+
+
 def _load_policies(config: dict[str, Any]) -> list[PolicySpec]:
     raw_policies = config.get("policies") or []
     if not isinstance(raw_policies, list):
@@ -59,13 +197,16 @@ def _load_policies(config: dict[str, Any]) -> list[PolicySpec]:
     policies: list[PolicySpec] = []
     for raw in raw_policies:
         if not isinstance(raw, dict):
-            continue
+            raise ValueError(f"policy entries must be mappings, got {type(raw).__name__}")
         policy_id = str(raw.get("id") or "").strip()
         if not policy_id:
             raise ValueError("policy id is required")
         mode = str(raw.get("mode") or "shadow").strip().lower()
         if mode not in {"paper", "shadow"}:
             raise ValueError(f"unsupported policy mode for {policy_id}: {mode}")
+        overrides = dict(raw.get("overrides") or {})
+        _validate_override_keys(policy_id, overrides)
+        _validate_override_values(policy_id, overrides)
         policies.append(
             PolicySpec(
                 policy_id=policy_id,
@@ -73,15 +214,84 @@ def _load_policies(config: dict[str, Any]) -> list[PolicySpec]:
                 mode=mode,
                 profile_prefix=str(raw.get("profile_prefix") or "KIS_MAIN"),
                 description=str(raw.get("description") or ""),
-                overrides=dict(raw.get("overrides") or {}),
+                overrides=overrides,
             )
         )
+    if not policies:
+        raise ValueError("at least one policy is required")
     return policies
+
+
+def _validate_override_keys(policy_id: str, overrides: dict[str, Any]) -> None:
+    keys = set(overrides)
+    replay_only = sorted(keys & SERVICE_REPLAY_ONLY_KEYS)
+    if replay_only:
+        raise ValueError(
+            f"{policy_id} contains service-policy replay-only overrides that "
+            f"the paper runtime does not enforce: {replay_only}"
+        )
+    unsupported = sorted(keys - RUNTIME_OVERRIDE_KEYS)
+    if unsupported:
+        raise ValueError(
+            f"{policy_id} contains unsupported paper runtime overrides: {unsupported}"
+        )
+    if "ppo_weighting" in overrides:
+        weighting = str(overrides["ppo_weighting"]).strip().lower()
+        if weighting not in PPO_WEIGHTING_VALUES:
+            raise ValueError(
+                f"{policy_id} contains unsupported ppo_weighting: {weighting}"
+            )
+
+
+def _validate_override_values(policy_id: str, overrides: dict[str, Any]) -> None:
+    int_min_keys = {
+        "max_orders_per_cycle": 1,
+        "max_order_qty_per_order": 1,
+        "ppo_max_names": 1,
+    }
+    for key, min_value in int_min_keys.items():
+        if key in overrides:
+            _require_int_min(policy_id, key, overrides[key], min_value=min_value)
+    bounded_keys = {
+        "ppo_min_cash": (0.0, 1.0, False),
+        "ppo_min_confidence": (0.0, 1.0, True),
+        "min_trade_probability": (0.0, 1.0, True),
+    }
+    for key, (min_value, max_value, max_inclusive) in bounded_keys.items():
+        if key in overrides:
+            _require_float_range(
+                policy_id,
+                key,
+                overrides[key],
+                min_value=min_value,
+                max_value=max_value,
+                max_inclusive=max_inclusive,
+            )
+    for key in ("allow_market_order", "trade_probability_gate_enabled"):
+        if key in overrides:
+            _require_bool_like(policy_id, key, overrides[key])
 
 
 def _repo_root(defaults: dict[str, Any]) -> Path:
     raw = str(defaults.get("repo_root") or DEFAULT_REPO_ROOT)
     return Path(raw).expanduser().resolve()
+
+
+def _resolve_registry_dir(repo_root: Path, raw: str | None) -> Path | None:
+    if raw is None or not str(raw).strip():
+        raise ValueError(
+            "personal policy lab requires an explicit non-production registry_dir"
+        )
+    reg_path = Path(str(raw)).expanduser()
+    if not reg_path.is_absolute():
+        reg_path = repo_root / reg_path
+    resolved = reg_path.resolve()
+    production_registry = (repo_root / "artifacts" / "lgbm").resolve()
+    if resolved == production_registry or production_registry in resolved.parents:
+        raise ValueError(
+            "personal policy lab cannot use production registry artifacts/lgbm"
+        )
+    return resolved
 
 
 def _as_list_tickers(raw: str | list[Any]) -> list[str]:
@@ -154,7 +364,6 @@ def _env_for_policy(base_env: dict[str, str], policy: PolicySpec, repo_root: Pat
     if env.get("PYTHONPATH"):
         pythonpath_parts.append(str(env["PYTHONPATH"]))
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
-    env.setdefault("ELEPHANT_MODE", "mode_b")
     return env
 
 
@@ -168,6 +377,73 @@ def _policy_overview(policy: PolicySpec, env: dict[str, str]) -> dict[str, Any]:
         "profile_source_presence": _profile_source_presence(env, policy.profile_prefix),
         "mapped_env_readiness": _readiness_from_env(env),
         "overrides": policy.overrides,
+        "override_semantics": _override_semantics(policy),
+    }
+
+
+def _override_semantics(policy: PolicySpec) -> dict[str, Any]:
+    return {
+        "runtime_enforced_override_keys": sorted(policy.overrides),
+        "supported_runtime_override_keys": sorted(RUNTIME_OVERRIDE_KEYS),
+        "service_policy_replay_only_keys_rejected": sorted(SERVICE_REPLAY_ONLY_KEYS),
+        "ignored_override_keys": [],
+        "note": (
+            "This personal paper lab enforces only runtime/PPO/order-cap keys. "
+            "Use ppo_min_cash for PPO allocation reserve; min_cash is a "
+            "service-replay cash guard and is rejected here. "
+            "Replay-only knobs are rejected instead of being silently ignored."
+        ),
+    }
+
+
+def _run_semantics(tickers: list[str]) -> dict[str, Any]:
+    ticker_count = len(tickers)
+    return {
+        "runtime_scope": "paper_or_shadow_runtime",
+        "service_policy_replay_equivalence": False,
+        "ticker_count": ticker_count,
+        "universe_note": (
+            "The weekend service-policy replay was evaluated on the 30-stock "
+            "research universe. A smaller paper ticker subset is operational "
+            "evidence, not a one-to-one replay reproduction."
+        ),
+        "runtime_enforced_fields": sorted(RUNTIME_OVERRIDE_KEYS),
+        "replay_only_fields_not_enforced_here": sorted(SERVICE_REPLAY_ONLY_KEYS),
+    }
+
+
+def _score_stats(scores: Any) -> dict[str, Any]:
+    if not isinstance(scores, dict):
+        return {
+            "score_count": 0,
+            "finite_score_count": 0,
+            "nonzero_score_count": 0,
+            "score_abs_sum": 0.0,
+            "score_std": 0.0,
+            "rankable": False,
+        }
+    values: list[float] = []
+    for value in scores.values():
+        try:
+            parsed = float(value)
+        except Exception:
+            continue
+        if math.isfinite(parsed):
+            values.append(parsed)
+    nonzero = [v for v in values if abs(v) > 1e-12]
+    if len(values) > 1:
+        mean = sum(values) / len(values)
+        variance = sum((v - mean) ** 2 for v in values) / len(values)
+        std = math.sqrt(variance)
+    else:
+        std = 0.0
+    return {
+        "score_count": len(scores),
+        "finite_score_count": len(values),
+        "nonzero_score_count": len(nonzero),
+        "score_abs_sum": float(sum(abs(v) for v in values)),
+        "score_std": float(std),
+        "rankable": bool(len(values) == 1 and nonzero) or bool(len(values) > 1 and std > 1e-12),
     }
 
 
@@ -185,7 +461,7 @@ def _apply_policy_overrides(trader: Any, policy: PolicySpec) -> dict[str, Any]:
     set_attr(trader, "_max_orders_per_cycle", "max_orders_per_cycle", int)
     set_attr(trader, "_max_order_qty_per_order", "max_order_qty_per_order", int)
     if "allow_market_order" in overrides:
-        value = bool(overrides["allow_market_order"])
+        value = _safe_bool(overrides["allow_market_order"], default=False)
         setattr(trader, "_allow_market_order", value)
         applied["allow_market_order"] = value
 
@@ -195,13 +471,19 @@ def _apply_policy_overrides(trader: Any, policy: PolicySpec) -> dict[str, Any]:
         set_attr(ppo, "_max_names", "ppo_max_names", int)
         set_attr(ppo, "_min_cash", "ppo_min_cash", float)
         set_attr(ppo, "_min_confidence", "ppo_min_confidence", float)
-        set_attr(ppo, "_trade_probability_gate_enabled", "trade_probability_gate_enabled", bool)
+        set_attr(
+            ppo,
+            "_trade_probability_gate_enabled",
+            "trade_probability_gate_enabled",
+            lambda value: _safe_bool(value, default=False),
+        )
         set_attr(ppo, "_min_trade_probability", "min_trade_probability", float)
-        if str(overrides.get("ppo_weighting") or "score").lower() == "equal":
+        weighting = str(overrides.get("ppo_weighting") or "score").strip().lower()
+        if weighting == "equal":
             ppo._compute_weights = types.MethodType(_equal_weight_compute_weights, ppo)
             applied["ppo_weighting"] = "equal"
         elif "ppo_weighting" in overrides:
-            applied["ppo_weighting"] = str(overrides["ppo_weighting"])
+            applied["ppo_weighting"] = "score"
 
     return applied
 
@@ -218,10 +500,8 @@ def _prepare_repo_imports(repo_root: Path, registry_dir: str | None) -> None:
     src = repo_root / "new"
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
-    if registry_dir:
-        reg_path = Path(registry_dir)
-        if not reg_path.is_absolute():
-            reg_path = repo_root / reg_path
+    reg_path = _resolve_registry_dir(repo_root, registry_dir)
+    if reg_path is not None:
         os.environ["ELEPHANT_LGBM_REGISTRY_DIR"] = str(reg_path)
 
 
@@ -271,6 +551,10 @@ def _run_paper_child(
         "mode": "paper",
         "policy_id": policy.policy_id,
         "policy_label": policy.label,
+        **_safety_flags(external_kis_api=True),
+        "runtime_semantics": _run_semantics(
+            _as_list_tickers(args.tickers or defaults.get("tickers", ""))
+        ),
         "applied_overrides": applied,
         "native_report": report,
     }
@@ -312,6 +596,8 @@ def _run_shadow_child(
             "mode": "shadow",
             "policy_id": policy.policy_id,
             "policy_label": policy.label,
+            **_safety_flags(external_kis_api=True),
+            "runtime_semantics": _run_semantics(tickers),
             "applied_overrides": applied,
             "guards": guards,
             "cycles": [],
@@ -365,13 +651,20 @@ def _run_shadow_child(
             order_guard = trader._order_guard(final_decision)
             quant_output = hot_result.get("quant_output") or {}
             scores = quant_output.get("scores") if isinstance(quant_output, dict) else {}
+            score_stats = _score_stats(scores)
+            if hot_result.get("skipped"):
+                cycle_status = "FAIL"
+            elif order_guard.get("status") == "FAIL":
+                cycle_status = "FAIL"
+            else:
+                cycle_status = "PASS"
             cycle_reports.append({
-                "status": "PASS" if not hot_result.get("skipped") else "FAIL",
+                "status": cycle_status,
                 "cycle_index": idx,
                 "started_at": started_at,
                 "portfolio_value": portfolio_value,
                 "position_count": len(current_positions),
-                "score_count": len(scores) if isinstance(scores, dict) else 0,
+                **score_stats,
                 "quant_mode": quant_output.get("mode") if isinstance(quant_output, dict) else None,
                 "order_delta_count": len(order_deltas),
                 "order_guard": order_guard,
@@ -390,21 +683,29 @@ def _run_shadow_child(
         if idx < cycles - 1:
             time.sleep(max(0.0, interval_sec))
 
-    score_nonempty_cycles = sum(1 for c in cycle_reports if int(c.get("score_count") or 0) > 0)
+    score_nonempty_cycles = sum(1 for c in cycle_reports if int(c.get("finite_score_count") or 0) > 0)
+    score_rankable_cycles = sum(1 for c in cycle_reports if c.get("rankable"))
     status = "PASS"
     if any(c.get("status") == "FAIL" for c in cycle_reports):
         status = "FAIL"
+    elif not cycle_reports:
+        status = "BLOCKED"
     elif cycle_reports and score_nonempty_cycles == 0:
+        status = "BLOCKED"
+    elif score_rankable_cycles == 0:
         status = "BLOCKED"
     return {
         "status": status,
         "mode": "shadow",
         "policy_id": policy.policy_id,
         "policy_label": policy.label,
+        **_safety_flags(external_kis_api=True),
+        "runtime_semantics": _run_semantics(tickers),
         "applied_overrides": applied,
         "guards": guards,
         "cycles": cycle_reports,
         "score_nonempty_cycles": score_nonempty_cycles,
+        "score_rankable_cycles": score_rankable_cycles,
         "order_delta_count": sum(int(c.get("order_delta_count") or 0) for c in cycle_reports),
     }
 
@@ -427,11 +728,12 @@ def _run_child(args: argparse.Namespace) -> int:
         "run_id": args.run_id,
         "repo_root": str(repo_root),
         "policy": _policy_overview(policy, os.environ),
+        **_safety_flags(external_kis_api=True),
         "prelive": None,
         "result": None,
     }
     try:
-        prelive_required = bool(defaults.get("prelive_required", True))
+        prelive_required = _safe_bool(defaults.get("prelive_required", True), default=True)
         if args.skip_prelive:
             prelive_required = False
         if prelive_required:
@@ -468,6 +770,10 @@ def _run_child(args: argparse.Namespace) -> int:
 def _dry_run(args: argparse.Namespace, config: dict[str, Any]) -> int:
     defaults = dict(config.get("run_defaults") or {})
     repo_root = _repo_root(defaults)
+    registry_dir = _resolve_registry_dir(
+        repo_root,
+        str(args.registry_dir or defaults.get("registry_dir") or ""),
+    )
     policies = _filter_policies(_load_policies(config), args.policy_id)
     items: list[dict[str, Any]] = []
     for policy in policies:
@@ -477,12 +783,18 @@ def _dry_run(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "status": "PASS",
         "action": "local_policy_lab_dry_run",
         "repo_root": str(repo_root),
-        "git_ignored_root": str(SCRIPT_PATH.parent),
+        "registry_dir": str(registry_dir) if registry_dir else None,
+        "git_ignored_root": str(RUNS_DIR),
+        "git_ignored_runs_dir": str(RUNS_DIR),
         "bundle_id": str(args.bundle_id or defaults.get("bundle_id")),
         "tickers": _as_list_tickers(args.tickers or defaults.get("tickers", "")),
         "cycles": int(args.cycles or defaults.get("cycles", 1)),
         "interval_sec": float(args.interval_sec if args.interval_sec is not None else defaults.get("interval_sec", 0)),
         "policies": items,
+        "runtime_semantics": _run_semantics(
+            _as_list_tickers(args.tickers or defaults.get("tickers", ""))
+        ),
+        **_safety_flags(external_kis_api=False),
         "secrets_printed": False,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -501,6 +813,10 @@ def _filter_policies(policies: list[PolicySpec], policy_id: str | None) -> list[
 def _run_parent(args: argparse.Namespace, config: dict[str, Any]) -> int:
     defaults = dict(config.get("run_defaults") or {})
     repo_root = _repo_root(defaults)
+    registry_dir = _resolve_registry_dir(
+        repo_root,
+        str(args.registry_dir or defaults.get("registry_dir") or ""),
+    )
     policies = _filter_policies(_load_policies(config), args.policy_id)
     run_id = _run_id(args.run_id)
     run_dir = RUNS_DIR / run_id
@@ -528,7 +844,7 @@ def _run_parent(args: argparse.Namespace, config: dict[str, Any]) -> int:
             "--bundle-id",
             str(args.bundle_id or defaults.get("bundle_id")),
             "--registry-dir",
-            str(args.registry_dir or defaults.get("registry_dir") or ""),
+            str(registry_dir or ""),
             "--tickers",
             ",".join(_as_list_tickers(args.tickers or defaults.get("tickers", ""))),
             "--cycles",
@@ -568,22 +884,59 @@ def _run_parent(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 "returncode": code,
                 "stdout_log": str(stdout_path),
                 "stderr_log": str(stderr_path),
-                "report_path": str(run_dir / f"{policy.policy_id}.json"),
+                **_child_report_state(run_dir / f"{policy.policy_id}.json"),
             })
         launched = still_running
 
     index = {
-        "status": "PASS" if all(item["returncode"] == 0 for item in completed) else "BLOCKED",
+        "status": "PASS" if _parent_completed_successfully(completed) else "BLOCKED",
         "generated_at": datetime.now(KST).isoformat(),
         "run_id": run_id,
         "repo_root": str(repo_root),
         "bundle_id": str(args.bundle_id or defaults.get("bundle_id")),
         "policies": completed,
+        "runtime_semantics": _run_semantics(
+            _as_list_tickers(args.tickers or defaults.get("tickers", ""))
+        ),
+        **_safety_flags(external_kis_api=bool(completed)),
         "secrets_printed": False,
     }
     _json_dump(run_dir / "index.json", index)
     print(json.dumps(index, ensure_ascii=False, indent=2))
     return 0 if index["status"] == "PASS" else 1
+
+
+def _child_report_state(path: Path) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "report_path": str(path),
+        "report_exists": path.exists(),
+        "report_parse_error": None,
+        "child_result_status": None,
+    }
+    if not path.exists():
+        return state
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        result = data.get("result") if isinstance(data, dict) else None
+        state["child_result_status"] = (
+            result.get("status") if isinstance(result, dict) else None
+        )
+    except Exception as e:
+        state["report_parse_error"] = f"{type(e).__name__}: {e}"
+    return state
+
+
+def _parent_completed_successfully(completed: list[dict[str, Any]]) -> bool:
+    if not completed:
+        return False
+    return all(
+        item.get("returncode") == 0
+        and item.get("report_exists") is True
+        and not item.get("report_parse_error")
+        and item.get("child_result_status") == "PASS"
+        for item in completed
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -610,12 +963,25 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    config = _load_yaml(Path(args.config).expanduser().resolve())
-    if args.child:
-        return _run_child(args)
-    if args.dry_run:
-        return _dry_run(args, config)
-    return _run_parent(args, config)
+    try:
+        config = _load_yaml(Path(args.config).expanduser().resolve())
+        _validate_config(config)
+        if args.child:
+            return _run_child(args)
+        if args.dry_run:
+            return _dry_run(args, config)
+        return _run_parent(args, config)
+    except Exception as e:
+        report = {
+            "status": "BLOCKED",
+            "action": "local_policy_lab_startup",
+            "error": str(e),
+            "error_type": type(e).__name__,
+            **_safety_flags(external_kis_api=False),
+            "secrets_printed": False,
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
 
 
 if __name__ == "__main__":

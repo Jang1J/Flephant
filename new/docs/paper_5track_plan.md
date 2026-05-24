@@ -40,7 +40,7 @@
 | `SAFE_SLOW` | 예 | 안정성 비교 | 주문 수/종목 수 축소, cash 증가, confidence 강화 |
 | `ACTIVE_SMALL` | 예 | 기회 탐색 | confidence 완화, 종목 수 증가, 수량 1주 유지 |
 | `TOPK_EQUAL` | 예 | PPO 대비 비교 | Top-K를 균등 비중으로 실제 paper 주문 비교 |
-| `STRICT_GATE` | 예 | 강한 필터 비교 | confidence/trade-probability gate 강화 |
+| `STRICT_GATE` | 아니오(Shadow) | 강한 필터 비교 | confidence/trade-probability gate 강화, 첫날은 주문 후보만 기록 |
 
 ## 4. 계좌 준비
 
