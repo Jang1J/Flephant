@@ -112,7 +112,7 @@ class CNNBranch:
         epochs: int,
         batch_size: int,
         seed: int,
-        nan_fallback: float = 0.0,
+        nan_fallback: float,
     ) -> None:
         self._n_features = n_features
         self._hidden = hidden_channels
@@ -315,7 +315,9 @@ class CommitteeModel:
         self._meta_max_iter: int = int(cfg.get("meta_fuser_max_iter", 100))
         self._meta_C: float = float(cfg.get("meta_fuser_C", 1.0))
         self._sharpe_threshold: float = float(cfg.get("sharpe_improvement_threshold", 0.0))
-        self._cnn_nan_fallback: float = float(cfg.get("cnn_nan_fallback", 0.0))
+        if "cnn_nan_fallback" not in cfg:
+            raise CommitteeTrainError("committee.cnn_nan_fallback 설정 누락")
+        self._cnn_nan_fallback: float = float(cfg["cnn_nan_fallback"])
         self._artifacts_path = Path(cfg.get("artifacts_path", "artifacts/committee"))
         self._artifacts_path.mkdir(parents=True, exist_ok=True)
 

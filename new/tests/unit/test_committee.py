@@ -45,6 +45,7 @@ def _make_committee(tmp_path: Path | None = None, **overrides):
         "meta_fuser_max_iter": 10,
         "meta_fuser_C": 1.0,
         "sharpe_improvement_threshold": 0.0,
+        "cnn_nan_fallback": 0.0,
         "artifacts_path": str(tmp_path / "committee") if tmp_path else "artifacts/committee",
     }
     cfg.update(overrides)
@@ -91,7 +92,35 @@ def _make_cnn_branch(n_features: int = 4, tmp_path: Path | None = None):
         epochs=2,
         batch_size=8,
         seed=0,
+        nan_fallback=0.0,
     )
+
+
+def _torch_modules_with_empty_loader() -> dict[str, MagicMock]:
+    """CNN scaler tests에서 학습 loop만 비우는 torch module mock."""
+    mock_torch = MagicMock()
+    mock_torch.tensor.side_effect = lambda value, dtype=None: value
+    mock_torch.float32 = np.float32
+    mock_torch.optim.Adam.return_value = MagicMock()
+
+    mock_nn = MagicMock()
+    mock_nn.BCELoss.return_value = MagicMock()
+
+    mock_data = MagicMock()
+    mock_data.TensorDataset.side_effect = lambda *args: args
+    mock_data.DataLoader.return_value = []
+
+    mock_utils = MagicMock()
+    mock_utils.data = mock_data
+    mock_torch.nn = mock_nn
+    mock_torch.utils = mock_utils
+
+    return {
+        "torch": mock_torch,
+        "torch.nn": mock_nn,
+        "torch.utils": mock_utils,
+        "torch.utils.data": mock_data,
+    }
 
 
 # ====================================================================== #
@@ -103,6 +132,28 @@ def test_committee_init_loads_config(tmp_path: Path):
     assert model._cnn_epochs == 5
     assert model._cnn_hidden == 4
     assert model._meta_max_iter == 10
+
+
+def test_committee_init_requires_cnn_nan_fallback(tmp_path: Path):
+    """committee.cnn_nan_fallback 누락 시 코드 기본값으로 숨기지 않고 fail-closed."""
+    from src.models.committee import CommitteeTrainError
+
+    cfg = {
+        "cnn_hidden_channels": 4,
+        "cnn_learning_rate": 0.01,
+        "cnn_epochs": 2,
+        "cnn_batch_size": 8,
+        "cnn_seed": 0,
+        "meta_fuser_max_iter": 10,
+        "meta_fuser_C": 1.0,
+        "sharpe_improvement_threshold": 0.0,
+        "artifacts_path": str(tmp_path / "committee"),
+    }
+    with patch("src.models.committee.config_load", return_value=cfg):
+        from src.models.committee import CommitteeModel
+
+        with pytest.raises(CommitteeTrainError, match="cnn_nan_fallback"):
+            CommitteeModel()
 
 
 # ====================================================================== #
@@ -244,13 +295,8 @@ def test_cnn_branch_scaler_persists_after_fit():
         scaler_instance = MagicMock()
         scaler_instance.fit_transform.return_value = X.astype(np.float32)
         MockScaler.return_value = scaler_instance
-        mock_torch = MagicMock()
-        with patch.dict("sys.modules", {"torch": mock_torch, "torch.nn": mock_torch.nn,
-                                         "torch.utils.data": mock_torch.utils.data}):
-            try:
-                branch.fit(X, y)
-            except (TypeError, AttributeError):
-                pass
+        with patch.dict("sys.modules", _torch_modules_with_empty_loader()):
+            branch.fit(X, y)
 
     # scaler 인스턴스가 생성되고 fit_transform 호출됐는지 검증
     assert branch._scaler is not None
@@ -291,13 +337,8 @@ def test_cnn_branch_fit_nan_aware_order():
         scaler_instance = MagicMock()
         scaler_instance.fit_transform.side_effect = capture_and_return_zeros
         MockScaler.return_value = scaler_instance
-        mock_torch = MagicMock()
-        with patch.dict("sys.modules", {"torch": mock_torch, "torch.nn": mock_torch.nn,
-                                         "torch.utils.data": mock_torch.utils.data}):
-            try:
-                branch.fit(X, y)
-            except (TypeError, AttributeError):
-                pass
+        with patch.dict("sys.modules", _torch_modules_with_empty_loader()):
+            branch.fit(X, y)
 
     assert len(captured_inputs) == 1, "StandardScaler.fit_transform 한 번 호출 기대"
     X_to_scaler = captured_inputs[0]
@@ -383,11 +424,11 @@ def test_cnn_branch_load_raises_when_scaler_missing(tmp_path: Path):
 # 5. CommitteeResult.to_dict() 필드 확인
 # ====================================================================== #
 
-def test_committee_result_to_dict():
+def test_committee_result_to_dict(tmp_path: Path):
     from src.models.committee import CommitteeResult
     r = CommitteeResult(
         version="v1",
-        artifact_dir="/tmp/v1",
+        artifact_dir=str(tmp_path / "v1"),
         tree_only_sr=0.5,
         committee_sr=0.7,
         delta_sharpe=0.2,
