@@ -47,6 +47,12 @@ class _PaperAutoSession:
         self.total_cycles: int = 0
         self.started_at: str = ""
         self.last_cycle_at: str = ""
+        self.stop_requested: bool = False
+        self.terminal_status: str = ""
+        self.stop_reason: str = ""
+        self.ended_at: str = ""
+        self.report_path: str = ""
+        self.last_error: str = ""
 
     def start(
         self,
@@ -76,6 +82,12 @@ class _PaperAutoSession:
             self.completed_cycles = 0
             self.started_at = datetime.now(_KST).isoformat()
             self.last_cycle_at = ""
+            self.stop_requested = False
+            self.terminal_status = "RUNNING"
+            self.stop_reason = ""
+            self.ended_at = ""
+            self.report_path = ""
+            self.last_error = ""
             self.running = True
             self._stop_event.clear()
 
@@ -123,6 +135,8 @@ class _PaperAutoSession:
                     "reason": f"요청 {session_id} != 실행 {self.session_id}",
                 }
             self._stop_event.set()
+            self.stop_requested = True
+            self.terminal_status = "STOPPING"
             return {
                 "accepted": True,
                 "status": "STOPPING",
@@ -141,6 +155,13 @@ class _PaperAutoSession:
                 "started_at": self.started_at,
                 "bundle_id": self.bundle_id,
                 "last_cycle_at": self.last_cycle_at,
+                "stop_requested": self.stop_requested,
+                "terminal_status": self.terminal_status,
+                "stop_reason": self.stop_reason,
+                "ended_at": self.ended_at,
+                "report_path": self.report_path,
+                "last_error": self.last_error,
+                "kafka": _kafka_status(self._kafka),
             }
 
     def _run_loop(
@@ -172,12 +193,31 @@ class _PaperAutoSession:
                 sleep_fn=interruptible_sleep,
             )
 
-            trader.run(
+            report = trader.run(
                 tickers=tickers,
                 cycles=cycles,
                 interval_sec=interval_sec,
                 confirm_phrase=confirm_phrase,
             )
+            report = report if isinstance(report, dict) else {}
+            stop_reason = (
+                "USER_REQUESTED" if self._stop_event.is_set() else "COMPLETED"
+            )
+            terminal_status = (
+                "STOPPED"
+                if stop_reason == "USER_REQUESTED"
+                else str(report.get("status") or "COMPLETED")
+            )
+            with self._lock:
+                self.stop_requested = self.stop_requested or self._stop_event.is_set()
+                self.terminal_status = terminal_status
+                self.stop_reason = stop_reason
+                self.ended_at = datetime.now(_KST).isoformat()
+                self.report_path = str(
+                    report.get("report_path_relative")
+                    or report.get("report_path")
+                    or ""
+                )
 
             self._kafka.emit(
                 "AUTO_TRADING_STOPPED",
@@ -186,13 +226,18 @@ class _PaperAutoSession:
                 bundle_id=bundle_id,
                 payload={
                     "completed_cycles": self.completed_cycles,
-                    "stop_reason": (
-                        "USER_REQUESTED" if self._stop_event.is_set() else "COMPLETED"
-                    ),
+                    "stop_reason": stop_reason,
+                    "terminal_status": self.terminal_status,
+                    "report_path": self.report_path,
                 },
             )
             self._kafka.flush()
         except InterruptedError:
+            with self._lock:
+                self.stop_requested = True
+                self.terminal_status = "STOPPED"
+                self.stop_reason = "USER_REQUESTED"
+                self.ended_at = datetime.now(_KST).isoformat()
             self._kafka.emit(
                 "AUTO_TRADING_STOPPED",
                 session_id=self.session_id,
@@ -201,22 +246,35 @@ class _PaperAutoSession:
                 payload={
                     "completed_cycles": self.completed_cycles,
                     "stop_reason": "USER_REQUESTED",
+                    "terminal_status": self.terminal_status,
+                    "report_path": self.report_path,
                 },
             )
             self._kafka.flush()
         except Exception as e:
             logger.error("[grpc] auto trading 비정상 종료: %s", e)
+            with self._lock:
+                self.terminal_status = "FAILED"
+                self.stop_reason = "ERROR"
+                self.ended_at = datetime.now(_KST).isoformat()
+                self.last_error = str(e)
             self._kafka.emit(
                 "AUTO_TRADING_FAILED",
                 session_id=self.session_id,
                 request_id=self.request_id,
                 bundle_id=bundle_id,
-                payload={"error": str(e)},
+                payload={
+                    "error": str(e),
+                    "terminal_status": self.terminal_status,
+                    "report_path": self.report_path,
+                },
             )
             self._kafka.flush()
         finally:
             with self._lock:
                 self.running = False
+                if not self.ended_at:
+                    self.ended_at = datetime.now(_KST).isoformat()
 
 
 def _dict_rows(value: Any) -> list[dict[str, Any]]:
@@ -232,6 +290,79 @@ def _event_ticker(value: Any) -> str | None:
 
 def _first_not_none(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
+
+
+def _kafka_status(kafka: Any) -> dict[str, Any]:
+    try:
+        status = kafka.status()
+    except AttributeError:
+        status = {}
+    except Exception as e:
+        status = {"last_error": str(e)}
+    status = status if isinstance(status, dict) else {}
+    return {
+        "connected": bool(status.get("connected", False)),
+        "topic": str(status.get("topic", "")),
+        "last_error": str(status.get("last_error", "")),
+    }
+
+
+def _normalize_start_tickers(raw_tickers: Any) -> tuple[list[str], list[str]]:
+    tickers: list[str] = []
+    invalid: list[str] = []
+    for raw in list(raw_tickers or []):
+        value = str(raw).strip()
+        if not value:
+            continue
+        if not value.isdigit():
+            invalid.append(value)
+            continue
+        tickers.append(pad_ticker(value))
+    return tickers, invalid
+
+
+def _validate_paper_auto_start_args(
+    *,
+    bundle_id: str,
+    cycles: int,
+    interval_sec: int,
+    tickers: list[str],
+    invalid_tickers: list[str],
+    confirm_phrase: str,
+    required_confirm_phrase: str,
+    max_tickers: int,
+) -> dict[str, Any]:
+    if not bundle_id:
+        return {"status": "INVALID_ARGUMENT", "reason": "bundle_id_required"}
+    if required_confirm_phrase and confirm_phrase != required_confirm_phrase:
+        return {
+            "status": "INVALID_ARGUMENT",
+            "reason": "confirm_phrase_missing_or_mismatch",
+            "required_phrase": required_confirm_phrase,
+        }
+    if cycles <= 0:
+        return {"status": "INVALID_ARGUMENT", "reason": "cycles_must_be_positive"}
+    if interval_sec < 0:
+        return {
+            "status": "INVALID_ARGUMENT",
+            "reason": "interval_sec_must_be_non_negative",
+        }
+    if invalid_tickers:
+        return {
+            "status": "INVALID_ARGUMENT",
+            "reason": "ticker_must_be_numeric",
+            "invalid_tickers": invalid_tickers,
+        }
+    if not tickers:
+        return {"status": "INVALID_ARGUMENT", "reason": "tickers_required"}
+    if max_tickers > 0 and len(tickers) > max_tickers:
+        return {
+            "status": "INVALID_ARGUMENT",
+            "reason": "ticker_count_exceeds_max",
+            "max_tickers": max_tickers,
+            "ticker_count": len(tickers),
+        }
+    return {"status": "PASS", "tickers": tickers}
 
 
 def _event_order_no(row: dict[str, Any]) -> Any:
@@ -528,15 +659,53 @@ def _make_servicer(
                     accepted=False, status="CONFIG_MISSING",
                     reason="paper_auto_trading.default_interval_sec 설정 누락",
                 )
-            default_cycles = int(pa_cfg["default_max_cycles"])
-            default_interval = int(pa_cfg["default_interval_sec"])
+            try:
+                default_cycles = int(pa_cfg["default_max_cycles"])
+                default_interval = int(pa_cfg["default_interval_sec"])
+                requested_cycles = int(getattr(request, "cycles", 0) or default_cycles)
+                requested_interval = int(
+                    getattr(request, "interval_sec", 0) or default_interval
+                )
+                max_tickers = int(pa_cfg.get("max_tickers", 0) or 0)
+            except Exception as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_auto_trading 설정값 변환 실패: {e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False, status="CONFIG_INVALID",
+                    reason=f"paper_auto_trading_config_invalid:{e}",
+                )
+            requested_bundle_id = str(getattr(request, "bundle_id", "") or bundle_id)
+            requested_tickers, invalid_tickers = _normalize_start_tickers(
+                getattr(request, "tickers", []),
+            )
+            confirm_phrase = str(getattr(request, "confirm_phrase", ""))
+            validation = _validate_paper_auto_start_args(
+                bundle_id=requested_bundle_id,
+                cycles=requested_cycles,
+                interval_sec=requested_interval,
+                tickers=requested_tickers,
+                invalid_tickers=invalid_tickers,
+                confirm_phrase=confirm_phrase,
+                required_confirm_phrase=str(pa_cfg.get("confirm_start_phrase", "")),
+                max_tickers=max_tickers,
+            )
+            if validation["status"] != "PASS":
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(str(validation["reason"]))
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status=str(validation["status"]),
+                    reason=str(validation["reason"]),
+                )
             result = session.start(
                 request_id=str(getattr(request, "request_id", "")),
-                bundle_id=str(getattr(request, "bundle_id", "") or bundle_id),
-                cycles=int(getattr(request, "cycles", 0) or default_cycles),
-                interval_sec=int(getattr(request, "interval_sec", 0) or default_interval),
-                tickers=list(getattr(request, "tickers", [])),
-                confirm_phrase=str(getattr(request, "confirm_phrase", "")),
+                bundle_id=requested_bundle_id,
+                cycles=requested_cycles,
+                interval_sec=requested_interval,
+                tickers=list(validation["tickers"]),
+                confirm_phrase=confirm_phrase,
                 root=root,
             )
             return pb2.StartPaperAutoTradingResponse(
@@ -572,6 +741,15 @@ def _make_servicer(
                 started_at=str(s["started_at"]),
                 bundle_id=str(s["bundle_id"]),
                 last_cycle_at=str(s["last_cycle_at"]),
+                stop_requested=bool(s["stop_requested"]),
+                terminal_status=str(s["terminal_status"]),
+                stop_reason=str(s["stop_reason"]),
+                ended_at=str(s["ended_at"]),
+                report_path=str(s["report_path"]),
+                kafka_connected=bool(s["kafka"]["connected"]),
+                kafka_topic=str(s["kafka"]["topic"]),
+                kafka_last_error=str(s["kafka"]["last_error"]),
+                last_error=str(s["last_error"]),
             )
 
     return AiBeBridgeServicer()

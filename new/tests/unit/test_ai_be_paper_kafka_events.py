@@ -4,7 +4,12 @@ from __future__ import annotations
 import uuid
 
 import src.integration.grpc.server as grpc_server
-from src.integration.grpc.server import _PaperAutoSession, _paper_cycle_events
+from src.integration.grpc.server import (
+    _PaperAutoSession,
+    _normalize_start_tickers,
+    _paper_cycle_events,
+    _validate_paper_auto_start_args,
+)
 from src.integration.kafka.producer import KafkaEventProducer
 
 
@@ -18,6 +23,13 @@ class _RecordingKafka:
 
     def flush(self) -> None:
         self.flushed = True
+
+    def status(self) -> dict:
+        return {
+            "connected": False,
+            "topic": "test-topic",
+            "last_error": "no broker in unit test",
+        }
 
 
 def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
@@ -56,6 +68,129 @@ def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
         key for key in kafka_sender.value
         if key != "payload"
     }
+
+
+def test_kafka_status_reports_readiness_without_secret_values() -> None:
+    producer = KafkaEventProducer.__new__(KafkaEventProducer)
+    producer._topic = "paper-topic"
+    producer._bootstrap_servers = "localhost:9092"
+    producer._producer = None
+    producer._last_error = "connection refused"
+
+    status = producer.status()
+
+    assert status == {
+        "connected": False,
+        "topic": "paper-topic",
+        "bootstrap_servers_set": True,
+        "last_error": "connection refused",
+    }
+
+
+def test_start_validation_rejects_bad_request_before_thread_start() -> None:
+    tickers, invalid = _normalize_start_tickers(["005930", "BAD"])
+
+    result = _validate_paper_auto_start_args(
+        bundle_id="BUNDLE-1",
+        cycles=1,
+        interval_sec=60,
+        tickers=tickers,
+        invalid_tickers=invalid,
+        confirm_phrase="WRONG",
+        required_confirm_phrase="PAPER_AUTO_OK",
+        max_tickers=30,
+    )
+
+    assert result["status"] == "INVALID_ARGUMENT"
+    assert result["reason"] == "confirm_phrase_missing_or_mismatch"
+
+
+def test_start_validation_normalizes_tickers_and_accepts_valid_request() -> None:
+    tickers, invalid = _normalize_start_tickers(["5930", "000660"])
+
+    result = _validate_paper_auto_start_args(
+        bundle_id="BUNDLE-1",
+        cycles=1,
+        interval_sec=0,
+        tickers=tickers,
+        invalid_tickers=invalid,
+        confirm_phrase="PAPER_AUTO_OK",
+        required_confirm_phrase="PAPER_AUTO_OK",
+        max_tickers=30,
+    )
+
+    assert result == {"status": "PASS", "tickers": ["005930", "000660"]}
+
+
+def test_start_rpc_rejects_bad_confirm_before_session_start(monkeypatch) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+
+    class _Grpc:
+        class StatusCode:
+            INVALID_ARGUMENT = "INVALID_ARGUMENT"
+            FAILED_PRECONDITION = "FAILED_PRECONDITION"
+
+    class _Pb2Grpc:
+        class AiBeBridgeServiceServicer:
+            pass
+
+    class _Pb2:
+        class StartPaperAutoTradingResponse:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+    class _Context:
+        code = None
+        details = ""
+
+        def set_code(self, code) -> None:
+            self.code = code
+
+        def set_details(self, details: str) -> None:
+            self.details = details
+
+    class _Request:
+        request_id = "BE-REQ-001"
+        bundle_id = "BUNDLE-1"
+        cycles = 1
+        interval_sec = 60
+        tickers = ["005930"]
+        confirm_phrase = "WRONG"
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("session.start must not run for invalid Start RPC")
+
+    monkeypatch.setattr(
+        grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 60,
+            "confirm_start_phrase": "PAPER_AUTO_OK",
+            "max_tickers": 30,
+        },
+    )
+    monkeypatch.setattr(session, "start", fail_if_called)
+
+    servicer = grpc_server._make_servicer(
+        _Grpc,
+        _Pb2,
+        _Pb2Grpc,
+        bundle_id="BUNDLE-1",
+        root=None,
+        session=session,
+    )
+    context = _Context()
+
+    response = servicer.StartPaperAutoTrading(_Request(), context)
+
+    assert response.accepted is False
+    assert response.status == "INVALID_ARGUMENT"
+    assert response.reason == "confirm_phrase_missing_or_mismatch"
+    assert context.code == _Grpc.StatusCode.INVALID_ARGUMENT
+    assert context.details == "confirm_phrase_missing_or_mismatch"
+    assert kafka.events == []
 
 
 def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> None:
@@ -258,6 +393,7 @@ def test_start_event_precedes_immediate_thread_failure(monkeypatch) -> None:
     ]
     assert kafka.events[1][1]["request_id"] == "BE-REQ-001"
     assert kafka.flushed is True
+    assert session.status()["last_error"] == "paper-auto init failed"
 
 
 def test_user_stop_is_published_as_stopped_with_start_request_id(monkeypatch) -> None:
@@ -293,5 +429,52 @@ def test_user_stop_is_published_as_stopped_with_start_request_id(monkeypatch) ->
     ]
     assert kafka.events[0][1]["request_id"] == "BE-REQ-001"
     assert kafka.events[0][1]["payload"]["stop_reason"] == "USER_REQUESTED"
+    assert kafka.events[0][1]["payload"]["terminal_status"] == "STOPPED"
     assert kafka.flushed is True
     assert session.running is False
+    assert session.status()["terminal_status"] == "STOPPED"
+    assert session.status()["stop_requested"] is True
+
+
+def test_session_status_exposes_terminal_report_path_and_kafka_state(monkeypatch) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    session.session_id = "AI-SESSION"
+    session.request_id = "BE-REQ-001"
+    session.bundle_id = "BUNDLE-1"
+    session.running = True
+
+    class _Trader:
+        def run(self, **_kwargs) -> dict:
+            return {
+                "status": "PASS",
+                "report_path_relative": "artifacts/reports/paper_auto_trading/run.json",
+            }
+
+    monkeypatch.setattr(
+        grpc_server,
+        "_make_grpc_paper_auto_trader",
+        lambda **_kwargs: _Trader(),
+    )
+
+    session._run_loop(
+        bundle_id="BUNDLE-1",
+        cycles=3,
+        interval_sec=10,
+        tickers=["005930"],
+        confirm_phrase="PAPER_AUTO_OK",
+        root=None,
+    )
+
+    status = session.status()
+
+    assert status["running"] is False
+    assert status["terminal_status"] == "PASS"
+    assert status["stop_reason"] == "COMPLETED"
+    assert status["ended_at"]
+    assert status["report_path"] == "artifacts/reports/paper_auto_trading/run.json"
+    assert status["kafka"] == {
+        "connected": False,
+        "topic": "test-topic",
+        "last_error": "no broker in unit test",
+    }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from scripts.generate_ai_grpc_stubs import main as generate_ai_grpc_stubs
 from src.integration.grpc.payloads import (
     build_ack_payload,
     build_health_payload,
@@ -28,8 +29,42 @@ def test_ai_be_proto_declares_grpc_replacements_for_http_bridge():
         "PublishExecutionFeedback",
         "PublishInternalMessage",
         "PublishAgentReport",
+        "StartPaperAutoTrading",
+        "StopPaperAutoTrading",
+        "GetPaperAutoTradingStatus",
     ]:
         assert f"rpc {rpc_name}" in text
+
+
+def test_paper_auto_status_proto_exposes_operability_fields():
+    text = PROTO.read_text(encoding="utf-8")
+
+    assert "message PaperAutoTradingStatusResponse" in text
+    for field in [
+        "stop_requested",
+        "terminal_status",
+        "stop_reason",
+        "ended_at",
+        "report_path",
+        "kafka_connected",
+        "kafka_topic",
+        "kafka_last_error",
+        "last_error",
+    ]:
+        assert field in text
+
+
+def test_ai_be_proto_stubs_generate_after_paper_auto_contract_change(tmp_path):
+    out_dir = tmp_path / "grpc_generated"
+
+    assert generate_ai_grpc_stubs([
+        "--proto", str(PROTO),
+        "--output-dir", str(out_dir),
+    ]) == 0
+    generated = (out_dir / "elephant_ai_bridge_pb2.py").read_text(encoding="utf-8")
+    assert "StartPaperAutoTrading" in generated
+    assert "kafka_connected" in generated
+    assert "last_error" in generated
 
 
 def test_ai_be_proto_preserves_c8_c9_c10_core_fields():

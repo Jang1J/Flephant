@@ -53,26 +53,29 @@ class KafkaEventProducer:
         self._topic = topic or os.environ.get(
             "KAFKA_TOPIC", _DEFAULT_TOPIC,
         )
-        servers = bootstrap_servers or os.environ.get(
+        self._bootstrap_servers = bootstrap_servers or os.environ.get(
             "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092",
         )
         self._producer: Any = None
+        self._last_error = ""
         try:
             from kafka import KafkaProducer
 
             self._producer = KafkaProducer(
-                bootstrap_servers=servers,
+                bootstrap_servers=self._bootstrap_servers,
                 value_serializer=lambda v: json.dumps(
                     v, ensure_ascii=False, default=str,
                 ).encode("utf-8"),
                 key_serializer=lambda k: k.encode("utf-8") if k else None,
             )
             logger.info(
-                "[kafka] Producer 연결: %s topic=%s", servers, self._topic,
+                "[kafka] Producer 연결: %s topic=%s", self._bootstrap_servers, self._topic,
             )
         except ImportError:
-            logger.warning("[kafka] kafka-python 미설치. 이벤트 로깅만 수행.")
+            self._last_error = "kafka-python 미설치"
+            logger.warning("[kafka] %s. 이벤트 로깅만 수행.", self._last_error)
         except Exception as e:
+            self._last_error = str(e)
             logger.warning("[kafka] Producer 연결 실패: %s. 이벤트 로깅만 수행.", e)
 
     def emit(
@@ -120,6 +123,15 @@ class KafkaEventProducer:
             logger.info(
                 "[kafka] (no-op) %s session=%s", event_type, session_id,
             )
+
+    def status(self) -> dict[str, Any]:
+        """Return producer readiness without exposing broker credentials."""
+        return {
+            "connected": self._producer is not None,
+            "topic": self._topic,
+            "bootstrap_servers_set": bool(str(self._bootstrap_servers).strip()),
+            "last_error": self._last_error,
+        }
 
     def flush(self) -> None:
         """미전송 이벤트 일괄 전송. 세션 종료 시 호출."""

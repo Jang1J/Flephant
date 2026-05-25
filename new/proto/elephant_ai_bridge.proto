@@ -228,4 +228,13 @@ message PaperAutoTradingStatusResponse {
   string started_at = 7;
   string bundle_id = 8;
   string last_cycle_at = 9;
+  bool stop_requested = 10;
+  string terminal_status = 11;
+  string stop_reason = 12;
+  string ended_at = 13;
+  string report_path = 14;
+  bool kafka_connected = 15;
+  string kafka_topic = 16;
+  string kafka_last_error = 17;
+  string last_error = 18;
 }
