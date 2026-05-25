@@ -91,7 +91,6 @@ class _PaperAutoSession:
                 },
                 daemon=True,
             )
-            self._thread.start()
 
             self._kafka.emit(
                 "AUTO_TRADING_STARTED",
@@ -100,6 +99,7 @@ class _PaperAutoSession:
                 bundle_id=bundle_id,
                 payload={"cycles": cycles, "tickers": tickers},
             )
+            self._thread.start()
             return {
                 "accepted": True,
                 "status": "STARTED",
