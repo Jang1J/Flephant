@@ -350,8 +350,24 @@ def _make_servicer(
 
         def StartPaperAutoTrading(self, request: Any, context: Any) -> Any:  # noqa: N802
             pa_cfg = config_load("risk_config.yaml", "paper_auto_trading") or {}
-            default_cycles = int(pa_cfg.get("default_max_cycles", 1))
-            default_interval = int(pa_cfg.get("default_interval_sec", 60))
+            if "default_max_cycles" not in pa_cfg:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("paper_auto_trading.default_max_cycles 설정 누락")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False, status="CONFIG_MISSING",
+                    reason="paper_auto_trading.default_max_cycles 설정 누락",
+                )
+            if "default_interval_sec" not in pa_cfg:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("paper_auto_trading.default_interval_sec 설정 누락")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False, status="CONFIG_MISSING",
+                    reason="paper_auto_trading.default_interval_sec 설정 누락",
+                )
+            default_cycles = int(pa_cfg["default_max_cycles"])
+            default_interval = int(pa_cfg["default_interval_sec"])
             result = session.start(
                 bundle_id=str(getattr(request, "bundle_id", "") or bundle_id),
                 cycles=int(getattr(request, "cycles", 0) or default_cycles),

@@ -84,7 +84,8 @@ class KafkaEventProducer:
     ) -> None:
         """이벤트 발행. Kafka 미연결 시 로깅만."""
         if event_type not in PAPER_TRADING_EVENTS:
-            logger.warning("[kafka] 알 수 없는 event_type: %s", event_type)
+            logger.warning("[kafka] 알 수 없는 event_type: %s. 발행 중단.", event_type)
+            return
 
         event: dict[str, Any] = {
             "event_type": event_type,
@@ -131,5 +132,5 @@ class KafkaEventProducer:
             try:
                 self._producer.flush()
                 self._producer.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[kafka] Producer 종료 실패: %s", e)
