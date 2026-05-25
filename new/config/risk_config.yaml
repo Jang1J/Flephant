@@ -153,6 +153,17 @@ paper_auto_trading:
   require_active_scores_for_no_order_skip: true  # score 없는 no_order_deltas는 운영 PASS 금지
 
 grpc_recommendations:
+  mode_b_metadata:
+    schema_version: "1.0.0"
+    data_version: "2026-05-26"
+    last_updated: "2026-05-26"
+    updated_by: "codex-ai-be-grpc-recommendations"
+    mode_b_editable: false
+    human_approval_required: false
+    backup_retention_days: 365
+    update_trigger: "manual_only"
+    rationale: "BE 추천종목 gRPC 조회용 read-only 표시 정책. 주문/비중 권한 없음."
+  default_bundle_id: "BUNDLE-20260521-POSTCLOSE"
   default_top_k: 10
   max_top_k: 30
   risk_level:

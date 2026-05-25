@@ -169,6 +169,7 @@ def _resolve_recommendation_config() -> dict[str, Any]:
     risk_level_cfg = cfg.get("risk_level")
     risk_level_cfg = risk_level_cfg if isinstance(risk_level_cfg, dict) else {}
     return {
+        "default_bundle_id": str(cfg["default_bundle_id"]),
         "default_top_k": default_top_k,
         "max_top_k": max_top_k,
         "low_min_confidence": float(risk_level_cfg["low_min_confidence"]),
@@ -187,7 +188,7 @@ def _normalize_recommendation_tickers(
     universe_set = set(universe)
     invalid: list[str] = []
     normalized: list[str] = []
-    raw_list = list(raw_tickers or [])
+    raw_list = [raw_tickers] if isinstance(raw_tickers, str) else list(raw_tickers or [])
     if not raw_list:
         return universe, [], names
     for raw in raw_list:
@@ -206,10 +207,10 @@ def _normalize_recommendation_tickers(
 
 def _risk_level_for_confidence(confidence: float, cfg: dict[str, Any]) -> str:
     if confidence >= float(cfg["low_min_confidence"]):
-        return "LOW"
+        return "low"
     if confidence >= float(cfg["medium_min_confidence"]):
-        return "MEDIUM"
-    return "HIGH"
+        return "medium"
+    return "high"
 
 
 def _candidate_registry_dir(repo_root: Path, bundle_id: str) -> Path | None:
@@ -264,7 +265,8 @@ def build_recommendations_payload(
     """
     repo_root = root or _REPO_ROOT
     response_request_id = request_id or f"REQ-{uuid.uuid4().hex[:12]}"
-    requested_bundle_id = str(bundle_id or "").strip()
+    raw_bundle_id = str(bundle_id or "").strip()
+    requested_bundle_id = raw_bundle_id
     requested_asof = str(asof or "").strip()
     diagnostics: dict[str, Any] = {
         "external_order_api_called": False,
@@ -273,6 +275,9 @@ def build_recommendations_payload(
     }
     try:
         cfg = _resolve_recommendation_config()
+        requested_bundle_id = raw_bundle_id or str(cfg["default_bundle_id"]).strip()
+        if not requested_bundle_id:
+            raise ValueError("grpc_recommendations.default_bundle_id_required")
         warmup_bars = int(config_load("risk_config.yaml", "quant_agent")["warmup_bars"])
     except Exception as e:
         diagnostics["config_error"] = str(e)
@@ -384,6 +389,7 @@ def build_recommendations_payload(
 
     if bar_errors:
         diagnostics["bar_errors"] = bar_errors
+    if bar_errors and len(bar_errors) == len(selected_tickers):
         return _recommendation_blocked_payload(
             request_id=response_request_id,
             bundle_id=response_bundle_id,
@@ -434,7 +440,9 @@ def build_recommendations_payload(
             invalid_score_tickers.append(str(ticker))
             continue
         finite_scores[pad_ticker(str(ticker))] = value
-    if invalid_score_tickers or not finite_scores:
+    if invalid_score_tickers:
+        diagnostics["invalid_score_tickers"] = invalid_score_tickers
+    if not finite_scores:
         diagnostics["invalid_score_tickers"] = invalid_score_tickers
         return _recommendation_blocked_payload(
             request_id=response_request_id,

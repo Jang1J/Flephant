@@ -194,6 +194,13 @@ class _FakeRecommendationQuant:
         }
 
 
+class _StableBundleRecommendationQuant(_FakeRecommendationQuant):
+    model_metadata = {
+        "version": "model-v1",
+        "bundle_id": "BUNDLE-20260521-POSTCLOSE",
+    }
+
+
 class _BlockedRecommendationQuant(_FakeRecommendationQuant):
     def score_cross_section(self, tickers: list[str], *, asof: str) -> dict:
         return {
@@ -201,6 +208,17 @@ class _BlockedRecommendationQuant(_FakeRecommendationQuant):
             "blocker": "required_feature_missing",
             "scores": {},
             "ts": asof,
+        }
+
+
+class _InvalidScoreRecommendationQuant(_FakeRecommendationQuant):
+    def score_cross_section(self, tickers: list[str], *, asof: str) -> dict:
+        return {
+            "mode": "active",
+            "ts": asof,
+            "scores": {"005930": 0.42, "000660": float("nan")},
+            "confidences": {"005930": 0.09, "000660": 0.04},
+            "n_tickers": len(tickers),
         }
 
 
@@ -220,6 +238,13 @@ class _FakeMarketDataClient:
                 "volume": 1000 + idx,
             })
         return bars
+
+
+class _PartialFailingMarketDataClient(_FakeMarketDataClient):
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
+        if ticker == "000660":
+            raise RuntimeError("transient minute bar failure")
+        return super().inquire_minute_bar(ticker, n_bars=n_bars)
 
 
 def test_recommendations_payload_returns_read_only_ranked_items():
@@ -247,11 +272,71 @@ def test_recommendations_payload_returns_read_only_ranked_items():
     assert item["stock_name"] == "삼성전자"
     assert item["ranking"] == 1
     assert item["score"] == 0.42
-    assert item["risk_level"] == "LOW"
+    assert item["risk_level"] == "low"
     assert item["expected_return"] == 0.0
     assert item["expected_return_available"] is False
     for forbidden in ["target_weights", "order_deltas", "quantity", "side"]:
         assert forbidden not in item
+
+
+def test_recommendations_payload_treats_string_ticker_as_single_ticker():
+    payload = build_recommendations_payload(
+        request_id="REQ-STRING-TICKER",
+        bundle_id="BUNDLE-TEST",
+        tickers="005930",
+        top_k=1,
+        quant_agent=_FakeRecommendationQuant(),
+        market_data_client=_FakeMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert [item["ticker"] for item in payload["recommendations"]] == ["005930"]
+
+
+def test_recommendations_payload_uses_stable_default_bundle_when_request_empty():
+    payload = build_recommendations_payload(
+        request_id="REQ-DEFAULT-BUNDLE",
+        tickers=["005930"],
+        top_k=1,
+        quant_agent=_StableBundleRecommendationQuant(),
+        market_data_client=_FakeMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert payload["bundle_id"] == "BUNDLE-20260521-POSTCLOSE"
+    assert payload["recommendations"][0]["bundle_id"] == "BUNDLE-20260521-POSTCLOSE"
+
+
+def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
+    payload = build_recommendations_payload(
+        request_id="REQ-PARTIAL-BARS",
+        bundle_id="BUNDLE-TEST",
+        tickers=["005930", "000660"],
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        market_data_client=_PartialFailingMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert payload["recommendations"]
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert "000660" in diagnostics["bar_errors"]
+
+
+def test_recommendations_payload_keeps_partial_invalid_scores_as_diagnostics():
+    payload = build_recommendations_payload(
+        request_id="REQ-PARTIAL-SCORES",
+        bundle_id="BUNDLE-TEST",
+        tickers=["005930", "000660"],
+        include_diagnostics=True,
+        quant_agent=_InvalidScoreRecommendationQuant(),
+        market_data_client=_FakeMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert [item["ticker"] for item in payload["recommendations"]] == ["005930"]
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert diagnostics["invalid_score_tickers"] == ["000660"]
 
 
 def test_recommendations_payload_blocks_when_quant_is_not_active():

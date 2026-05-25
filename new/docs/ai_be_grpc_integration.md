@@ -46,7 +46,7 @@ BE 추천종목 화면은 `GetRecommendations`를 호출한다.
 | 필드 | 설명 |
 |---|---|
 | `request_id` | BE 요청 추적 ID. 비어 있으면 AI 서버가 응답용 ID를 생성 |
-| `bundle_id` | 추천에 사용할 paper baseline bundle. 기본 운영값은 `BUNDLE-20260521-POSTCLOSE` |
+| `bundle_id` | 추천에 사용할 paper baseline bundle. 비어 있으면 `risk_config.yaml.grpc_recommendations.default_bundle_id` 사용 |
 | `asof` | 선택. 비어 있으면 조회한 최신 1분봉 시각을 사용 |
 | `tickers` | 선택. 비어 있으면 `new/config/universe_config.yaml`의 active 30종목 전체 |
 | `top_k` | 선택. 기본 10, 최대 30 (`risk_config.yaml`의 `grpc_recommendations`) |
@@ -61,7 +61,7 @@ BE 추천종목 화면은 `GetRecommendations`를 호출한다.
 | `ranking`, `score` | LightGBM cross-sectional ranking 순위와 raw score |
 | `reason` | 추천 사유 코드. 현재는 ranking signal이며 기대수익률은 미보정 |
 | `expected_return`, `expected_return_available` | 현재 모델 score는 보정된 수익률이 아니므로 `expected_return_available=false` |
-| `risk_level` | confidence 기반 `LOW|MEDIUM|HIGH` 표시 |
+| `risk_level` | confidence 기반 `low|medium|high` 표시 |
 | `model_version`, `bundle_id` | 사용한 모델/번들 식별자 |
 
 추천 RPC는 read-only다. 필요한 Dual-Source artifact가 없거나 Quant가 `active`가 아니면 `status=BLOCKED`와 원인만 반환하고, 더미 추천종목을 만들지 않는다.
