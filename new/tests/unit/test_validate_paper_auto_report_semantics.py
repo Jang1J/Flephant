@@ -165,3 +165,102 @@ def test_paper_auto_semantics_allows_rankable_no_rebalance_pass(
     assert report["reports"][0]["warnings"] == [
         "pass_with_only_no_order_delta_cycles_evidence_limited"
     ]
+
+
+def test_paper_auto_semantics_filters_by_generated_date(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_trade_20260522_144359.json").write_text(
+        """
+{
+  "status": "PASS",
+  "generated_at": "2026-05-22T13:18:13+09:00",
+  "params": {"required_bundle_id": "BUNDLE-TEST"},
+  "stages": {
+    "cycles": {
+      "items": [
+        {
+          "order_guard": {"status": "SKIP", "reason": "no_order_deltas"},
+          "execution": null,
+          "hot_result": {
+            "quant_output": {"mode": "warmup", "scores": {}},
+            "final_decision": {"order_deltas": []}
+          }
+        }
+      ]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    (report_dir / "paper_auto_trade_20260526_101500.json").write_text(
+        """
+{
+  "status": "PASS",
+  "generated_at": "2026-05-26T10:15:00+09:00",
+  "params": {"required_bundle_id": "BUNDLE-TEST"},
+  "stages": {
+    "cycles": {
+      "items": [
+        {
+          "order_guard": {"status": "PASS"},
+          "execution": {"execution_report": {"fills": [{"ticker": "005930"}]}},
+          "hot_result": {
+            "quant_output": {
+              "mode": "active",
+              "scores": {"005930": 0.1, "000660": 0.2}
+            },
+            "final_decision": {
+              "order_deltas": [{"ticker": "005930", "side": "buy", "qty": 1}]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260526",
+    )
+
+    assert report["status"] == "PASS"
+    assert report["generated_date"] == "20260526"
+    assert report["report_count"] == 1
+    assert report["reports"][0]["path"].endswith("paper_auto_trade_20260526_101500.json")
+
+
+def test_paper_auto_semantics_blocks_when_generated_date_has_no_reports(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    (repo_root / "artifacts" / "reports" / "paper_auto_trading").mkdir(parents=True)
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260526",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["report_count"] == 0
+    assert report["failures"] == [{
+        "reason": "paper_auto_report_missing",
+        "bundle_id": "BUNDLE-TEST",
+        "report_dir": "artifacts/reports/paper_auto_trading",
+        "pattern": "paper_auto_trade_*.json",
+        "generated_date": "20260526",
+    }]

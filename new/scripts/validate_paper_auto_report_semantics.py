@@ -29,6 +29,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="artifacts/reports/paper_auto_trading",
     )
     parser.add_argument("--pattern", default="paper_auto_trade_*.json")
+    parser.add_argument(
+        "--generated-date",
+        default="",
+        help="Filter reports by KST date YYYYMMDD. Useful to exclude historical false-PASS fixtures.",
+    )
     parser.add_argument("--write-report", action="store_true")
     return parser.parse_args(argv)
 
@@ -79,6 +84,20 @@ def _iter_reports(report_dir: Path, pattern: str) -> list[Path]:
     if not report_dir.exists():
         return []
     return sorted(path for path in report_dir.glob(pattern) if path.is_file())
+
+
+def _matches_generated_date(path: Path, report: dict[str, Any], generated_date: str) -> bool:
+    target = str(generated_date or "").strip()
+    if not target:
+        return True
+    generated_at = str(report.get("generated_at") or "")
+    if len(target) == 8:
+        iso_date = f"{target[:4]}-{target[4:6]}-{target[6:8]}"
+        if generated_at.startswith(iso_date):
+            return True
+        if path.name.startswith(f"paper_auto_trade_{target}_"):
+            return True
+    return False
 
 
 def _cycle_quant_output(cycle: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +207,7 @@ def build_report(
     bundle_id: str = "",
     report_dir: str | Path = "artifacts/reports/paper_auto_trading",
     pattern: str = "paper_auto_trade_*.json",
+    generated_date: str = "",
 ) -> dict[str, Any]:
     base_dir = Path(report_dir)
     if not base_dir.is_absolute():
@@ -202,6 +222,8 @@ def build_report(
             )
             if bundle_id and required_bundle_id != bundle_id:
                 continue
+            if not _matches_generated_date(path, report, generated_date):
+                continue
             summary = _summarize_report(path, report)
             report_summaries.append(summary)
             if summary["blockers"]:
@@ -212,6 +234,14 @@ def build_report(
                 "error_type": type(e).__name__,
                 "error": str(e),
             })
+    if bundle_id and not report_summaries:
+        failures.append({
+            "reason": "paper_auto_report_missing",
+            "bundle_id": bundle_id,
+            "report_dir": str(base_dir.relative_to(REPO_ROOT)),
+            "pattern": pattern,
+            "generated_date": str(generated_date or ""),
+        })
     return {
         "schema_version": "1.0.0",
         "status": "PASS" if not failures else "BLOCKED",
@@ -220,6 +250,7 @@ def build_report(
         "bundle_id": bundle_id,
         "report_dir": str(base_dir.relative_to(REPO_ROOT)),
         "pattern": pattern,
+        "generated_date": str(generated_date or ""),
         "report_count": len(report_summaries),
         "failure_count": len(failures),
         "failures": failures,
@@ -252,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         bundle_id=str(args.bundle_id),
         report_dir=args.report_dir,
         pattern=str(args.pattern),
+        generated_date=str(args.generated_date),
     )
     if args.write_report:
         _write_report(report)

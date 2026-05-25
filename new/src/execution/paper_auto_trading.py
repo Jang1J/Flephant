@@ -47,6 +47,10 @@ class PaperAutoTrader:
         now_fn: Callable[[], datetime] | None = None,
         required_bundle_id: str | None = None,
         kill_switch: KillSwitch | None = None,
+        track_id: str | None = None,
+        policy_hash: str | None = None,
+        max_orders_per_cycle: int | None = None,
+        max_order_qty_per_order: int | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -63,6 +67,8 @@ class PaperAutoTrader:
         self._sleep = sleep_fn or time.sleep
         self._now = now_fn or (lambda: datetime.now(_KST))
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
+        self._track_id = str(track_id or "").strip()
+        self._policy_hash = str(policy_hash or "").strip()
         self._kill_switch = kill_switch or KillSwitch()
         self._active_trade_universe: set[str] | None = None
 
@@ -88,12 +94,16 @@ class PaperAutoTrader:
             default=True,
         )
         self._max_orders_per_cycle = safe_int(
-            self._cfg["max_orders_per_cycle"],
+            max_orders_per_cycle
+            if max_orders_per_cycle is not None
+            else self._cfg["max_orders_per_cycle"],
             default=1,
             min_value=1,
         )
         self._max_order_qty_per_order = safe_int(
-            self._cfg["max_order_qty_per_order"],
+            max_order_qty_per_order
+            if max_order_qty_per_order is not None
+            else self._cfg["max_order_qty_per_order"],
             default=1,
             min_value=1,
         )
@@ -1189,6 +1199,12 @@ class PaperAutoTrader:
                 "cycles": int(cycles),
                 "interval_sec": float(interval_sec),
                 "required_bundle_id": self._required_bundle_id,
+                "track_id": self._track_id,
+                "policy_hash": self._policy_hash,
+                "execution_policy": {
+                    "max_orders_per_cycle": self._max_orders_per_cycle,
+                    "max_order_qty_per_order": self._max_order_qty_per_order,
+                },
             },
             "stages": {},
             "failures": [],

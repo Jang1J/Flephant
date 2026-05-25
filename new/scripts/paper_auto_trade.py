@@ -23,6 +23,42 @@ from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.safe_cast import safe_bool  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 
+_PROFILE_SUFFIXES = (
+    "APP_KEY",
+    "APP_SECRET",
+    "ACCOUNT_NUMBER",
+    "ACCOUNT_PRODUCT_CODE",
+)
+
+
+def _profile_token(raw: str) -> str:
+    return str(raw or "").strip().upper().replace("-", "_")
+
+
+def _apply_kis_profile(profile: str) -> dict[str, Any]:
+    """Map TRACK_KIS_PAPER_* env vars into the effective KIS paper env."""
+    token = _profile_token(profile)
+    if not token:
+        return {"status": "PASS", "profile": ""}
+    sources = {suffix: f"{token}_KIS_PAPER_{suffix}" for suffix in _PROFILE_SUFFIXES}
+    missing = [env for env in sources.values() if not os.environ.get(env, "").strip()]
+    if missing:
+        return {
+            "status": "BLOCKED",
+            "reason": "kis_profile_env_missing",
+            "profile": token,
+            "missing_env": missing,
+        }
+    for suffix, source in sources.items():
+        value = os.environ[source].strip()
+        os.environ[f"KIS_PAPER_{suffix}"] = value
+        os.environ[f"KIS_{suffix}"] = value
+    return {
+        "status": "PASS",
+        "profile": token,
+        "selected_env": list(sources.values()),
+    }
+
 
 def _load_active_tickers(max_tickers: int) -> list[str]:
     cfg = config_load("universe_config.yaml") or {}
@@ -120,6 +156,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--registry-dir", default=None)
     parser.add_argument("--bundle-id", default="", help="strict prelive/paper auto 대상 bundle id")
     parser.add_argument(
+        "--report-dir",
+        default="",
+        help="Optional paper-auto report directory. Use a per-track directory for A/B runs.",
+    )
+    parser.add_argument("--track-id", default="", help="Optional track label, e.g. MAIN_BASELINE")
+    parser.add_argument("--policy-hash", default="", help="Optional fixed policy hash for evidence")
+    parser.add_argument(
+        "--kis-profile",
+        default="",
+        help="Optional env profile token, e.g. ACTIVE_SMALL maps ACTIVE_SMALL_KIS_PAPER_* into KIS_PAPER_*.",
+    )
+    parser.add_argument("--max-orders-per-cycle", type=int, default=None)
+    parser.add_argument("--max-order-qty-per-order", type=int, default=None)
+    parser.add_argument(
         "--cold-risk-report",
         default="",
         help="community/cold-path report JSON. If FDA veto is present, paper-auto honors it as risk warning.",
@@ -157,6 +207,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 1
 
+    profile_guard = _apply_kis_profile(str(args.kis_profile))
+    if profile_guard.get("status") != "PASS":
+        out = {
+            "status": "BLOCKED",
+            "action": "paper_auto_trade",
+            "reason": "kis_profile_not_ready",
+            "profile_guard": profile_guard,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 1
+
     tickers = _parse_tickers(str(args.tickers), int(args.max_tickers))
     prelive = None
     if safe_bool(cfg.get("require_prelive_pass", True), default=True):
@@ -178,7 +239,14 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     risk_warnings = _risk_warning_payloads_from_report(args.cold_risk_report)
-    trader = PaperAutoTrader(required_bundle_id=requested_bundle_id)
+    trader = PaperAutoTrader(
+        required_bundle_id=requested_bundle_id,
+        report_dir=str(args.report_dir).strip() or None,
+        track_id=str(args.track_id).strip() or _profile_token(str(args.kis_profile)),
+        policy_hash=str(args.policy_hash).strip(),
+        max_orders_per_cycle=args.max_orders_per_cycle,
+        max_order_qty_per_order=args.max_order_qty_per_order,
+    )
     report = trader.run(
         tickers=tickers,
         cycles=int(args.cycles),

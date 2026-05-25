@@ -510,6 +510,31 @@ def test_paper_auto_requires_confirm_phrase(tmp_path: Path) -> None:
     assert report["stages"]["start_guard"]["required_phrase"] == "PAPER_AUTO_OK"
 
 
+def test_paper_auto_report_embeds_track_metadata(tmp_path: Path) -> None:
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKIS(),
+        hot_runner=FakeHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+        required_bundle_id="BUNDLE-TEST",
+        track_id="MAIN_BASELINE",
+        policy_hash="policy123",
+        max_orders_per_cycle=4,
+        max_order_qty_per_order=1,
+    )
+
+    report = trader._base_report(tickers=["5930"], cycles=2, interval_sec=60)
+
+    assert report["params"]["track_id"] == "MAIN_BASELINE"
+    assert report["params"]["policy_hash"] == "policy123"
+    assert report["params"]["required_bundle_id"] == "BUNDLE-TEST"
+    assert report["params"]["tickers"] == ["005930"]
+    assert report["params"]["execution_policy"] == {
+        "max_orders_per_cycle": 4,
+        "max_order_qty_per_order": 1,
+    }
+
+
 def test_paper_auto_default_hot_runner_injects_dual_source_loader(
     tmp_path: Path,
     monkeypatch,
@@ -1568,8 +1593,22 @@ def test_paper_auto_cli_passes_bundle_to_prelive_and_trader(monkeypatch, capsys)
         return {"status": "PASS", "blockers": []}
 
     class FakeTrader:
-        def __init__(self, *, required_bundle_id: str | None = None) -> None:
+        def __init__(
+            self,
+            *,
+            required_bundle_id: str | None = None,
+            report_dir: str | None = None,
+            track_id: str = "",
+            policy_hash: str = "",
+            max_orders_per_cycle: int | None = None,
+            max_order_qty_per_order: int | None = None,
+        ) -> None:
             calls["required_bundle_id"] = required_bundle_id
+            calls["report_dir"] = report_dir
+            calls["track_id"] = track_id
+            calls["policy_hash"] = policy_hash
+            calls["max_orders_per_cycle"] = max_orders_per_cycle
+            calls["max_order_qty_per_order"] = max_order_qty_per_order
 
         def run(self, **kwargs: Any) -> dict[str, Any]:
             calls["run"] = kwargs
@@ -1591,5 +1630,70 @@ def test_paper_auto_cli_passes_bundle_to_prelive_and_trader(monkeypatch, capsys)
     assert rc == 0
     assert calls["prelive"]["bundle_id"] == "BUNDLE-TEST"
     assert calls["required_bundle_id"] == "BUNDLE-TEST"
+    assert calls["report_dir"] is None
+    assert calls["track_id"] == ""
+    assert calls["policy_hash"] == ""
+    assert calls["max_orders_per_cycle"] is None
+    assert calls["max_order_qty_per_order"] is None
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "PASS"
+
+
+def test_paper_auto_cli_maps_kis_profile_and_policy_overrides(
+    monkeypatch,
+    capsys,
+) -> None:
+    script = _load_paper_auto_trade_script()
+    calls: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        script,
+        "config_load",
+        lambda _file_name, _section=None: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 0,
+            "max_tickers": 1,
+            "require_prelive_pass": False,
+        },
+    )
+    for key, value in {
+        "ACTIVE_SMALL_KIS_PAPER_APP_KEY": "app_key",
+        "ACTIVE_SMALL_KIS_PAPER_APP_SECRET": "app_secret",
+        "ACTIVE_SMALL_KIS_PAPER_ACCOUNT_NUMBER": "12345678",
+        "ACTIVE_SMALL_KIS_PAPER_ACCOUNT_PRODUCT_CODE": "01",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    class FakeTrader:
+        def __init__(self, **kwargs: Any) -> None:
+            calls["init"] = kwargs
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            calls["run"] = kwargs
+            return {"status": "PASS", "stages": {}}
+
+    monkeypatch.setattr(script, "PaperAutoTrader", FakeTrader)
+
+    rc = script.main([
+        "--tickers",
+        "005930",
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--confirm-phrase",
+        "PAPER_AUTO_OK",
+        "--kis-profile",
+        "ACTIVE_SMALL",
+        "--max-orders-per-cycle",
+        "4",
+        "--max-order-qty-per-order",
+        "1",
+        "--no-write-report",
+    ])
+
+    assert rc == 0
+    assert calls["init"]["track_id"] == "ACTIVE_SMALL"
+    assert calls["init"]["max_orders_per_cycle"] == 4
+    assert calls["init"]["max_order_qty_per_order"] == 1
+    assert script.os.environ["KIS_PAPER_ACCOUNT_NUMBER"] == "12345678"
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "PASS"
