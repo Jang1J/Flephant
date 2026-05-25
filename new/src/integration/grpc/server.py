@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from src.integration.grpc.payloads import (
     build_ack_payload,
     build_health_payload,
+    build_recommendations_payload,
     build_service_readiness_payload,
 )
 from src.integration.kafka.producer import KafkaEventProducer
@@ -640,6 +641,25 @@ def _make_servicer(
 
         def PublishAgentReport(self, request: Any, context: Any) -> Any:  # noqa: N802
             return pb2.Ack(**_ack_from_request(request))
+
+        def GetRecommendations(self, request: Any, context: Any) -> Any:  # noqa: N802
+            payload = build_recommendations_payload(
+                request_id=str(getattr(request, "request_id", "")),
+                bundle_id=str(getattr(request, "bundle_id", "") or bundle_id),
+                asof=str(getattr(request, "asof", "")),
+                tickers=list(getattr(request, "tickers", [])),
+                top_k=int(getattr(request, "top_k", 0) or 0),
+                include_diagnostics=bool(getattr(request, "include_diagnostics", False)),
+                root=root,
+            )
+            items = [
+                pb2.RecommendationItem(**item)
+                for item in payload.pop("recommendations", [])
+            ]
+            return pb2.GetRecommendationsResponse(
+                **payload,
+                recommendations=items,
+            )
 
         def StartPaperAutoTrading(self, request: Any, context: Any) -> Any:  # noqa: N802
             pa_cfg = config_load("risk_config.yaml", "paper_auto_trading") or {}
