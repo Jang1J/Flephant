@@ -46,7 +46,7 @@ def _make_committee(tmp_path: Path | None = None, **overrides):
         "meta_fuser_C": 1.0,
         "sharpe_improvement_threshold": 0.0,
         "cnn_nan_fallback": 0.0,
-        "sharpe_label_col": "label_5m_ret",
+        "sharpe_label_col": "label_5m_net_ret",
         "top_k_fraction": 0.25,
         "artifacts_path": str(tmp_path / "committee") if tmp_path else "artifacts/committee",
     }
@@ -63,7 +63,7 @@ def _synthetic_panel(n_tickers: int = 5, n_ts: int = 30, n_features: int = 4):
     DatasetBuilder 출력과 동일한 컬럼 구조:
     - feat_0 ~ feat_{n-1}: feature 컬럼
     - relevance: LambdaRank 정수 label (0~3)
-    - label_5m_ret: float label (Sharpe 계산용)
+    - label_5m_net_ret: float label (Sharpe 계산용)
     """
     rng = np.random.default_rng(42)
     tickers = [f"{str(i).zfill(6)}" for i in range(n_tickers)]
@@ -78,7 +78,7 @@ def _synthetic_panel(n_tickers: int = 5, n_ts: int = 30, n_features: int = 4):
             rows.append((ts, t, *feat, label_ret, relevance))
 
     feat_cols = [f"feat_{i}" for i in range(n_features)]
-    cols = ["ts_close", "ticker"] + feat_cols + ["label_5m_ret", "relevance"]
+    cols = ["ts_close", "ticker"] + feat_cols + ["label_5m_net_ret", "relevance"]
     df = pd.DataFrame(rows, columns=cols)
     df = df.set_index(["ts_close", "ticker"])
     return df, feat_cols
@@ -631,14 +631,27 @@ def test_committee_oof_sharpe_positive(tmp_path: Path):
             for tk in range(n_tickers):
                 rows.append((ts, f"{tk:06d}", rng.normal(0, 0.002)))
 
-    df = pd.DataFrame(rows, columns=["ts_close", "ticker", "label_5m_ret"])
+    df = pd.DataFrame(rows, columns=["ts_close", "ticker", "label_5m_net_ret"])
     df = df.set_index(["ts_close", "ticker"])
 
-    labels = df["label_5m_ret"].to_numpy(dtype=np.float64)
+    labels = df["label_5m_net_ret"].to_numpy(dtype=np.float64)
     scores = labels + rng.normal(0, 0.0005, len(df))
 
     sr = model._compute_oof_sharpe(scores, df)
     assert sr > 0.0, f"SR 기대 > 0, 실제 {sr:.4f}"
+
+
+def test_committee_oof_sharpe_missing_configured_label_fails_closed(tmp_path: Path):
+    """설정된 Sharpe label이 없으면 과거 label_5m_ret로 fallback하지 않는다."""
+    model = _make_committee(tmp_path=tmp_path)
+    idx = pd.MultiIndex.from_product(
+        [[pd.Timestamp("2026-01-01 09:01")], ["005930", "000660"]],
+        names=["ts_close", "ticker"],
+    )
+    panel = pd.DataFrame({"label_5m_ret": [0.01, -0.01]}, index=idx)
+    scores = np.asarray([0.9, 0.1], dtype=np.float64)
+
+    assert model._compute_oof_sharpe(scores, panel) == 0.0
 
 
 # ====================================================================== #

@@ -636,9 +636,10 @@ class CommitteeModel:
 
         label_col = self._sharpe_label_col
         if label_col not in panel.columns:
-            label_col = "label_5m_ret"
-        if label_col not in panel.columns:
-            logger.warning("[committee] Sharpe label '%s' 없음. 0.0 반환.", label_col)
+            logger.warning(
+                "[committee] 설정된 Sharpe label '%s' 없음. 0.0 반환.",
+                label_col,
+            )
             return 0.0
 
         ts_level = panel.index.get_level_values("ts_close")

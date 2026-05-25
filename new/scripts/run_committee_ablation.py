@@ -11,7 +11,7 @@ improved} 결과를 JSON으로 저장한다.
 실행 (Mode B 시간창 18-22 KST 내 실행):
     python new/scripts/run_committee_ablation.py
 
-기본값으로 실행하면 live_20260515 모델과 동일 조건으로 ablation.
+기본값으로 실행하면 BUNDLE-20260521-POSTCLOSE paper baseline과 동일 조건으로 ablation.
 
 Mode B 가드:
     CommitteeModel.fit()은 @mode_b_only 데코레이터로 ELEPHANT_MODE=mode_b와
@@ -39,12 +39,9 @@ if str(_NEW_SRC) not in sys.path:
 
 os.environ.setdefault("ELEPHANT_MODE", "mode_b")
 
-from src.data.dataset_builder import (  # noqa: E402
-    DUAL_SOURCE_FEATURES,
-    EXOGENOUS_FEATURES,
-    DatasetBuilder,
-)
+from src.data.dataset_builder import DatasetBuilder  # noqa: E402
 from src.models.committee import CommitteeModel  # noqa: E402
+from src.models.lgbm_trainer import _load_feature_cols as _load_lgbm_feature_cols  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
@@ -78,22 +75,30 @@ def _load_universe_tickers(max_tickers: int) -> list[str]:
     return tickers[:max_tickers]
 
 
+def _default_max_tickers() -> int:
+    """paper_auto_trading.max_tickers에서 기본 universe cap 로드."""
+    cfg = config_load("risk_config.yaml", "paper_auto_trading") or {}
+    if "max_tickers" not in cfg:
+        raise RuntimeError("risk_config.yaml paper_auto_trading.max_tickers 설정 누락")
+    return int(cfg["max_tickers"])
+
+
 def _build_feature_cols() -> list[str]:
     """기존 SSOT에서 feature_cols 조합. 하드코딩 금지.
 
-      - OHLCV: risk_config.yaml preprocessor.feature_cols
-      - Dual-Source: dataset_builder.DUAL_SOURCE_FEATURES (community 4개 제외)
-      - Exogenous: dataset_builder.EXOGENOUS_FEATURES
+      - OHLCV: LGBMTrainer feature loader
+      - Dual-Source: LGBMTrainer feature loader 결과에서 community 4개 제외
+      - Exogenous: LGBMTrainer feature loader
 
     결과: 4 + 1 + 9 = 14 (BUNDLE-20260521-POSTCLOSE 운영 모델과 동일).
     """
-    pp_cfg = config_load("risk_config.yaml", "preprocessor") or {}
-    ohlcv_cols: list[str] = list(pp_cfg.get("feature_cols", []))
-    dual_source_cols = [
-        c for c in DUAL_SOURCE_FEATURES if c not in _COMMUNITY_FEATURES_EXCLUDED
+    return [
+        col for col in _load_lgbm_feature_cols(
+            include_dual_source=True,
+            include_exogenous=True,
+        )
+        if col not in _COMMUNITY_FEATURES_EXCLUDED
     ]
-    exogenous_cols = list(EXOGENOUS_FEATURES)
-    return ohlcv_cols + dual_source_cols + exogenous_cols
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,8 +115,8 @@ def parse_args() -> argparse.Namespace:
         help="train 종료일 YYYYMMDD",
     )
     p.add_argument(
-        "--max-tickers", type=int, default=30,
-        help="universe_config.yaml active+pending 종목 중 상위 N개 (default 30)",
+        "--max-tickers", type=int, default=None,
+        help="universe_config.yaml active+pending 종목 중 상위 N개 (default: risk_config paper_auto_trading.max_tickers)",
     )
     p.add_argument(
         "--tickers", nargs="*", default=None,
@@ -134,15 +139,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    max_tickers = int(args.max_tickers) if args.max_tickers is not None else _default_max_tickers()
     tickers = (
         list(args.tickers) if args.tickers
-        else _load_universe_tickers(args.max_tickers)
+        else _load_universe_tickers(max_tickers)
     )
     feature_cols = _build_feature_cols()
 
     started_at = datetime.now(_KST)
     logger.info(
-        "[ablation] 시작. window=%s~%s tickers=%d features=%d label_col=%s",
+        "[위원회절제] 시작. window=%s~%s tickers=%d features=%d label_col=%s",
         args.start_date, args.end_date, len(tickers), len(feature_cols),
         args.label_col,
     )
@@ -157,7 +163,7 @@ def main() -> int:
         end_date=args.end_date,
     )
     logger.info(
-        "[ablation] panel 빌드 완료. rows=%d cols=%d loaded_tickers=%s",
+        "[위원회절제] panel 빌드 완료. rows=%d cols=%d loaded_tickers=%s",
         len(panel), len(panel.columns),
         panel.attrs.get("loaded_tickers", []),
     )
@@ -165,7 +171,7 @@ def main() -> int:
     missing = [c for c in feature_cols if c not in panel.columns]
     if missing:
         raise RuntimeError(
-            f"[ablation] panel에 누락된 feature_cols={missing}. "
+            f"[위원회절제] panel에 누락된 feature_cols={missing}. "
             "dataset_builder dual_source/exogenous join 결과 확인."
         )
 
@@ -187,10 +193,12 @@ def main() -> int:
         "args": {
             "start_date": args.start_date,
             "end_date": args.end_date,
+            "max_tickers": max_tickers,
             "n_tickers": len(tickers),
             "tickers": list(tickers),
             "label_col": args.label_col,
             "feature_cols": feature_cols,
+            "feature_policy_source": "src.models.lgbm_trainer._load_feature_cols",
             "feature_cols_excluded_community": sorted(_COMMUNITY_FEATURES_EXCLUDED),
         },
         "panel": {
@@ -206,7 +214,7 @@ def main() -> int:
         f"committee_ablation_{started_at.strftime('%Y%m%d_%H%M%S')}.json"
     )
     with report_path.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, ensure_ascii=False, indent=2, default=str)
+        json.dump(report, fh, ensure_ascii=False, indent=2)
 
     print()
     print("=" * 60)
