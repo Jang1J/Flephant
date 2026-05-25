@@ -1727,6 +1727,14 @@ committee:
       메타파라미터 변경 전 ablation 검증 필수.
 
 # ============================================================
+# feature_18_experiment: 14피처 vs 18피처 비교 실험 파라미터
+# 추가 4피처(volume_ratio, price_range, 30m_ret, vwap_dev) 생성에 사용.
+# ============================================================
+feature_18_experiment:
+  volume_ratio_window: 30           # volume_ratio rolling mean window (volume_z_windows[0]과 동일 스케일)
+  ret_window: 30                    # feat_Xm_ret momentum window (intraday_feature_windows[0]과 동일 스케일)
+
+# ============================================================
 # knowledge_base: S3-11 KnowledgeBase Layer 5 파라미터
 # new/src/knowledge/kb.py가 이 섹션에서 로드 (불변 원칙 5 하드코딩 금지).
 # 6 storage_type: micro_notes/macro_notes/debate_history/decision_history/backtest_history/factor_zoo
