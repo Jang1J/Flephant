@@ -30,6 +30,13 @@ service AiBeBridgeService {
   rpc PublishExecutionFeedback(ExecutionFeedbackEnvelope) returns (Ack);
   rpc PublishInternalMessage(InternalMessageEnvelope) returns (Ack);
   rpc PublishAgentReport(AgentReportEnvelope) returns (Ack);
+
+  // Paper auto trading lifecycle.
+  // BE에서 Start 요청 시 PaperAutoTrader를 비동기로 실행.
+  // 동시 1세션만 허용 (session lock).
+  rpc StartPaperAutoTrading(StartPaperAutoTradingRequest) returns (StartPaperAutoTradingResponse);
+  rpc StopPaperAutoTrading(StopPaperAutoTradingRequest) returns (StopPaperAutoTradingResponse);
+  rpc GetPaperAutoTradingStatus(GetPaperAutoTradingStatusRequest) returns (PaperAutoTradingStatusResponse);
 }
 
 message HealthCheckRequest {
@@ -172,4 +179,53 @@ message AgentReportEnvelope {
   string summary = 6;
   string payload_json = 7;
   string idempotency_key = 8;
+}
+
+// ── Paper Auto Trading ──────────────────────────────────────
+
+message StartPaperAutoTradingRequest {
+  string request_id = 1;
+  string bundle_id = 2;
+  int32 cycles = 3;
+  int32 interval_sec = 4;
+  repeated string tickers = 5;
+  string confirm_phrase = 6;
+}
+
+message StartPaperAutoTradingResponse {
+  string request_id = 1;
+  bool accepted = 2;
+  string status = 3;
+  string reason = 4;
+  string session_id = 5;
+  string started_at = 6;
+}
+
+message StopPaperAutoTradingRequest {
+  string request_id = 1;
+  string session_id = 2;
+}
+
+message StopPaperAutoTradingResponse {
+  string request_id = 1;
+  bool accepted = 2;
+  string status = 3;
+  string reason = 4;
+  string stopped_at = 5;
+}
+
+message GetPaperAutoTradingStatusRequest {
+  string request_id = 1;
+}
+
+message PaperAutoTradingStatusResponse {
+  string request_id = 1;
+  bool running = 2;
+  string session_id = 3;
+  string status = 4;
+  int32 completed_cycles = 5;
+  int32 total_cycles = 6;
+  string started_at = 7;
+  string bundle_id = 8;
+  string last_cycle_at = 9;
 }
