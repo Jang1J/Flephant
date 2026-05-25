@@ -125,17 +125,18 @@ class _PaperAutoSession:
             }
 
     def status(self) -> dict[str, Any]:
-        """현재 상태 반환."""
-        return {
-            "running": self.running,
-            "session_id": self.session_id,
-            "status": "RUNNING" if self.running else "IDLE",
-            "completed_cycles": self.completed_cycles,
-            "total_cycles": self.total_cycles,
-            "started_at": self.started_at,
-            "bundle_id": self.bundle_id,
-            "last_cycle_at": self.last_cycle_at,
-        }
+        """현재 상태 반환. lock으로 백그라운드 스레드와 일관성 보장."""
+        with self._lock:
+            return {
+                "running": self.running,
+                "session_id": self.session_id,
+                "status": "RUNNING" if self.running else "IDLE",
+                "completed_cycles": self.completed_cycles,
+                "total_cycles": self.total_cycles,
+                "started_at": self.started_at,
+                "bundle_id": self.bundle_id,
+                "last_cycle_at": self.last_cycle_at,
+            }
 
     def _run_loop(
         self,
@@ -159,7 +160,7 @@ class _PaperAutoSession:
                 if stop_event.wait(timeout=sec):
                     raise InterruptedError("stop requested via gRPC")
 
-            trader = _GrpcPaperAutoTrader(
+            trader = _make_grpc_paper_auto_trader(
                 kafka=self._kafka,
                 session_ref=self,
                 required_bundle_id=bundle_id,
@@ -179,6 +180,7 @@ class _PaperAutoSession:
                 bundle_id=bundle_id,
                 payload={"completed_cycles": self.completed_cycles},
             )
+            self._kafka.flush()
         except Exception as e:
             logger.error("[grpc] auto trading 비정상 종료: %s", e)
             self._kafka.emit(
@@ -187,75 +189,83 @@ class _PaperAutoSession:
                 bundle_id=bundle_id,
                 payload={"error": str(e)},
             )
+            self._kafka.flush()
         finally:
             with self._lock:
                 self.running = False
 
 
-class _GrpcPaperAutoTrader:
+def _make_grpc_paper_auto_trader(
+    *,
+    kafka: KafkaEventProducer,
+    session_ref: _PaperAutoSession,
+    **kwargs: Any,
+) -> Any:
     """PaperAutoTrader를 상속해 run_once()마다 실시간 kafka 이벤트 발행.
 
     run() 내부에서 매 cycle마다 run_once()를 호출하므로,
     override한 run_once()에서 super() 호출 후 kafka emit → 실시간.
     PaperAutoTrader 원본 코드 수정 없음.
+
+    lazy import로 circular import 회피.
     """
+    from src.execution.paper_auto_trading import PaperAutoTrader
 
-    def __new__(cls, *, kafka: KafkaEventProducer, session_ref: _PaperAutoSession, **kwargs: Any) -> Any:
-        from src.execution.paper_auto_trading import PaperAutoTrader
+    class _GrpcPaperAutoTrader(PaperAutoTrader):
 
-        class _Impl(PaperAutoTrader):
-            def __init__(self, *, _kafka: KafkaEventProducer, _session: _PaperAutoSession, **kw: Any) -> None:
-                super().__init__(**kw)
-                self._grpc_kafka = _kafka
-                self._grpc_session = _session
+        def __init__(self, *, _kafka: KafkaEventProducer, _session: _PaperAutoSession, **kw: Any) -> None:
+            super().__init__(**kw)
+            self._grpc_kafka = _kafka
+            self._grpc_session = _session
 
-            def run_once(self, *, tickers: list[str], cycle_index: int = 0, risk_warnings: Any = None) -> dict[str, Any]:
-                result = super().run_once(
-                    tickers=tickers,
-                    cycle_index=cycle_index,
-                    risk_warnings=risk_warnings,
-                )
+        def run_once(self, *, tickers: list[str], cycle_index: int = 0, risk_warnings: Any = None) -> dict[str, Any]:
+            result = super().run_once(
+                tickers=tickers,
+                cycle_index=cycle_index,
+                risk_warnings=risk_warnings,
+            )
 
+            with self._grpc_session._lock:
                 self._grpc_session.completed_cycles = cycle_index + 1
                 self._grpc_session.last_cycle_at = datetime.now(_KST).isoformat()
 
-                sid = self._grpc_session.session_id
-                bid = self._grpc_session.bundle_id
+            sid = self._grpc_session.session_id
+            bid = self._grpc_session.bundle_id
 
-                self._grpc_kafka.emit(
-                    "DECISION_COMPLETED",
-                    session_id=sid,
-                    bundle_id=bid,
-                    payload={"cycle": cycle_index + 1, "status": result.get("status", "")},
-                )
+            self._grpc_kafka.emit(
+                "DECISION_COMPLETED",
+                session_id=sid,
+                bundle_id=bid,
+                payload={"cycle": cycle_index + 1, "status": result.get("status", "")},
+            )
 
-                execution = result.get("stages", {}).get("execution", {})
-                if isinstance(execution, dict):
-                    for od in execution.get("order_deltas", []):
-                        self._grpc_kafka.emit(
-                            "PAPER_ORDER_SUBMITTED",
-                            session_id=sid,
-                            bundle_id=bid,
-                            payload={"ticker": od.get("ticker", ""), "side": od.get("side", "")},
-                        )
-                    for fill in execution.get("fills", []):
-                        self._grpc_kafka.emit(
-                            "PAPER_ORDER_FILLED",
-                            session_id=sid,
-                            bundle_id=bid,
-                            payload={"ticker": fill.get("ticker", "")},
-                        )
-                    for rej in execution.get("rejections", []):
-                        self._grpc_kafka.emit(
-                            "PAPER_ORDER_FAILED",
-                            session_id=sid,
-                            bundle_id=bid,
-                            payload={"ticker": rej.get("ticker", ""), "reason": rej.get("reason", "")},
-                        )
+            execution = result.get("stages", {}).get("execution", {})
+            if isinstance(execution, dict):
+                for od in execution.get("order_deltas", []):
+                    self._grpc_kafka.emit(
+                        "PAPER_ORDER_SUBMITTED",
+                        session_id=sid,
+                        bundle_id=bid,
+                        payload={"ticker": od.get("ticker", ""), "side": od.get("side", "")},
+                    )
+                for fill in execution.get("fills", []):
+                    self._grpc_kafka.emit(
+                        "PAPER_ORDER_FILLED",
+                        session_id=sid,
+                        bundle_id=bid,
+                        payload={"ticker": fill.get("ticker", "")},
+                    )
+                for rej in execution.get("rejections", []):
+                    self._grpc_kafka.emit(
+                        "PAPER_ORDER_FAILED",
+                        session_id=sid,
+                        bundle_id=bid,
+                        payload={"ticker": rej.get("ticker", ""), "reason": rej.get("reason", "")},
+                    )
 
-                return result
+            return result
 
-        return _Impl(_kafka=kafka, _session=session_ref, **kwargs)
+    return _GrpcPaperAutoTrader(_kafka=kafka, _session=session_ref, **kwargs)
 
 
 def _load_grpc_modules() -> tuple[Any, Any, Any]:

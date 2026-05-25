@@ -97,12 +97,16 @@ class KafkaEventProducer:
 
         if self._producer is not None:
             try:
-                self._producer.send(
+                future = self._producer.send(
                     self._topic,
                     key=session_id or event_type,
                     value=event,
                 )
-                self._producer.flush()
+                future.add_errback(
+                    lambda exc: logger.error(
+                        "[kafka] 비동기 발행 실패: %s — %s", event_type, exc,
+                    )
+                )
                 logger.info(
                     "[kafka] 이벤트 발행: %s session=%s", event_type, session_id,
                 )
@@ -113,10 +117,19 @@ class KafkaEventProducer:
                 "[kafka] (no-op) %s session=%s", event_type, session_id,
             )
 
-    def close(self) -> None:
-        """Producer 정리."""
+    def flush(self) -> None:
+        """미전송 이벤트 일괄 전송. 세션 종료 시 호출."""
         if self._producer is not None:
             try:
+                self._producer.flush()
+            except Exception as e:
+                logger.warning("[kafka] flush 실패: %s", e)
+
+    def close(self) -> None:
+        """Producer 정리. flush 후 종료."""
+        if self._producer is not None:
+            try:
+                self._producer.flush()
                 self._producer.close()
             except Exception:
                 pass
