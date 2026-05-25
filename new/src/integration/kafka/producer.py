@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -79,6 +80,7 @@ class KafkaEventProducer:
         event_type: str,
         *,
         session_id: str = "",
+        request_id: str = "",
         bundle_id: str = "",
         payload: dict[str, Any] | None = None,
     ) -> None:
@@ -88,13 +90,14 @@ class KafkaEventProducer:
             return
 
         event: dict[str, Any] = {
+            "event_id": str(uuid.uuid4()),
             "event_type": event_type,
             "session_id": session_id,
+            "request_id": request_id,
             "bundle_id": bundle_id,
             "timestamp": datetime.now(_KST).isoformat(),
+            "payload": dict(payload or {}),
         }
-        if payload:
-            event.update(payload)
 
         if self._producer is not None:
             try:

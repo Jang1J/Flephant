@@ -19,6 +19,7 @@ from src.integration.grpc.payloads import (
 from src.integration.kafka.producer import KafkaEventProducer
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("grpc_server")
 _KST = ZoneInfo("Asia/Seoul")
@@ -39,6 +40,7 @@ class _PaperAutoSession:
         self._stop_event = threading.Event()
         self._kafka = kafka
         self.session_id: str = ""
+        self.request_id: str = ""
         self.bundle_id: str = ""
         self.running: bool = False
         self.completed_cycles: int = 0
@@ -49,6 +51,7 @@ class _PaperAutoSession:
     def start(
         self,
         *,
+        request_id: str,
         bundle_id: str,
         cycles: int,
         interval_sec: int,
@@ -67,6 +70,7 @@ class _PaperAutoSession:
                 }
 
             self.session_id = uuid.uuid4().hex[:8]
+            self.request_id = request_id
             self.bundle_id = bundle_id
             self.total_cycles = cycles
             self.completed_cycles = 0
@@ -92,6 +96,7 @@ class _PaperAutoSession:
             self._kafka.emit(
                 "AUTO_TRADING_STARTED",
                 session_id=self.session_id,
+                request_id=self.request_id,
                 bundle_id=bundle_id,
                 payload={"cycles": cycles, "tickers": tickers},
             )
@@ -177,8 +182,26 @@ class _PaperAutoSession:
             self._kafka.emit(
                 "AUTO_TRADING_STOPPED",
                 session_id=self.session_id,
+                request_id=self.request_id,
                 bundle_id=bundle_id,
-                payload={"completed_cycles": self.completed_cycles},
+                payload={
+                    "completed_cycles": self.completed_cycles,
+                    "stop_reason": (
+                        "USER_REQUESTED" if self._stop_event.is_set() else "COMPLETED"
+                    ),
+                },
+            )
+            self._kafka.flush()
+        except InterruptedError:
+            self._kafka.emit(
+                "AUTO_TRADING_STOPPED",
+                session_id=self.session_id,
+                request_id=self.request_id,
+                bundle_id=bundle_id,
+                payload={
+                    "completed_cycles": self.completed_cycles,
+                    "stop_reason": "USER_REQUESTED",
+                },
             )
             self._kafka.flush()
         except Exception as e:
@@ -186,6 +209,7 @@ class _PaperAutoSession:
             self._kafka.emit(
                 "AUTO_TRADING_FAILED",
                 session_id=self.session_id,
+                request_id=self.request_id,
                 bundle_id=bundle_id,
                 payload={"error": str(e)},
             )
@@ -193,6 +217,153 @@ class _PaperAutoSession:
         finally:
             with self._lock:
                 self.running = False
+
+
+def _dict_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [row for row in value if isinstance(row, dict)]
+
+
+def _event_ticker(value: Any) -> str | None:
+    raw = str(value).strip() if value is not None else ""
+    return pad_ticker(raw) if raw else None
+
+
+def _first_not_none(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
+def _event_order_no(row: dict[str, Any]) -> Any:
+    response = row.get("broker_response")
+    response = response if isinstance(response, dict) else {}
+    return (
+        row.get("broker_order_id")
+        or row.get("order_id")
+        or row.get("order_no")
+        or row.get("odno")
+        or row.get("ODNO")
+        or response.get("broker_order_id")
+        or response.get("order_id")
+        or response.get("order_no")
+        or response.get("odno")
+        or response.get("ODNO")
+    )
+
+
+def _paper_cycle_events(
+    result: dict[str, Any],
+    *,
+    cycle: int,
+) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    hot_result = result.get("hot_result")
+    hot_result = hot_result if isinstance(hot_result, dict) else {}
+    decision = hot_result.get("final_decision")
+    decision = decision if isinstance(decision, dict) else {}
+    order_deltas = _dict_rows(decision.get("order_deltas"))
+    decision_payload = {
+        "cycle": cycle,
+        "status": result.get("status", ""),
+        "decision_id": decision.get("decision_id"),
+        "approved": decision.get("approved"),
+        "reason_code": decision.get("reason_code"),
+        "order_count": len(order_deltas),
+    }
+
+    execution = result.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    report = execution.get("execution_report")
+    report = report if isinstance(report, dict) else {}
+    if not report:
+        return decision_payload, []
+
+    common = {
+        "order_plan_id": report.get("order_plan_id"),
+        "execution_mode": "paper",
+        "kis_mode": "virtual",
+        "paper_only": True,
+    }
+    events: list[tuple[str, dict[str, Any]]] = []
+    submitted_rows = _dict_rows(report.get("fills"))
+    for row in submitted_rows:
+        response = row.get("broker_response")
+        response = response if isinstance(response, dict) else {}
+        order_no = _event_order_no(row)
+        events.append((
+            "PAPER_ORDER_SUBMITTED",
+            {
+                **common,
+                "ticker": _event_ticker(row.get("ticker")),
+                "side": row.get("side"),
+                "quantity": row.get("qty"),
+                "price": _first_not_none(row.get("price"), response.get("price")),
+                "order_type": _first_not_none(
+                    row.get("order_type"),
+                    response.get("order_type"),
+                ),
+                "kis_order_no": order_no,
+                "broker_order_id": order_no,
+            },
+        ))
+
+    for row in _dict_rows(report.get("rejections")):
+        response = row.get("broker_response")
+        response = response if isinstance(response, dict) else {}
+        events.append((
+            "PAPER_ORDER_FAILED",
+            {
+                **common,
+                "ticker": _event_ticker(row.get("ticker")),
+                "side": row.get("side"),
+                "quantity": row.get("qty"),
+                "price": _first_not_none(row.get("price"), response.get("price")),
+                "error_code": (
+                    row.get("error_code")
+                    or response.get("msg_cd")
+                    or response.get("rt_cd")
+                ),
+                "reason": row.get("reason"),
+            },
+        ))
+
+    confirmed_rows: list[dict[str, Any]] = []
+    confirmed_order_ids: set[str] = set()
+
+    def add_confirmed_row(row: dict[str, Any]) -> None:
+        order_id = str(_event_order_no(row) or "").strip()
+        if order_id and order_id in confirmed_order_ids:
+            return
+        if order_id:
+            confirmed_order_ids.add(order_id)
+        # Order id가 없으면 서로 다른 체결일 수 있으므로 임의로 합치지 않는다.
+        confirmed_rows.append(row)
+
+    history = result.get("order_history_verification")
+    history = history if isinstance(history, dict) else {}
+    for query in _dict_rows(history.get("queries")):
+        for row in _dict_rows(query.get("matched_orders")):
+            if str(row.get("status", "")).lower() in {"filled", "partial_filled"}:
+                add_confirmed_row(row)
+    if not confirmed_rows:
+        for row in submitted_rows:
+            if str(row.get("broker_status", "")).lower() in {"filled", "partial_filled"}:
+                add_confirmed_row(row)
+
+    for row in confirmed_rows:
+        order_no = _event_order_no(row)
+        events.append((
+            "PAPER_ORDER_FILLED",
+            {
+                **common,
+                "ticker": _event_ticker(row.get("ticker")),
+                "side": row.get("side"),
+                "filled_quantity": row.get("filled_qty", row.get("qty")),
+                "filled_price": row.get("avg_fill_price"),
+                "kis_order_no": order_no,
+                "broker_order_id": order_no,
+            },
+        ))
+    return decision_payload, events
 
 
 def _make_grpc_paper_auto_trader(
@@ -231,37 +402,28 @@ def _make_grpc_paper_auto_trader(
 
             sid = self._grpc_session.session_id
             bid = self._grpc_session.bundle_id
+            rid = self._grpc_session.request_id
+            decision_payload, order_events = _paper_cycle_events(
+                result,
+                cycle=cycle_index + 1,
+            )
 
             self._grpc_kafka.emit(
                 "DECISION_COMPLETED",
                 session_id=sid,
+                request_id=rid,
                 bundle_id=bid,
-                payload={"cycle": cycle_index + 1, "status": result.get("status", "")},
+                payload=decision_payload,
             )
 
-            execution = result.get("execution", {})
-            if isinstance(execution, dict):
-                for od in execution.get("order_deltas", []):
-                    self._grpc_kafka.emit(
-                        "PAPER_ORDER_SUBMITTED",
-                        session_id=sid,
-                        bundle_id=bid,
-                        payload={"ticker": od.get("ticker", ""), "side": od.get("side", "")},
-                    )
-                for fill in execution.get("fills", []):
-                    self._grpc_kafka.emit(
-                        "PAPER_ORDER_FILLED",
-                        session_id=sid,
-                        bundle_id=bid,
-                        payload={"ticker": fill.get("ticker", "")},
-                    )
-                for rej in execution.get("rejections", []):
-                    self._grpc_kafka.emit(
-                        "PAPER_ORDER_FAILED",
-                        session_id=sid,
-                        bundle_id=bid,
-                        payload={"ticker": rej.get("ticker", ""), "reason": rej.get("reason", "")},
-                    )
+            for event_type, payload in order_events:
+                self._grpc_kafka.emit(
+                    event_type,
+                    session_id=sid,
+                    request_id=rid,
+                    bundle_id=bid,
+                    payload=payload,
+                )
 
             return result
 
@@ -369,6 +531,7 @@ def _make_servicer(
             default_cycles = int(pa_cfg["default_max_cycles"])
             default_interval = int(pa_cfg["default_interval_sec"])
             result = session.start(
+                request_id=str(getattr(request, "request_id", "")),
                 bundle_id=str(getattr(request, "bundle_id", "") or bundle_id),
                 cycles=int(getattr(request, "cycles", 0) or default_cycles),
                 interval_sec=int(getattr(request, "interval_sec", 0) or default_interval),
