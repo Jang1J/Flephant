@@ -202,6 +202,7 @@ def _train_lambdarank_oof(panel, feature_cols, label_col):
 
     oof_scores = np.full(len(panel), np.nan, dtype=float)
     fold_info = []
+    booster = None
 
     for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(panel), 1):
         # LambdaRank: 동일 ts_close 행이 연속해야 group 대응이 맞음
@@ -240,6 +241,12 @@ def _train_lambdarank_oof(panel, feature_cols, label_col):
         logger.info(
             "[실험] fold %d 완료. train=%d val=%d best_iter=%d",
             fold_idx, len(train_idx), len(val_idx), booster.best_iteration,
+        )
+
+    if booster is None or not fold_info:
+        raise RuntimeError(
+            "insufficient_walk_forward_folds: no validation folds generated. "
+            "Increase the date range or adjust risk_config.yaml walk_forward train/test/step settings."
         )
 
     return oof_scores, fold_info, booster
@@ -295,7 +302,7 @@ def main() -> int:
         raise RuntimeError(f"extended feature 누락: {missing}")
 
     logger.info("[실험] === Baseline %d피처 LambdaRank 학습 ===", len(baseline_feature_cols))
-    oof_14, folds_14, booster_14 = _train_lambdarank_oof(panel, baseline_feature_cols, args.label_col)
+    oof_14, folds_14, _booster_14 = _train_lambdarank_oof(panel, baseline_feature_cols, args.label_col)
     sharpe_14 = _cross_sectional_oof_sharpe(panel, oof_14, sharpe_label_col, top_k_fraction, annualization_factor)
 
     logger.info("[실험] === Extended %d피처 LambdaRank 학습 ===", len(extended_feature_cols))

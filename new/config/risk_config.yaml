@@ -1728,7 +1728,7 @@ committee:
 
 # ============================================================
 # feature_18_experiment: 14피처 vs 18피처 비교 실험 파라미터
-# 추가 4피처(volume_ratio, price_range, 10m_ret, vwap_dev) 생성에 사용.
+# 추가 4피처(volume_ratio, price_range, 30m_ret, vwap_dev) 생성에 사용.
 # ============================================================
 feature_18_experiment:
   volume_ratio_window: 30           # volume_ratio rolling mean window (volume_z_windows[0]과 동일 스케일)
