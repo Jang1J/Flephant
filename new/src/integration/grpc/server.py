@@ -19,6 +19,7 @@ from src.integration.grpc.payloads import (
 from src.integration.kafka.producer import KafkaEventProducer
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
+from src.utils.ticker_utils import pad_ticker
 
 logger = get_logger("grpc_server")
 _KST = ZoneInfo("Asia/Seoul")
@@ -224,6 +225,11 @@ def _dict_rows(value: Any) -> list[dict[str, Any]]:
     return [row for row in value if isinstance(row, dict)]
 
 
+def _event_ticker(value: Any) -> str | None:
+    raw = str(value).strip() if value is not None else ""
+    return pad_ticker(raw) if raw else None
+
+
 def _paper_cycle_events(
     result: dict[str, Any],
     *,
@@ -272,7 +278,7 @@ def _paper_cycle_events(
             "PAPER_ORDER_SUBMITTED",
             {
                 **common,
-                "ticker": row.get("ticker"),
+                "ticker": _event_ticker(row.get("ticker")),
                 "side": row.get("side"),
                 "quantity": row.get("qty"),
                 "price": row.get("price", response.get("price")),
@@ -289,7 +295,7 @@ def _paper_cycle_events(
             "PAPER_ORDER_FAILED",
             {
                 **common,
-                "ticker": row.get("ticker"),
+                "ticker": _event_ticker(row.get("ticker")),
                 "side": row.get("side"),
                 "quantity": row.get("qty"),
                 "price": row.get("price", response.get("price")),
@@ -303,17 +309,27 @@ def _paper_cycle_events(
         ))
 
     confirmed_rows: list[dict[str, Any]] = []
+    confirmed_order_ids: set[str] = set()
+
+    def add_confirmed_row(row: dict[str, Any]) -> None:
+        order_id = str(row.get("order_id") or row.get("broker_order_id") or "").strip()
+        if order_id and order_id in confirmed_order_ids:
+            return
+        if order_id:
+            confirmed_order_ids.add(order_id)
+        # Order id가 없으면 서로 다른 체결일 수 있으므로 임의로 합치지 않는다.
+        confirmed_rows.append(row)
+
     history = result.get("order_history_verification")
     history = history if isinstance(history, dict) else {}
     for query in _dict_rows(history.get("queries")):
         for row in _dict_rows(query.get("matched_orders")):
             if str(row.get("status", "")).lower() in {"filled", "partial_filled"}:
-                confirmed_rows.append(row)
+                add_confirmed_row(row)
     if not confirmed_rows:
-        confirmed_rows = [
-            row for row in submitted_rows
-            if str(row.get("broker_status", "")).lower() in {"filled", "partial_filled"}
-        ]
+        for row in submitted_rows:
+            if str(row.get("broker_status", "")).lower() in {"filled", "partial_filled"}:
+                add_confirmed_row(row)
 
     for row in confirmed_rows:
         order_no = row.get("order_id") or row.get("broker_order_id")
@@ -321,7 +337,7 @@ def _paper_cycle_events(
             "PAPER_ORDER_FILLED",
             {
                 **common,
-                "ticker": row.get("ticker"),
+                "ticker": _event_ticker(row.get("ticker")),
                 "side": row.get("side"),
                 "filled_quantity": row.get("filled_qty", row.get("qty")),
                 "filled_price": row.get("avg_fill_price"),

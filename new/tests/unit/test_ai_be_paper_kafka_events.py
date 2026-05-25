@@ -73,7 +73,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
             "execution_report": {
                 "order_plan_id": "OP-1",
                 "fills": [{
-                    "ticker": "005930",
+                    "ticker": "5930",
                     "side": "buy",
                     "qty": 1,
                     "broker_status": "submitted",
@@ -84,7 +84,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
                     },
                 }],
                 "rejections": [{
-                    "ticker": "000660",
+                    "ticker": 660,
                     "side": "buy",
                     "qty": 2,
                     "reason": "broker_rt_cd_1",
@@ -105,6 +105,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
         "PAPER_ORDER_FAILED",
     ]
     submitted = events[0][1]
+    assert submitted["ticker"] == "005930"
     assert submitted["quantity"] == 1
     assert submitted["price"] == 72500.0
     assert submitted["order_type"] == "00"
@@ -113,6 +114,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
     assert submitted["execution_mode"] == "paper"
     assert submitted["kis_mode"] == "virtual"
     failed = events[1][1]
+    assert failed["ticker"] == "000660"
     assert failed["error_code"] == "EGW00001"
     assert failed["reason"] == "broker_rt_cd_1"
     assert failed["price"] is None
@@ -136,7 +138,16 @@ def test_paper_cycle_emits_filled_when_order_history_confirms_fill() -> None:
             "queries": [{
                 "matched_orders": [{
                     "order_id": "OD-1",
-                    "ticker": "005930",
+                    "ticker": "5930",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_qty": 1,
+                    "avg_fill_price": 72450.0,
+                }],
+            }, {
+                "matched_orders": [{
+                    "order_id": "OD-1",
+                    "ticker": "5930",
                     "side": "buy",
                     "status": "filled",
                     "filled_qty": 1,
@@ -153,6 +164,7 @@ def test_paper_cycle_emits_filled_when_order_history_confirms_fill() -> None:
         "PAPER_ORDER_FILLED",
     ]
     filled = events[1][1]
+    assert filled["ticker"] == "005930"
     assert filled["filled_quantity"] == 1
     assert filled["filled_price"] == 72450.0
     assert filled["broker_order_id"] == "OD-1"
