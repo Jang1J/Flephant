@@ -176,9 +176,13 @@ def test_paper_cycle_emits_filled_when_order_history_confirms_fill() -> None:
 def test_start_event_carries_start_request_id(monkeypatch) -> None:
     kafka = _RecordingKafka()
     session = _PaperAutoSession(kafka=kafka)
+    seen_events_at_thread_start: list[str] = []
 
     class _Thread:
         def start(self) -> None:
+            seen_events_at_thread_start.extend(
+                event_type for event_type, _payload in kafka.events
+            )
             return None
 
     monkeypatch.setattr(
@@ -198,6 +202,62 @@ def test_start_event_carries_start_request_id(monkeypatch) -> None:
 
     assert kafka.events[0][0] == "AUTO_TRADING_STARTED"
     assert kafka.events[0][1]["request_id"] == "BE-REQ-001"
+    assert seen_events_at_thread_start == ["AUTO_TRADING_STARTED"]
+
+
+def test_start_event_precedes_immediate_thread_failure(monkeypatch) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    captured: dict[str, object] = {}
+
+    class _Thread:
+        def __init__(self, *, target, kwargs, **_unused) -> None:
+            captured["target"] = target
+            captured["kwargs"] = kwargs
+
+        def start(self) -> None:
+            captured["events_at_start"] = [
+                event_type for event_type, _payload in kafka.events
+            ]
+            return None
+
+    class _BrokenTrader:
+        def run(self, **_kwargs) -> None:
+            raise RuntimeError("paper-auto init failed")
+
+    monkeypatch.setattr(grpc_server.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        grpc_server,
+        "_make_grpc_paper_auto_trader",
+        lambda **_kwargs: _BrokenTrader(),
+    )
+
+    session.start(
+        request_id="BE-REQ-001",
+        bundle_id="BUNDLE-1",
+        cycles=1,
+        interval_sec=0,
+        tickers=["005930"],
+        confirm_phrase="PAPER_ORDER_OK",
+    )
+
+    assert [event_type for event_type, _payload in kafka.events] == [
+        "AUTO_TRADING_STARTED",
+    ]
+    assert captured["events_at_start"] == ["AUTO_TRADING_STARTED"]
+
+    target = captured["target"]
+    kwargs = captured["kwargs"]
+    assert callable(target)
+    assert isinstance(kwargs, dict)
+    target(**kwargs)
+
+    assert [event_type for event_type, _payload in kafka.events] == [
+        "AUTO_TRADING_STARTED",
+        "AUTO_TRADING_FAILED",
+    ]
+    assert kafka.events[1][1]["request_id"] == "BE-REQ-001"
+    assert kafka.flushed is True
 
 
 def test_user_stop_is_published_as_stopped_with_start_request_id(monkeypatch) -> None:
