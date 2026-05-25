@@ -152,6 +152,15 @@ paper_auto_trading:
   fail_on_quant_blocked: true              # Quant feature blocker를 no-order PASS로 위장하지 않음
   require_active_scores_for_no_order_skip: true  # score 없는 no_order_deltas는 운영 PASS 금지
 
+grpc_recommendations:
+  default_top_k: 10
+  max_top_k: 30
+  risk_level:
+    low_min_confidence: 0.08
+    medium_min_confidence: 0.03
+  reason_code: "MODEL_RANKING_SIGNAL"
+  expected_return_unavailable_reason: "expected_return_unavailable_not_calibrated"
+
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"
   confirm_deploy_phrase: "DEPLOY_CANDIDATE_OK"

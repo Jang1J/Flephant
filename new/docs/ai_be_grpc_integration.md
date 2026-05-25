@@ -25,6 +25,7 @@
 | `PublishExecutionFeedback` | `/v1/execution-feedback` | C10 execution feedback 전달 |
 | `PublishInternalMessage` | `/v1/internal/messages` | C4 blackboard message 전달 |
 | `PublishAgentReport` | `/v1/internal/agent-reports` | C5 agent report 전달 |
+| `GetRecommendations` | recommendation list | BE 추천종목 화면용 read-only 모델 랭킹 조회 |
 
 ## 안전 정책
 
@@ -32,8 +33,38 @@
 - `HealthCheckResponse.live_trading_allowed=false`가 기본이다.
 - `ExecutionFeedbackEnvelope.live_enabled=true`가 들어오면 AI 서버는 `REJECTED_LIVE_DISABLED`로 거부한다.
 - production registry를 수정하지 않는다.
-- `.env`를 읽지 않는다. 서버는 로컬 산출물만 read-only로 확인한다.
+- `.env` 파일을 직접 읽지 않는다. 추천 RPC는 실행 프로세스에 이미 주입된 환경으로 KIS read-only 시세 조회를 사용할 수 있지만, 주문 API는 호출하지 않는다.
 - FDA는 `target_weights`와 `order_deltas`를 read-only echo로만 가진다. 비중은 PPO, 주문 변경분은 Portfolio Manager 소유다.
+- `GetRecommendations`는 추천종목 표시용 신호만 반환한다. `target_weights`, `order_deltas`, 주문 수량, 주문 방향은 반환하지 않으며 주문 승인으로 해석하면 안 된다.
+
+## 추천종목 RPC
+
+BE 추천종목 화면은 `GetRecommendations`를 호출한다.
+
+요청 필드:
+
+| 필드 | 설명 |
+|---|---|
+| `request_id` | BE 요청 추적 ID. 비어 있으면 AI 서버가 응답용 ID를 생성 |
+| `bundle_id` | 추천에 사용할 paper baseline bundle. 기본 운영값은 `BUNDLE-20260521-POSTCLOSE` |
+| `asof` | 선택. 비어 있으면 조회한 최신 1분봉 시각을 사용 |
+| `tickers` | 선택. 비어 있으면 `new/config/universe_config.yaml`의 active 30종목 전체 |
+| `top_k` | 선택. 기본 10, 최대 30 (`risk_config.yaml`의 `grpc_recommendations`) |
+| `include_diagnostics` | 장애 원인/quant mode 등 진단 JSON 포함 여부 |
+
+응답의 `RecommendationItem`은 다음 필드를 포함한다.
+
+| 필드 | 설명 |
+|---|---|
+| `recommendation_id`, `request_id` | 추천 항목/요청 추적 ID |
+| `stock_code`, `ticker`, `stock_name` | 종목 식별자와 이름 |
+| `ranking`, `score` | LightGBM cross-sectional ranking 순위와 raw score |
+| `reason` | 추천 사유 코드. 현재는 ranking signal이며 기대수익률은 미보정 |
+| `expected_return`, `expected_return_available` | 현재 모델 score는 보정된 수익률이 아니므로 `expected_return_available=false` |
+| `risk_level` | confidence 기반 `LOW|MEDIUM|HIGH` 표시 |
+| `model_version`, `bundle_id` | 사용한 모델/번들 식별자 |
+
+추천 RPC는 read-only다. 필요한 Dual-Source artifact가 없거나 Quant가 `active`가 아니면 `status=BLOCKED`와 원인만 반환하고, 더미 추천종목을 만들지 않는다.
 
 ## AI 쪽 실행 방법
 

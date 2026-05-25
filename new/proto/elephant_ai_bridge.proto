@@ -31,6 +31,10 @@ service AiBeBridgeService {
   rpc PublishInternalMessage(InternalMessageEnvelope) returns (Ack);
   rpc PublishAgentReport(AgentReportEnvelope) returns (Ack);
 
+  // Read-only model recommendation list for BE dashboard/search UI.
+  // This does not authorize orders and never enables live trading.
+  rpc GetRecommendations(GetRecommendationsRequest) returns (GetRecommendationsResponse);
+
   // Paper auto trading lifecycle.
   // BE에서 Start 요청 시 PaperAutoTrader를 비동기로 실행.
   // 동시 1세션만 허용 (session lock).
@@ -84,6 +88,46 @@ message Ack {
   string reason = 4;
   string received_at = 5;
   string idempotency_key = 6;
+}
+
+message GetRecommendationsRequest {
+  string request_id = 1;
+  string bundle_id = 2;
+  string asof = 3;
+  repeated string tickers = 4;
+  int32 top_k = 5;
+  bool include_diagnostics = 6;
+}
+
+message RecommendationItem {
+  string recommendation_id = 1;
+  string request_id = 2;
+  string stock_code = 3;
+  string ticker = 4;
+  string stock_name = 5;
+  int32 ranking = 6;
+  double score = 7;
+  string reason = 8;
+  double expected_return = 9;
+  bool expected_return_available = 10;
+  string risk_level = 11;
+  string model_version = 12;
+  string bundle_id = 13;
+}
+
+message GetRecommendationsResponse {
+  string request_id = 1;
+  string status = 2;
+  string reason = 3;
+  string generated_at = 4;
+  string bundle_id = 5;
+  string model_version = 6;
+  string asof = 7;
+  string mode = 8;
+  repeated RecommendationItem recommendations = 9;
+  bool live_trading_allowed = 10;
+  bool registry_mutated = 11;
+  string diagnostics_json = 12;
 }
 
 message OrderDelta {
