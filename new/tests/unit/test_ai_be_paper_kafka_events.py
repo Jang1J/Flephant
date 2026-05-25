@@ -76,6 +76,8 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
                     "ticker": "5930",
                     "side": "buy",
                     "qty": 1,
+                    "price": None,
+                    "order_type": None,
                     "broker_status": "submitted",
                     "broker_order_id": "OD-1",
                     "broker_response": {
@@ -87,8 +89,9 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
                     "ticker": 660,
                     "side": "buy",
                     "qty": 2,
+                    "price": None,
                     "reason": "broker_rt_cd_1",
-                    "broker_response": {"msg_cd": "EGW00001"},
+                    "broker_response": {"msg_cd": "EGW00001", "price": 190000.0},
                 }],
             },
         },
@@ -117,7 +120,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
     assert failed["ticker"] == "000660"
     assert failed["error_code"] == "EGW00001"
     assert failed["reason"] == "broker_rt_cd_1"
-    assert failed["price"] is None
+    assert failed["price"] == 190000.0
 
 
 def test_paper_cycle_emits_filled_when_order_history_confirms_fill() -> None:
@@ -137,21 +140,21 @@ def test_paper_cycle_emits_filled_when_order_history_confirms_fill() -> None:
         "order_history_verification": {
             "queries": [{
                 "matched_orders": [{
-                    "order_id": "OD-1",
                     "ticker": "5930",
                     "side": "buy",
                     "status": "filled",
                     "filled_qty": 1,
                     "avg_fill_price": 72450.0,
+                    "broker_response": {"ODNO": "OD-1"},
                 }],
             }, {
                 "matched_orders": [{
-                    "order_id": "OD-1",
                     "ticker": "5930",
                     "side": "buy",
                     "status": "filled",
                     "filled_qty": 1,
                     "avg_fill_price": 72450.0,
+                    "broker_response": {"ODNO": "OD-1"},
                 }],
             }],
         },

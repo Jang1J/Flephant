@@ -230,6 +230,27 @@ def _event_ticker(value: Any) -> str | None:
     return pad_ticker(raw) if raw else None
 
 
+def _first_not_none(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
+def _event_order_no(row: dict[str, Any]) -> Any:
+    response = row.get("broker_response")
+    response = response if isinstance(response, dict) else {}
+    return (
+        row.get("broker_order_id")
+        or row.get("order_id")
+        or row.get("order_no")
+        or row.get("odno")
+        or row.get("ODNO")
+        or response.get("broker_order_id")
+        or response.get("order_id")
+        or response.get("order_no")
+        or response.get("odno")
+        or response.get("ODNO")
+    )
+
+
 def _paper_cycle_events(
     result: dict[str, Any],
     *,
@@ -267,13 +288,7 @@ def _paper_cycle_events(
     for row in submitted_rows:
         response = row.get("broker_response")
         response = response if isinstance(response, dict) else {}
-        order_no = (
-            row.get("broker_order_id")
-            or response.get("order_id")
-            or response.get("order_no")
-            or response.get("odno")
-            or response.get("ODNO")
-        )
+        order_no = _event_order_no(row)
         events.append((
             "PAPER_ORDER_SUBMITTED",
             {
@@ -281,8 +296,11 @@ def _paper_cycle_events(
                 "ticker": _event_ticker(row.get("ticker")),
                 "side": row.get("side"),
                 "quantity": row.get("qty"),
-                "price": row.get("price", response.get("price")),
-                "order_type": row.get("order_type", response.get("order_type")),
+                "price": _first_not_none(row.get("price"), response.get("price")),
+                "order_type": _first_not_none(
+                    row.get("order_type"),
+                    response.get("order_type"),
+                ),
                 "kis_order_no": order_no,
                 "broker_order_id": order_no,
             },
@@ -298,7 +316,7 @@ def _paper_cycle_events(
                 "ticker": _event_ticker(row.get("ticker")),
                 "side": row.get("side"),
                 "quantity": row.get("qty"),
-                "price": row.get("price", response.get("price")),
+                "price": _first_not_none(row.get("price"), response.get("price")),
                 "error_code": (
                     row.get("error_code")
                     or response.get("msg_cd")
@@ -312,7 +330,7 @@ def _paper_cycle_events(
     confirmed_order_ids: set[str] = set()
 
     def add_confirmed_row(row: dict[str, Any]) -> None:
-        order_id = str(row.get("order_id") or row.get("broker_order_id") or "").strip()
+        order_id = str(_event_order_no(row) or "").strip()
         if order_id and order_id in confirmed_order_ids:
             return
         if order_id:
@@ -332,7 +350,7 @@ def _paper_cycle_events(
                 add_confirmed_row(row)
 
     for row in confirmed_rows:
-        order_no = row.get("order_id") or row.get("broker_order_id")
+        order_no = _event_order_no(row)
         events.append((
             "PAPER_ORDER_FILLED",
             {
