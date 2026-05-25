@@ -239,7 +239,7 @@ def _make_grpc_paper_auto_trader(
                 payload={"cycle": cycle_index + 1, "status": result.get("status", "")},
             )
 
-            execution = result.get("stages", {}).get("execution", {})
+            execution = result.get("execution", {})
             if isinstance(execution, dict):
                 for od in execution.get("order_deltas", []):
                     self._grpc_kafka.emit(
