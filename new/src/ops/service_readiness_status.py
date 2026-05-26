@@ -8,6 +8,7 @@ never mutates registry artifacts. Backend services can import
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -752,6 +753,8 @@ def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
             return False
         if item.get("status") != "PASS":
             return False
+        if not _paper_auto_cycle_bar_readiness_matched(item):
+            return False
         verification = item.get("order_history_verification")
         if not isinstance(verification, dict) or verification.get("status") != "PASS":
             return False
@@ -768,6 +771,48 @@ def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
             if matched <= 0:
                 return False
     return True
+
+
+def _paper_auto_cycle_bar_readiness_matched(item: dict[str, Any]) -> bool:
+    bar_readiness = item.get("hot_path_bar_readiness")
+    if isinstance(bar_readiness, dict):
+        return bar_readiness.get("status") == "PASS"
+
+    # Legacy paper-auto reports before the explicit bar-readiness field can be
+    # trusted only when they show enough consumed bars and active quant scores.
+    try:
+        n_bars = int(item.get("n_bars", 0) or 0)
+    except (TypeError, ValueError):
+        n_bars = 0
+    hot_result = item.get("hot_result") if isinstance(item.get("hot_result"), dict) else {}
+    quant_output = (
+        hot_result.get("quant_output") if isinstance(hot_result, dict) else {}
+    )
+    scores = (
+        quant_output.get("scores", {}) if isinstance(quant_output, dict) else {}
+    )
+    required_bars = safe_int(
+        (config_load("risk_config.yaml", "quant_agent") or {}).get("warmup_bars"),
+        default=60,
+        min_value=1,
+    )
+    finite_scores = []
+    if isinstance(scores, dict):
+        for value in scores.values():
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(score):
+                return False
+            finite_scores.append(score)
+    return (
+        n_bars >= required_bars
+        and isinstance(quant_output, dict)
+        and str(quant_output.get("mode", "")).lower() == "active"
+        and len(finite_scores) > 0
+        and len(set(finite_scores)) > 1
+    )
 
 
 def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:

@@ -220,6 +220,120 @@ def test_build_news_dart_archive_writes_deploy_quality_zero_event_file(
     assert raw["provenance"]["zero_event_window"] is True
 
 
+def test_build_news_dart_archive_caps_naver_direct_and_broadcast_inputs():
+    mod = _load_script("build_news_dart_archive")
+
+    class FakeNaver:
+        def search_news(self, query, display=100, start=1, sort="date"):
+            return [
+                SimpleNamespace(
+                    pub_date=mod.datetime(2026, 5, 8, 8, idx, tzinfo=mod._KST),
+                    naver_link=f"https://news.example/{query}/{idx}",
+                    original_link="",
+                    title=f"{query} 호재 {idx}",
+                    description="테스트 기사",
+                )
+                for idx in range(5)
+            ]
+
+    direct = mod._fetch_naver_for_ticker(
+        FakeNaver(),
+        ticker="005930",
+        meta={"name": "삼성전자"},
+        window_start=mod.datetime(2026, 5, 8, 7, 0, tzinfo=mod._KST),
+        window_end=mod.datetime(2026, 5, 8, 8, 30, tzinfo=mod._KST),
+        max_pages=10,
+        max_items=2,
+    )
+    broadcast = mod._fetch_naver_broadcast(
+        FakeNaver(),
+        query="코스피",
+        target_tickers=["005930", "000660", "035420"],
+        window_start=mod.datetime(2026, 5, 8, 7, 0, tzinfo=mod._KST),
+        window_end=mod.datetime(2026, 5, 8, 8, 30, tzinfo=mod._KST),
+        kind="naver_market",
+        level="market",
+        max_pages=10,
+        max_items=2,
+    )
+
+    assert len(direct) == 2
+    assert len(broadcast) == 6  # 2 capped items broadcast to 3 tickers.
+
+
+def test_build_news_dart_archive_report_records_text_limits_and_caps(
+    monkeypatch,
+    tmp_path,
+):
+    mod = _load_script("build_news_dart_archive")
+    corp_cache = tmp_path / "corp_cache.json"
+    corp_cache.write_text(
+        json.dumps({
+            "mapping": {
+                "005930": {
+                    "corp_code": "00126380",
+                    "name": "삼성전자",
+                    "aliases": [],
+                }
+            }
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    class RealClient:
+        _is_mock = False
+
+    class FakeNaver(RealClient):
+        def search_news(self, query, display=100, start=1, sort="date"):
+            return [
+                SimpleNamespace(
+                    pub_date=mod.datetime(2026, 5, 8, 8, idx, tzinfo=mod._KST),
+                    naver_link=f"https://news.example/{idx}",
+                    original_link="",
+                    title=f"{query} 호재 {idx}",
+                    description="테스트 기사",
+                )
+                for idx in range(5)
+            ]
+
+    def fake_config_load(name, *args, **kwargs):
+        if name == "dual_source.yaml":
+            return {
+                "materialization": {
+                    "max_news_texts_per_ticker": 2,
+                    "max_news_texts_per_fallback_scope": 3,
+                    "max_market_backstop_texts": 4,
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "DARTRestClient", lambda: RealClient())
+    monkeypatch.setattr(mod, "NaverNewsClient", lambda: FakeNaver())
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+    monkeypatch.setattr(mod, "_fetch_dart_window", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mod, "_load_sector_to_tickers", lambda: {})
+    monkeypatch.setattr(mod, "_MARKET_QUERIES", ())
+
+    output_dir = tmp_path / "raw" / "dual_source"
+    report = mod.build_archive(
+        end_date="20260508",
+        business_days=1,
+        corp_cache_path=corp_cache,
+        output_dir=output_dir,
+        report_dir=tmp_path / "reports",
+        naver_max_pages=10,
+    )
+    raw = json.loads((output_dir / "20260508.json").read_text(encoding="utf-8"))
+
+    assert report["status"] == "PASS"
+    assert report["text_limits"]["max_news_texts_per_ticker"] == 2
+    assert report["fetch_stats"]["005930"]["naver_event_count"] == 2
+    assert report["fetch_stats"]["005930"]["naver_event_cap_limit"] == 2
+    assert report["fetch_stats"]["005930"]["naver_event_cap_applied"] is True
+    assert raw["provenance"]["event_count"] == 2
+
+
 def test_dual_source_history_blocks_missing_event_timestamp(monkeypatch, tmp_path):
     mod = _load_script("materialize_dual_source_history")
     raw_dir = tmp_path / "raw"
@@ -333,6 +447,96 @@ def test_dual_source_history_uses_sector_and_market_fallback(monkeypatch, tmp_pa
     assert artifact.exists()
     assert "news_scope=sector_fallback" in artifact.read_text(encoding="utf-8")
     assert "market_backstop" in artifact.read_text(encoding="utf-8")
+
+
+def test_dual_source_history_caps_scoring_texts_from_config(monkeypatch, tmp_path):
+    mod = _load_script("materialize_dual_source_history")
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "ticker": "005930",
+            "event_ts": "2026-05-08T08:00:00+09:00",
+            "source": "news",
+            "title": f"삼성전자 호재 {idx}",
+        }
+        for idx in range(5)
+    ]
+    (raw_dir / "20260508.json").write_text(
+        json.dumps({
+            "provenance": {"deploy_quality": True},
+            "events": events,
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    captured_rows = []
+
+    class DummyScorer:
+        def score_universe(self, rows, snapshot_ts=None):
+            captured_rows.extend(rows)
+            return [
+                {
+                    "ticker": row["ticker"],
+                    "asof": "2026-05-08T08:30:00+09:00",
+                    "news_score_t": 0.5 if row["news_texts"] else 0.0,
+                    "comm_score_t_1": 0.0,
+                    "comm_score_t_2": 0.0,
+                    "news_comm_divergence": 0.5 if row["news_texts"] else 0.0,
+                    "community_noise_multiplier": 1.0,
+                    "source_notes": "test",
+                }
+                for row in rows
+            ]
+
+        def score(self, **kwargs):
+            return {
+                "ticker": kwargs["ticker"],
+                "asof": "2026-05-08T08:30:00+09:00",
+                "news_score_t": 0.5,
+                "comm_score_t_1": 0.0,
+                "comm_score_t_2": 0.0,
+                "news_comm_divergence": 0.5,
+                "community_noise_multiplier": 1.0,
+                "source_notes": "market",
+            }
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if file_name == "risk_config.yaml" and section == "phase2_feature_backfill":
+            return {"min_dual_source_non_neutral_date_coverage": 0.0}
+        if file_name == "dual_source.yaml":
+            return {
+                "materialization": {
+                    "max_news_texts_per_ticker": 2,
+                    "max_news_texts_per_fallback_scope": 3,
+                    "max_market_backstop_texts": 2,
+                    "max_community_texts_per_ticker": 2,
+                }
+            }
+        return {}
+
+    monkeypatch.setattr(mod, "config_load", fake_config_load)
+    monkeypatch.setattr(mod, "_load_active_universe", lambda: [{"ticker": "005930"}])
+    monkeypatch.setattr(mod, "_business_dates", lambda end_date, business_days: ["20260508"])
+    monkeypatch.setattr(mod, "DualSourceScorer", lambda: DummyScorer())
+
+    report = mod.materialize_dual_source_history(
+        end_date="20260508",
+        business_days=1,
+        raw_events_dir=raw_dir,
+        artifact_dir=tmp_path / "dual_source",
+        output_dir=tmp_path / "reports",
+    )
+
+    assert report["status"] == "PASS", report
+    assert len(captured_rows[0]["news_texts"]) == 2
+    source_stats = report["per_date"][0]["source_stats"]
+    assert source_stats["text_limits"]["max_news_texts_per_ticker"] == 2
+    ticker_stats = source_stats["text_cap_stats"]["news"]["ticker"]
+    assert ticker_stats["original_text_count"] == 5
+    assert ticker_stats["kept_text_count"] == 2
+    assert ticker_stats["dropped_text_count"] == 3
+    assert source_stats["market_news_text_count"] == 5
+    assert source_stats["market_news_text_count_after_cap"] == 2
 
 
 def test_dual_source_history_coverage_threshold_uses_risk_config(monkeypatch, tmp_path):

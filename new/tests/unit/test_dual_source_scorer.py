@@ -113,6 +113,86 @@ class TestNewsScoreT:
         )
         assert note == "finbert_fallback"
 
+    def test_score_news_caps_large_input_and_records_source_note(
+        self,
+        scorer: DualSourceScorer,
+    ) -> None:
+        """Deploy materialization cap이 scorer 최후 방어선으로도 적용된다."""
+        scorer._max_news_texts_per_score = 2
+
+        _, note = scorer.score_news(
+            news_texts=[
+                "삼성전자 호재 기대감 상승",
+                "삼성전자 추가 호재 기대",
+                "삼성전자 악재 우려",
+            ],
+            data_ts=_SAFE_DATA_TS,
+            snapshot_ts=_SAFE_SNAPSHOT,
+        )
+
+        assert "text_cap=2/3" in note
+
+    def test_finbert_cache_dedupes_within_and_across_calls(
+        self,
+        monkeypatch,
+    ) -> None:
+        """FinBERT 입력만 dedup하고 score 평균은 원래 중복 가중치를 보존한다."""
+        import src.data.dual_source_scorer as mod
+
+        calls: list[list[str]] = []
+
+        def fake_finbert_scores(texts: list[str], *, batch_size: int) -> list[float]:
+            calls.append(list(texts))
+            values = {"positive": 0.6, "negative": -0.3, "fresh": 0.2}
+            return [values[text] for text in texts]
+
+        monkeypatch.setattr(mod, "_try_load_finbert", lambda: True)
+        monkeypatch.setattr(mod, "_finbert_scores", fake_finbert_scores)
+
+        scorer = DualSourceScorer()
+        score, note = scorer.score_news(
+            news_texts=["positive", "positive", "negative"],
+            data_ts=_SAFE_DATA_TS,
+            snapshot_ts=_SAFE_SNAPSHOT,
+        )
+
+        assert calls == [["positive", "negative"]]
+        assert score == pytest.approx((0.6 + 0.6 - 0.3) / 3)
+        assert note == "finbert"
+
+        second_score, _ = scorer.score_news(
+            news_texts=["positive", "fresh"],
+            data_ts=_SAFE_DATA_TS,
+            snapshot_ts=_SAFE_SNAPSHOT,
+        )
+        assert calls == [["positive", "negative"], ["fresh"]]
+        assert second_score == pytest.approx((0.6 + 0.2) / 2)
+
+    def test_finbert_fallback_preserves_text_cap_source_note(
+        self,
+        monkeypatch,
+    ) -> None:
+        """FinBERT 예외 fallback에서도 text_cap provenance를 유지한다."""
+        import src.data.dual_source_scorer as mod
+
+        def fail_finbert_scores(texts: list[str], *, batch_size: int) -> list[float]:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(mod, "_try_load_finbert", lambda: True)
+        monkeypatch.setattr(mod, "_finbert_scores", fail_finbert_scores)
+
+        scorer = DualSourceScorer()
+        scorer._max_news_texts_per_score = 2
+
+        _, note = scorer.score_news(
+            news_texts=["삼성전자 호재", "삼성전자 악재", "삼성전자 중립"],
+            data_ts=_SAFE_DATA_TS,
+            snapshot_ts=_SAFE_SNAPSHOT,
+        )
+
+        assert "text_cap=2/3" in note
+        assert "finbert_fallback" in note
+
     def test_score_clamped_minus_one_to_plus_one(self) -> None:
         """keyword fallback 점수 -1 ~ +1 범위 clamp 검증."""
         sentiment_dict = {

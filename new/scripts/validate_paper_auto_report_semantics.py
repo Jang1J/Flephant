@@ -29,7 +29,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="artifacts/reports/paper_auto_trading",
     )
     parser.add_argument("--pattern", default="paper_auto_trade_*.json")
+    parser.add_argument(
+        "--generated-date",
+        default="",
+        help="Filter reports by KST date YYYYMMDD. Useful to exclude historical false-PASS fixtures.",
+    )
     parser.add_argument("--write-report", action="store_true")
+    parser.add_argument(
+        "--no-write-report",
+        action="store_true",
+        help="Accepted for CLI consistency; this validator is read-only unless --write-report is set.",
+    )
     return parser.parse_args(argv)
 
 
@@ -78,7 +88,21 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _iter_reports(report_dir: Path, pattern: str) -> list[Path]:
     if not report_dir.exists():
         return []
-    return sorted(path for path in report_dir.glob(pattern) if path.is_file())
+    return sorted(path for path in report_dir.rglob(pattern) if path.is_file())
+
+
+def _matches_generated_date(path: Path, report: dict[str, Any], generated_date: str) -> bool:
+    target = str(generated_date or "").strip()
+    if not target:
+        return True
+    generated_at = str(report.get("generated_at") or "")
+    if len(target) == 8:
+        iso_date = f"{target[:4]}-{target[4:6]}-{target[6:8]}"
+        if generated_at.startswith(iso_date):
+            return True
+        if path.name.startswith(f"paper_auto_trade_{target}_"):
+            return True
+    return False
 
 
 def _cycle_quant_output(cycle: dict[str, Any]) -> dict[str, Any]:
@@ -88,6 +112,10 @@ def _cycle_quant_output(cycle: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cycle_order_deltas(cycle: dict[str, Any]) -> list[dict[str, Any]]:
+    direct = cycle.get("final_decision")
+    if isinstance(direct, dict):
+        deltas = direct.get("order_deltas")
+        return [delta for delta in deltas if isinstance(delta, dict)] if isinstance(deltas, list) else []
     hot_result = cycle.get("hot_result") if isinstance(cycle.get("hot_result"), dict) else {}
     decision = hot_result.get("final_decision") if isinstance(hot_result, dict) else {}
     deltas = decision.get("order_deltas") if isinstance(decision, dict) else []
@@ -114,6 +142,39 @@ def _cycle_rejection_count(cycle: dict[str, Any]) -> int:
     return len(rejections) if isinstance(rejections, list) else 0
 
 
+def _cycle_has_broker_execution(cycle: dict[str, Any]) -> bool:
+    execution = cycle.get("execution") if isinstance(cycle.get("execution"), dict) else {}
+    if not execution:
+        return False
+    execution_report = (
+        execution.get("execution_report") if isinstance(execution, dict) else {}
+    )
+    report_status = (
+        execution_report.get("status") if isinstance(execution_report, dict) else None
+    )
+    status = str(report_status or execution.get("status") or "").upper()
+    if status in {"NOT_SUBMITTED_SHADOW", "SKIPPED", "NO_ORDERS", "FAIL", "FAILED", "REJECTED"}:
+        return False
+    if status not in {"SUBMITTED", "FILLED", "PARTIAL_FILLED", "PASS"}:
+        return False
+    return _cycle_fill_count(cycle) > 0 or _cycle_rejection_count(cycle) > 0
+
+
+def _cycle_is_shadow_execution(cycle: dict[str, Any]) -> bool:
+    execution = cycle.get("execution") if isinstance(cycle.get("execution"), dict) else {}
+    report = execution.get("execution_report") if isinstance(execution.get("execution_report"), dict) else {}
+    statuses = {
+        str(execution.get("status") or "").upper(),
+        str(report.get("status") or "").upper(),
+    }
+    return "NOT_SUBMITTED_SHADOW" in statuses
+
+
+def _cycle_bar_readiness(cycle: dict[str, Any]) -> dict[str, Any] | None:
+    readiness = cycle.get("hot_path_bar_readiness")
+    return readiness if isinstance(readiness, dict) else None
+
+
 def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
     cycles = (((report.get("stages") or {}).get("cycles") or {}).get("items") or [])
     if not isinstance(cycles, list):
@@ -126,6 +187,9 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
     execution_cycles = 0
     fill_count = 0
     rejection_count = 0
+    shadow_order_delta_cycles = 0
+    hot_path_bar_readiness_present_cycles = 0
+    hot_path_bar_readiness_pass_cycles = 0
     for cycle in cycles:
         if not isinstance(cycle, dict):
             continue
@@ -143,11 +207,21 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         order_guard = cycle.get("order_guard") if isinstance(cycle.get("order_guard"), dict) else {}
         if order_guard.get("reason") == "no_order_deltas":
             no_order_delta_cycles += 1
-        if isinstance(cycle.get("execution"), dict):
+        if _cycle_has_broker_execution(cycle):
             execution_cycles += 1
+        if deltas and _cycle_is_shadow_execution(cycle):
+            shadow_order_delta_cycles += 1
         fill_count += _cycle_fill_count(cycle)
         rejection_count += _cycle_rejection_count(cycle)
+        bar_readiness = _cycle_bar_readiness(cycle)
+        if bar_readiness is not None:
+            hot_path_bar_readiness_present_cycles += 1
+            if str(bar_readiness.get("status") or "").upper() == "PASS":
+                hot_path_bar_readiness_pass_cycles += 1
 
+    hot_path_bar_readiness_missing_cycles = (
+        len(cycles) - hot_path_bar_readiness_present_cycles
+    )
     required_bundle_id = ((report.get("params") or {}).get("required_bundle_id") or "")
     summary = {
         "path": str(path.relative_to(REPO_ROOT)),
@@ -163,6 +237,10 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         "execution_cycles": execution_cycles,
         "fill_count": fill_count,
         "rejection_count": rejection_count,
+        "shadow_order_delta_cycles": shadow_order_delta_cycles,
+        "hot_path_bar_readiness_present_cycles": hot_path_bar_readiness_present_cycles,
+        "hot_path_bar_readiness_pass_cycles": hot_path_bar_readiness_pass_cycles,
+        "hot_path_bar_readiness_missing_cycles": hot_path_bar_readiness_missing_cycles,
         "blockers": [],
         "warnings": [],
     }
@@ -180,6 +258,13 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
                 summary["warnings"].append(
                     "pass_with_only_no_order_delta_cycles_evidence_limited"
                 )
+        if cycles and order_delta_count > 0 and execution_cycles == 0:
+            if shadow_order_delta_cycles > 0:
+                summary["warnings"].append("shadow_only_order_deltas_not_broker_execution")
+            else:
+                summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
+        if execution_cycles > 0 and hot_path_bar_readiness_missing_cycles > 0:
+            summary["warnings"].append("hot_path_bar_readiness_missing_legacy_report")
     return summary
 
 
@@ -188,6 +273,7 @@ def build_report(
     bundle_id: str = "",
     report_dir: str | Path = "artifacts/reports/paper_auto_trading",
     pattern: str = "paper_auto_trade_*.json",
+    generated_date: str = "",
 ) -> dict[str, Any]:
     base_dir = Path(report_dir)
     if not base_dir.is_absolute():
@@ -202,6 +288,8 @@ def build_report(
             )
             if bundle_id and required_bundle_id != bundle_id:
                 continue
+            if not _matches_generated_date(path, report, generated_date):
+                continue
             summary = _summarize_report(path, report)
             report_summaries.append(summary)
             if summary["blockers"]:
@@ -212,6 +300,14 @@ def build_report(
                 "error_type": type(e).__name__,
                 "error": str(e),
             })
+    if bundle_id and not report_summaries:
+        failures.append({
+            "reason": "paper_auto_report_missing",
+            "bundle_id": bundle_id,
+            "report_dir": str(base_dir.relative_to(REPO_ROOT)),
+            "pattern": pattern,
+            "generated_date": str(generated_date or ""),
+        })
     return {
         "schema_version": "1.0.0",
         "status": "PASS" if not failures else "BLOCKED",
@@ -220,6 +316,8 @@ def build_report(
         "bundle_id": bundle_id,
         "report_dir": str(base_dir.relative_to(REPO_ROOT)),
         "pattern": pattern,
+        "scan_mode": "recursive",
+        "generated_date": str(generated_date or ""),
         "report_count": len(report_summaries),
         "failure_count": len(failures),
         "failures": failures,
@@ -252,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         bundle_id=str(args.bundle_id),
         report_dir=args.report_dir,
         pattern=str(args.pattern),
+        generated_date=str(args.generated_date),
     )
     if args.write_report:
         _write_report(report)

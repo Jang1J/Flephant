@@ -326,6 +326,17 @@ def build_report(
     }
 
 
+def _write_report(report: dict[str, Any], *, report_dir: Path) -> dict[str, Any]:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(_KST).strftime("%Y%m%d_%H%M%S")
+    bundle_id = str(report.get("bundle_id", "unknown")).replace("/", "_")
+    path = report_dir / f"artifact_claims_{bundle_id}_{ts}.json"
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, ensure_ascii=False, indent=2)
+    report["report_path"] = str(path)
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle-id", default="BUNDLE-20260521-POSTCLOSE")
@@ -333,6 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-notebooks", action="store_true")
     parser.add_argument("--include-validation-zip", action="store_true")
     parser.add_argument("--fail-on-any-missing", action="store_true")
+    parser.add_argument("--write-report", action="store_true")
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=ROOT / "artifacts" / "reports" / "artifact_claims",
+    )
     args = parser.parse_args(argv)
 
     report = build_report(
@@ -341,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
         include_notebooks=bool(args.include_notebooks),
         include_validation_zip=bool(args.include_validation_zip),
     )
+    if args.write_report:
+        report = _write_report(report, report_dir=args.report_dir)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if report["status"] == "FAIL":
         return 1

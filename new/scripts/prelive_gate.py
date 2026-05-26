@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -1068,6 +1069,10 @@ def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
     for item in items:
         if not isinstance(item, dict):
             continue
+        if item.get("status") != "PASS":
+            continue
+        if not _paper_auto_cycle_bar_readiness_matched(item):
+            continue
         history = item.get("order_history_verification")
         if not isinstance(history, dict) or history.get("status") != "PASS":
             continue
@@ -1079,6 +1084,42 @@ def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
             ) > 0:
                 return True
     return False
+
+
+def _paper_auto_cycle_bar_readiness_matched(item: dict[str, Any]) -> bool:
+    bar_readiness = item.get("hot_path_bar_readiness")
+    if isinstance(bar_readiness, dict):
+        return bar_readiness.get("status") == "PASS"
+
+    n_bars = safe_int(item.get("n_bars", 0), default=0, min_value=0)
+    required_bars = safe_int(
+        (
+            _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
+            .get("quant_agent", {})
+            .get("warmup_bars")
+        ),
+        default=60,
+        min_value=1,
+    )
+    hot_result = item.get("hot_result") if isinstance(item.get("hot_result"), dict) else {}
+    quant_output = hot_result.get("quant_output") if isinstance(hot_result, dict) else {}
+    if not isinstance(quant_output, dict):
+        return False
+    if str(quant_output.get("mode", "")).lower() != "active":
+        return False
+    scores = quant_output.get("scores", {})
+    if not isinstance(scores, dict):
+        return False
+    finite_scores: list[float] = []
+    for value in scores.values():
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(score):
+            return False
+        finite_scores.append(score)
+    return n_bars >= required_bars and len(finite_scores) > 0 and len(set(finite_scores)) > 1
 
 
 def _parse_report_ts(value: Any) -> datetime | None:

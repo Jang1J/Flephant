@@ -21,6 +21,13 @@ news:
   score_window_hours: 12
   finbert_batch_size: 16
 
+materialization:
+  max_news_texts_per_ticker: 80
+  max_news_texts_per_fallback_scope: 120
+  max_market_backstop_texts: 120
+  max_community_texts_per_ticker: 20
+  rationale: "장전 deploy-quality materialize에서 48MB+ raw archive가 CPU FinBERT를 장시간 점유하지 않도록 PIT-safe event order를 유지한 채 scoring 입력량을 제한한다."
+
 community:
   scorer: "spam_rules + manipulation_rules + sentiment_dict + optional_small_model"
   decay_lambda: 0.4

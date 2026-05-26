@@ -151,6 +151,11 @@ paper_auto_trading:
   require_serving_feature_readiness: true  # active model 필수 serving feature 누락 시 broker 주문 전 fail-closed
   fail_on_quant_blocked: true              # Quant feature blocker를 no-order PASS로 위장하지 않음
   require_active_scores_for_no_order_skip: true  # score 없는 no_order_deltas는 운영 PASS 금지
+  historical_warmup_topup:
+    enabled: true
+    data_dir: "artifacts/data"
+    max_files_per_ticker: 5
+    rationale: "KIS minute endpoint can return fewer rows than quant_agent.warmup_bars near open; top up only with past artifact bars before the latest KIS window."
 
 grpc_recommendations:
   mode_b_metadata:
