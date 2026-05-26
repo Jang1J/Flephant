@@ -367,6 +367,7 @@ class DualSourceScorer:
         self._spam_rules: list[dict] = load_spam_rules().get("filters", [])
         self._manipulation_rules: list[dict] = load_manipulation_rules().get("rules", [])
         self._sentiment_dict: dict = load_sentiment_dict()
+        self._finbert_cache: dict[str, float] = {}
 
         logger.info(
             "[dual_source] 초기화 완료: news_decay=%.2f comm_decay=%.2f "
@@ -425,13 +426,26 @@ class DualSourceScorer:
         scores: list[float] = []
         if use_finbert:
             try:
-                scores = _finbert_scores(
-                    valid_texts,
-                    batch_size=self._finbert_batch_size,
+                uncached = list(
+                    dict.fromkeys(
+                        text for text in valid_texts if text not in self._finbert_cache
+                    )
                 )
+                if uncached:
+                    new_scores = _finbert_scores(
+                        uncached,
+                        batch_size=self._finbert_batch_size,
+                    )
+                    for text, score in zip(uncached, new_scores):
+                        self._finbert_cache[text] = score
+                scores = [self._finbert_cache[text] for text in valid_texts]
             except Exception as e:
                 logger.warning("[dual_source] FinBERT batch 추론 실패 fallback: %s", e)
-                source_note = "finbert_fallback"
+                source_note = (
+                    f"{source_note}|finbert_fallback"
+                    if "text_cap=" in source_note and "finbert_fallback" not in source_note
+                    else "finbert_fallback"
+                )
                 scores = [
                     _keyword_fallback_score(text, self._sentiment_dict)
                     for text in valid_texts

@@ -12,7 +12,7 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -33,7 +33,11 @@ def _asof(value: str | None) -> str:
     raw = str(value or "").strip()
     if raw:
         return raw
-    return datetime.now(_KST).isoformat()
+    now = datetime.now(_KST)
+    cutoff = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    if now < cutoff:
+        cutoff -= timedelta(days=1)
+    return cutoff.isoformat()
 
 
 def _date_key(asof: str) -> str:
@@ -94,6 +98,31 @@ def build_report(
 
     quant = quant_factory() if quant_factory else QuantAgent(dual_source_loader=load_latest_scores)
     normalized_tickers = [pad_ticker(str(t)) for t in tickers if str(t).strip()]
+    if not normalized_tickers:
+        return {
+            "status": "FAIL",
+            "generated_at": datetime.now(_KST).isoformat(),
+            "bundle_id": bundle_id,
+            "registry_dir": str(resolved_registry) if resolved_registry else None,
+            "model_version": None,
+            "model_bundle_id": None,
+            "asof": asof,
+            "artifact_date": _date_key(asof),
+            "tickers": [],
+            "required": False,
+            "required_dual_source_cols": [],
+            "required_artifacts": [],
+            "missing_artifacts": [],
+            "artifact_sha256": None,
+            "serving_feature_readiness": {
+                "status": "FAIL",
+                "reason": "empty_ticker_set",
+            },
+            "blockers": [{"reason": "empty_ticker_set"}],
+            "external_kis_api": False,
+            "live_trading_allowed": False,
+            "production_registry_mutated": False,
+        }
     readiness = quant.serving_feature_readiness(normalized_tickers, asof)
     if not isinstance(readiness, dict):
         readiness = {
@@ -106,7 +135,7 @@ def build_report(
     if not isinstance(metadata, dict):
         metadata = None
     model_match = _model_bundle_matches(metadata, bundle_id)
-    date_key = _date_key(asof)
+    date_key = str(readiness.get("artifact_date") or _date_key(asof))
     artifact_path = ROOT / "artifacts" / "dual_source" / f"{date_key}.json"
     artifact_rel = str(artifact_path.relative_to(ROOT))
 

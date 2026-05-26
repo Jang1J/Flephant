@@ -722,6 +722,18 @@ def test_paper_auto_topup_continues_when_latest_file_is_cutoff_filtered(
     ]
 
 
+def test_paper_auto_bar_limit_zero_returns_empty() -> None:
+    bars = [
+        {
+            "ticker": "005930",
+            "ts_close": "2026-05-26T09:00:00+09:00",
+            "close": 70000,
+        }
+    ]
+
+    assert PaperAutoTrader._dedupe_sort_limit_bars(bars, 0) == []  # noqa: SLF001
+
+
 def test_paper_auto_default_hot_runner_injects_dual_source_loader(
     tmp_path: Path,
     monkeypatch,

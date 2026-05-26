@@ -54,7 +54,8 @@ def _write_report(
         "cycles": [cycle for _ in range(cycles)],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def test_daily_summary_excludes_smoke_and_empty_track_from_ab(tmp_path):

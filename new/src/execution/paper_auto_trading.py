@@ -685,8 +685,8 @@ class PaperAutoTrader:
     def _required_warmup_bars() -> int:
         return safe_int(
             (config_load("risk_config.yaml", "quant_agent") or {}).get("warmup_bars"),
-            default=0,
-            min_value=0,
+            default=1,
+            min_value=1,
         )
 
     def _hot_path_bar_readiness(
@@ -702,6 +702,17 @@ class PaperAutoTrader:
         latest_bar_ts_by_ticker: dict[str, str | None] = {}
         future_rows: list[dict[str, str]] = []
         invalid_rows: list[dict[str, str]] = []
+        if required_bars <= 0:
+            return {
+                "status": "FAIL",
+                "required_bars": int(required_bars),
+                "rows_by_ticker": {},
+                "missing_bars_by_ticker": {},
+                "latest_bar_ts_by_ticker": {},
+                "future_rows": [],
+                "invalid_rows": [{"ticker": "*", "ts_close": "invalid_required_bars"}],
+                "bar_warmup_topup": dict(self._last_bar_fetch_metadata or {}),
+            }
         asof_ts = self._parse_bar_ts(asof)
 
         for raw_ticker, bars in bars_by_ticker.items():
@@ -914,6 +925,8 @@ class PaperAutoTrader:
         bars: Iterable[dict[str, Any]],
         limit: int,
     ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
         by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for bar in bars:
             if not isinstance(bar, dict):

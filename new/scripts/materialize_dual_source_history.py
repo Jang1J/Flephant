@@ -464,20 +464,16 @@ def _payload_rows_from_events(
         comm_texts_t1 = list(bucket.get("comm_texts_t1", []) or [])
         comm_scope = "ticker" if comm_texts_t1 else "none"
         if not comm_texts_t1 and sector and sector_comm_texts.get(sector):
-            comm_texts_t1 = _limited_texts(sector_comm_texts[sector], fallback_limit)
+            comm_texts_t1 = list(sector_comm_texts[sector])
             comm_scope = "sector_fallback"
             if sector in sector_latest_ts:
                 data_ts_candidates.append(sector_latest_ts[sector])
         elif not comm_texts_t1 and market_comm_texts:
-            comm_texts_t1 = _limited_texts(market_comm_texts, fallback_limit)
+            comm_texts_t1 = list(market_comm_texts)
             comm_scope = "market_fallback"
             if latest_market_ts is not None:
                 data_ts_candidates.append(latest_market_ts)
-        comm_limit = (
-            limits["max_community_texts_per_ticker"]
-            if comm_scope == "ticker"
-            else fallback_limit
-        )
+        comm_limit = limits["max_community_texts_per_ticker"] or fallback_limit
         comm_texts_t1 = _limited_texts_with_stats(
             comm_texts_t1,
             comm_limit,

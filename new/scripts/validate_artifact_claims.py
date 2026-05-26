@@ -347,7 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--write-report", action="store_true")
     parser.add_argument(
         "--report-dir",
-        default=str(ROOT / "artifacts" / "reports" / "artifact_claims"),
+        type=Path,
+        default=ROOT / "artifacts" / "reports" / "artifact_claims",
     )
     args = parser.parse_args(argv)
 
@@ -358,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         include_validation_zip=bool(args.include_validation_zip),
     )
     if args.write_report:
-        report = _write_report(report, report_dir=Path(str(args.report_dir)))
+        report = _write_report(report, report_dir=args.report_dir)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if report["status"] == "FAIL":
         return 1

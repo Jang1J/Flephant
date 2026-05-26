@@ -45,6 +45,13 @@ class _BlockedQuant(_FakeQuant):
         }
 
 
+class _DifferentArtifactDateQuant(_FakeQuant):
+    def serving_feature_readiness(self, tickers, asof):
+        payload = super().serving_feature_readiness(tickers, asof)
+        payload["artifact_date"] = "20260525"
+        return payload
+
+
 def test_serving_feature_readiness_build_report_passes_with_matching_bundle() -> None:
     mod = _load_module()
 
@@ -61,6 +68,37 @@ def test_serving_feature_readiness_build_report_passes_with_matching_bundle() ->
     assert report["production_registry_mutated"] is False
     assert report["tickers"] == ["005930", "000660"]
     assert report["required_artifacts"] == ["artifacts/dual_source/20260526.json"]
+
+
+def test_serving_feature_readiness_empty_tickers_fail_closed() -> None:
+    mod = _load_module()
+
+    report = mod.build_report(
+        bundle_id="BUNDLE-20260521-POSTCLOSE",
+        registry_dir="",
+        tickers=[],
+        asof="2026-05-26T08:30:00+09:00",
+        quant_factory=_FakeQuant,
+    )
+
+    assert report["status"] == "FAIL"
+    assert report["tickers"] == []
+    assert report["blockers"] == [{"reason": "empty_ticker_set"}]
+
+
+def test_serving_feature_readiness_uses_quant_artifact_date() -> None:
+    mod = _load_module()
+
+    report = mod.build_report(
+        bundle_id="BUNDLE-20260521-POSTCLOSE",
+        registry_dir="",
+        tickers=["005930"],
+        asof="2026-05-26T08:30:00+09:00",
+        quant_factory=_DifferentArtifactDateQuant,
+    )
+
+    assert report["artifact_date"] == "20260525"
+    assert report["required_artifacts"] == ["artifacts/dual_source/20260525.json"]
 
 
 def test_serving_feature_readiness_blocks_missing_feature_or_wrong_bundle() -> None:
