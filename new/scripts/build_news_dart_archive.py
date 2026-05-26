@@ -30,6 +30,7 @@ if str(SRC) not in sys.path:
 from src.connectors.dart_rest import DARTRestClient  # noqa: E402
 from src.connectors.naver_rest import NaverNewsClient  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
@@ -119,6 +120,29 @@ def _load_ticker_meta(path: Path) -> dict[str, dict[str, Any]]:
     return mapping
 
 
+def _materialization_limits() -> dict[str, int]:
+    """Load deploy-time input caps from dual_source.yaml materialization section."""
+    cfg = config_load("dual_source.yaml") or {}
+    materialization = cfg.get("materialization") or {}
+    return {
+        "max_news_texts_per_ticker": safe_int(
+            materialization.get("max_news_texts_per_ticker"),
+            default=0,
+            min_value=0,
+        ),
+        "max_news_texts_per_fallback_scope": safe_int(
+            materialization.get("max_news_texts_per_fallback_scope"),
+            default=0,
+            min_value=0,
+        ),
+        "max_market_backstop_texts": safe_int(
+            materialization.get("max_market_backstop_texts"),
+            default=0,
+            min_value=0,
+        ),
+    }
+
+
 def _fetch_dart_window(
     client: DARTRestClient,
     *,
@@ -173,6 +197,7 @@ def _fetch_naver_for_ticker(
     window_start: datetime,
     window_end: datetime,
     max_pages: int = 10,
+    max_items: int = 0,
 ) -> list[dict[str, Any]]:
     """회사명 + aliases query × Naver search_news (sort=date) + pub_date 윈도우 필터."""
     queries: list[str] = []
@@ -234,6 +259,8 @@ def _fetch_naver_for_ticker(
                     "_query": query,
                 })
                 page_in_window += 1
+                if max_items > 0 and len(out) >= max_items:
+                    return out
             # sort=date라 page 끝까지 모두 window_start 보다 옛날이면 break (다음 페이지 더 옛날)
             if page_too_old >= len(items) and page_in_window == 0:
                 break
@@ -271,6 +298,7 @@ def _fetch_naver_broadcast(
     kind: str,
     level: str,
     max_pages: int = 10,
+    max_items: int = 0,
 ) -> list[dict[str, Any]]:
     """Naver search → window filter → target_tickers 전체에 같은 event broadcast.
 
@@ -311,7 +339,11 @@ def _fetch_naver_broadcast(
             seen_links.add(link)
             items_in_window.append((item, pub_date, link))
             page_in_window += 1
+            if max_items > 0 and len(items_in_window) >= max_items:
+                break
         # sort=date 라 page 모두 window_start 이전이면 다음 페이지도 더 오래된 거. break.
+        if max_items > 0 and len(items_in_window) >= max_items:
+            break
         if page_too_old >= len(items) and page_in_window == 0:
             break
 
@@ -378,6 +410,7 @@ def build_archive(
 
     dart = DARTRestClient()
     naver = NaverNewsClient()
+    text_limits = _materialization_limits()
     provider_availability = {
         "dart_real": _client_is_real(dart),
         "naver_real": _client_is_real(naver),
@@ -394,6 +427,7 @@ def build_archive(
             "files_written": [],
             "total_events": 0,
             "provider_availability": provider_availability,
+            "text_limits": text_limits,
             "fetch_stats": {},
             "sector_broadcast_stats": {},
             "market_broadcast_stats": {},
@@ -420,11 +454,17 @@ def build_archive(
             window_start=overall_window_start,
             window_end=overall_window_end,
             max_pages=naver_max_pages,
+            max_items=text_limits["max_news_texts_per_ticker"],
         )
         events_by_ticker[ticker] = dart_events + naver_events
         fetch_stats[ticker] = {
             "dart_event_count": len(dart_events),
             "naver_event_count": len(naver_events),
+            "naver_event_cap_limit": text_limits["max_news_texts_per_ticker"],
+            "naver_event_cap_applied": (
+                text_limits["max_news_texts_per_ticker"] > 0
+                and len(naver_events) >= text_limits["max_news_texts_per_ticker"]
+            ),
         }
 
     # Stage A2: sector keyword broadcast (news_filter 3-level matching Level 2)
@@ -444,6 +484,7 @@ def build_archive(
             kind="naver_sector",
             level="sector",
             max_pages=naver_max_pages,
+            max_items=text_limits["max_news_texts_per_fallback_scope"],
         )
         sector_broadcast_stats[sector_name] = (
             len(sector_events) // max(len(sector_tickers), 1)
@@ -465,6 +506,7 @@ def build_archive(
             kind="naver_market",
             level="market",
             max_pages=naver_max_pages,
+            max_items=text_limits["max_market_backstop_texts"],
         )
         market_broadcast_stats[market_query] = (
             len(market_events) // max(len(all_active_tickers), 1)
@@ -487,6 +529,7 @@ def build_archive(
             "files_written": [],
             "total_events": 0,
             "provider_availability": provider_availability,
+            "text_limits": text_limits,
             "fetch_stats": fetch_stats,
             "sector_broadcast_stats": sector_broadcast_stats,
             "market_broadcast_stats": market_broadcast_stats,
@@ -591,6 +634,7 @@ def build_archive(
         "files_written": files_written,
         "total_events": total_events,
         "provider_availability": provider_availability,
+        "text_limits": text_limits,
         "fetch_stats": fetch_stats,
         "sector_broadcast_stats": sector_broadcast_stats,
         "market_broadcast_stats": market_broadcast_stats,

@@ -284,6 +284,7 @@ def test_service_status_passes_with_external_broker_evidence(
                         "cycles": {
                             "items": [{
                                 "status": "PASS",
+                                "hot_path_bar_readiness": {"status": "PASS"},
                                 "order_history_verification": {
                                     "status": "PASS",
                                     "queries": [{"matched_order_count": 1}],
@@ -387,6 +388,92 @@ def test_service_status_blocks_failed_auto_cycle_even_with_preflight_evidence(
     assert payload["status"] == "PARTIAL"
     assert payload["broker_evidence"] == "BLOCKED"
     assert payload["kis_broker_evidence"]["paper_auto_cycle_history_matched"] is False
+
+
+def test_paper_auto_cycle_history_requires_hot_path_bar_readiness() -> None:
+    matched = service_readiness_status._paper_auto_cycle_history_matched({
+        "stages": {
+            "paper_auto_cycle": {
+                "stages": {
+                    "cycles": {
+                        "items": [{
+                            "status": "PASS",
+                            "order_history_verification": {
+                                "status": "PASS",
+                                "queries": [{"matched_order_count": 1}],
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    })
+
+    assert matched is False
+
+
+def test_paper_auto_cycle_history_accepts_legacy_active_bar_evidence() -> None:
+    matched = service_readiness_status._paper_auto_cycle_history_matched({
+        "stages": {
+            "paper_auto_cycle": {
+                "stages": {
+                    "cycles": {
+                        "items": [{
+                            "status": "PASS",
+                            "n_bars": 300,
+                            "hot_result": {
+                                "quant_output": {
+                                    "mode": "active",
+                                    "scores": {"005930": 0.1, "000660": 0.2},
+                                },
+                            },
+                            "order_history_verification": {
+                                "status": "PASS",
+                                "queries": [{"matched_order_count": 1}],
+                            },
+                        }],
+                    },
+                },
+            },
+        },
+    })
+
+    assert matched is True
+
+
+def test_paper_auto_cycle_history_rejects_legacy_short_or_unrankable_bars() -> None:
+    def _payload(n_bars: int, scores: dict[str, float]):
+        return {
+            "stages": {
+                "paper_auto_cycle": {
+                    "stages": {
+                        "cycles": {
+                            "items": [{
+                                "status": "PASS",
+                                "n_bars": n_bars,
+                                "hot_result": {
+                                    "quant_output": {
+                                        "mode": "active",
+                                        "scores": scores,
+                                    },
+                                },
+                                "order_history_verification": {
+                                    "status": "PASS",
+                                    "queries": [{"matched_order_count": 1}],
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        }
+
+    assert service_readiness_status._paper_auto_cycle_history_matched(
+        _payload(1, {"005930": 0.1, "000660": 0.2})
+    ) is False
+    assert service_readiness_status._paper_auto_cycle_history_matched(
+        _payload(300, {"005930": 0.1, "000660": 0.1})
+    ) is False
 
 
 def test_service_status_summarizes_latest_paper_smoke_market_closed(
@@ -584,6 +671,7 @@ def test_service_status_blocks_newer_failed_experiment_even_with_older_pass(
                         "cycles": {
                             "items": [{
                                 "status": "PASS",
+                                "hot_path_bar_readiness": {"status": "PASS"},
                                 "order_history_verification": {
                                     "status": "PASS",
                                     "queries": [{"matched_order_count": 1}],
@@ -641,6 +729,7 @@ def test_broker_evidence_treats_string_false_external_flag_as_false(
                         "cycles": {
                             "items": [{
                                 "status": "PASS",
+                                "hot_path_bar_readiness": {"status": "PASS"},
                                 "order_history_verification": {
                                     "status": "PASS",
                                     "queries": [{"matched_order_count": 1}],
@@ -764,6 +853,7 @@ def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
                     "cycles": {
                         "items": [{
                             "status": "PASS",
+                            "hot_path_bar_readiness": {"status": "PASS"},
                             "order_history_verification": {
                                 "status": "PASS",
                                 "queries": [{"matched_order_count": 1}],
@@ -828,6 +918,7 @@ def test_broker_evidence_blocks_newer_external_fail_over_older_pass_same_bundle(
                     "cycles": {
                         "items": [{
                             "status": "PASS",
+                            "hot_path_bar_readiness": {"status": "PASS"},
                             "order_history_verification": {
                                 "status": "PASS",
                                 "queries": [{"matched_order_count": 1}],
@@ -884,6 +975,7 @@ def test_broker_evidence_blocks_stale_external_report(
                     "cycles": {
                         "items": [{
                             "status": "PASS",
+                            "hot_path_bar_readiness": {"status": "PASS"},
                             "order_history_verification": {
                                 "status": "PASS",
                                 "queries": [{"matched_order_count": 1}],
@@ -931,6 +1023,7 @@ def test_broker_evidence_blocks_missing_nested_guard(
                     "cycles": {
                         "items": [{
                             "status": "PASS",
+                            "hot_path_bar_readiness": {"status": "PASS"},
                             "order_history_verification": {
                                 "status": "PASS",
                                 "queries": [{"matched_order_count": 1}],

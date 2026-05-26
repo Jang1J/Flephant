@@ -36,6 +36,7 @@ from src.data.filter_loader import (
 )
 from src.utils.config_loader import load as config_load
 from src.utils.pit_guard import PITViolationError, assert_pit_safe
+from src.utils.safe_cast import safe_int
 
 logger = logging.getLogger(__name__)
 
@@ -329,9 +330,33 @@ class DualSourceScorer:
         news_cfg: dict = cfg.get("news", {})
         comm_cfg: dict = cfg.get("community", {})
         div_cfg: dict = cfg.get("divergence", {})
+        materialization_cfg: dict = cfg.get("materialization", {}) or {}
 
         self._news_decay_lambda: float = float(news_cfg.get("decay_lambda", 0.8))
         self._finbert_batch_size: int = max(1, int(news_cfg.get("finbert_batch_size", 1)))
+        scorer_text_caps = [
+            safe_int(
+                materialization_cfg.get("max_news_texts_per_ticker"),
+                default=0,
+                min_value=0,
+            ),
+            safe_int(
+                materialization_cfg.get("max_news_texts_per_fallback_scope"),
+                default=0,
+                min_value=0,
+            ),
+            safe_int(
+                materialization_cfg.get("max_market_backstop_texts"),
+                default=0,
+                min_value=0,
+            ),
+        ]
+        self._max_news_texts_per_score: int = max(scorer_text_caps)
+        self._max_news_texts_per_ticker: int = safe_int(
+            materialization_cfg.get("max_news_texts_per_ticker"),
+            default=0,
+            min_value=0,
+        )
         self._comm_decay_lambda: float = float(comm_cfg.get("decay_lambda", 0.4))
         self._peak_lag_days: int = int(comm_cfg.get("peak_lag_days", 2))
         self._noise_zscore_threshold: float = float(comm_cfg.get("noise_zscore", 2.5))
@@ -389,6 +414,13 @@ class DualSourceScorer:
         valid_texts = [text for text in news_texts if text and text.strip()]
         if not valid_texts:
             return 0.0, source_note
+        original_text_count = len(valid_texts)
+        if self._max_news_texts_per_score > 0:
+            valid_texts = valid_texts[:self._max_news_texts_per_score]
+            if len(valid_texts) < original_text_count:
+                source_note = (
+                    f"{source_note}|text_cap={len(valid_texts)}/{original_text_count}"
+                )
 
         scores: list[float] = []
         if use_finbert:

@@ -113,6 +113,25 @@ class TestNewsScoreT:
         )
         assert note == "finbert_fallback"
 
+    def test_score_news_caps_large_input_and_records_source_note(
+        self,
+        scorer: DualSourceScorer,
+    ) -> None:
+        """Deploy materialization cap이 scorer 최후 방어선으로도 적용된다."""
+        scorer._max_news_texts_per_score = 2
+
+        _, note = scorer.score_news(
+            news_texts=[
+                "삼성전자 호재 기대감 상승",
+                "삼성전자 추가 호재 기대",
+                "삼성전자 악재 우려",
+            ],
+            data_ts=_SAFE_DATA_TS,
+            snapshot_ts=_SAFE_SNAPSHOT,
+        )
+
+        assert "text_cap=2/3" in note
+
     def test_score_clamped_minus_one_to_plus_one(self) -> None:
         """keyword fallback 점수 -1 ~ +1 범위 clamp 검증."""
         sentiment_dict = {

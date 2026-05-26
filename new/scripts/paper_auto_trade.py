@@ -170,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-orders-per-cycle", type=int, default=None)
     parser.add_argument("--max-order-qty-per-order", type=int, default=None)
     parser.add_argument(
+        "--shadow-only",
+        action="store_true",
+        help="Run Hot Path/order guards but do not submit broker orders.",
+    )
+    parser.add_argument(
         "--cold-risk-report",
         default="",
         help="community/cold-path report JSON. If FDA veto is present, paper-auto honors it as risk warning.",
@@ -246,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         policy_hash=str(args.policy_hash).strip(),
         max_orders_per_cycle=args.max_orders_per_cycle,
         max_order_qty_per_order=args.max_order_qty_per_order,
+        submit_orders=not bool(args.shadow_only),
     )
     report = trader.run(
         tickers=tickers,

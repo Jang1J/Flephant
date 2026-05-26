@@ -6,10 +6,11 @@ Pre-live gate를 통과한 뒤 Hot Path 산출물을 ExecutionGateway(paper)에 
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from src.agents.hot.quant import QuantAgent
@@ -51,6 +52,7 @@ class PaperAutoTrader:
         policy_hash: str | None = None,
         max_orders_per_cycle: int | None = None,
         max_order_qty_per_order: int | None = None,
+        submit_orders: bool = True,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -69,6 +71,7 @@ class PaperAutoTrader:
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
         self._track_id = str(track_id or "").strip()
         self._policy_hash = str(policy_hash or "").strip()
+        self._submit_orders = bool(submit_orders)
         self._kill_switch = kill_switch or KillSwitch()
         self._active_trade_universe: set[str] | None = None
 
@@ -130,6 +133,7 @@ class PaperAutoTrader:
         )
         self._consecutive_read_errors = 0
         self._run_guard_passed = False
+        self._last_bar_fetch_metadata: dict[str, Any] = {}
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -205,12 +209,6 @@ class PaperAutoTrader:
         cycle_reports: list[dict[str, Any]] = []
         self._run_guard_passed = True
         try:
-            try:
-                if getattr(self._hot_runner, "state", None).value != "HOT_RUNNING":
-                    self._hot_runner.start()
-            except AttributeError:
-                self._hot_runner.start()
-
             for idx in range(cycles_int):
                 try:
                     cycle = self.run_once(
@@ -228,7 +226,10 @@ class PaperAutoTrader:
                         cycle_index=idx,
                         reason="paper_auto_cycle_exception",
                         error=e,
+                        started_at=self._now_kst().isoformat(),
                     )
+                if idx == 0 and isinstance(cycle.get("account_state"), dict):
+                    report["account_initial_state"] = dict(cycle["account_state"])
                 cycle_reports.append(cycle)
                 if cycle.get("status") == "FAIL":
                     break
@@ -241,6 +242,7 @@ class PaperAutoTrader:
                     cycle_index=len(cycle_reports),
                     reason="paper_auto_run_exception",
                     error=e,
+                    started_at=self._now_kst().isoformat(),
                 )
             )
         finally:
@@ -260,8 +262,8 @@ class PaperAutoTrader:
         cycle_index: int = 0,
         risk_warnings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        started_at = datetime.now(_KST).isoformat()
         if not self._run_guard_passed:
+            started_at = self._now_kst().isoformat()
             return {
                 "status": "FAIL",
                 "cycle_index": cycle_index,
@@ -269,6 +271,7 @@ class PaperAutoTrader:
                 "reason": "run_once_requires_start_guard",
             }
         market_session_guard = self._market_session_check()
+        started_at = str(market_session_guard.get("now") or self._now_kst().isoformat())
         if market_session_guard["status"] != "PASS":
             return {
                 "status": "PASS" if market_session_guard.get("safe_skip") else "FAIL",
@@ -280,7 +283,7 @@ class PaperAutoTrader:
         padded = [pad_ticker(str(t)) for t in tickers]
         try:
             balance = self._kis_client.get_balance()
-            bars_by_ticker = self._fetch_recent_bars(padded)
+            bars_by_ticker = self._fetch_recent_bars(padded, asof=started_at)
         except Exception as e:
             if self._is_transient_read_error(e):
                 self._consecutive_read_errors += 1
@@ -302,6 +305,7 @@ class PaperAutoTrader:
                     error=e,
                     consecutive_read_errors=self._consecutive_read_errors,
                     fail_closed=fail_closed,
+                    started_at=started_at,
                 )
             raise
         self._consecutive_read_errors = 0
@@ -312,12 +316,35 @@ class PaperAutoTrader:
             latest_prices,
             portfolio_value,
         )
+        hot_path_bar_readiness = self._hot_path_bar_readiness(
+            bars_by_ticker,
+            required_bars=self._required_warmup_bars(),
+            asof=started_at,
+        )
+        account_state = self._account_state_report(
+            balance=balance,
+            current_positions=current_positions,
+            portfolio_value=portfolio_value,
+            captured_at=started_at,
+            mode=str(getattr(self._kis_client, "mode", "unknown")).lower(),
+        )
+        if hot_path_bar_readiness["status"] != "PASS":
+            return {
+                "status": "FAIL",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "hot_path_bar_readiness",
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
+                "execution": None,
+            }
 
         bars_batch = [
             bar
             for ticker in padded
             for bar in bars_by_ticker.get(ticker, [])
         ]
+        self._ensure_hot_runner_started()
         external_risk_warnings = self._normalize_risk_warnings(risk_warnings)
         hot_result = self._hot_runner.run_once(
             tickers=padded,
@@ -342,6 +369,8 @@ class PaperAutoTrader:
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "reason": hot_result.get("reason", "hot_runner_skipped"),
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
                 "hot_result": hot_result,
             }
         if (
@@ -356,6 +385,8 @@ class PaperAutoTrader:
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "reason": hot_result.get("failure_stage", "hot_runner_failed"),
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
                 "hot_result": hot_result,
                 "execution": None,
             }
@@ -368,6 +399,8 @@ class PaperAutoTrader:
                 "started_at": started_at,
                 "reason": "quant_signal_readiness",
                 "quant_signal_guard": quant_signal_guard,
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
                 "hot_result": hot_result,
                 "execution": None,
             }
@@ -385,11 +418,57 @@ class PaperAutoTrader:
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "cold_path_risk_warning_count": len(external_risk_warnings),
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
+                "quant_signal_guard": quant_signal_guard,
                 "order_guard": order_guard,
                 "order_count_caps_applied": order_count_caps_applied,
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
                 "execution": None,
+            }
+
+        if not self._submit_orders:
+            shadow_execution = {
+                "status": "NOT_SUBMITTED_SHADOW",
+                "broker_order_submitted": False,
+                "reason": "shadow_only_no_broker_submit",
+                "would_submit_count": len(final_decision.get("order_deltas", [])),
+                "execution_report": {
+                    "status": "NOT_SUBMITTED_SHADOW",
+                    "fills": [],
+                    "rejections": [],
+                    "orders": [],
+                },
+            }
+            return {
+                "status": "PASS",
+                "cycle_index": cycle_index,
+                "started_at": started_at,
+                "reason": "shadow_only_no_broker_submit",
+                "safe_skip": True,
+                "cold_path_risk_warning_count": len(external_risk_warnings),
+                "portfolio_value": portfolio_value,
+                "n_bars": len(bars_batch),
+                "hot_path_bar_readiness": hot_path_bar_readiness,
+                "account_state": account_state,
+                "quant_signal_guard": quant_signal_guard,
+                "order_guard": order_guard,
+                "order_count_caps_applied": order_count_caps_applied,
+                "order_caps_applied": order_caps_applied,
+                "hot_result": hot_result,
+                "shadow_order_deltas": final_decision.get("order_deltas", []),
+                "execution_order_deltas": final_decision.get("order_deltas", []),
+                "would_submit_count": len(final_decision.get("order_deltas", [])),
+                "broker_order_submitted": False,
+                "shadow_execution": shadow_execution,
+                "execution": shadow_execution,
+                "broker_blockers": [],
+                "order_history_verification": {
+                    "status": "SKIP",
+                    "safe_skip": True,
+                    "reason": "shadow_only_no_broker_submit",
+                },
             }
 
         gateway = ExecutionGateway(
@@ -415,10 +494,16 @@ class PaperAutoTrader:
             "cold_path_risk_warning_count": len(external_risk_warnings),
             "portfolio_value": portfolio_value,
             "n_bars": len(bars_batch),
+            "hot_path_bar_readiness": hot_path_bar_readiness,
+            "account_state": account_state,
+            "quant_signal_guard": quant_signal_guard,
             "order_guard": order_guard,
             "order_count_caps_applied": order_count_caps_applied,
             "order_caps_applied": order_caps_applied,
             "hot_result": hot_result,
+            "submitted_order_deltas": final_decision.get("order_deltas", []),
+            "execution_order_deltas": final_decision.get("order_deltas", []),
+            "broker_order_submitted": True,
             "execution": execution,
             "broker_blockers": broker_blockers,
             "order_history_verification": order_history,
@@ -430,12 +515,17 @@ class PaperAutoTrader:
         cycle_index: int,
         reason: str,
         error: Exception,
+        started_at: str,
     ) -> dict[str, Any]:
         return {
             "status": "FAIL",
             "cycle_index": int(cycle_index),
-            "started_at": datetime.now(_KST).isoformat(),
+            "started_at": started_at,
             "reason": reason,
+            "hot_path_bar_readiness": {
+                "status": "UNKNOWN",
+                "reason": "cycle_exception_before_bar_readiness",
+            },
             "exception_type": type(error).__name__,
             "error": str(error),
             "fail_closed": True,
@@ -449,16 +539,22 @@ class PaperAutoTrader:
         error: Exception,
         consecutive_read_errors: int,
         fail_closed: bool,
+        started_at: str,
     ) -> dict[str, Any]:
         return {
             "status": "FAIL" if fail_closed else "SKIP",
             "cycle_index": int(cycle_index),
-            "started_at": datetime.now(_KST).isoformat(),
+            "started_at": started_at,
             "reason": (
                 "paper_auto_read_error_budget_exhausted"
                 if fail_closed
                 else "paper_auto_read_transient_error_skip"
             ),
+            "hot_path_bar_readiness": {
+                "status": "UNKNOWN",
+                "reason": "read_error_before_bar_readiness",
+                "required_bars": self._required_warmup_bars(),
+            },
             "safe_skip": not fail_closed,
             "exception_type": type(error).__name__,
             "error": str(error),
@@ -515,13 +611,340 @@ class PaperAutoTrader:
         quant = QuantAgent(dual_source_loader=load_latest_scores)
         return HotRunner(quant=quant, ppo=self._make_ppo_allocator())
 
-    def _fetch_recent_bars(self, tickers: list[str]) -> dict[str, list[dict[str, Any]]]:
-        warmup = int(config_load("risk_config.yaml", "quant_agent")["warmup_bars"])
+    def _ensure_hot_runner_started(self) -> None:
+        try:
+            if getattr(self._hot_runner, "state", None).value == "HOT_RUNNING":
+                return
+        except AttributeError:
+            pass
+        self._hot_runner.start()
+
+    def _fetch_recent_bars(
+        self,
+        tickers: list[str],
+        *,
+        asof: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        warmup = self._required_warmup_bars()
         out: dict[str, list[dict[str, Any]]] = {}
+        topup_cfg = self._cfg.get("historical_warmup_topup") or {}
+        topup_enabled = safe_bool(topup_cfg.get("enabled", False), default=False)
+        metadata: dict[str, Any] = {
+            "status": "PASS",
+            "required_bars": int(warmup),
+            "topup_enabled": topup_enabled,
+            "future_bar_filtered": False,
+            "future_rows_kept_for_readiness": True,
+            "selection_policy": "kis_recent_then_pit_safe_historical_artifact_topup",
+            "live_rows_by_ticker": {},
+            "historical_topup_rows_by_ticker": {},
+            "final_rows_by_ticker": {},
+            "topup_cutoff_by_ticker": {},
+            "topup_files_used_by_ticker": {},
+            "topup_file_scan_count_by_ticker": {},
+            "tickers": {},
+        }
         for ticker in tickers:
-            bars = self._kis_client.inquire_minute_bar(ticker, n_bars=warmup)
-            out[ticker] = list(bars)
+            padded = pad_ticker(str(ticker))
+            bars = list(self._kis_client.inquire_minute_bar(padded, n_bars=warmup))
+            filtered_bars = self._filter_future_bars(bars, asof=asof)
+            topped_up, topup_meta = self._historical_warmup_topup(
+                padded,
+                filtered_bars,
+                warmup,
+            )
+            out[padded] = topped_up
+            metadata["live_rows_by_ticker"][padded] = len(filtered_bars)
+            metadata["historical_topup_rows_by_ticker"][padded] = int(
+                topup_meta.get("historical_topup_count", 0)
+            )
+            metadata["final_rows_by_ticker"][padded] = len(topped_up)
+            metadata["topup_cutoff_by_ticker"][padded] = topup_meta.get("cutoff_ts")
+            metadata["topup_files_used_by_ticker"][padded] = topup_meta.get("files_used", [])
+            metadata["topup_file_scan_count_by_ticker"][padded] = int(
+                topup_meta.get("files_scanned_count", 0)
+            )
+            metadata["tickers"][padded] = {
+                "raw_live_bar_count": len(bars),
+                "live_bar_count": len(filtered_bars),
+                "historical_topup_count": int(topup_meta.get("historical_topup_count", 0)),
+                "final_bar_count": len(topped_up),
+                "topup_needed": len(filtered_bars) < warmup,
+                "topup_applied": int(topup_meta.get("historical_topup_count", 0)) > 0,
+                "topup_enabled": bool(topup_meta.get("topup_enabled", topup_enabled)),
+                "cutoff_ts": topup_meta.get("cutoff_ts"),
+                "files_scanned": topup_meta.get("files_scanned", []),
+                "files_used": topup_meta.get("files_used", []),
+                "max_files_per_ticker": topup_meta.get("max_files_per_ticker"),
+                "reason": topup_meta.get("reason"),
+            }
+        self._last_bar_fetch_metadata = metadata
         return out
+
+    @staticmethod
+    def _required_warmup_bars() -> int:
+        return safe_int(
+            (config_load("risk_config.yaml", "quant_agent") or {}).get("warmup_bars"),
+            default=0,
+            min_value=0,
+        )
+
+    def _hot_path_bar_readiness(
+        self,
+        bars_by_ticker: dict[str, list[dict[str, Any]]],
+        *,
+        required_bars: int,
+        asof: str | None,
+    ) -> dict[str, Any]:
+        """Report whether the Hot Path has enough PIT-safe bars for scoring."""
+        rows_by_ticker: dict[str, int] = {}
+        missing_bars_by_ticker: dict[str, int] = {}
+        latest_bar_ts_by_ticker: dict[str, str | None] = {}
+        future_rows: list[dict[str, str]] = []
+        invalid_rows: list[dict[str, str]] = []
+        asof_ts = self._parse_bar_ts(asof)
+
+        for raw_ticker, bars in bars_by_ticker.items():
+            ticker = pad_ticker(str(raw_ticker))
+            rows_by_ticker[ticker] = len(bars)
+            if len(bars) < required_bars:
+                missing_bars_by_ticker[ticker] = required_bars - len(bars)
+
+            parsed_ts: list[datetime] = []
+            for bar in bars:
+                raw_ts = str(bar.get("ts_close") or "")
+                bar_ts = self._parse_bar_ts(raw_ts)
+                if bar_ts is None:
+                    invalid_rows.append({"ticker": ticker, "ts_close": raw_ts})
+                    continue
+                parsed_ts.append(bar_ts)
+                if asof_ts is not None and bar_ts > asof_ts:
+                    future_rows.append({"ticker": ticker, "ts_close": raw_ts})
+            latest_bar_ts_by_ticker[ticker] = (
+                max(parsed_ts).isoformat() if parsed_ts else None
+            )
+
+        status = (
+            "PASS"
+            if not missing_bars_by_ticker and not future_rows and not invalid_rows
+            else "FAIL"
+        )
+        return {
+            "status": status,
+            "required_bars": int(required_bars),
+            "rows_by_ticker": rows_by_ticker,
+            "missing_bars_by_ticker": missing_bars_by_ticker,
+            "latest_bar_ts_by_ticker": latest_bar_ts_by_ticker,
+            "future_rows": future_rows,
+            "invalid_rows": invalid_rows,
+            "bar_warmup_topup": dict(self._last_bar_fetch_metadata or {}),
+        }
+
+    def _filter_future_bars(
+        self,
+        bars: list[dict[str, Any]],
+        *,
+        asof: str | None,
+    ) -> list[dict[str, Any]]:
+        # Keep raw live rows so _hot_path_bar_readiness can fail closed on
+        # invalid/future bars before HotRunner or broker submission.
+        return list(bars)
+
+    def _historical_warmup_topup(
+        self,
+        ticker: str,
+        live_bars: list[dict[str, Any]],
+        warmup: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Top up KIS's short recent-bar window with PIT-safe artifact bars."""
+        topup_meta: dict[str, Any] = {
+            "topup_enabled": False,
+            "historical_topup_count": 0,
+            "files_scanned": [],
+            "files_used": [],
+            "files_scanned_count": 0,
+            "max_files_per_ticker": None,
+            "cutoff_ts": None,
+        }
+        if len(live_bars) >= warmup:
+            topup_meta["reason"] = "live_window_sufficient"
+            final_bars = self._dedupe_sort_limit_bars(live_bars, warmup)
+            return final_bars, topup_meta
+        topup_cfg = self._cfg.get("historical_warmup_topup") or {}
+        if not safe_bool(topup_cfg.get("enabled", False), default=False):
+            topup_meta["reason"] = "topup_disabled"
+            final_bars = self._dedupe_sort_limit_bars(live_bars, warmup)
+            return final_bars, topup_meta
+
+        historical, load_meta = self._load_historical_warmup_bars(
+            ticker=ticker,
+            live_bars=live_bars,
+            missing=max(0, warmup - len(live_bars)),
+            topup_cfg=topup_cfg,
+        )
+        topup_meta.update(load_meta)
+        topup_meta["topup_enabled"] = True
+        topup_meta["historical_topup_count"] = len(historical)
+        topup_meta["reason"] = (
+            "historical_topup_applied" if historical else "historical_topup_unavailable"
+        )
+        if historical:
+            logger.info(
+                "[paper_auto_trading] historical warmup topup: ticker=%s "
+                "live=%d historical=%d warmup=%d",
+                pad_ticker(str(ticker)),
+                len(live_bars),
+                len(historical),
+                warmup,
+            )
+        final_bars = self._dedupe_sort_limit_bars([*historical, *live_bars], warmup)
+        return final_bars, topup_meta
+
+    def _load_historical_warmup_bars(
+        self,
+        *,
+        ticker: str,
+        live_bars: list[dict[str, Any]],
+        missing: int,
+        topup_cfg: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        metadata: dict[str, Any] = {
+            "topup_enabled": True,
+            "historical_topup_count": 0,
+            "files_scanned": [],
+            "files_used": [],
+            "files_scanned_count": 0,
+            "max_files_per_ticker": None,
+            "cutoff_ts": None,
+        }
+        if missing <= 0:
+            metadata["reason"] = "no_missing_bars"
+            return [], metadata
+        data_dir = Path(str(topup_cfg.get("data_dir", "artifacts/data")))
+        if not data_dir.is_absolute():
+            data_dir = _PROJECT_ROOT / data_dir
+        ticker_dir = data_dir / pad_ticker(str(ticker))
+        if not ticker_dir.exists():
+            metadata["reason"] = "ticker_history_dir_missing"
+            return [], metadata
+
+        cutoff = self._historical_topup_cutoff(live_bars)
+        max_files = safe_int(topup_cfg.get("max_files_per_ticker", 5), default=5, min_value=1)
+        metadata["cutoff_ts"] = cutoff.isoformat() if cutoff is not None else None
+        metadata["max_files_per_ticker"] = max_files
+        candidate_files = sorted(ticker_dir.glob("bars_1m_*.parquet"), reverse=True)
+        filtered: list[dict[str, Any]] = []
+        for path in candidate_files[:max_files]:
+            rel_path = str(path)
+            try:
+                rel_path = str(path.relative_to(_PROJECT_ROOT))
+            except ValueError:
+                pass
+            metadata["files_scanned"].append(rel_path)
+            rows = self._read_warmup_bar_file(path)
+            before_count = len(filtered)
+            for row in rows:
+                ts = self._parse_bar_ts(row.get("ts_close"))
+                if ts is None:
+                    continue
+                if cutoff is not None and ts >= cutoff:
+                    continue
+                filtered.append(row)
+            if len(filtered) > before_count:
+                metadata["files_used"].append(rel_path)
+            if len(filtered) >= missing:
+                break
+        metadata["files_scanned_count"] = len(metadata["files_scanned"])
+        final_rows = self._dedupe_sort_limit_bars(filtered, missing)
+        metadata["historical_topup_count"] = len(final_rows)
+        return final_rows, metadata
+
+    def _historical_topup_cutoff(self, live_bars: list[dict[str, Any]]) -> datetime | None:
+        timestamps = [
+            ts
+            for ts in (self._parse_bar_ts(bar.get("ts_close")) for bar in live_bars)
+            if ts is not None
+        ]
+        if timestamps:
+            return min(timestamps)
+        now = self._now()
+        if now.tzinfo is None:
+            return now.replace(tzinfo=_KST)
+        return now.astimezone(_KST)
+
+    def _now_kst(self) -> datetime:
+        now = self._now()
+        if now.tzinfo is None:
+            return now.replace(tzinfo=_KST)
+        return now.astimezone(_KST)
+
+    @staticmethod
+    def _read_warmup_bar_file(path: Path) -> list[dict[str, Any]]:
+        try:
+            import pandas as pd
+        except ImportError as e:
+            logger.warning("[paper_auto_trading] pandas unavailable for warmup topup: %s", e)
+            return []
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as e:
+            logger.warning("[paper_auto_trading] warmup topup read failed: %s error=%s", path, e)
+            return []
+        records: list[dict[str, Any]] = []
+        for record in frame.to_dict("records"):
+            if not isinstance(record, dict):
+                continue
+            records.append(PaperAutoTrader._normalize_bar_record(record))
+        return records
+
+    @staticmethod
+    def _normalize_bar_record(record: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = dict(record)
+        ts = out.get("ts_close")
+        if hasattr(ts, "isoformat"):
+            out["ts_close"] = ts.isoformat()
+        for key in ("open", "high", "low", "close", "volume"):
+            if key in out:
+                out[key] = safe_float(out.get(key), default=0.0)
+        out["ticker"] = pad_ticker(str(out.get("ticker", "")))
+        return out
+
+    @staticmethod
+    def _dedupe_sort_limit_bars(
+        bars: Iterable[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for bar in bars:
+            if not isinstance(bar, dict):
+                continue
+            ticker = pad_ticker(str(bar.get("ticker", "")))
+            ts_close = str(bar.get("ts_close") or "")
+            if ticker == "000000" or not ts_close:
+                continue
+            normalized = dict(bar)
+            normalized["ticker"] = ticker
+            by_key[(ticker, ts_close)] = normalized
+        ordered = sorted(
+            by_key.values(),
+            key=lambda item: (
+                pad_ticker(str(item.get("ticker", ""))),
+                str(item.get("ts_close") or ""),
+            ),
+        )
+        return ordered[-limit:]
+
+    @staticmethod
+    def _parse_bar_ts(raw: Any) -> datetime | None:
+        if raw is None:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=_KST)
+        return ts.astimezone(_KST)
 
     @staticmethod
     def _latest_prices(bars_by_ticker: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
@@ -570,6 +993,42 @@ class PaperAutoTrader:
                 "weight": float(weight),
             })
         return out
+
+    @staticmethod
+    def _account_state_report(
+        *,
+        balance: dict[str, Any],
+        current_positions: list[dict[str, Any]],
+        portfolio_value: float,
+        captured_at: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        bal = balance.get("balance") if isinstance(balance.get("balance"), dict) else {}
+        positions = [
+            {
+                "ticker": pad_ticker(str(pos.get("ticker", ""))),
+                "qty": safe_lossless_int(pos.get("qty", 0), default=0, min_value=0),
+                "available_qty": safe_lossless_int(
+                    pos.get("available_qty", 0),
+                    default=0,
+                    min_value=0,
+                ),
+                "weight": safe_float(pos.get("weight", 0.0), default=0.0),
+            }
+            for pos in current_positions
+        ]
+        return {
+            "status": "PASS",
+            "captured_at": captured_at,
+            "source": "kis_virtual_balance",
+            "_mode": mode,
+            "position_count": len(positions),
+            "current_position_count": len(positions),
+            "positions": positions,
+            "cash": safe_float(bal.get("cash", 0.0), default=0.0),
+            "net_asset": safe_float(bal.get("net_asset", 0.0), default=0.0),
+            "portfolio_value": float(portfolio_value),
+        }
 
     def _start_guard(self, confirm_phrase: str | None) -> dict[str, Any]:
         if confirm_phrase != self._confirm_start_phrase:
@@ -1050,7 +1509,7 @@ class PaperAutoTrader:
         """Block paper orders when Quant did not emit active, non-empty scores."""
         quant_output = hot_result.get("quant_output") if isinstance(hot_result, dict) else None
         if not isinstance(quant_output, dict):
-            return {"status": "PASS", "reason": "quant_output_not_reported"}
+            return {"status": "FAIL", "reason": "quant_output_not_reported"}
         mode = str(quant_output.get("mode", "unknown"))
         scores = quant_output.get("scores", {})
         score_count = len(scores) if isinstance(scores, dict) else 0
@@ -1061,11 +1520,34 @@ class PaperAutoTrader:
                 "quant_mode": mode,
                 "score_count": score_count,
             }
+        finite_scores: list[float] = []
+        for value in scores.values():
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(parsed):
+                finite_scores.append(parsed)
+        rankable = (
+            bool(len(finite_scores) == 1 and abs(finite_scores[0]) > 1e-12)
+            or bool(len(finite_scores) > 1 and len(set(finite_scores)) > 1)
+        )
+        if len(finite_scores) != score_count or not rankable:
+            return {
+                "status": "FAIL",
+                "reason": "active_model_quant_scores_not_rankable",
+                "quant_mode": mode,
+                "score_count": score_count,
+                "finite_score_count": len(finite_scores),
+                "rankable": rankable,
+            }
         return {
             "status": "PASS",
             "reason": "active_quant_scores_present",
             "quant_mode": mode,
             "score_count": score_count,
+            "finite_score_count": len(finite_scores),
+            "rankable": rankable,
         }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
@@ -1193,6 +1675,8 @@ class PaperAutoTrader:
                 "execution_mode": "paper",
                 "live_enabled": False,
                 "confirm_start_required": True,
+                "broker_submit_enabled": self._submit_orders,
+                "shadow_only": not self._submit_orders,
             },
             "params": {
                 "tickers": [pad_ticker(str(t)) for t in tickers],

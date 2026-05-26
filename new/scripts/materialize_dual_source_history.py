@@ -23,7 +23,7 @@ if str(SRC) not in sys.path:
 from src.data.dual_source_runner import _load_active_universe  # noqa: E402
 from src.data.dual_source_scorer import DualSourceScorer  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
-from src.utils.safe_cast import safe_bool, safe_float  # noqa: E402
+from src.utils.safe_cast import safe_bool, safe_float, safe_int  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
     kospi_trading_dates_between,
     kospi_trading_start_date,
@@ -141,6 +141,68 @@ def _limited_texts(texts: list[str], limit: int | None) -> list[str]:
     return list(texts[:limit])
 
 
+def _materialization_text_limits() -> dict[str, int | None]:
+    cfg = config_load("dual_source.yaml") or {}
+    materialization = cfg.get("materialization", {}) or {}
+
+    def _limit(key: str) -> int | None:
+        value = safe_int(
+            materialization.get(key),
+            default=0,
+            min_value=0,
+        )
+        return value if value > 0 else None
+
+    return {
+        "max_news_texts_per_ticker": _limit("max_news_texts_per_ticker"),
+        "max_news_texts_per_fallback_scope": _limit("max_news_texts_per_fallback_scope"),
+        "max_market_backstop_texts": _limit("max_market_backstop_texts"),
+        "max_community_texts_per_ticker": _limit("max_community_texts_per_ticker"),
+    }
+
+
+def _record_text_cap(
+    stats: dict[str, dict[str, dict[str, int]]],
+    *,
+    channel: str,
+    scope: str,
+    original: int,
+    kept: int,
+) -> None:
+    channel_bucket = stats.setdefault(channel, {})
+    bucket = channel_bucket.setdefault(
+        scope,
+        {
+            "original_text_count": 0,
+            "kept_text_count": 0,
+            "dropped_text_count": 0,
+        },
+    )
+    bucket["original_text_count"] += int(original)
+    bucket["kept_text_count"] += int(kept)
+    bucket["dropped_text_count"] += max(int(original) - int(kept), 0)
+
+
+def _limited_texts_with_stats(
+    texts: list[str],
+    limit: int | None,
+    stats: dict[str, dict[str, dict[str, int]]],
+    *,
+    channel: str,
+    scope: str,
+) -> list[str]:
+    original = len(texts)
+    kept_texts = _limited_texts(texts, limit)
+    _record_text_cap(
+        stats,
+        channel=channel,
+        scope=scope,
+        original=original,
+        kept=len(kept_texts),
+    )
+    return kept_texts
+
+
 def _bump_scope_count(
     counts: dict[str, dict[str, int]],
     *,
@@ -232,6 +294,8 @@ def _payload_rows_from_explicit_rows(
     snapshot: datetime,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows_by_ticker: dict[str, dict[str, Any]] = {}
+    limits = _materialization_text_limits()
+    text_cap_stats: dict[str, dict[str, dict[str, int]]] = {}
     for row in payload.get("rows", []) or []:
         if not isinstance(row, dict):
             continue
@@ -241,11 +305,32 @@ def _payload_rows_from_explicit_rows(
         data_ts = _required_ts(row.get("data_ts"), field="rows[].data_ts", snapshot=snapshot)
         if data_ts > snapshot:
             raise ValueError(f"PIT violation: ticker={ticker} data_ts={data_ts.isoformat()} > snapshot={snapshot.isoformat()}")
+        news_texts = _limited_texts_with_stats(
+            [str(text) for text in (row.get("news_texts", []) or []) if str(text).strip()],
+            limits["max_news_texts_per_ticker"],
+            text_cap_stats,
+            channel="news",
+            scope="explicit_row",
+        )
+        comm_texts_t1 = _limited_texts_with_stats(
+            [str(text) for text in (row.get("comm_texts_t1", []) or []) if str(text).strip()],
+            limits["max_community_texts_per_ticker"],
+            text_cap_stats,
+            channel="community",
+            scope="explicit_row_t1",
+        )
+        comm_texts_t2 = _limited_texts_with_stats(
+            [str(text) for text in (row.get("comm_texts_t2", []) or []) if str(text).strip()],
+            limits["max_community_texts_per_ticker"],
+            text_cap_stats,
+            channel="community",
+            scope="explicit_row_t2",
+        )
         rows_by_ticker[ticker] = {
             "ticker": ticker,
-            "news_texts": list(row.get("news_texts", []) or []),
-            "comm_texts_t1": list(row.get("comm_texts_t1", []) or []),
-            "comm_texts_t2": list(row.get("comm_texts_t2", []) or []),
+            "news_texts": news_texts,
+            "comm_texts_t1": comm_texts_t1,
+            "comm_texts_t2": comm_texts_t2,
             "current_volume": float(row.get("current_volume", 0.0) or 0.0),
             "historical_volumes": list(row.get("historical_volumes", []) or []),
             "data_ts": data_ts.isoformat(),
@@ -265,6 +350,8 @@ def _payload_rows_from_explicit_rows(
     return out, {
         "input_shape": "rows",
         "raw_row_count": len(payload.get("rows", []) or []),
+        "text_limits": limits,
+        "text_cap_stats": text_cap_stats,
     }
 
 
@@ -275,6 +362,8 @@ def _payload_rows_from_events(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     ticker_to_sector = _load_ticker_sector_map()
     fallback_limit = _fallback_text_limit()
+    limits = _materialization_text_limits()
+    text_cap_stats: dict[str, dict[str, dict[str, int]]] = {}
     grouped: dict[str, dict[str, Any]] = {}
     event_count = 0
     news_count = 0
@@ -334,6 +423,13 @@ def _payload_rows_from_events(
 
     out = []
     fallback_scope_counts: dict[str, dict[str, int]] = {"news": {}, "community": {}}
+    market_news_texts_for_backstop = _limited_texts_with_stats(
+        market_news_texts,
+        limits["max_market_backstop_texts"],
+        text_cap_stats,
+        channel="news",
+        scope="market_backstop",
+    )
     for item in universe:
         ticker = str(item["ticker"]).zfill(6)
         bucket = grouped.get(ticker, {})
@@ -352,6 +448,18 @@ def _payload_rows_from_events(
             news_scope = "market_fallback"
             if latest_market_ts is not None:
                 data_ts_candidates.append(latest_market_ts)
+        news_limit = (
+            limits["max_news_texts_per_ticker"]
+            if news_scope == "ticker"
+            else limits["max_news_texts_per_fallback_scope"]
+        )
+        news_texts = _limited_texts_with_stats(
+            news_texts,
+            news_limit,
+            text_cap_stats,
+            channel="news",
+            scope=news_scope,
+        )
 
         comm_texts_t1 = list(bucket.get("comm_texts_t1", []) or [])
         comm_scope = "ticker" if comm_texts_t1 else "none"
@@ -365,6 +473,18 @@ def _payload_rows_from_events(
             comm_scope = "market_fallback"
             if latest_market_ts is not None:
                 data_ts_candidates.append(latest_market_ts)
+        comm_limit = (
+            limits["max_community_texts_per_ticker"]
+            if comm_scope == "ticker"
+            else fallback_limit
+        )
+        comm_texts_t1 = _limited_texts_with_stats(
+            comm_texts_t1,
+            comm_limit,
+            text_cap_stats,
+            channel="community",
+            scope=comm_scope,
+        )
 
         _bump_scope_count(fallback_scope_counts, channel="news", scope=news_scope)
         _bump_scope_count(fallback_scope_counts, channel="community", scope=comm_scope)
@@ -380,7 +500,7 @@ def _payload_rows_from_events(
                 "news": news_scope,
                 "community": comm_scope,
             },
-            "_market_news_texts": market_news_texts,
+            "_market_news_texts": market_news_texts_for_backstop,
             "_market_news_data_ts": (latest_market_ts or snapshot).isoformat(),
         })
     return out, {
@@ -389,8 +509,11 @@ def _payload_rows_from_events(
         "news_event_count": news_count,
         "community_event_count": community_count,
         "fallback_text_limit": fallback_limit,
+        "text_limits": limits,
+        "text_cap_stats": text_cap_stats,
         "fallback_scope_counts": fallback_scope_counts,
         "market_news_text_count": len(market_news_texts),
+        "market_news_text_count_after_cap": len(market_news_texts_for_backstop),
         "market_community_text_count": len(market_comm_texts),
     }
 
