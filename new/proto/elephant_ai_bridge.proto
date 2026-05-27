@@ -281,4 +281,13 @@ message PaperAutoTradingStatusResponse {
   string kafka_topic = 16;
   string kafka_last_error = 17;
   string last_error = 18;
+  string start_request_id = 19;
+  int32 orders_submitted = 20;
+  int32 orders_filled = 21;
+  int32 orders_rejected = 22;
+  string last_cycle_status = 23;
+  bool kafka_required = 24;
+  string kis_mode = 25;
+  bool live_trading_allowed = 26;
+  bool production_registry_mutated = 27;
 }

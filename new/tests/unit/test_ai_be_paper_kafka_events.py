@@ -49,6 +49,8 @@ def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
     producer = KafkaEventProducer.__new__(KafkaEventProducer)
     producer._topic = "test-topic"
     producer._producer = kafka_sender
+    producer._required = False
+    producer._sequence_by_session = {}
 
     producer.emit(
         "AUTO_TRADING_STARTED",
@@ -62,6 +64,8 @@ def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
     assert kafka_sender.value["session_id"] == "AI-SESSION"
     assert kafka_sender.value["request_id"] == "BE-REQ-001"
     assert kafka_sender.value["bundle_id"] == "BUNDLE-1"
+    assert kafka_sender.value["event_key"] == "AI-SESSION"
+    assert kafka_sender.value["sequence_no"] == 1
     assert kafka_sender.value["timestamp"]
     assert kafka_sender.value["payload"] == {"cycles": 3}
     assert "cycles" not in {
@@ -83,8 +87,53 @@ def test_kafka_status_reports_readiness_without_secret_values() -> None:
         "connected": False,
         "topic": "paper-topic",
         "bootstrap_servers_set": True,
+        "required": False,
         "last_error": "connection refused",
     }
+
+
+def test_kafka_required_mode_raises_when_dependency_missing(monkeypatch) -> None:
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "kafka":
+            raise ImportError("missing kafka")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    try:
+        KafkaEventProducer(required=True)
+    except RuntimeError as e:
+        assert "kafka-python" in str(e)
+    else:
+        raise AssertionError("required Kafka must fail startup when unavailable")
+
+
+def test_kafka_required_emit_failure_raises() -> None:
+    class _Producer:
+        def send(self, *_args, **_kwargs):
+            raise RuntimeError("broker down")
+
+    producer = KafkaEventProducer.__new__(KafkaEventProducer)
+    producer._topic = "test-topic"
+    producer._producer = _Producer()
+    producer._required = True
+    producer._last_error = ""
+    producer._sequence_by_session = {}
+
+    try:
+        producer.emit(
+            "AUTO_TRADING_STARTED",
+            session_id="AI-SESSION",
+            request_id="REQ-1",
+            bundle_id="BUNDLE-1",
+        )
+    except RuntimeError as e:
+        assert "Kafka required emit failed" in str(e)
+    else:
+        raise AssertionError("required Kafka must fail closed on emit failure")
+    assert producer._last_error == "broker down"
 
 
 def test_start_validation_rejects_bad_request_before_thread_start() -> None:
@@ -193,6 +242,198 @@ def test_start_rpc_rejects_bad_confirm_before_session_start(monkeypatch) -> None
     assert kafka.events == []
 
 
+def test_start_rpc_requires_paper_candidate_registry_before_session_start(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+
+    class _Grpc:
+        class StatusCode:
+            INVALID_ARGUMENT = "INVALID_ARGUMENT"
+            FAILED_PRECONDITION = "FAILED_PRECONDITION"
+
+    class _Pb2Grpc:
+        class AiBeBridgeServiceServicer:
+            pass
+
+    class _Pb2:
+        class StartPaperAutoTradingResponse:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+    class _Context:
+        code = None
+        details = ""
+
+        def set_code(self, code) -> None:
+            self.code = code
+
+        def set_details(self, details: str) -> None:
+            self.details = details
+
+    class _Request:
+        request_id = "BE-REQ-001"
+        bundle_id = "BUNDLE-MISSING"
+        cycles = 1
+        interval_sec = 60
+        tickers = ["005930"]
+        confirm_phrase = "PAPER_AUTO_OK"
+
+    monkeypatch.setattr(
+        grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 60,
+            "confirm_start_phrase": "PAPER_AUTO_OK",
+            "max_tickers": 30,
+            "require_prelive_pass": False,
+        },
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_market_start_guard",
+        lambda **_kwargs: {"status": "PASS"},
+    )
+    monkeypatch.setattr(session, "start", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("session.start must not run without candidate registry")
+    ))
+
+    servicer = grpc_server._make_servicer(
+        _Grpc,
+        _Pb2,
+        _Pb2Grpc,
+        bundle_id="BUNDLE-MISSING",
+        root=tmp_path,
+        session=session,
+    )
+
+    response = servicer.StartPaperAutoTrading(_Request(), _Context())
+
+    assert response.accepted is False
+    assert response.status == "MODEL_REGISTRY_NOT_READY"
+    assert response.reason == "paper_candidate_registry_not_found"
+
+
+def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    calls: dict[str, object] = {}
+
+    class _Grpc:
+        class StatusCode:
+            INVALID_ARGUMENT = "INVALID_ARGUMENT"
+            FAILED_PRECONDITION = "FAILED_PRECONDITION"
+
+    class _Pb2Grpc:
+        class AiBeBridgeServiceServicer:
+            pass
+
+    class _Pb2:
+        class StartPaperAutoTradingResponse:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+    class _Context:
+        code = None
+        details = ""
+
+        def set_code(self, code) -> None:
+            self.code = code
+
+        def set_details(self, details: str) -> None:
+            self.details = details
+
+    class _Request:
+        request_id = "BE-REQ-001"
+        bundle_id = "BUNDLE-1"
+        cycles = 1
+        interval_sec = 60
+        tickers = ["005930"]
+        confirm_phrase = "PAPER_AUTO_OK"
+
+    class _PreliveGate:
+        @staticmethod
+        def _final_dataset_gate_cfg() -> dict:
+            return {"expected_end_date": "20260521", "rehearsal_business_days": 253}
+
+        @staticmethod
+        def _parse_dataset_date(_value):
+            return grpc_server.datetime(2026, 5, 21, tzinfo=grpc_server._KST).date()
+
+        @staticmethod
+        def build_report(**_kwargs) -> dict:
+            return {
+                "status": "BLOCKED",
+                "blockers": ["05_backtest_real_candidate"],
+                "stages": {
+                    "01_code_ssot": {"status": "PASS", "live_enabled": False},
+                    "02_real_data_readiness": {"status": "PASS"},
+                    "03_80_business_day_data": {"status": "PASS"},
+                    "04_lgbm_real_train": {"status": "PASS"},
+                    "06_paper_balance": {"status": "PASS"},
+                    "07_paper_reconciliation": {"status": "PASS"},
+                    "08_paper_probe_order": {"status": "PASS"},
+                    "09_ops_risk": {"status": "PASS"},
+                },
+            }
+
+    monkeypatch.setattr(
+        grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 60,
+            "confirm_start_phrase": "PAPER_AUTO_OK",
+            "max_tickers": 30,
+            "require_prelive_pass": True,
+        },
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_market_start_guard",
+        lambda **_kwargs: {"status": "PASS"},
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_load_prelive_gate_module",
+        lambda: _PreliveGate,
+    )
+
+    def fake_start(**kwargs):
+        calls.update(kwargs)
+        return {
+            "accepted": True,
+            "status": "START_REQUESTED",
+            "session_id": "AI-SESSION",
+        }
+
+    monkeypatch.setattr(session, "start", fake_start)
+
+    servicer = grpc_server._make_servicer(
+        _Grpc,
+        _Pb2,
+        _Pb2Grpc,
+        bundle_id="BUNDLE-1",
+        root=tmp_path,
+        session=session,
+    )
+
+    response = servicer.StartPaperAutoTrading(_Request(), _Context())
+
+    assert response.accepted is True
+    assert response.status == "START_REQUESTED"
+    assert calls["registry_dir"] == registry_dir
+
+
 def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> None:
     result = {
         "status": "PASS",
@@ -240,6 +481,7 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
     assert decision["order_count"] == 2
     assert [event_type for event_type, _payload in events] == [
         "PAPER_ORDER_SUBMITTED",
+        "PAPER_ORDER_REJECTED",
         "PAPER_ORDER_FAILED",
     ]
     submitted = events[0][1]
@@ -251,7 +493,10 @@ def test_paper_cycle_maps_submitted_and_failed_without_false_filled_event() -> N
     assert submitted["paper_only"] is True
     assert submitted["execution_mode"] == "paper"
     assert submitted["kis_mode"] == "virtual"
-    failed = events[1][1]
+    rejected = events[1][1]
+    assert rejected["ticker"] == "000660"
+    assert rejected["error_code"] == "EGW00001"
+    failed = events[2][1]
     assert failed["ticker"] == "000660"
     assert failed["error_code"] == "EGW00001"
     assert failed["reason"] == "broker_rt_cd_1"
@@ -335,9 +580,9 @@ def test_start_event_carries_start_request_id(monkeypatch) -> None:
         confirm_phrase="PAPER_ORDER_OK",
     )
 
-    assert kafka.events[0][0] == "AUTO_TRADING_STARTED"
+    assert kafka.events[0][0] == "AUTO_TRADING_START_REQUESTED"
     assert kafka.events[0][1]["request_id"] == "BE-REQ-001"
-    assert seen_events_at_thread_start == ["AUTO_TRADING_STARTED"]
+    assert seen_events_at_thread_start == ["AUTO_TRADING_START_REQUESTED"]
 
 
 def test_start_event_precedes_immediate_thread_failure(monkeypatch) -> None:
@@ -377,9 +622,9 @@ def test_start_event_precedes_immediate_thread_failure(monkeypatch) -> None:
     )
 
     assert [event_type for event_type, _payload in kafka.events] == [
-        "AUTO_TRADING_STARTED",
+        "AUTO_TRADING_START_REQUESTED",
     ]
-    assert captured["events_at_start"] == ["AUTO_TRADING_STARTED"]
+    assert captured["events_at_start"] == ["AUTO_TRADING_START_REQUESTED"]
 
     target = captured["target"]
     kwargs = captured["kwargs"]
@@ -388,12 +633,78 @@ def test_start_event_precedes_immediate_thread_failure(monkeypatch) -> None:
     target(**kwargs)
 
     assert [event_type for event_type, _payload in kafka.events] == [
-        "AUTO_TRADING_STARTED",
+        "AUTO_TRADING_START_REQUESTED",
         "AUTO_TRADING_FAILED",
     ]
     assert kafka.events[1][1]["request_id"] == "BE-REQ-001"
     assert kafka.flushed is True
     assert session.status()["last_error"] == "paper-auto init failed"
+
+
+def test_started_event_is_emitted_only_after_run_preflight(tmp_path) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    session.session_id = "AI-SESSION"
+    session.request_id = "BE-REQ-001"
+    session.bundle_id = "BUNDLE-1"
+
+    trader = grpc_server._make_grpc_paper_auto_trader(
+        kafka=kafka,
+        session_ref=session,
+        kis_client=object(),
+        hot_runner=object(),
+        report_dir=tmp_path,
+    )
+
+    assert kafka.events == []
+
+    trader._on_run_preflight_passed({
+        "cycles": 3,
+        "tickers": ["005930"],
+    })
+
+    assert [event_type for event_type, _payload in kafka.events] == [
+        "AUTO_TRADING_STARTED",
+    ]
+    payload = kafka.events[0][1]["payload"]
+    assert payload["phase"] == "RUNNING"
+    assert payload["worker_started"] is True
+    assert payload["preflight_passed"] is True
+
+
+def test_decision_event_is_published_before_broker_submit(tmp_path) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    session.session_id = "AI-SESSION"
+    session.request_id = "BE-REQ-001"
+    session.bundle_id = "BUNDLE-1"
+    trader = grpc_server._make_grpc_paper_auto_trader(
+        kafka=kafka,
+        session_ref=session,
+        kis_client=object(),
+        hot_runner=object(),
+        report_dir=tmp_path,
+    )
+
+    trader._on_before_broker_submit(
+        cycle_index=0,
+        final_decision={
+            "decision_id": "DEC-1",
+            "approved": True,
+            "reason_code": "PASS",
+            "order_deltas": [{"ticker": "005930"}],
+        },
+        hot_result={"quant_output": {"mode": "active"}},
+        order_guard={"status": "PASS"},
+    )
+
+    assert [event_type for event_type, _payload in kafka.events] == [
+        "DECISION_COMPLETED",
+    ]
+    payload = kafka.events[0][1]["payload"]
+    assert payload["phase"] == "PRE_BROKER_SUBMIT"
+    assert payload["decision_id"] == "DEC-1"
+    assert payload["order_count"] == 1
 
 
 def test_user_stop_is_published_as_stopped_with_start_request_id(monkeypatch) -> None:
@@ -476,5 +787,88 @@ def test_session_status_exposes_terminal_report_path_and_kafka_state(monkeypatch
     assert status["kafka"] == {
         "connected": False,
         "topic": "test-topic",
+        "required": False,
         "last_error": "no broker in unit test",
     }
+
+
+def test_failed_paper_report_emits_failed_not_stopped(monkeypatch) -> None:
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    session.session_id = "AI-SESSION"
+    session.request_id = "BE-REQ-001"
+    session.bundle_id = "BUNDLE-1"
+    session.running = True
+
+    class _Trader:
+        def run(self, **_kwargs) -> dict:
+            return {
+                "status": "FAIL",
+                "report_path_relative": "artifacts/reports/paper_auto_trading/fail.json",
+            }
+
+    monkeypatch.setattr(
+        grpc_server,
+        "_make_grpc_paper_auto_trader",
+        lambda **_kwargs: _Trader(),
+    )
+
+    session._run_loop(
+        bundle_id="BUNDLE-1",
+        cycles=1,
+        interval_sec=0,
+        tickers=["005930"],
+        confirm_phrase="PAPER_AUTO_OK",
+        root=None,
+    )
+
+    assert [event_type for event_type, _payload in kafka.events] == [
+        "AUTO_TRADING_FAILED",
+    ]
+    assert kafka.events[0][1]["payload"]["stop_reason"] == "FAIL_CLOSED"
+    assert session.status()["terminal_status"] == "FAIL"
+
+
+def test_remaining_market_cycles_supports_full_day_default() -> None:
+    now = grpc_server.datetime(2026, 5, 27, 8, 30, tzinfo=grpc_server._KST)
+
+    cycles = grpc_server._remaining_market_cycles(
+        interval_sec=60,
+        pa_cfg={
+            "market_open_time": "09:00",
+            "market_close_time": "15:30",
+        },
+        now=now,
+    )
+
+    assert cycles == 390
+
+
+def test_market_start_guard_blocks_preopen_start() -> None:
+    now = grpc_server.datetime(2026, 5, 27, 8, 30, tzinfo=grpc_server._KST)
+
+    guard = grpc_server._market_start_guard(
+        pa_cfg={
+            "market_open_time": "09:00",
+            "market_close_time": "15:30",
+        },
+        now=now,
+    )
+
+    assert guard["status"] == "BLOCKED"
+    assert guard["reason"] == "market_not_open"
+
+
+def test_remaining_market_cycles_blocks_after_close() -> None:
+    now = grpc_server.datetime(2026, 5, 27, 15, 31, tzinfo=grpc_server._KST)
+
+    cycles = grpc_server._remaining_market_cycles(
+        interval_sec=60,
+        pa_cfg={
+            "market_open_time": "09:00",
+            "market_close_time": "15:30",
+        },
+        now=now,
+    )
+
+    assert cycles == 0
