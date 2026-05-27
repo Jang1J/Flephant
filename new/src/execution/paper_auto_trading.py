@@ -114,6 +114,27 @@ class PaperAutoTrader:
             self._cfg.get("allow_market_order", False),
             default=False,
         )
+        service_policy_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
+        execution_cfg = config_load("risk_config.yaml", "execution") or {}
+        self._allow_position_pyramiding = safe_bool(
+            service_policy_cfg.get(
+                "allow_position_pyramiding",
+                execution_cfg.get("allow_position_pyramiding", False),
+            ),
+            default=False,
+        )
+        self._min_holding_bars = safe_int(
+            service_policy_cfg.get("min_holding_bars", 0),
+            default=0,
+            min_value=0,
+        )
+        self._rebalance_cooldown_bars = safe_int(
+            service_policy_cfg.get("rebalance_cooldown_bars", 0),
+            default=0,
+            min_value=0,
+        )
+        self._last_order_cycle_by_ticker: dict[str, int] = {}
+        self._holding_since_cycle_by_ticker: dict[str, int] = {}
         self._max_consecutive_read_error_skips = safe_int(
             self._cfg.get("max_consecutive_read_error_skips", 3),
             default=3,
@@ -350,6 +371,10 @@ class PaperAutoTrader:
             latest_prices,
             portfolio_value,
         )
+        self._sync_runtime_position_state(
+            current_positions=current_positions,
+            cycle_index=cycle_index,
+        )
         hot_path_bar_readiness = self._hot_path_bar_readiness(
             bars_by_ticker,
             required_bars=self._required_warmup_bars(),
@@ -475,9 +500,22 @@ class PaperAutoTrader:
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
         ]
+        runtime_policy_applied = self._apply_runtime_service_policy(
+            final_decision=final_decision,
+            current_positions=current_positions,
+            cycle_index=cycle_index,
+        )
         order_count_caps_applied = self._cap_order_count(final_decision)
         order_caps_applied = self._cap_order_quantities(final_decision)
         order_guard = self._order_guard(final_decision, hot_result=hot_result)
+        if (
+            runtime_policy_applied
+            and order_guard.get("status") == "SKIP"
+            and order_guard.get("safe_skip")
+        ):
+            order_guard = dict(order_guard)
+            order_guard["reason"] = "runtime_service_policy_filtered_all_orders"
+            order_guard["runtime_service_policy_applied"] = runtime_policy_applied
         if order_guard["status"] != "PASS":
             return {
                 "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
@@ -488,6 +526,7 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "quant_signal_guard": quant_signal_guard,
                 "order_guard": order_guard,
+                "runtime_service_policy_applied": runtime_policy_applied,
                 "order_count_caps_applied": order_count_caps_applied,
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
@@ -527,6 +566,7 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "quant_signal_guard": quant_signal_guard,
                 "order_guard": order_guard,
+                "runtime_service_policy_applied": runtime_policy_applied,
                 "order_count_caps_applied": order_count_caps_applied,
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
@@ -560,6 +600,11 @@ class PaperAutoTrader:
         status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
         if order_history.get("status") != "PASS":
             status = "FAIL"
+        if status == "PASS":
+            self._record_runtime_policy_submitted_orders(
+                final_decision.get("order_deltas", []),
+                cycle_index=cycle_index,
+            )
         return {
             "status": status,
             "cycle_index": cycle_index,
@@ -571,6 +616,7 @@ class PaperAutoTrader:
             "account_state": account_state,
             "quant_signal_guard": quant_signal_guard,
             "order_guard": order_guard,
+            "runtime_service_policy_applied": runtime_policy_applied,
             "order_count_caps_applied": order_count_caps_applied,
             "order_caps_applied": order_caps_applied,
             "hot_result": hot_result,
@@ -1426,6 +1472,182 @@ class PaperAutoTrader:
         logger.warning("[paper_auto_trading] 주문 개수 cap 적용: %s", cap_record)
         return [cap_record]
 
+    def _apply_runtime_service_policy(
+        self,
+        *,
+        final_decision: dict[str, Any],
+        current_positions: list[dict[str, Any]],
+        cycle_index: int,
+    ) -> list[dict[str, Any]]:
+        """Apply runtime execution policy before paper broker submission.
+
+        Service-policy replay already honors no-pyramiding, rebalance
+        cooldown, and min-holding constraints. Paper-auto must do the same
+        before broker submit so evidence does not drift from the policy being
+        validated.
+        """
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return []
+
+        current_qty_by_ticker: dict[str, int] = {}
+        for pos in current_positions:
+            if not isinstance(pos, dict):
+                continue
+            ticker = pad_ticker(str(pos.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            current_qty_by_ticker[ticker] = safe_lossless_int(
+                pos.get("qty", 0),
+                default=0,
+                min_value=0,
+            )
+
+        kept: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
+        for idx, od in enumerate(raw_order_deltas):
+            if not isinstance(od, dict):
+                kept.append(od)
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
+            reason = str(od.get("reason", "")).lower()
+            held_qty = current_qty_by_ticker.get(ticker, 0)
+            if side == "sell" and reason == "risk_reduce":
+                kept.append(od)
+                continue
+            last_order_cycle = self._last_order_cycle_by_ticker.get(ticker)
+            if (
+                last_order_cycle is not None
+                and self._rebalance_cooldown_bars > 0
+                and cycle_index - int(last_order_cycle) < self._rebalance_cooldown_bars
+            ):
+                dropped.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": safe_lossless_int(
+                        od.get("qty", 0),
+                        default=0,
+                        min_value=0,
+                    ),
+                    "held_qty": held_qty,
+                    "reason": "rebalance_cooldown_active",
+                    "policy": "service_policy_replay.rebalance_cooldown_bars",
+                    "required_bars": self._rebalance_cooldown_bars,
+                    "last_order_cycle": int(last_order_cycle),
+                    "cycle_index": int(cycle_index),
+                })
+                continue
+            if (
+                side == "sell"
+                and held_qty > 0
+                and self._min_holding_bars > 0
+            ):
+                holding_since = self._holding_since_cycle_by_ticker.get(
+                    ticker,
+                    cycle_index,
+                )
+                held_age = cycle_index - int(holding_since)
+                if held_age < self._min_holding_bars:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": safe_lossless_int(
+                            od.get("qty", 0),
+                            default=0,
+                            min_value=0,
+                        ),
+                        "held_qty": held_qty,
+                        "reason": "min_holding_bars_active",
+                        "policy": "service_policy_replay.min_holding_bars",
+                        "required_bars": self._min_holding_bars,
+                        "holding_since_cycle": int(holding_since),
+                        "held_age_bars": int(held_age),
+                    })
+                    continue
+            if (
+                side == "buy"
+                and not self._allow_position_pyramiding
+                and held_qty > 0
+            ):
+                dropped.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": safe_lossless_int(
+                        od.get("qty", 0),
+                        default=0,
+                        min_value=0,
+                    ),
+                    "held_qty": held_qty,
+                    "reason": "position_pyramiding_disabled",
+                    "policy": "service_policy_replay.allow_position_pyramiding",
+                    "allowed": False,
+                })
+                continue
+            kept.append(od)
+
+        if not dropped:
+            return []
+
+        final_decision["order_deltas"] = kept
+        record = {
+            "policy": "service_policy_replay",
+            "allow_position_pyramiding": self._allow_position_pyramiding,
+            "min_holding_bars": self._min_holding_bars,
+            "rebalance_cooldown_bars": self._rebalance_cooldown_bars,
+            "original_count": len(raw_order_deltas),
+            "kept_count": len(kept),
+            "dropped_count": len(dropped),
+            "dropped": dropped,
+        }
+        final_decision.setdefault("paper_auto_runtime_service_policy_applied", [])
+        final_decision["paper_auto_runtime_service_policy_applied"].append(record)
+        logger.warning("[paper_auto_trading] runtime service policy 적용: %s", record)
+        return [record]
+
+    def _sync_runtime_position_state(
+        self,
+        *,
+        current_positions: list[dict[str, Any]],
+        cycle_index: int,
+    ) -> None:
+        current_tickers: set[str] = set()
+        for pos in current_positions:
+            if not isinstance(pos, dict):
+                continue
+            ticker = pad_ticker(str(pos.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
+            if qty <= 0:
+                continue
+            current_tickers.add(ticker)
+            self._holding_since_cycle_by_ticker.setdefault(ticker, cycle_index)
+
+        for ticker in list(self._holding_since_cycle_by_ticker):
+            if ticker not in current_tickers:
+                self._holding_since_cycle_by_ticker.pop(ticker, None)
+
+    def _record_runtime_policy_submitted_orders(
+        self,
+        order_deltas: list[dict[str, Any]],
+        *,
+        cycle_index: int,
+    ) -> None:
+        for od in order_deltas:
+            if not isinstance(od, dict):
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            side = str(od.get("side", "")).lower()
+            self._last_order_cycle_by_ticker[ticker] = cycle_index
+            if side == "buy":
+                self._holding_since_cycle_by_ticker.setdefault(ticker, cycle_index)
+
     @staticmethod
     def _order_count_cap_sort_key(item: tuple[int, dict[str, Any]]) -> tuple[float, float, float, str, int]:
         index, od = item
@@ -1848,6 +2070,10 @@ class PaperAutoTrader:
                 "execution_policy": {
                     "max_orders_per_cycle": self._max_orders_per_cycle,
                     "max_order_qty_per_order": self._max_order_qty_per_order,
+                    "allow_position_pyramiding": self._allow_position_pyramiding,
+                    "min_holding_bars": self._min_holding_bars,
+                    "rebalance_cooldown_bars": self._rebalance_cooldown_bars,
+                    "policy_source": "service_policy_replay",
                 },
             },
             "stages": {},

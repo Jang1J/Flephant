@@ -122,7 +122,7 @@ def test_sell_reduces_existing_holding_only() -> None:
 def test_policy_config_maps_risk_config_values() -> None:
     policy = ServicePolicyConfig.from_config()
     assert policy.max_orders_per_cycle == 3
-    assert policy.max_order_qty_per_order == 2
+    assert policy.max_order_qty_per_order == 1
     assert policy.top_k_fraction == pytest.approx(0.10)
     assert policy.total_cost_bps == 15.0
     assert policy.daily_turnover_cap == 0.30

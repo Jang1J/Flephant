@@ -154,6 +154,34 @@ class FakePaperKIS:
         return {"orders": orders, "summary": {}, "_mode": self.mode}
 
 
+class FakePaperKISWithPosition(FakePaperKIS):
+    def __init__(
+        self,
+        *,
+        ticker: str = "005930",
+        qty: int = 1,
+        current_price: float = 70000.0,
+    ) -> None:
+        super().__init__()
+        self.ticker = ticker
+        self.qty = qty
+        self.current_price = current_price
+
+    def get_balance(self) -> dict[str, Any]:
+        return {
+            "balance": {"cash": 1_000_000.0, "net_asset": 1_000_000.0},
+            "positions": [
+                {
+                    "ticker": self.ticker,
+                    "qty": self.qty,
+                    "available_qty": self.qty,
+                    "current_price": self.current_price,
+                }
+            ],
+            "_mode": self.mode,
+        }
+
+
 class ShortWindowPaperKIS(FakePaperKIS):
     def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
         return [
@@ -583,6 +611,35 @@ class FakeZeroScoreExitHotRunner(FakeHotRunner):
         }
 
 
+class FakeSellHotRunner(FakeHotRunner):
+    def __init__(self, *, reason: str = "rebalance") -> None:
+        super().__init__(qty=1)
+        self.reason = reason
+
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "quant_output": self.active_quant_output(),
+            "final_decision": {
+                "decision_id": "FDA-SELL",
+                "approved": True,
+                "reason_code": "NORMAL_APPROVE",
+                "order_deltas": [
+                    {
+                        "ticker": "005930",
+                        "side": "sell",
+                        "qty": 1,
+                        "price": 70000.0,
+                        "order_type": "00",
+                        "reason": self.reason,
+                        "delta_weight": -0.01,
+                    }
+                ],
+            },
+            "latency_ms": 1.0,
+        }
+
+
 class FakeBlockedQuantHotRunner(FakeHotRunner):
     def run_once(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
@@ -678,6 +735,10 @@ def test_paper_auto_report_embeds_track_metadata(tmp_path: Path) -> None:
     assert report["params"]["execution_policy"] == {
         "max_orders_per_cycle": 4,
         "max_order_qty_per_order": 1,
+        "allow_position_pyramiding": False,
+        "min_holding_bars": 195,
+        "rebalance_cooldown_bars": 195,
+        "policy_source": "service_policy_replay",
     }
 
 
@@ -1881,6 +1942,123 @@ def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
     assert [
         order["qty"] for order in cycle["submitted_order_deltas"]
     ] == [1, 1, 1]
+
+
+def test_paper_auto_blocks_buy_pyramiding_before_broker_submit(tmp_path: Path) -> None:
+    client = FakePaperKISWithPosition(ticker="005930", qty=1)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "PASS"
+    assert cycle["status"] == "PASS"
+    assert cycle["order_guard"]["status"] == "SKIP"
+    assert cycle["order_guard"]["reason"] == "runtime_service_policy_filtered_all_orders"
+    applied = cycle["runtime_service_policy_applied"][0]
+    assert applied["policy"] == "service_policy_replay"
+    assert applied["dropped"][0]["reason"] == "position_pyramiding_disabled"
+    assert applied["dropped"][0]["ticker"] == "005930"
+    assert cycle["execution"] is None
+    assert client.orders == []
+
+
+def test_paper_auto_min_holding_blocks_rebalance_sell(tmp_path: Path) -> None:
+    client = FakePaperKISWithPosition(ticker="005930", qty=2)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeSellHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "PASS"
+    assert cycle["order_guard"]["status"] == "SKIP"
+    applied = cycle["runtime_service_policy_applied"][0]
+    assert applied["dropped"][0]["reason"] == "min_holding_bars_active"
+    assert cycle["execution"] is None
+    assert client.orders == []
+
+
+def test_paper_auto_runtime_policy_allows_risk_reduce_sell(tmp_path: Path) -> None:
+    client = FakePaperKISWithPosition(ticker="005930", qty=2)
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeSellHotRunner(reason="risk_reduce"),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "PASS"
+    assert cycle["order_guard"] == {"status": "PASS", "n_orders": 1}
+    assert cycle["runtime_service_policy_applied"] == []
+    assert cycle["submitted_order_deltas"][0]["side"] == "sell"
+    assert client.orders == [{
+        "ticker": "005930",
+        "side": "sell",
+        "qty": 1,
+        "price": 70000.0,
+        "order_type": "00",
+    }]
+
+
+def test_paper_auto_runtime_policy_blocks_cooldown_rebuy(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._active_trade_universe = {"005930"}  # noqa: SLF001
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=2,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    first, second = report["stages"]["cycles"]["items"]
+    assert first["status"] == "PASS"
+    assert second["status"] == "PASS"
+    assert second["order_guard"]["status"] == "SKIP"
+    applied = second["runtime_service_policy_applied"][0]
+    assert applied["dropped"][0]["reason"] == "rebalance_cooldown_active"
+    assert len(client.orders) == 1
 
 
 def test_paper_auto_treats_string_false_market_order_as_disabled(
