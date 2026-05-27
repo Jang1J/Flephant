@@ -184,6 +184,13 @@ class FutureTimestampPaperKIS(FakePaperKIS):
         return bars
 
 
+class ShortWindowFutureTimestampPaperKIS(ShortWindowPaperKIS):
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        bars = super().inquire_minute_bar(ticker, n_bars)
+        bars[-1]["ts_close"] = "2026-05-26T10:01:00+09:00"
+        return bars
+
+
 class FakeRealKIS(FakePaperKIS):
     mode = "real"
 
@@ -521,6 +528,33 @@ class FakeUnrankableScoreHotRunner(FakeHotRunner):
         }
 
 
+class FakeFlatNonZeroScoreHotRunner(FakeHotRunner):
+    def run_once(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "quant_output": {
+                "mode": "active",
+                "scores": {"005930": -0.00125, "000660": -0.00125},
+                "n_tickers": 2,
+            },
+            "final_decision": {
+                "decision_id": "FDA-FLAT-SCORE",
+                "approved": True,
+                "reason_code": "NORMAL_APPROVE",
+                "order_deltas": [
+                    {
+                        "ticker": "005930",
+                        "side": "buy",
+                        "qty": 1,
+                        "price": 70000.0,
+                        "order_type": "00",
+                    }
+                ],
+            },
+            "latency_ms": 1.0,
+        }
+
+
 class FakeZeroScoreExitHotRunner(FakeHotRunner):
     def run_once(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
@@ -668,7 +702,10 @@ def test_paper_auto_tops_up_short_kis_window_with_past_artifact_bars(
         "max_files_per_ticker": 2,
     }
 
-    bars = trader._fetch_recent_bars(["005930"])["005930"]  # noqa: SLF001
+    bars = trader._fetch_recent_bars(  # noqa: SLF001
+        ["005930"],
+        asof="2026-05-26T10:00:00+09:00",
+    )["005930"]
 
     assert len(bars) == 60
     assert bars[0]["ts_close"].startswith("2026-05-21")
@@ -709,7 +746,10 @@ def test_paper_auto_topup_continues_when_latest_file_is_cutoff_filtered(
         "max_files_per_ticker": 2,
     }
 
-    bars = trader._fetch_recent_bars(["005930"])["005930"]  # noqa: SLF001
+    bars = trader._fetch_recent_bars(  # noqa: SLF001
+        ["005930"],
+        asof="2026-05-26T10:00:00+09:00",
+    )["005930"]
 
     assert len(bars) == 60
     assert bars[0]["ts_close"].startswith("2026-05-21")
@@ -804,6 +844,8 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["hot_path_bar_readiness"]["bar_warmup_topup"]["tickers"]["005930"] == {
         "raw_live_bar_count": 60,
         "live_bar_count": 60,
+        "future_bar_filtered_count": 0,
+        "future_bar_filtered_rows": [],
         "historical_topup_count": 0,
         "final_bar_count": 60,
         "topup_needed": False,
@@ -887,7 +929,9 @@ def test_paper_auto_fails_closed_when_live_bar_timestamp_invalid(tmp_path: Path)
     assert client.orders == []
 
 
-def test_paper_auto_fails_closed_when_live_bar_is_future(tmp_path: Path) -> None:
+def test_paper_auto_filters_future_live_bar_and_fails_closed_if_still_short(
+    tmp_path: Path,
+) -> None:
     client = FutureTimestampPaperKIS()
     hot_runner = FakeHotRunner()
     trader = PaperAutoTrader(
@@ -909,11 +953,57 @@ def test_paper_auto_fails_closed_when_live_bar_is_future(tmp_path: Path) -> None
     cycle = report["stages"]["cycles"]["items"][0]
     assert report["status"] == "FAIL"
     assert cycle["reason"] == "hot_path_bar_readiness"
-    assert cycle["hot_path_bar_readiness"]["future_rows"] == [
-        {"ticker": "005930", "ts_close": "2026-05-26T10:01:00+09:00"}
-    ]
+    assert cycle["hot_path_bar_readiness"]["future_rows"] == []
+    assert cycle["hot_path_bar_readiness"]["missing_bars_by_ticker"] == {"005930": 1}
+    topup_meta = cycle["hot_path_bar_readiness"]["bar_warmup_topup"]
+    assert topup_meta["future_bar_filtered"] is True
+    assert topup_meta["future_rows_kept_for_readiness"] is False
+    assert topup_meta["tickers"]["005930"]["future_bar_filtered_count"] == 1
     assert hot_runner.start_calls == 0
     assert client.orders == []
+
+
+def test_paper_auto_tops_up_after_filtering_future_live_bar(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_warmup_parquet(
+        data_dir / "005930" / "bars_1m_20260521.parquet",
+        "005930",
+        rows=35,
+    )
+    client = ShortWindowFutureTimestampPaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(),
+        report_dir=tmp_path,
+        now_fn=lambda: datetime(2026, 5, 26, 10, 0, tzinfo=_KST),
+    )
+    trader._cfg["historical_warmup_topup"] = {  # noqa: SLF001
+        "enabled": True,
+        "data_dir": str(data_dir),
+        "max_files_per_ticker": 2,
+    }
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    readiness = cycle["hot_path_bar_readiness"]
+    assert report["status"] == "PASS"
+    assert readiness["status"] == "PASS"
+    assert readiness["future_rows"] == []
+    assert readiness["rows_by_ticker"] == {"005930": 60}
+    topup_meta = readiness["bar_warmup_topup"]
+    assert topup_meta["future_bar_filtered"] is True
+    assert topup_meta["future_rows_kept_for_readiness"] is False
+    assert topup_meta["live_rows_by_ticker"] == {"005930": 29}
+    assert topup_meta["historical_topup_rows_by_ticker"] == {"005930": 31}
+    assert topup_meta["tickers"]["005930"]["future_bar_filtered_count"] == 1
+    assert client.orders
 
 
 def test_paper_auto_shadow_only_does_not_submit_broker_order(tmp_path: Path) -> None:
@@ -973,7 +1063,7 @@ def test_paper_auto_fails_zero_score_no_order_run(tmp_path: Path) -> None:
     assert client.orders == []
 
 
-def test_paper_auto_fails_unrankable_active_score_before_broker(tmp_path: Path) -> None:
+def test_paper_auto_fails_all_zero_active_score_before_broker(tmp_path: Path) -> None:
     client = FakePaperKIS()
     trader = PaperAutoTrader(
         kis_client=client,
@@ -993,7 +1083,38 @@ def test_paper_auto_fails_unrankable_active_score_before_broker(tmp_path: Path) 
     assert report["status"] == "FAIL"
     cycle = report["stages"]["cycles"]["items"][0]
     assert cycle["reason"] == "quant_signal_readiness"
+    assert cycle["quant_signal_guard"]["reason"] == "active_model_quant_scores_all_zero"
+    assert cycle["quant_signal_guard"]["all_zero"] is True
+    assert client.orders == []
+
+
+def test_paper_auto_skips_flat_nonzero_active_scores_without_broker(
+    tmp_path: Path,
+) -> None:
+    client = FakePaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeFlatNonZeroScoreHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert cycle["status"] == "SKIP"
+    assert cycle["safe_skip"] is True
+    assert cycle["reason"] == "quant_signal_readiness"
     assert cycle["quant_signal_guard"]["reason"] == "active_model_quant_scores_not_rankable"
+    assert cycle["quant_signal_guard"]["all_zero"] is False
+    assert cycle["broker_order_submitted"] is False
+    assert cycle["execution"]["reason"] == "quant_scores_not_rankable_no_broker_submit"
     assert client.orders == []
 
 
@@ -1349,6 +1470,7 @@ def test_paper_auto_checks_market_session_each_cycle(tmp_path: Path) -> None:
 
     cycles = report["stages"]["cycles"]["items"]
     assert len(cycles) == 2
+    assert report["stages"]["cycles"]["stop_reason"] == "outside_market_session"
     assert client.orders == [{
         "ticker": "005930",
         "side": "buy",
@@ -1356,8 +1478,39 @@ def test_paper_auto_checks_market_session_each_cycle(tmp_path: Path) -> None:
         "price": 70000.0,
         "order_type": "00",
     }]
+    assert cycles[1]["status"] == "SKIP"
     assert cycles[1]["market_session_guard"]["reason"] == "outside_market_session"
     assert cycles[1]["execution"] is None
+
+
+def test_paper_auto_interrupt_writes_safe_skip_cycle(tmp_path: Path) -> None:
+    client = FakePaperKIS()
+
+    def interrupt_sleep(_: float) -> None:
+        raise KeyboardInterrupt
+
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(qty=1),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+        sleep_fn=interrupt_sleep,
+    )
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=2,
+        interval_sec=60,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycles = report["stages"]["cycles"]["items"]
+    assert report["status"] == "PASS"
+    assert report["stages"]["cycles"]["stop_reason"] == "paper_auto_interrupted"
+    assert [cycle["status"] for cycle in cycles] == ["PASS", "SKIP"]
+    assert cycles[1]["reason"] == "paper_auto_interrupted"
+    assert cycles[1]["broker_order_submitted"] is False
 
 
 def test_paper_auto_skips_before_market_open(tmp_path: Path) -> None:
@@ -1659,7 +1812,7 @@ def test_paper_auto_caps_qty_over_limit_before_execution(tmp_path: Path) -> None
     assert client.orders == [{
         "ticker": "005930",
         "side": "buy",
-        "qty": 2,
+        "qty": 1,
         "price": 70000.0,
         "order_type": "00",
     }]
@@ -1670,11 +1823,11 @@ def test_paper_auto_caps_qty_over_limit_before_execution(tmp_path: Path) -> None
         "ticker": "005930",
         "side": "buy",
         "original_qty": 3,
-        "capped_qty": 2,
-        "max_order_qty_per_order": 2,
+        "capped_qty": 1,
+        "max_order_qty_per_order": 1,
     }]
     assert cycle["hot_result"]["final_decision"]["order_deltas"][0]["qty"] == 3
-    assert cycle["submitted_order_deltas"][0]["qty"] == 2
+    assert cycle["submitted_order_deltas"][0]["qty"] == 1
     assert cycle["execution"]["execution_report"]["status"] == "submitted"
 
 
@@ -1711,7 +1864,7 @@ def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
         "403870",
         "005930",
     ]
-    assert [order["qty"] for order in client.orders] == [2, 2, 2]
+    assert [order["qty"] for order in client.orders] == [1, 1, 1]
     assert cycle["order_count_caps_applied"][0]["original_count"] == 5
     assert cycle["order_count_caps_applied"][0]["capped_count"] == 3
     assert cycle["order_count_caps_applied"][0]["max_orders_per_cycle"] == 3
@@ -1727,7 +1880,7 @@ def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
     ] == ["000660", "403870", "005930"]
     assert [
         order["qty"] for order in cycle["submitted_order_deltas"]
-    ] == [2, 2, 2]
+    ] == [1, 1, 1]
 
 
 def test_paper_auto_treats_string_false_market_order_as_disabled(
@@ -1880,15 +2033,72 @@ def test_paper_auto_rejects_real_mode(tmp_path: Path) -> None:
     assert report["stages"]["mode_guard"]["error_code"] == "PAPER_MODE_REQUIRED"
 
 
-def test_paper_auto_cli_rejects_paper_rehearsal_scope(capsys) -> None:
+def test_paper_auto_cli_allows_paper_rehearsal_scope_for_paper_only_gate(
+    monkeypatch,
+    capsys,
+) -> None:
     script = _load_paper_auto_trade_script()
+    calls: dict[str, Any] = {}
 
-    rc = script.main(["--prelive-scope", "paper-rehearsal", "--no-write-report"])
+    monkeypatch.setattr(
+        script,
+        "config_load",
+        lambda _file_name, _section=None: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 0,
+            "max_tickers": 1,
+            "require_prelive_pass": True,
+        },
+    )
 
-    assert rc == 1
+    def fake_build_report(**kwargs: Any) -> dict[str, Any]:
+        calls["prelive"] = kwargs
+        return {
+            "status": "BLOCKED",
+            "blockers": ["05_backtest_real_candidate"],
+            "stages": {
+                "01_code_ssot": {"status": "PASS", "live_enabled": False},
+                "02_real_data_readiness": {"status": "PASS"},
+                "03_80_business_day_data": {"status": "PASS"},
+                "04_lgbm_real_train": {"status": "PASS"},
+                "06_paper_balance": {"status": "PASS"},
+                "07_paper_reconciliation": {"status": "PASS"},
+                "08_paper_probe_order": {"status": "PASS"},
+                "09_ops_risk": {"status": "PASS"},
+            },
+        }
+
+    class FakeTrader:
+        def __init__(self, **kwargs: Any) -> None:
+            calls["init"] = kwargs
+
+        def run(self, **kwargs: Any) -> dict[str, Any]:
+            calls["run"] = kwargs
+            return {"status": "PASS", "stages": {}}
+
+    monkeypatch.setattr(script.prelive_gate, "build_report", fake_build_report)
+    monkeypatch.setattr(script, "PaperAutoTrader", FakeTrader)
+
+    rc = script.main([
+        "--prelive-scope",
+        "paper-rehearsal",
+        "--bundle-id",
+        "BUNDLE-TEST",
+        "--tickers",
+        "005930",
+        "--confirm-phrase",
+        "PAPER_AUTO_OK",
+        "--no-write-report",
+    ])
+
+    assert rc == 0
+    assert calls["prelive"]["bundle_id"] == "BUNDLE-TEST"
     out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "BLOCKED"
-    assert out["reason"] == "paper_rehearsal_scope_not_allowed_for_auto_trade"
+    assert out["status"] == "PASS"
+    assert out["prelive_scope"] == "paper-rehearsal"
+    assert out["prelive_gate_status"] == "PASS"
+    assert out["strict_prelive_gate_status"] == "BLOCKED"
+    assert out["strict_prelive_gate_blockers"] == ["05_backtest_real_candidate"]
 
 
 def test_paper_auto_cli_requires_bundle_id_for_strict(capsys) -> None:

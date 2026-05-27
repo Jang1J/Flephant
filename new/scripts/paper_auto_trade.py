@@ -139,6 +139,62 @@ def _default_strict_business_days() -> int:
     return int(gate_cfg.get("rehearsal_business_days") or 80)
 
 
+def _paper_rehearsal_gate_from_strict(prelive: dict[str, Any]) -> dict[str, Any]:
+    """Allow paper-only runtime evidence while keeping deploy blockers explicit."""
+    stages = prelive.get("stages") if isinstance(prelive, dict) else {}
+    stages = stages if isinstance(stages, dict) else {}
+    required_stages = [
+        "01_code_ssot",
+        "02_real_data_readiness",
+        "03_80_business_day_data",
+        "04_lgbm_real_train",
+        "06_paper_balance",
+        "07_paper_reconciliation",
+        "08_paper_probe_order",
+        "09_ops_risk",
+    ]
+    blockers: list[str] = []
+    for stage_name in required_stages:
+        stage = stages.get(stage_name)
+        if not isinstance(stage, dict) or stage.get("status") != "PASS":
+            blockers.append(stage_name)
+
+    strict_blockers = [
+        str(blocker)
+        for blocker in (prelive.get("blockers") or [])
+        if str(blocker).strip()
+    ]
+    allowed_strict_blockers = {"05_backtest_real_candidate"}
+    unexpected_strict_blockers = sorted(
+        set(strict_blockers) - allowed_strict_blockers
+    )
+    blockers.extend(unexpected_strict_blockers)
+
+    stage_01 = stages.get("01_code_ssot") if isinstance(stages, dict) else {}
+    live_enabled = bool(
+        stage_01.get("live_enabled")
+    ) if isinstance(stage_01, dict) else True
+    if live_enabled:
+        blockers.append("live_enabled_true")
+
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "scope": "paper-rehearsal",
+        "blockers": blockers,
+        "allowed_strict_blockers": sorted(allowed_strict_blockers),
+        "strict_prelive_status": prelive.get("status"),
+        "strict_prelive_blockers": strict_blockers,
+        "required_stage_statuses": {
+            stage_name: (
+                stages.get(stage_name, {}).get("status")
+                if isinstance(stages.get(stage_name), dict)
+                else None
+            )
+            for stage_name in required_stages
+        },
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = config_load("risk_config.yaml", "paper_auto_trading")
     parser = argparse.ArgumentParser(description="KIS virtual paper auto trading")
@@ -191,16 +247,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.registry_dir:
         os.environ["ELEPHANT_LGBM_REGISTRY_DIR"] = str(args.registry_dir)
 
-    if args.prelive_scope == "paper-rehearsal":
-        out = {
-            "status": "BLOCKED",
-            "action": "paper_auto_trade",
-            "reason": "paper_rehearsal_scope_not_allowed_for_auto_trade",
-            "prelive_scope": args.prelive_scope,
-            "required_prelive_scope": "strict",
-        }
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 1
     requested_bundle_id = str(args.bundle_id).strip()
     if not requested_bundle_id:
         out = {
@@ -225,12 +271,18 @@ def main(argv: list[str] | None = None) -> int:
 
     tickers = _parse_tickers(str(args.tickers), int(args.max_tickers))
     prelive = None
+    strict_prelive = None
     if safe_bool(cfg.get("require_prelive_pass", True), default=True):
-        prelive = prelive_gate.build_report(
+        strict_prelive = prelive_gate.build_report(
             end_date=str(args.end_date),
             business_days=int(args.business_days),
             max_tickers=int(args.max_tickers),
             bundle_id=requested_bundle_id,
+        )
+        prelive = (
+            _paper_rehearsal_gate_from_strict(strict_prelive)
+            if args.prelive_scope == "paper-rehearsal"
+            else strict_prelive
         )
         if prelive.get("status") != "PASS":
             out = {
@@ -240,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
                 "prelive_scope": args.prelive_scope,
                 "prelive_gate": prelive,
             }
+            if strict_prelive is not None and strict_prelive is not prelive:
+                out["strict_prelive_gate"] = strict_prelive
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return 1
 
@@ -267,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     if prelive is not None:
         report["prelive_gate_status"] = prelive.get("status")
         report["prelive_gate_blockers"] = prelive.get("blockers", [])
+        report["prelive_scope"] = args.prelive_scope
+    if strict_prelive is not None and strict_prelive is not prelive:
+        report["strict_prelive_gate_status"] = strict_prelive.get("status")
+        report["strict_prelive_gate_blockers"] = strict_prelive.get("blockers", [])
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report.get("status") == "PASS" else 1
 

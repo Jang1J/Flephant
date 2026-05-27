@@ -139,12 +139,12 @@ paper_auto_trading:
   require_virtual_mode: true
   require_prelive_pass: true
   require_active_model: true
-  default_max_cycles: 1
+  default_max_cycles: 390
   default_interval_sec: 60
   max_tickers: 30
   max_orders_per_cycle: 3
-  max_order_qty_per_order: 2
-  max_order_qty_per_order_prelive_cap: 2
+  max_order_qty_per_order: 1
+  max_order_qty_per_order_prelive_cap: 1
   allow_market_order: false
   use_latest_ppo_policy_if_available: true
   max_consecutive_read_error_skips: 3  # balance/분봉 read-only transient 오류는 N회까지 주문 없이 skip

@@ -135,6 +135,21 @@ class PaperAutoTrader:
         self._run_guard_passed = False
         self._last_bar_fetch_metadata: dict[str, Any] = {}
 
+    def _on_run_preflight_passed(self, report: dict[str, Any]) -> None:
+        """Hook for wrappers after run-level guards pass and before cycles."""
+        return None
+
+    def _on_before_broker_submit(
+        self,
+        *,
+        cycle_index: int,
+        final_decision: dict[str, Any],
+        hot_result: dict[str, Any],
+        order_guard: dict[str, Any],
+    ) -> None:
+        """Hook for wrappers that must publish/validate before broker submit."""
+        return None
+
     @property
     def confirm_start_phrase(self) -> str:
         return self._confirm_start_phrase
@@ -207,7 +222,9 @@ class PaperAutoTrader:
             return self._finish_report(report, write_report)
 
         cycle_reports: list[dict[str, Any]] = []
+        stop_reason: str | None = None
         self._run_guard_passed = True
+        self._on_run_preflight_passed(report)
         try:
             for idx in range(cycles_int):
                 try:
@@ -231,10 +248,22 @@ class PaperAutoTrader:
                 if idx == 0 and isinstance(cycle.get("account_state"), dict):
                     report["account_initial_state"] = dict(cycle["account_state"])
                 cycle_reports.append(cycle)
+                if self._is_terminal_market_skip(cycle):
+                    stop_reason = str(cycle.get("reason") or "market_session_skip")
+                    break
                 if cycle.get("status") == "FAIL":
                     break
                 if idx < cycles_int - 1:
                     self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        except KeyboardInterrupt:
+            logger.warning("[paper_auto_trading] interrupt 수신. report를 저장하고 안전 종료합니다.")
+            stop_reason = "paper_auto_interrupted"
+            cycle_reports.append(
+                self._interrupted_cycle_report(
+                    cycle_index=len(cycle_reports),
+                    started_at=self._now_kst().isoformat(),
+                )
+            )
         except Exception as e:
             logger.warning("[paper_auto_trading] run 예외로 fail-closed 처리: %s", e)
             cycle_reports.append(
@@ -250,6 +279,9 @@ class PaperAutoTrader:
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
+            "requested_cycles": cycles_int,
+            "completed_cycles": len(cycle_reports),
+            "stop_reason": stop_reason,
             "items": cycle_reports,
         }
         report["status"] = self._overall_status(report)
@@ -274,9 +306,11 @@ class PaperAutoTrader:
         started_at = str(market_session_guard.get("now") or self._now_kst().isoformat())
         if market_session_guard["status"] != "PASS":
             return {
-                "status": "PASS" if market_session_guard.get("safe_skip") else "FAIL",
+                "status": "SKIP" if market_session_guard.get("safe_skip") else "FAIL",
                 "cycle_index": cycle_index,
                 "started_at": started_at,
+                "reason": market_session_guard.get("reason"),
+                "safe_skip": bool(market_session_guard.get("safe_skip")),
                 "market_session_guard": market_session_guard,
                 "execution": None,
             }
@@ -393,6 +427,38 @@ class PaperAutoTrader:
 
         quant_signal_guard = self._quant_signal_guard(hot_result)
         if quant_signal_guard["status"] != "PASS":
+            if quant_signal_guard.get("reason") == "active_model_quant_scores_not_rankable":
+                return {
+                    "status": "SKIP",
+                    "safe_skip": True,
+                    "cycle_index": cycle_index,
+                    "started_at": started_at,
+                    "reason": "quant_signal_readiness",
+                    "cold_path_risk_warning_count": len(external_risk_warnings),
+                    "portfolio_value": portfolio_value,
+                    "n_bars": len(bars_batch),
+                    "quant_signal_guard": quant_signal_guard,
+                    "hot_path_bar_readiness": hot_path_bar_readiness,
+                    "account_state": account_state,
+                    "hot_result": hot_result,
+                    "broker_order_submitted": False,
+                    "execution": {
+                        "status": "SKIP",
+                        "broker_order_submitted": False,
+                        "reason": "quant_scores_not_rankable_no_broker_submit",
+                        "execution_report": {
+                            "status": "SKIP",
+                            "fills": [],
+                            "rejections": [],
+                            "orders": [],
+                        },
+                    },
+                    "order_history_verification": {
+                        "status": "SKIP",
+                        "safe_skip": True,
+                        "reason": "quant_scores_not_rankable_no_broker_submit",
+                    },
+                }
             return {
                 "status": "FAIL",
                 "cycle_index": cycle_index,
@@ -427,6 +493,13 @@ class PaperAutoTrader:
                 "hot_result": hot_result,
                 "execution": None,
             }
+
+        self._on_before_broker_submit(
+            cycle_index=cycle_index,
+            final_decision=final_decision,
+            hot_result=hot_result,
+            order_guard=order_guard,
+        )
 
         if not self._submit_orders:
             shadow_execution = {
@@ -565,6 +638,34 @@ class PaperAutoTrader:
         }
 
     @staticmethod
+    def _is_terminal_market_skip(cycle: dict[str, Any]) -> bool:
+        if cycle.get("status") != "SKIP":
+            return False
+        guard = cycle.get("market_session_guard")
+        if not isinstance(guard, dict):
+            return False
+        return bool(guard.get("safe_skip")) and str(guard.get("reason") or "") in {
+            "outside_market_session",
+            "not_kospi_trading_day",
+        }
+
+    @staticmethod
+    def _interrupted_cycle_report(
+        *,
+        cycle_index: int,
+        started_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "SKIP",
+            "cycle_index": int(cycle_index),
+            "started_at": started_at,
+            "reason": "paper_auto_interrupted",
+            "safe_skip": True,
+            "broker_order_submitted": False,
+            "execution": None,
+        }
+
+    @staticmethod
     def _is_transient_read_error(error: Exception) -> bool:
         text = str(error)
         non_transient_markers = (
@@ -647,13 +748,20 @@ class PaperAutoTrader:
         for ticker in tickers:
             padded = pad_ticker(str(ticker))
             bars = list(self._kis_client.inquire_minute_bar(padded, n_bars=warmup))
-            filtered_bars = self._filter_future_bars(bars, asof=asof)
+            filtered_bars, future_filter_meta = self._filter_future_bars(
+                bars,
+                asof=asof,
+                ticker=padded,
+            )
             topped_up, topup_meta = self._historical_warmup_topup(
                 padded,
                 filtered_bars,
                 warmup,
             )
             out[padded] = topped_up
+            if int(future_filter_meta.get("filtered_count", 0)) > 0:
+                metadata["future_bar_filtered"] = True
+            metadata["future_rows_kept_for_readiness"] = False
             metadata["live_rows_by_ticker"][padded] = len(filtered_bars)
             metadata["historical_topup_rows_by_ticker"][padded] = int(
                 topup_meta.get("historical_topup_count", 0)
@@ -667,6 +775,10 @@ class PaperAutoTrader:
             metadata["tickers"][padded] = {
                 "raw_live_bar_count": len(bars),
                 "live_bar_count": len(filtered_bars),
+                "future_bar_filtered_count": int(
+                    future_filter_meta.get("filtered_count", 0)
+                ),
+                "future_bar_filtered_rows": future_filter_meta.get("filtered_rows", []),
                 "historical_topup_count": int(topup_meta.get("historical_topup_count", 0)),
                 "final_bar_count": len(topped_up),
                 "topup_needed": len(filtered_bars) < warmup,
@@ -756,10 +868,30 @@ class PaperAutoTrader:
         bars: list[dict[str, Any]],
         *,
         asof: str | None,
-    ) -> list[dict[str, Any]]:
-        # Keep raw live rows so _hot_path_bar_readiness can fail closed on
-        # invalid/future bars before HotRunner or broker submission.
-        return list(bars)
+        ticker: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Drop forming/future KIS bars before readiness and HotRunner.
+
+        KIS can return the currently forming one-minute bar with a close timestamp
+        greater than the cycle asof. Keeping that row would either violate PIT or
+        repeatedly fail the run at the minute boundary. Invalid timestamps are
+        deliberately kept so _hot_path_bar_readiness still fails closed on them.
+        """
+        asof_ts = self._parse_bar_ts(asof) if asof is not None else self._now_kst()
+        filtered: list[dict[str, Any]] = []
+        future_rows: list[dict[str, str]] = []
+        padded = pad_ticker(str(ticker))
+        for bar in bars:
+            raw_ts = str(bar.get("ts_close") or "")
+            bar_ts = self._parse_bar_ts(raw_ts)
+            if bar_ts is not None and asof_ts is not None and bar_ts > asof_ts:
+                future_rows.append({"ticker": padded, "ts_close": raw_ts})
+                continue
+            filtered.append(bar)
+        return filtered, {
+            "filtered_count": len(future_rows),
+            "filtered_rows": future_rows[:10],
+        }
 
     def _historical_warmup_topup(
         self,
@@ -1545,7 +1677,20 @@ class PaperAutoTrader:
             bool(len(finite_scores) == 1 and abs(finite_scores[0]) > 1e-12)
             or bool(len(finite_scores) > 1 and len(set(finite_scores)) > 1)
         )
-        if len(finite_scores) != score_count or not rankable:
+        all_zero = bool(finite_scores) and all(abs(value) <= 1e-12 for value in finite_scores)
+        if len(finite_scores) != score_count or all_zero:
+            return {
+                "status": "FAIL",
+                "reason": "active_model_quant_scores_all_zero"
+                if all_zero
+                else "active_model_quant_scores_not_rankable",
+                "quant_mode": mode,
+                "score_count": score_count,
+                "finite_score_count": len(finite_scores),
+                "rankable": rankable,
+                "all_zero": all_zero,
+            }
+        if not rankable:
             return {
                 "status": "FAIL",
                 "reason": "active_model_quant_scores_not_rankable",
@@ -1553,6 +1698,7 @@ class PaperAutoTrader:
                 "score_count": score_count,
                 "finite_score_count": len(finite_scores),
                 "rankable": rankable,
+                "all_zero": all_zero,
             }
         return {
             "status": "PASS",
@@ -1561,6 +1707,7 @@ class PaperAutoTrader:
             "score_count": score_count,
             "finite_score_count": len(finite_scores),
             "rankable": rankable,
+            "all_zero": all_zero,
         }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
