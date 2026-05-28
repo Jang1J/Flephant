@@ -60,6 +60,48 @@ PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/print_env_rea
 The output must show `status=PASS`; it prints presence and length only, never
 secret values.
 
+## Paper Candidate Registry Staging (Prerequisite)
+
+The paper-auto preflight checks `active_registry` against the bundle-scoped paper
+candidate registry. That check reads `active_version` from
+`artifacts/lgbm_paper_candidate/{bundle_id}/registry.json`. If that file is missing
+or has no `active_version`, preflight fails with `active_version_null` and every
+downstream paper step (rehearsal, `collect_kis_paper_evidence`, paper-auto) blocks,
+even on an empty account.
+
+Copying model files into the candidate directory is NOT enough. Only
+`prepare_paper_lgbm_registry.py` writes `registry.json` with `active_version`, and
+no scheduler or nightly job runs it automatically.
+
+Stage the active version once per bundle (paper-only; never mutates the production
+registry):
+
+```bash
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/prepare_paper_lgbm_registry.py \
+  --candidate-version <version from artifacts/bundles/{bundle_id}/lgbm/latest_model_metadata.json> \
+  --source-dir artifacts/bundles/{bundle_id}/lgbm \
+  --target-dir artifacts/lgbm_paper_candidate/{bundle_id} \
+  --force \
+  --confirm-phrase PREPARE_PAPER_LGBM_OK
+```
+
+Verify (read-only):
+
+```bash
+PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/model_registry_readiness.py \
+  --registry-dir artifacts/lgbm_paper_candidate/{bundle_id} \
+  --require-active
+```
+
+Expect `blockers: []` and a populated `active_version`. `status` may be `WARN` on
+`candidate_not_marked_deploy_quality`; preflight accepts `WARN`, so that is fine.
+The staging output must show `paper_only_registry`, `live_trading_allowed=false`,
+and `production_registry_mutated=false`.
+
+Re-run this **once whenever paper trading is pointed at a different bundle** (for
+example, a newly trained post-close candidate). The staged `registry.json` persists
+on disk, so the same bundle never needs re-staging; only a bundle switch does.
+
 ## Balance And Reconciliation
 
 ```bash
@@ -188,6 +230,10 @@ Pre-open pass criteria:
 At `09:00 KST`, collect KIS virtual evidence first. This command performs the
 paper-only balance, probe order, order-history requery, and one-cycle rehearsal
 bundle. It must remain virtual/paper only.
+
+Before this run on a fresh machine — or after switching to a new bundle — stage the
+paper candidate registry first (see "Paper Candidate Registry Staging"). Without it
+the rehearsal blocks with `active_version_null`.
 
 ```bash
 # In an operator-approved shell, inject KIS paper credentials without printing them.
