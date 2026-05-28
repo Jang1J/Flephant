@@ -360,7 +360,7 @@ def paper_auto_order_path_evidence_from_report(
     unique_order_ids = sorted({order_id for order_id in broker_order_ids if order_id})
     unmatched = [
         order_id for order_id in unique_order_ids
-        if verified_order_ids and order_id not in verified_order_ids
+        if order_id not in verified_order_ids
     ]
     if unmatched:
         failures.append({"reason": "submitted_order_unmatched", "order_ids": unmatched})

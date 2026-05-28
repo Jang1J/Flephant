@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.ops.paper_order_path_evidence import find_fresh_paper_order_path_evidence
+from src.ops.paper_order_path_evidence import (
+    find_fresh_paper_order_path_evidence,
+    paper_auto_order_path_evidence_from_report,
+)
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -98,6 +101,24 @@ def test_order_path_blocks_matched_zero(tmp_path: Path) -> None:
 
     assert result["status"] == "BLOCKED"
     assert result["inspected_reports"][0]["failures"]
+
+
+def test_order_path_blocks_matched_count_without_verified_order_id(tmp_path: Path) -> None:
+    report = _paper_auto_report()
+    query = report["stages"]["cycles"]["items"][0]["order_history_verification"]["queries"][0]
+    query["query"] = {"ticker": "005930"}
+    query["matched_orders"] = []
+
+    result = paper_auto_order_path_evidence_from_report(
+        report,
+        report_path=tmp_path / "artifacts/reports/paper_auto_trading/MAIN/paper_auto_trade_20260529.json",
+        root=tmp_path,
+        bundle_id="BUNDLE-TEST",
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["unmatched_order_count"] == 1
+    assert any(failure["reason"] == "submitted_order_unmatched" for failure in result["failures"])
 
 
 def test_order_path_blocks_stale_report(tmp_path: Path) -> None:
