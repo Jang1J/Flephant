@@ -23,6 +23,10 @@ if str(SRC) not in sys.path:
 import paper_auto_service_rehearsal  # noqa: E402
 from src.connectors.kis_rest import KISRestClient  # noqa: E402
 from src.execution.paper_trading import PaperTradingRunner  # noqa: E402
+from src.ops.paper_order_path_evidence import (  # noqa: E402
+    find_fresh_paper_order_path_evidence,
+    summarize_paper_order_path_evidence,
+)
 from src.utils.auth import AuthenticationError  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 
@@ -103,8 +107,20 @@ def _blocked_service_rehearsal_report(
         "cold_risk_report_path": str(args.cold_risk_report or ""),
         "cold_risk_warning_count": 0,
         "blockers": ["paper_auto_service_rehearsal_exception"],
-        "stage_statuses": {"paper_auto_cycle": "BLOCKED"},
-        "broker_evidence": {},
+        "stage_statuses": {
+            "paper_auto_cycle": "BLOCKED",
+            "paper_order_path": "BLOCKED",
+        },
+        "broker_evidence": {
+            "paper_order_path": {
+                "status": "BLOCKED",
+                "reason": "paper_auto_service_rehearsal_exception",
+            }
+        },
+        "paper_order_path_evidence": {
+            "status": "BLOCKED",
+            "reason": "paper_auto_service_rehearsal_exception",
+        },
         "stages": {
             "paper_auto_cycle": {
                 "status": "BLOCKED",
@@ -135,21 +151,63 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
 
-    price = args.price
-    if price is None and bool(args.auto_price) and str(args.order_type) != "01":
-        price = _run_with_token_retry(lambda: {"price": _auto_price(args.ticker)})["price"]
-
-    stages["probe_order"] = _run_with_token_retry(
-        lambda: runner.submit_probe_order(
-            ticker=args.ticker,
-            side=args.side,
-            qty=int(args.qty),
-            price=price,
-            order_type=str(args.order_type),
-            confirm_phrase=args.probe_confirm_phrase,
-            write_report=not bool(args.no_write_report),
-        )
+    probe_mode = str(
+        getattr(args, "probe_mode", "if-no-fresh-order-evidence")
+        or "if-no-fresh-order-evidence"
     )
+    existing_order_path = find_fresh_paper_order_path_evidence(
+        root=ROOT,
+        bundle_id=str(args.bundle_id),
+    )
+    probe_policy: dict[str, Any] = {
+        "mode": probe_mode,
+        "initial_order_path_status": existing_order_path.get("status"),
+        "probe_submitted": False,
+    }
+    should_probe = probe_mode == "always" or (
+        probe_mode == "if-no-fresh-order-evidence"
+        and existing_order_path.get("status") != "PASS"
+    )
+    if probe_mode == "never" and existing_order_path.get("status") != "PASS":
+        stages["paper_order_path"] = existing_order_path
+        stages["probe_order"] = {
+            "status": "SKIP",
+            "safe_skip": True,
+            "reason": "probe_mode_never_order_path_evidence_missing",
+        }
+        probe_policy["skip_reason"] = "probe_mode_never_order_path_evidence_missing"
+    elif should_probe:
+        price = args.price
+        if price is None and bool(args.auto_price) and str(args.order_type) != "01":
+            price = _run_with_token_retry(lambda: {"price": _auto_price(args.ticker)})["price"]
+
+        stages["probe_order"] = _run_with_token_retry(
+            lambda: runner.submit_probe_order(
+                ticker=args.ticker,
+                side=args.side,
+                qty=int(args.qty),
+                price=price,
+                order_type=str(args.order_type),
+                confirm_phrase=args.probe_confirm_phrase,
+                write_report=not bool(args.no_write_report),
+            )
+        )
+        probe_policy["probe_submitted"] = True
+        stages["paper_order_path"] = summarize_paper_order_path_evidence(
+            stages["probe_order"],
+            root=ROOT,
+            bundle_id=str(args.bundle_id),
+        )
+    else:
+        stages["paper_order_path"] = existing_order_path
+        stages["probe_order"] = {
+            "status": "SKIP",
+            "safe_skip": True,
+            "reason": "fresh_paper_order_path_evidence_found",
+            "evidence_type": existing_order_path.get("evidence_type"),
+            "report_path": existing_order_path.get("report_path"),
+        }
+        probe_policy["skip_reason"] = "fresh_paper_order_path_evidence_found"
 
     rehearsal_args = Namespace(
         internal_fake_kis=False,
@@ -163,31 +221,48 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         no_write_report=bool(args.no_write_report),
         use_real_hot_runner=bool(args.use_real_hot_runner),
     )
-    try:
-        stages["paper_auto_service_rehearsal"] = _run_with_token_retry(
-            lambda: paper_auto_service_rehearsal.build_report(rehearsal_args)
-        )
-    except Exception as e:
-        stages["paper_auto_service_rehearsal"] = _blocked_service_rehearsal_report(
-            args,
-            e,
-        )
-    if not bool(args.no_write_report):
-        stages["paper_auto_service_rehearsal"] = _write_service_rehearsal_report(
-            stages["paper_auto_service_rehearsal"]
-        )
+    run_rehearsal = not (
+        probe_mode == "never" and existing_order_path.get("status") != "PASS"
+    )
+    if run_rehearsal:
+        try:
+            stages["paper_auto_service_rehearsal"] = _run_with_token_retry(
+                lambda: paper_auto_service_rehearsal.build_report(rehearsal_args)
+            )
+        except Exception as e:
+            stages["paper_auto_service_rehearsal"] = _blocked_service_rehearsal_report(
+                args,
+                e,
+            )
+        if not bool(args.no_write_report):
+            stages["paper_auto_service_rehearsal"] = _write_service_rehearsal_report(
+                stages["paper_auto_service_rehearsal"]
+            )
+    else:
+        stages["paper_auto_service_rehearsal"] = {
+            "status": "SKIP",
+            "safe_skip": True,
+            "reason": "order_path_evidence_missing_probe_mode_never",
+        }
 
-    blockers = [
-        name
-        for name, stage in stages.items()
-        if isinstance(stage, dict) and stage.get("status") != "PASS"
-    ]
+    blockers = []
+    for name, stage in stages.items():
+        if not isinstance(stage, dict) or stage.get("status") == "PASS":
+            continue
+        if (
+            name == "probe_order"
+            and stage.get("status") == "SKIP"
+            and stages.get("paper_order_path", {}).get("status") == "PASS"
+        ):
+            continue
+        blockers.append(name)
     return {
         "status": "PASS" if not blockers else "BLOCKED",
         "generated_at": datetime.now(_KST).isoformat(),
         "action": "collect_kis_paper_evidence",
         "bundle_id": args.bundle_id,
         "registry_dir": registry_dir,
+        "probe_policy": probe_policy,
         "blockers": blockers,
         "stage_statuses": {
             name: stage.get("status") if isinstance(stage, dict) else "UNKNOWN"
@@ -217,6 +292,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--system-positions-json", default=None)
     parser.add_argument("--assume-empty-system-positions", action="store_true")
     parser.add_argument("--probe-confirm-phrase", default="PAPER_ORDER_OK")
+    parser.add_argument(
+        "--probe-mode",
+        choices=["always", "if-no-fresh-order-evidence", "never"],
+        default="if-no-fresh-order-evidence",
+        help=(
+            "Probe submission policy. Use 'never' for read-only daily readiness; "
+            "'if-no-fresh-order-evidence' submits a probe only when no verified "
+            "paper order-path evidence exists."
+        ),
+    )
     parser.add_argument("--auto-confirm-phrase", default="PAPER_AUTO_OK")
     parser.add_argument(
         "--cold-risk-report",

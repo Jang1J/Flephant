@@ -25,6 +25,21 @@ def _now_iso() -> str:
     return datetime.now(_KST).isoformat()
 
 
+def _runtime() -> dict:
+    return {"kis_mode": "virtual", "live_enabled": False}
+
+
+def _probe_execution(order_id: str = "OD-1") -> dict:
+    return {
+        "status": "PASS",
+        "result": {
+            "execution_report": {
+                "fills": [{"broker_order_id": order_id}],
+            },
+        },
+    }
+
+
 def test_paper_auto_preflight_passes_when_all_narrow_gates_pass(monkeypatch) -> None:
     monkeypatch.setattr(
         paper_auto_preflight.print_env_readiness,
@@ -114,11 +129,14 @@ def test_paper_evidence_blocks_probe_without_matched_order(monkeypatch) -> None:
             }
         if "submit_probe_order" in pattern:
             return {
+                "action": "submit_probe_order",
                 "status": "PASS",
                 "_path": "probe.json",
                 "generated_at": _now_iso(),
+                "runtime": _runtime(),
                 "evidence": _evidence(),
                 "stages": {
+                    "execution": _probe_execution(),
                     "order_history": {
                         "status": "PASS",
                         "matched_order_count": 0,
@@ -153,11 +171,14 @@ def test_paper_evidence_accepts_matched_broker_order(monkeypatch) -> None:
             }
         if "submit_probe_order" in pattern:
             return {
+                "action": "submit_probe_order",
                 "status": "PASS",
                 "_path": "probe.json",
                 "generated_at": _now_iso(),
+                "runtime": _runtime(),
                 "evidence": _evidence(),
                 "stages": {
+                    "execution": _probe_execution(),
                     "order_history": {
                         "status": "PASS",
                         "matched_order_count": 1,
@@ -191,9 +212,11 @@ def test_paper_evidence_reports_market_closed_probe_blocker(monkeypatch) -> None
             }
         if "submit_probe_order" in pattern:
             return {
+                "action": "submit_probe_order",
                 "status": "FAIL",
                 "_path": "probe.json",
                 "generated_at": _now_iso(),
+                "runtime": _runtime(),
                 "evidence": _evidence(),
                 "stages": {
                     "execution": {
@@ -241,9 +264,11 @@ def test_paper_evidence_reports_non_business_day_probe_blocker(monkeypatch) -> N
             }
         if "submit_probe_order" in pattern:
             return {
+                "action": "submit_probe_order",
                 "status": "FAIL",
                 "_path": "probe.json",
                 "generated_at": _now_iso(),
+                "runtime": _runtime(),
                 "evidence": _evidence(),
                 "stages": {
                     "execution": {
@@ -291,11 +316,14 @@ def test_paper_evidence_blocks_mismatched_broker_fingerprint(monkeypatch) -> Non
             }
         if "submit_probe_order" in pattern:
             return {
+                "action": "submit_probe_order",
                 "status": "PASS",
                 "_path": "probe.json",
                 "generated_at": _now_iso(),
+                "runtime": _runtime(),
                 "evidence": {"broker_env_fingerprint": "fp-b"},
                 "stages": {
+                    "execution": _probe_execution(),
                     "order_history": {
                         "status": "PASS",
                         "matched_order_count": 1,

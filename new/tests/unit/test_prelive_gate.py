@@ -540,8 +540,18 @@ def test_probe_order_blocks_without_order_history_match(monkeypatch, tmp_path):
             {
                 "action": "submit_probe_order",
                 "status": "PASS",
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "runtime": {"kis_mode": "virtual", "live_enabled": False},
+                "evidence": {"broker_env_fingerprint": "fp-test"},
                 "stages": {
-                    "execution": {"status": "PASS"},
+                    "execution": {
+                        "status": "PASS",
+                        "result": {
+                            "execution_report": {
+                                "fills": [{"broker_order_id": "OD-1"}],
+                            },
+                        },
+                    },
                     "order_history": {
                         "status": "PASS",
                         "matched_order_count": 0,
@@ -570,8 +580,18 @@ def test_probe_order_passes_with_order_history_match(monkeypatch, tmp_path):
             {
                 "action": "submit_probe_order",
                 "status": "PASS",
+                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "runtime": {"kis_mode": "virtual", "live_enabled": False},
+                "evidence": {"broker_env_fingerprint": "fp-test"},
                 "stages": {
-                    "execution": {"status": "PASS"},
+                    "execution": {
+                        "status": "PASS",
+                        "result": {
+                            "execution_report": {
+                                "fills": [{"broker_order_id": "OD-1"}],
+                            },
+                        },
+                    },
                     "order_history": {
                         "status": "PASS",
                         "matched_order_count": 1,
@@ -870,8 +890,7 @@ def test_bundle_balance_stage_passes_when_probe_stage_is_blocked(monkeypatch, tm
     }
     assert probe["status"] == "BLOCKED"
     assert probe["required_broker_evidence_nested"]["stage_statuses"] == {
-        "probe_order": "BLOCKED",
-        "order_history_requery": "BLOCKED",
+        "paper_order_path": "BLOCKED",
     }
 
 

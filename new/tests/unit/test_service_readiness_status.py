@@ -818,7 +818,11 @@ def test_service_status_blocks_paper_trading_only_even_if_history_pass(
     assert payload["deploy_quality"] == "PASS"
     assert payload["broker_evidence"] == "BLOCKED"
     assert payload["kis_broker_evidence"]["blocker"] == "paper_auto_bundle_evidence_missing"
-    assert payload["kis_broker_evidence"]["paper_trading_evidence"]["order_history"]["status"] == "PASS"
+    assert payload["kis_broker_evidence"]["paper_trading_evidence"]["order_history"]["status"] == "BLOCKED"
+    assert (
+        payload["kis_broker_evidence"]["paper_trading_evidence"]["paper_order_path"]["status"]
+        == "BLOCKED"
+    )
 
 
 def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(

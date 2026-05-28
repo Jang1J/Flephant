@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
 
 import paper_auto_preflight  # noqa: E402
 from src.execution.paper_auto_trading import PaperAutoTrader  # noqa: E402
+from src.ops.paper_order_path_evidence import summarize_paper_order_path_evidence  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.safe_cast import safe_float  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
@@ -208,10 +209,12 @@ def _broker_evidence_from_preflight(preflight: dict[str, Any]) -> dict[str, Any]
     balance = evidence.get("balance_reconciliation")
     probe = evidence.get("probe_order")
     history = evidence.get("order_history")
+    order_path = evidence.get("paper_order_path")
     return {
         "balance_reconciliation": balance if isinstance(balance, dict) else {"status": "MISSING"},
         "probe_order": probe if isinstance(probe, dict) else {"status": "MISSING"},
         "order_history_requery": history if isinstance(history, dict) else {"status": "MISSING"},
+        "paper_order_path": order_path if isinstance(order_path, dict) else {"status": "MISSING"},
     }
 
 
@@ -305,11 +308,39 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         else None
     )
     report_bundle_id = requested_bundle_id or bundle_id
+    paper_cycle = stages.get("paper_auto_cycle") if isinstance(stages, dict) else {}
+    cycle_order_path = (
+        summarize_paper_order_path_evidence(
+            paper_cycle,
+            root=ROOT,
+            bundle_id=report_bundle_id,
+        )
+        if isinstance(paper_cycle, dict)
+        else {"status": "MISSING"}
+    )
+    if cycle_order_path.get("status") == "PASS":
+        broker_evidence["paper_order_path"] = cycle_order_path
+        broker_evidence["probe_order"] = {
+            "status": "PASS",
+            "deprecated": True,
+            "replaced_by": "paper_order_path",
+            "evidence_type": cycle_order_path.get("evidence_type"),
+        }
+        broker_evidence["order_history_requery"] = {
+            "status": "PASS",
+            "evidence_type": cycle_order_path.get("evidence_type"),
+            "matched_order_count": cycle_order_path.get("matched_order_count", 0),
+        }
     evidence_level = "external_kis_virtual"
     if args.internal_fake_kis and use_real_hot_runner:
         evidence_level = "internal_fake_kis_real_hot_runner"
     elif args.internal_fake_kis:
         evidence_level = "internal_fake_kis"
+    stage_statuses = _stage_statuses(stages, preflight)
+    if cycle_order_path.get("status") == "PASS":
+        stage_statuses["paper_order_path"] = "PASS"
+        stage_statuses["probe_order"] = "PASS"
+        stage_statuses["order_history_requery"] = "PASS"
     return {
         "status": status,
         "action": "paper_auto_service_rehearsal",
@@ -322,8 +353,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "live_trading_enabled": False,
         "cold_risk_report_path": str(getattr(args, "cold_risk_report", "") or ""),
         "cold_risk_warning_count": len(risk_warnings),
-        "stage_statuses": _stage_statuses(stages, preflight),
+        "stage_statuses": stage_statuses,
         "broker_evidence": broker_evidence,
+        "paper_order_path_evidence": cycle_order_path,
         "stages": stages,
     }
 

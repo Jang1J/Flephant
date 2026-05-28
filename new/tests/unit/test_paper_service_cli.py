@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 if str(SCRIPTS) not in sys.path:
@@ -11,6 +13,33 @@ if str(SCRIPTS) not in sys.path:
 import paper_service_rehearsal  # noqa: E402
 import paper_trading_smoke  # noqa: E402
 import collect_kis_paper_evidence  # noqa: E402
+
+_KST = ZoneInfo("Asia/Seoul")
+
+
+def _probe_pass_report() -> dict:
+    return {
+        "action": "submit_probe_order",
+        "status": "PASS",
+        "generated_at": datetime.now(_KST).isoformat(),
+        "runtime": {"kis_mode": "virtual", "live_enabled": False},
+        "evidence": {"broker_env_fingerprint": "fp-test"},
+        "stages": {
+            "execution": {
+                "status": "PASS",
+                "result": {
+                    "execution_report": {
+                        "fills": [{"broker_order_id": "OD-1"}],
+                    },
+                },
+            },
+            "order_history": {
+                "status": "PASS",
+                "matched_order_count": 1,
+                "_mode": "virtual",
+            },
+        },
+    }
 
 
 def test_paper_trading_smoke_can_assume_empty_system_positions() -> None:
@@ -64,7 +93,7 @@ def test_collect_kis_paper_evidence_derives_registry_dir_from_bundle(monkeypatch
             confirm_phrase,
             write_report=True,
         ):
-            return {"status": "PASS"}
+            return _probe_pass_report()
 
     def fake_service_rehearsal(args):
         calls["registry_dir"] = args.registry_dir
@@ -122,7 +151,7 @@ def test_collect_kis_paper_evidence_forwards_cold_risk_report(monkeypatch) -> No
             confirm_phrase,
             write_report=True,
         ):
-            return {"status": "PASS"}
+            return _probe_pass_report()
 
     def fake_service_rehearsal(args):
         calls["cold_risk_report"] = args.cold_risk_report
@@ -183,7 +212,7 @@ def test_collect_kis_paper_evidence_converts_service_exception_to_blocked(
             confirm_phrase,
             write_report=True,
         ):
-            return {"status": "PASS"}
+            return _probe_pass_report()
 
     def fail_service_rehearsal(args):
         raise ConnectionError("dns failed")

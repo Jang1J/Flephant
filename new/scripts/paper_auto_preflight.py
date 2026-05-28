@@ -22,6 +22,10 @@ if str(SRC) not in sys.path:
 
 import model_registry_readiness  # noqa: E402
 import print_env_readiness  # noqa: E402
+from src.ops.paper_order_path_evidence import (  # noqa: E402
+    find_fresh_paper_order_path_evidence,
+    summarize_paper_order_path_evidence,
+)
 from src.utils.config_loader import load as config_load  # noqa: E402
 from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 
@@ -195,12 +199,36 @@ def _paper_evidence() -> dict[str, Any]:
     if order_history and not probe_history_ok:
         evidence_reports.append(order_history)
     evidence_guard = _evidence_set_guard(evidence_reports)
+    profile_fingerprint = _evidence_fingerprint(balance)
+    order_path_candidates: list[dict[str, Any]] = []
+    for item in (probe, order_history):
+        if not isinstance(item, dict):
+            continue
+        raw_path = item.get("_path")
+        path = Path(str(raw_path)) if raw_path else None
+        order_path_candidates.append(
+            summarize_paper_order_path_evidence(
+                item,
+                report_path=path,
+                root=ROOT,
+                profile_fingerprint=profile_fingerprint or None,
+            )
+        )
+    order_path = next(
+        (candidate for candidate in order_path_candidates if candidate.get("status") == "PASS"),
+        None,
+    )
+    if order_path is None:
+        order_path = find_fresh_paper_order_path_evidence(
+            root=ROOT,
+            profile_fingerprint=profile_fingerprint or None,
+        )
+    order_path_ok = order_path.get("status") == "PASS"
     status = (
         "PASS"
         if (
             balance_ok
-            and probe_ok
-            and (probe_history_ok or history_ok)
+            and order_path_ok
             and evidence_guard.get("status") == "PASS"
         )
         else "BLOCKED"
@@ -221,19 +249,27 @@ def _paper_evidence() -> dict[str, Any]:
             ),
         },
         "probe_order": {
-            "status": "PASS" if probe_ok else "BLOCKED",
+            "status": "PASS" if order_path_ok else "BLOCKED",
             "report_path": probe.get("_path") if probe else None,
-            "blocker": _probe_order_blocker(probe) if not probe_ok else {},
+            "deprecated": True,
+            "replaced_by": "paper_order_path",
+            "evidence_type": order_path.get("evidence_type"),
+            "blocker": _probe_order_blocker(probe) if not order_path_ok else {},
         },
         "order_history": {
-            "status": "PASS" if (probe_history_ok or history_ok) else "BLOCKED",
+            "status": "PASS" if order_path_ok else "BLOCKED",
             "report_path": (
                 order_history.get("_path")
                 if order_history
                 else probe.get("_path") if probe_history_ok and probe else None
             ),
-            "matched_order_count": max(probe_matched_order_count, history_matched_order_count),
+            "matched_order_count": max(
+                safe_int(order_path.get("matched_order_count", 0), default=0, min_value=0),
+                probe_matched_order_count,
+                history_matched_order_count,
+            ),
         },
+        "paper_order_path": order_path,
     }
 
 
