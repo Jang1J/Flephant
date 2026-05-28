@@ -514,11 +514,12 @@ class PaperAutoTrader:
             and order_guard.get("safe_skip")
         ):
             order_guard = dict(order_guard)
-            order_guard["reason"] = "runtime_service_policy_filtered_all_orders"
             order_guard["runtime_service_policy_applied"] = runtime_policy_applied
+            if not final_decision.get("order_deltas"):
+                order_guard["reason"] = "runtime_service_policy_filtered_all_orders"
         if order_guard["status"] != "PASS":
             return {
-                "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
+                "status": "SKIP" if order_guard.get("safe_skip") else "FAIL",
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "cold_path_risk_warning_count": len(external_risk_warnings),
@@ -1514,6 +1515,47 @@ class PaperAutoTrader:
             reason = str(od.get("reason", "")).lower()
             held_qty = current_qty_by_ticker.get(ticker, 0)
             if side == "sell" and reason == "risk_reduce":
+                qty = safe_lossless_int(
+                    od.get("qty", 0),
+                    default=0,
+                    min_value=0,
+                )
+                if held_qty <= 0:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_requires_held_position",
+                        "policy": "risk_fast.execution_bridge.require_held_position",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
+                if qty <= 0:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_invalid_qty",
+                        "policy": "risk_fast.execution_bridge",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
+                if qty > held_qty:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_qty_exceeds_held_qty",
+                        "policy": "risk_fast.execution_bridge.require_held_position",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
                 kept.append(od)
                 continue
             last_order_cycle = self._last_order_cycle_by_ticker.get(ticker)

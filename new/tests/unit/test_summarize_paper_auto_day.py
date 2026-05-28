@@ -132,3 +132,77 @@ def test_daily_summary_filters_reports_by_bundle_id(tmp_path):
         "required_bundle_id": "BUNDLE-OTHER",
     }]
     assert summary["interpretation"]["broker_tracks"] == ["MAIN_BASELINE"]
+
+
+def test_daily_summary_blocks_order_deltas_without_broker_execution(tmp_path):
+    mod = _load_script("summarize_paper_auto_day")
+    path = tmp_path / "MAIN_BASELINE" / "paper_auto_trade_20260528_153000.json"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "status": "PASS",
+        "generated_at": "2026-05-28T15:30:00+09:00",
+        "params": {
+            "track_id": "MAIN_BASELINE",
+            "policy_hash": "MAIN-HASH",
+            "required_bundle_id": "BUNDLE-20260521-POSTCLOSE",
+            "cycles": 1,
+        },
+        "stages": {
+            "cycles": {
+                "items": [
+                    {
+                        "status": "SKIP",
+                        "order_guard": {
+                            "status": "SKIP",
+                            "safe_skip": True,
+                            "reason": "fda_veto",
+                        },
+                        "hot_result": {
+                            "quant_output": {
+                                "mode": "active",
+                                "scores": {"005930": 0.2, "000660": 0.1},
+                            },
+                            "final_decision": {
+                                "reason_code": "RISK_FAST_TRIGGER",
+                                "order_deltas": [
+                                    {
+                                        "ticker": "005930",
+                                        "side": "sell",
+                                        "qty": 1,
+                                        "reason": "risk_reduce",
+                                    }
+                                ],
+                            },
+                        },
+                        "execution": None,
+                    }
+                ]
+            }
+        },
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    summary = mod.build_summary(
+        generated_date="20260528",
+        bundle_id="BUNDLE-20260521-POSTCLOSE",
+        report_root=tmp_path,
+    )
+
+    assert summary["status"] == "BLOCKED"
+    assert "explained_order_deltas_without_broker_execution" in summary["blockers"]
+    assert summary["totals"]["order_delta_no_submit_cycles"] == 1
+    assert summary["totals"]["explained_order_delta_no_submit_cycles"] == 1
+    assert summary["totals"]["unexplained_order_delta_no_submit_cycles"] == 0
+    assert summary["totals"]["order_delta_no_submit_reason_counts"] == {"fda_veto": 1}
+    assert summary["interpretation"]["explained_no_submit_reasons"] == {"fda_veto": 1}
+    assert summary["interpretation"]["unexplained_no_submit_count"] == 0
+    assert summary["interpretation"]["remaining_policy_gaps"] == [
+        "risk_fast_or_fda_veto_no_submit",
+        "broker_submit_absent_for_order_deltas",
+        "not_ab_comparison",
+    ]
+    assert summary["interpretation"]["remaining_quant_gaps"] == []
+    assert summary["interpretation"]["safe_statement"] == (
+        "no broker execution evidence; inspect no-submit policy reasons"
+    )

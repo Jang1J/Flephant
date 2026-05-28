@@ -29,7 +29,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_float
+from src.utils.safe_cast import safe_bool, safe_float
 
 logger = get_logger("fda")
 
@@ -139,12 +139,64 @@ class FDAAgent(AgentBase):
             section="fda_uncertainty_link",
             key="reason_code_on_boost",
         )
+        defaults_cfg = self._require_config_section("fda_decision_defaults")
+        self._default_approve_confidence = self._require_probability(
+            defaults_cfg,
+            section="fda_decision_defaults",
+            key="approve_confidence",
+        )
+        self._default_veto_confidence = self._require_probability(
+            defaults_cfg,
+            section="fda_decision_defaults",
+            key="veto_confidence",
+        )
+        self._risk_reduce_bridge_cfg = self._load_risk_reduce_bridge_config()
 
         logger.info(
             "[fda] 초기화: CAN_CHANGE_WEIGHT=%s, reason_codes=%d종, cold_path=%s",
             self.CAN_CHANGE_WEIGHT, len(self._valid_reason_codes),
             "enabled" if self._llm_router else "disabled_fail_closed",
         )
+
+    @staticmethod
+    def _load_risk_reduce_bridge_config() -> dict[str, Any]:
+        """RiskFast→risk_reduce sell 승인 브리지 설정.
+
+        설정 누락은 운영 안전상 disabled로 닫는다. FDA는 여전히 주문/비중을
+        수정하지 않고, PM이 이미 만든 risk_reduce-only 주문의 승인 여부만 판단한다.
+        """
+        try:
+            risk_cfg = config_load("risk_config.yaml", "risk_fast")
+        except Exception:
+            return {"enabled": False}
+        if not isinstance(risk_cfg, dict):
+            return {"enabled": False}
+        bridge = risk_cfg.get("execution_bridge")
+        if not isinstance(bridge, dict):
+            return {"enabled": False}
+        levels = bridge.get("risk_levels") or []
+        return {
+            "enabled": safe_bool(bridge.get("enabled"), default=False),
+            "risk_levels": {
+                str(level).strip().lower()
+                for level in levels
+                if str(level).strip()
+            },
+            "fda_approve_risk_reduce_only": safe_bool(
+                bridge.get("fda_approve_risk_reduce_only"),
+                default=False,
+            ),
+            "allow_critical_risk_reduce": safe_bool(
+                bridge.get("allow_critical_risk_reduce"),
+                default=False,
+            ),
+            "approve_confidence": safe_float(
+                bridge.get("approve_confidence"),
+                default=0.0,
+                min_value=0.0,
+                max_value=1.0,
+            ),
+        }
 
     @staticmethod
     def _require_config_section(section: str) -> dict[str, Any]:
@@ -349,6 +401,39 @@ class FDAAgent(AgentBase):
             if rf_level in ("critical", "high"):
                 triggered = risk_fast_eval.get("triggered_rules", [])
                 affected = risk_fast_eval.get("affected_tickers", [])
+                if self._can_approve_risk_reduce_only(
+                    risk_fast_eval=risk_fast_eval,
+                    affected_tickers=affected,
+                    order_deltas=order_deltas or [],
+                ):
+                    return self._finalize_decision(
+                        approved=True,
+                        reason_code="NORMAL_APPROVE",
+                        veto_reason=None,
+                        target_weights=target_weights or {},
+                        order_deltas=order_deltas or [],
+                        portfolio_patch_ref=portfolio_patch_ref,
+                        t0=t0,
+                        risk_overrides=[
+                            {
+                                "rule": "risk_fast_risk_reduce_bridge",
+                                "original": "risk_fast_veto",
+                                "override": "approve_risk_reduce_only",
+                                "justification": (
+                                    f"RiskFast {rf_level} affected held ticker; "
+                                    "PM supplied sell/risk_reduce-only deltas"
+                                ),
+                                "triggered_rules": triggered,
+                                "affected_tickers": affected,
+                            }
+                        ],
+                        confidence=safe_float(
+                            self._risk_reduce_bridge_cfg.get("approve_confidence"),
+                            default=0.0,
+                            min_value=0.0,
+                            max_value=1.0,
+                        ),
+                    )
                 return self._build_veto_decision(
                     reason_code="RISK_FAST_TRIGGER",
                     veto_reason=(
@@ -397,6 +482,63 @@ class FDAAgent(AgentBase):
             active_reports=active_reports or [],
             t0=t0,
         )
+
+    def _can_approve_risk_reduce_only(
+        self,
+        *,
+        risk_fast_eval: dict[str, Any],
+        affected_tickers: Any,
+        order_deltas: list[dict[str, Any]],
+    ) -> bool:
+        bridge = self._risk_reduce_bridge_cfg
+        if not safe_bool(bridge.get("enabled"), default=False):
+            return False
+        if not safe_bool(bridge.get("fda_approve_risk_reduce_only"), default=False):
+            return False
+        if safe_float(bridge.get("approve_confidence"), default=0.0) <= 0.0:
+            return False
+        level = str(risk_fast_eval.get("risk_level") or "").strip().lower()
+        severity = str(risk_fast_eval.get("severity") or "").strip().lower()
+        recommended_action = str(
+            risk_fast_eval.get("recommended_action") or ""
+        ).strip().lower()
+        triggered_rules = {
+            str(rule).strip().lower()
+            for rule in (risk_fast_eval.get("triggered_rules") or [])
+            if str(rule).strip()
+        }
+        critical_or_halt = (
+            level == "critical"
+            or severity == "critical"
+            or recommended_action == "halt"
+            or "rule_top10_collapse" in triggered_rules
+        )
+        if critical_or_halt and not safe_bool(
+            bridge.get("allow_critical_risk_reduce"),
+            default=False,
+        ):
+            return False
+        configured_levels = bridge.get("risk_levels")
+        if isinstance(configured_levels, set) and configured_levels and level not in configured_levels:
+            return False
+        affected = {
+            str(ticker).zfill(6)
+            for ticker in (affected_tickers or [])
+            if str(ticker).strip()
+        }
+        # RiskFast sidecar unavailable 등 affected가 비어 있으면 안전하게 기존 veto 유지.
+        if not affected or not order_deltas:
+            return False
+        for delta in order_deltas:
+            ticker = str(delta.get("ticker", "")).zfill(6)
+            side = str(delta.get("side", "")).lower()
+            reason = str(delta.get("reason", "")).lower()
+            qty = int(delta.get("qty") or 0)
+            if side != "sell" or reason != "risk_reduce" or qty <= 0:
+                return False
+            if ticker not in affected:
+                return False
+        return True
 
     # ================================================================== #
     # Internal: Decision builders
@@ -473,10 +615,13 @@ class FDAAgent(AgentBase):
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         now_iso = datetime.now(tz=timezone.utc).isoformat()
+        default_confidence = (
+            self._default_approve_confidence if approved else self._default_veto_confidence
+        )
         final_confidence = (
-            self._safe_confidence(confidence, default=1.0 if approved else 0.5)
+            self._safe_confidence(confidence, default=default_confidence)
             if confidence is not None
-            else (1.0 if approved else 0.5)
+            else default_confidence
         )
 
         return {

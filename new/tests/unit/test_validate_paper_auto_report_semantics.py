@@ -284,6 +284,68 @@ def test_paper_auto_semantics_does_not_count_shadow_as_broker_execution(
     ]
 
 
+def test_paper_auto_semantics_allows_explained_fda_veto_no_submit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
+    report_dir.mkdir(parents=True)
+    (report_dir / "paper_auto_trade_20260528_153000.json").write_text(
+        """
+{
+  "status": "PASS",
+  "generated_at": "2026-05-28T15:30:00+09:00",
+  "params": {"required_bundle_id": "BUNDLE-TEST"},
+  "stages": {
+    "cycles": {
+      "status": "PASS",
+      "items": [
+        {
+          "status": "SKIP",
+          "order_guard": {
+            "status": "SKIP",
+            "safe_skip": true,
+            "reason": "fda_veto"
+          },
+          "execution": null,
+          "hot_result": {
+            "quant_output": {
+              "mode": "active",
+              "scores": {"005930": 0.1, "000660": 0.2}
+            },
+            "final_decision": {
+              "approved": false,
+              "reason_code": "RISK_FAST_TRIGGER",
+              "order_deltas": [
+                {"ticker": "005930", "side": "sell", "qty": 1, "reason": "risk_reduce"}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(bundle_id="BUNDLE-TEST")
+
+    assert report["status"] == "BLOCKED"
+    assert report["failure_count"] == 1
+    summary = report["reports"][0]
+    assert summary["explained_no_submit_order_delta_cycles"] == 1
+    assert summary["unexplained_order_delta_no_broker_cycles"] == 0
+    assert summary["explained_no_submit_reasons"] == {"fda_veto": 1}
+    assert summary["blockers"] == [
+        "pass_with_order_deltas_no_broker_execution_explained_by_guard"
+    ]
+
+
 def test_paper_auto_semantics_filters_by_generated_date(
     tmp_path,
     monkeypatch,

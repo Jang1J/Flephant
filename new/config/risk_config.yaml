@@ -129,6 +129,7 @@ paper_trading:
   max_probe_order_qty: 1
   allow_market_order: false
   evidence_max_age_sec: 86400
+  require_same_day_evidence: true
 
 paper_auto_trading:
   report_dir: "artifacts/reports/paper_auto_trading"
@@ -1428,6 +1429,13 @@ system_os_metrics:
 # Sprint 2 S2-9 FDA Cold Path 구현 시 이 섹션에서 로드 필수. 하드코딩 금지.
 # PIT-Safety: divergence는 장전 배치 점수 기반 → 실시간 publish 안전.
 # ============================================================
+fda_decision_defaults:
+  approve_confidence: 1.0
+  veto_confidence: 0.5
+  metadata:
+    owner: "risk_policy"
+    rationale: "FDA 기본 approve/veto confidence는 코드 하드코딩 없이 config에서 로드한다."
+
 fda_uncertainty_link:
   mode_b_metadata:
     schema_version: "1.0.0"
@@ -1502,6 +1510,15 @@ risk_fast:
   volume_lookback_bars: 20          # 거래량 평균 계산 기준 봉 수
   min_bars_required: 2              # 규칙 평가 최소 bar 수
   narrative_max_chars: 300          # RiskSlow LLM 응답 narrative 최대 길이
+  execution_bridge:
+    enabled: true
+    risk_levels: ["high", "medium"]
+    fda_approve_risk_reduce_only: true
+    approve_confidence: 0.72
+    allow_critical_risk_reduce: false
+    suppress_rebalance_orders: true
+    require_held_position: true
+    rationale: "RiskFast 위험 감지는 전체 주문 차단만 하지 않고, 보유 중인 affected ticker에 한해 PM이 생성한 risk_reduce sell만 paper submit 가능하게 연결한다. FDA는 비중/주문을 수정하지 않고 risk_reduce-only patch를 approve/veto만 한다."
 
   # Cold Path RiskAgentFast (cold/risk_fast.py) 전용 임계값
   # Hot Path sidecar(위 섹션)와 별개. Cold Path 이벤트 기반 규칙.

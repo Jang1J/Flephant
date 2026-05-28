@@ -23,6 +23,16 @@ if str(SRC) not in sys.path:
 _KST = ZoneInfo("Asia/Seoul")
 _DEFAULT_REPORT_ROOT = ROOT / "artifacts" / "reports" / "paper_auto_trading"
 _DEFAULT_OUTPUT_DIR = ROOT / "artifacts" / "reports" / "paper_auto_daily_summary"
+_EXPLAINED_NO_SUBMIT_REASONS = frozenset({
+    "fda_veto",
+    "runtime_service_policy_filtered_all_orders",
+    "quant_signal_readiness",
+    "no_order_deltas",
+    "RISK_FAST_TRIGGER",
+    "QUANT_ANOMALY",
+    "outside_market_session",
+    "market_session_skip",
+})
 
 
 def _repo_relative(path: Path) -> str:
@@ -127,6 +137,10 @@ def _submitted_count_and_source(cycle: dict[str, Any]) -> tuple[int, str]:
     return 0, "none"
 
 
+def _is_explained_no_submit_reason(reason: str) -> bool:
+    return str(reason or "").strip() in _EXPLAINED_NO_SUBMIT_REASONS
+
+
 def summarize_report(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     cycles = _cycle_items(data)
     cycle_status_counts = Counter(str(item.get("status") or "null") for item in cycles)
@@ -138,6 +152,10 @@ def summarize_report(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     execution_cycles = 0
     fill_count = 0
     rejection_count = 0
+    order_delta_no_submit_cycles = 0
+    explained_order_delta_no_submit_cycles = 0
+    unexplained_order_delta_no_submit_cycles = 0
+    order_delta_no_submit_reasons: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
     submitted_count_sources: Counter[str] = Counter()
     hot_path_bar_readiness_present_cycles = 0
@@ -176,6 +194,13 @@ def summarize_report(path: Path, data: dict[str, Any]) -> dict[str, Any]:
             or "none"
         )
         reason_counts[str(reason)] += 1
+        if isinstance(order_deltas, list) and order_deltas and submitted_count == 0 and not _is_broker_execution(cycle):
+            order_delta_no_submit_cycles += 1
+            order_delta_no_submit_reasons[str(reason)] += 1
+            if _is_explained_no_submit_reason(str(reason)):
+                explained_order_delta_no_submit_cycles += 1
+            else:
+                unexplained_order_delta_no_submit_cycles += 1
 
     false_pass_suspect = (
         str(data.get("status")) == "PASS"
@@ -212,6 +237,10 @@ def summarize_report(path: Path, data: dict[str, Any]) -> dict[str, Any]:
         "order_delta_count": order_delta_count,
         "submitted_order_delta_count": submitted_order_delta_count,
         "submitted_count_source_counts": dict(submitted_count_sources),
+        "order_delta_no_submit_cycles": order_delta_no_submit_cycles,
+        "explained_order_delta_no_submit_cycles": explained_order_delta_no_submit_cycles,
+        "unexplained_order_delta_no_submit_cycles": unexplained_order_delta_no_submit_cycles,
+        "order_delta_no_submit_reasons": dict(order_delta_no_submit_reasons),
         "execution_cycles": execution_cycles,
         "fill_count": fill_count,
         "rejection_count": rejection_count,
@@ -246,6 +275,13 @@ def build_summary(
 
     reports = [summarize_report(path, data) for path, data in filtered_reports]
     false_pass_reports = [item["path"] for item in reports if item["false_pass_suspect"]]
+    order_delta_no_submit_reason_counts: Counter[str] = Counter()
+    reason_counts_total: Counter[str] = Counter()
+    for item in reports:
+        order_delta_no_submit_reason_counts.update(
+            item.get("order_delta_no_submit_reasons") or {}
+        )
+        reason_counts_total.update(item.get("reason_counts") or {})
     broker_tracks = [
         item
         for item in reports
@@ -264,6 +300,11 @@ def build_summary(
         "rankable_score_cycles": sum(int(item.get("rankable_score_cycles") or 0) for item in reports),
         "order_delta_count": sum(int(item.get("order_delta_count") or 0) for item in reports),
         "submitted_order_delta_count": sum(int(item.get("submitted_order_delta_count") or 0) for item in reports),
+        "order_delta_no_submit_cycles": sum(int(item.get("order_delta_no_submit_cycles") or 0) for item in reports),
+        "explained_order_delta_no_submit_cycles": sum(int(item.get("explained_order_delta_no_submit_cycles") or 0) for item in reports),
+        "unexplained_order_delta_no_submit_cycles": sum(int(item.get("unexplained_order_delta_no_submit_cycles") or 0) for item in reports),
+        "order_delta_no_submit_reason_counts": dict(order_delta_no_submit_reason_counts),
+        "reason_counts": dict(reason_counts_total),
         "execution_cycles": sum(int(item.get("execution_cycles") or 0) for item in reports),
         "fill_count": sum(int(item.get("fill_count") or 0) for item in reports),
         "rejection_count": sum(int(item.get("rejection_count") or 0) for item in reports),
@@ -277,6 +318,15 @@ def build_summary(
         blockers.append("paper_auto_report_missing")
     if false_pass_reports:
         blockers.append("false_pass_suspect")
+    if (
+        int(totals["order_delta_count"]) > 0
+        and int(totals["submitted_order_delta_count"]) == 0
+        and int(totals["execution_cycles"]) == 0
+    ):
+        if int(totals["unexplained_order_delta_no_submit_cycles"]) > 0:
+            blockers.append("unexplained_order_deltas_without_broker_execution")
+        else:
+            blockers.append("explained_order_deltas_without_broker_execution")
     for warning in sorted({
         warning
         for item in reports
@@ -288,6 +338,24 @@ def build_summary(
         warnings.append("not_ab_comparison")
     status = "PASS" if not blockers else "BLOCKED"
     evidence_scope = "ab_comparison" if len(broker_track_ids) >= 2 else "single_track_runtime"
+    remaining_policy_gaps: list[str] = []
+    if "runtime_service_policy_filtered_all_orders" in order_delta_no_submit_reason_counts:
+        remaining_policy_gaps.append("runtime_policy_filtered_all_orders")
+    if (
+        "RISK_FAST_TRIGGER" in order_delta_no_submit_reason_counts
+        or "fda_veto" in order_delta_no_submit_reason_counts
+    ):
+        remaining_policy_gaps.append("risk_fast_or_fda_veto_no_submit")
+    if int(totals["order_delta_count"]) > 0 and int(totals["submitted_order_delta_count"]) == 0:
+        remaining_policy_gaps.append("broker_submit_absent_for_order_deltas")
+    if len(broker_track_ids) < 2:
+        remaining_policy_gaps.append("not_ab_comparison")
+
+    remaining_quant_gaps: list[str] = []
+    if false_pass_reports:
+        remaining_quant_gaps.append("zero_or_non_rankable_score_pass_report_present")
+    if int(totals["rankable_score_cycles"]) < int(totals["score_nonempty_cycles"]):
+        remaining_quant_gaps.append("rankable_score_gap")
     return {
         "schema_version": "1.0.0",
         "status": status,
@@ -302,7 +370,17 @@ def build_summary(
             "ab_comparison_valid": len(broker_track_ids) >= 2,
             "broker_track_count": len(broker_track_ids),
             "broker_tracks": broker_track_ids,
+            "explained_no_submit_reasons": dict(order_delta_no_submit_reason_counts),
+            "unexplained_no_submit_count": totals["unexplained_order_delta_no_submit_cycles"],
+            "remaining_policy_gaps": remaining_policy_gaps,
+            "remaining_quant_gaps": remaining_quant_gaps,
             "safe_statement": (
+                "no broker execution evidence; inspect no-submit policy reasons"
+                if (
+                    "explained_order_deltas_without_broker_execution" in blockers
+                    or "unexplained_order_deltas_without_broker_execution" in blockers
+                )
+                else
                 "MAIN 단독 runtime stability evidence"
                 if evidence_scope == "single_track_runtime"
                 else "multi-track paper comparison evidence"
