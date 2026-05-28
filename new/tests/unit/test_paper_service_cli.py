@@ -195,6 +195,154 @@ def test_collect_kis_paper_evidence_forwards_cold_risk_report(monkeypatch) -> No
     assert calls["bundle_id"] == "BUNDLE-TEST"
 
 
+def test_collect_kis_paper_evidence_skips_probe_when_order_path_is_fresh(
+    monkeypatch,
+) -> None:
+    calls: dict[str, int] = {"probe": 0, "service": 0}
+
+    class FakeRunner:
+        def run_balance_reconciliation(self, system_positions=None, write_report=True):
+            return {"status": "PASS"}
+
+        def submit_probe_order(
+            self,
+            ticker,
+            side,
+            qty,
+            price,
+            order_type,
+            confirm_phrase,
+            write_report=True,
+        ):
+            calls["probe"] += 1
+            raise AssertionError("probe should be skipped when order-path evidence is fresh")
+
+    monkeypatch.setattr(collect_kis_paper_evidence, "PaperTradingRunner", FakeRunner)
+    monkeypatch.setattr(
+        collect_kis_paper_evidence,
+        "find_fresh_paper_order_path_evidence",
+        lambda **kwargs: {
+            "status": "PASS",
+            "evidence_type": "paper_auto_order",
+            "report_path": "artifacts/reports/paper_auto_trading/MAIN/report.json",
+            "matched_order_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        collect_kis_paper_evidence.paper_auto_service_rehearsal,
+        "build_report",
+        lambda args: calls.__setitem__("service", calls["service"] + 1)
+        or {"status": "PASS"},
+    )
+
+    report = collect_kis_paper_evidence.collect(
+        argparse.Namespace(
+            system_positions_json=None,
+            assume_empty_system_positions=False,
+            price=70000.0,
+            auto_price=False,
+            order_type="00",
+            ticker="005930",
+            side="buy",
+            qty=1,
+            probe_confirm_phrase="PAPER_ORDER_OK",
+            probe_mode="if-no-fresh-order-evidence",
+            auto_confirm_phrase="PAPER_AUTO_OK",
+            tickers="005930",
+            cycles=1,
+            interval_sec=0.0,
+            registry_dir="artifacts/lgbm_paper_candidate/BUNDLE-TEST",
+            cold_risk_report="",
+            no_write_report=True,
+            use_real_hot_runner=False,
+            bundle_id="BUNDLE-TEST",
+        )
+    )
+
+    assert report["status"] == "PASS"
+    assert calls == {"probe": 0, "service": 1}
+    assert report["probe_policy"]["probe_submitted"] is False
+    assert report["probe_policy"]["skip_reason"] == "fresh_paper_order_path_evidence_found"
+    assert report["stage_statuses"]["probe_order"] == "SKIP"
+    assert report["stage_statuses"]["paper_order_path"] == "PASS"
+
+
+def test_collect_kis_paper_evidence_probe_mode_never_blocks_without_order_path(
+    monkeypatch,
+) -> None:
+    calls: dict[str, int] = {"probe": 0, "service": 0}
+
+    class FakeRunner:
+        def run_balance_reconciliation(self, system_positions=None, write_report=True):
+            return {"status": "PASS"}
+
+        def submit_probe_order(
+            self,
+            ticker,
+            side,
+            qty,
+            price,
+            order_type,
+            confirm_phrase,
+            write_report=True,
+        ):
+            calls["probe"] += 1
+            raise AssertionError("probe-mode never must not submit a probe")
+
+    monkeypatch.setattr(collect_kis_paper_evidence, "PaperTradingRunner", FakeRunner)
+    monkeypatch.setattr(
+        collect_kis_paper_evidence,
+        "find_fresh_paper_order_path_evidence",
+        lambda **kwargs: {
+            "status": "BLOCKED",
+            "reason": "paper_order_path_evidence_missing",
+            "matched_order_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        collect_kis_paper_evidence.paper_auto_service_rehearsal,
+        "build_report",
+        lambda args: calls.__setitem__("service", calls["service"] + 1)
+        or {"status": "PASS"},
+    )
+
+    report = collect_kis_paper_evidence.collect(
+        argparse.Namespace(
+            system_positions_json=None,
+            assume_empty_system_positions=False,
+            price=70000.0,
+            auto_price=False,
+            order_type="00",
+            ticker="005930",
+            side="buy",
+            qty=1,
+            probe_confirm_phrase="PAPER_ORDER_OK",
+            probe_mode="never",
+            auto_confirm_phrase="PAPER_AUTO_OK",
+            tickers="005930",
+            cycles=1,
+            interval_sec=0.0,
+            registry_dir="artifacts/lgbm_paper_candidate/BUNDLE-TEST",
+            cold_risk_report="",
+            no_write_report=True,
+            use_real_hot_runner=False,
+            bundle_id="BUNDLE-TEST",
+        )
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert calls == {"probe": 0, "service": 0}
+    assert report["probe_policy"]["probe_submitted"] is False
+    assert (
+        report["probe_policy"]["skip_reason"]
+        == "probe_mode_never_order_path_evidence_missing"
+    )
+    assert report["stage_statuses"]["probe_order"] == "SKIP"
+    assert report["stage_statuses"]["paper_order_path"] == "BLOCKED"
+    assert report["stage_statuses"]["paper_auto_service_rehearsal"] == "SKIP"
+    assert "paper_order_path" in report["blockers"]
+
+
 def test_collect_kis_paper_evidence_converts_service_exception_to_blocked(
     monkeypatch,
 ) -> None:
