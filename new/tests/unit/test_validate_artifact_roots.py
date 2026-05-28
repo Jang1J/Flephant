@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -79,3 +80,79 @@ def test_paper_entrypoint_rejects_production_registry_default(tmp_path: Path) ->
         "path": "new/scripts/bad_paper.py",
         "default": "artifacts/lgbm",
     }]
+
+
+def test_production_registry_warns_on_inactive_candidate_missing_artifacts(tmp_path: Path) -> None:
+    mod = _load_script("validate_artifact_roots")
+    registry_dir = tmp_path / "artifacts" / "lgbm"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "registry.json").write_text(
+        json.dumps(
+            {
+                "active_version": None,
+                "versions": [
+                    {
+                        "version": "live_20260527",
+                        "status": "candidate",
+                        "model_path": "artifacts/lgbm/live_20260527.pkl",
+                        "metadata_path": "artifacts/lgbm/live_20260527_metadata.json",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    blockers, warnings, state = mod.check_production_registry_state(
+        _base_policy(),
+        root=tmp_path,
+    )
+
+    assert blockers == []
+    assert state["inactive_candidate_drift_count"] == 1
+    assert state["inactive_candidate_missing_artifact_count"] == 2
+    assert state["inactive_candidate_missing_artifacts"][0]["reason"] == (
+        "inactive_candidate_artifact_missing"
+    )
+    assert any(
+        item["reason"] == "inactive_candidate_artifacts_missing"
+        for item in warnings
+    )
+
+
+def test_production_registry_does_not_warn_for_complete_inactive_candidate(tmp_path: Path) -> None:
+    mod = _load_script("validate_artifact_roots")
+    registry_dir = tmp_path / "artifacts" / "lgbm"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "complete.pkl").write_text("model", encoding="utf-8")
+    (registry_dir / "complete_metadata.json").write_text("{}", encoding="utf-8")
+    (registry_dir / "registry.json").write_text(
+        json.dumps(
+            {
+                "active_version": None,
+                "versions": [
+                    {
+                        "version": "complete",
+                        "status": "candidate",
+                        "model_path": "artifacts/lgbm/complete.pkl",
+                        "metadata_path": "artifacts/lgbm/complete_metadata.json",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    blockers, warnings, state = mod.check_production_registry_state(
+        _base_policy(),
+        root=tmp_path,
+    )
+
+    assert blockers == []
+    assert warnings == []
+    assert state["inactive_candidate_drift_count"] == 1
+    assert "inactive_candidate_missing_artifact_count" not in state

@@ -44,15 +44,15 @@ def _scheduler_cfg() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _parse_hhmm(value: Any, default: str = "18:05") -> time:
+def _parse_hhmm(value: Any, default: str = "18:30") -> time:
     raw = str(value or default).strip()
     try:
         hour_raw, minute_raw = raw.split(":", 1)
         hour = safe_int(hour_raw, default=18, min_value=0, max_value=23)
-        minute = safe_int(minute_raw, default=5, min_value=0, max_value=59)
+        minute = safe_int(minute_raw, default=30, min_value=0, max_value=59)
         return time(hour, minute)
     except ValueError:
-        return time(18, 5)
+        return time(18, 30)
 
 
 def _state_path() -> Path:

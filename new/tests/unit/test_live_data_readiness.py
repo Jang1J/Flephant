@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -184,6 +185,36 @@ def _write_parquet_day(base_dir: Path, ticker: str, yyyymmdd: str, rows: int) ->
         ticker_dir / f"bars_1m_{yyyymmdd}.parquet",
         index=False,
     )
+
+
+def test_classify_exception_marks_dns_as_retryable():
+    readiness = _load_script_module()
+
+    result = readiness._classify_exception(
+        "Failed to resolve 'openapivts.koreainvestment.com'"
+    )
+
+    assert result["failure_class"] == "transient_network_dns"
+    assert result["retryable"] is True
+    assert result["retry_after_sec"] > 0
+
+
+def test_dns_preflight_reports_retryable_resolution_failure(monkeypatch):
+    readiness = _load_script_module()
+
+    def fake_getaddrinfo(host, port, type=None):
+        if host == "bad.example":
+            raise readiness.socket.gaierror("nodename nor servname provided")
+        return [(None, None, None, None, ("127.0.0.1", port))]
+
+    monkeypatch.setattr(readiness.socket, "getaddrinfo", fake_getaddrinfo)
+
+    result = readiness.run_dns_preflight(["ok.example", "bad.example"])
+
+    assert result["status"] == "FAIL"
+    assert result["failure_hosts"] == ["bad.example"]
+    assert result["retryable"] is True
+    assert result["hosts"]["bad.example"]["failure_class"] == "transient_network_dns"
 
 
 def test_load_active_tickers_includes_pending_for_final_dataset(monkeypatch, tmp_path):
@@ -814,6 +845,104 @@ def test_train_gate_blocks_partial_requested_dates_without_require_train(
     assert result["reason"] == "invalid_requested_artifact_dates"
     assert result["available_dates"] == 2
     assert result["required_dates"] == 3
+
+
+def test_train_gate_requires_non_production_registry_dir(monkeypatch, tmp_path):
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260507", 301)
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {"train_window_days": 1, "test_window_days": 1, "trading_minutes_per_day": 390}
+        return {}
+
+    class FailIfInstantiatedTrainer:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("missing registry guard should return before trainer init")
+
+    class FakeModelRegistry:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+    monkeypatch.setitem(
+        sys.modules,
+        "src.models.lgbm_trainer",
+        type("FakeTrainerModule", (), {"LGBMTrainer": FailIfInstantiatedTrainer}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "src.models.registry",
+        type("FakeRegistryModule", (), {"ModelRegistry": FakeModelRegistry}),
+    )
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260508",
+        require_train=True,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "non_production_train_registry_dir_required"
+
+
+def test_train_gate_blocks_production_registry_dir(monkeypatch, tmp_path):
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(readiness, "REPO_ROOT", tmp_path)
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260507", 301)
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+
+    def fake_config_load(file_name: str, section: str | None = None):
+        if section == "live_data_readiness":
+            return {
+                "train_min_rows_per_day": 300,
+                "require_all_tickers_for_train": True,
+            }
+        if section == "walk_forward":
+            return {"train_window_days": 1, "test_window_days": 1, "trading_minutes_per_day": 390}
+        return {}
+
+    class FailIfInstantiatedTrainer:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("production registry guard should return before trainer init")
+
+    class FakeModelRegistry:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(readiness, "config_load", fake_config_load)
+    monkeypatch.setitem(
+        sys.modules,
+        "src.models.lgbm_trainer",
+        type("FakeTrainerModule", (), {"LGBMTrainer": FailIfInstantiatedTrainer}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "src.models.registry",
+        type("FakeRegistryModule", (), {"ModelRegistry": FakeModelRegistry}),
+    )
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260508",
+        require_train=True,
+        train_registry_dir="artifacts/lgbm",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "production_train_registry_dir_blocked"
 
 
 def test_run_backfill_skips_existing_valid_artifacts(monkeypatch, tmp_path):

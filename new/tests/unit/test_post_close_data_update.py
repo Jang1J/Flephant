@@ -113,6 +113,80 @@ def test_dry_run_reports_full_stage_plan(monkeypatch):
         "post_backfill_prelive",
     }
     assert "--skip-existing-backfill" in report["commands"]["live_data_readiness"]
+    live_cmd = report["commands"]["live_data_readiness"]
+    assert "--train-registry-dir" in live_cmd
+    assert "--dns-preflight" in live_cmd
+    assert "artifacts/lgbm_research/post_close/20260518/live_data_readiness" in live_cmd
+    prelive_cmd = report["commands"]["post_backfill_prelive"]
+    assert "--registry-dir" in prelive_cmd
+    assert "artifacts/lgbm_research/post_close/20260518/post_backfill_prelive" in prelive_cmd
+
+
+def test_stage_retryable_only_for_transient_failures():
+    mod = _load_script_module()
+
+    assert mod._stage_retryable({"failure_class": "transient_network_dns"}) is True
+    assert mod._stage_retryable({"failure_classes": ["transient_network_dns"]}) is True
+    assert mod._stage_retryable({"retryable": True}) is True
+    assert mod._stage_retryable({"failure_class": "post_backfill_evidence_contract_failed"}) is False
+
+
+def test_retry_rechecks_mode_b_window_before_second_attempt(monkeypatch):
+    mod = _load_script_module()
+    cfg = _fake_config()
+    cfg["post_close_data_update"]["stages"] = {
+        "live_data_readiness": True,
+        "news_dart_archive": False,
+        "dual_source_materialize": False,
+        "exogenous_materialize": False,
+        "phase2_feature_backfill": False,
+        "post_backfill_prelive": False,
+    }
+    cfg["post_close_data_update"]["retry"] = {
+        "enabled": True,
+        "max_attempts": 2,
+        "backoff_sec": 0,
+    }
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+    monkeypatch.setattr(mod, "config_load", lambda *args, **kwargs: cfg)
+    monkeypatch.setattr(mod.time_module, "sleep", lambda _seconds: None)
+    windows = iter([
+        {"mode_ok": True, "window_ok": True},
+        {"mode_ok": True, "window_ok": True},
+        {"mode_ok": True, "window_ok": False},
+    ])
+    monkeypatch.setattr(mod, "_mode_b_window_state", lambda _now=None: next(windows))
+    calls = {"run_stage": 0}
+
+    def fake_run_stage(stage, timeout):
+        calls["run_stage"] += 1
+        if calls["run_stage"] > 1:
+            raise AssertionError("retry must not start after Mode B window closes")
+        return {
+            "status": "BLOCKED",
+            "command": stage.command,
+            "returncode": 1,
+            "failure_class": "transient_network_dns",
+            "retryable": True,
+        }
+
+    monkeypatch.setattr(mod, "_run_stage", fake_run_stage)
+
+    report = mod.run_update(
+        end_date="20260518",
+        business_days=249,
+        max_tickers=30,
+        dry_run=False,
+        run_prelive=False,
+        bundle_id="BUNDLE-TEST",
+        now=datetime(2026, 5, 18, 18, 30, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+
+    assert calls["run_stage"] == 1
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["live_data_readiness"]
+    attempts = report["stage_attempts"]["live_data_readiness"]
+    assert attempts[-1]["reason"] == "mode_b_window_closed_before_retry"
 
 
 def test_expanding_policy_extends_business_days_from_final_dataset_start(monkeypatch):

@@ -218,6 +218,40 @@ def run_pipeline(
         report["blockers"] = ["00_mode_b_guard"]
         return report
 
+    production_registry_dir = (REPO_ROOT / "artifacts" / "lgbm").resolve()
+    if not registry_dir:
+        stages["00_candidate_registry_guard"] = _stage(
+            "BLOCKED",
+            "post-backfill prelive requires a non-production candidate registry dir.",
+            {"production_registry_dir": _repo_relative(production_registry_dir)},
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["00_candidate_registry_guard"]
+        return report
+    candidate_registry_dir = Path(str(registry_dir)).expanduser()
+    if not candidate_registry_dir.is_absolute():
+        candidate_registry_dir = REPO_ROOT / candidate_registry_dir
+    try:
+        candidate_registry_resolved = candidate_registry_dir.resolve()
+    except OSError:
+        candidate_registry_resolved = candidate_registry_dir
+    if (
+        candidate_registry_resolved == production_registry_dir
+        and not allow_production_candidate_write
+    ):
+        stages["00_candidate_registry_guard"] = _stage(
+            "BLOCKED",
+            "production candidate registry write is blocked without explicit override.",
+            {
+                "registry_dir": _repo_relative(candidate_registry_dir),
+                "production_registry_dir": _repo_relative(production_registry_dir),
+            },
+        )
+        report["status"] = "BLOCKED"
+        report["blockers"] = ["00_candidate_registry_guard"]
+        return report
+    report["registry_dir"] = _repo_relative(candidate_registry_dir)
+
     readiness = _latest_readiness_status(end_date, business_days, max_tickers)
     stages["01_prelive_gate_before"] = readiness
     if readiness["status"] != "PASS":

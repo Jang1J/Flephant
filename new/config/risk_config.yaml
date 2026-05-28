@@ -1048,10 +1048,25 @@ post_close_data_update:
   trigger_after_snapshot_time: "pit_safety.snapshot_hour:snapshot_minute"
   stage_timeout_sec: 3600
   stop_on_stage_failure: true
+  retry:
+    enabled: true
+    max_attempts: 3
+    backoff_sec: 90
+    retryable_failure_classes:
+      - "transient_network_dns"
+      - "transient_network_timeout"
+      - "transient_network"
+      - "transient_rate_limit"
+      - "transient_external_5xx"
+      - "transient_stage_timeout"
+      - "transient_data_fetch_shortfall"
   skip_existing_backfill: true
   raw_events_dir: "artifacts/raw/dual_source"
   target_col_override: "label_195m_net_ret"
   run_post_backfill_prelive_by_default: false
+  registry_dirs:
+    live_data_readiness_train: "artifacts/lgbm_research/post_close/{target_end_date}/live_data_readiness"
+    post_backfill_prelive: "artifacts/lgbm_research/post_close/{target_end_date}/post_backfill_prelive"
   final_dataset_promotion:
     enabled: true
     update_risk_config: true
@@ -1069,7 +1084,7 @@ post_close_data_update:
       - "news_score_t"
   scheduler:
     enabled: true
-    run_time_kst: "18:05"
+    run_time_kst: "18:30"
     poll_interval_sec: 60
     retry_failed_after_sec: 1800
     state_path: "artifacts/reports/post_close_data_update_scheduler/state.json"

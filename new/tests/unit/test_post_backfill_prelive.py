@@ -92,6 +92,9 @@ def _feature_coverage(status: str = "PASS") -> dict:
     }
 
 
+_TEST_REGISTRY_DIR = "artifacts/lgbm_research/BUNDLE-TEST"
+
+
 def test_business_start_date_uses_krx_calendar():
     mod = _load_script_module()
 
@@ -137,12 +140,70 @@ def test_pipeline_stops_before_training_when_80d_gate_blocked(monkeypatch):
         confirm_phrase=None,
         order_type="00",
         target_col_override=None,
-        registry_dir=None,
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
     assert report["blockers"] == ["01_prelive_gate_before"]
     assert report["stages"]["02_lgbm_bundle"]["status"] == "SKIP"
+
+
+def test_pipeline_blocks_without_candidate_registry_dir(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    report = mod.run_pipeline(
+        end_date="20260508",
+        business_days=80,
+        max_tickers=20,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=None,
+        confirm_phrase=None,
+        order_type="00",
+        target_col_override=None,
+        registry_dir=None,
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["00_candidate_registry_guard"]
+    assert "non-production candidate registry dir" in (
+        report["stages"]["00_candidate_registry_guard"]["message"]
+    )
+
+
+def test_pipeline_blocks_production_candidate_registry_dir(monkeypatch):
+    mod = _load_script_module()
+    monkeypatch.setenv("ELEPHANT_MODE", "mode_b")
+
+    report = mod.run_pipeline(
+        end_date="20260508",
+        business_days=80,
+        max_tickers=20,
+        bundle_id="BUNDLE-TEST",
+        run_paper_balance=False,
+        system_positions_json=None,
+        submit_probe=False,
+        ticker="005930",
+        side="buy",
+        qty=1,
+        price=None,
+        confirm_phrase=None,
+        order_type="00",
+        target_col_override=None,
+        registry_dir="artifacts/lgbm",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["blockers"] == ["00_candidate_registry_guard"]
+    assert "production candidate registry write is blocked" in (
+        report["stages"]["00_candidate_registry_guard"]["message"]
+    )
 
 
 def test_pipeline_runs_ordered_happy_path(monkeypatch):
@@ -213,7 +274,7 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
         confirm_phrase="PAPER_ORDER_OK",
         order_type="00",
         target_col_override="label_session_close_net_ret",
-        registry_dir="artifacts/lgbm_research/BUNDLE-TEST",
+        registry_dir=_TEST_REGISTRY_DIR,
         dual_source_feature_cols=["news_score_t"],
     )
 
@@ -227,12 +288,12 @@ def test_pipeline_runs_ordered_happy_path(monkeypatch):
     assert gate_calls[0].get("bundle_id") is None
     assert gate_calls[-1]["bundle_id"] == "BUNDLE-TEST"
     assert report["training_tickers"] == ["005930", "105560"]
-    assert retrainer_init_kwargs["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
+    assert retrainer_init_kwargs["registry_dir"] == _TEST_REGISTRY_DIR
     assert retrainer_init_kwargs["allow_production_candidate_write"] is False
     assert retrainer_init_kwargs["dual_source_feature_cols"] == ["news_score_t"]
     assert retrain_kwargs["tickers"] == ["005930", "105560"]
     assert retrain_kwargs["target_col_override"] == "label_session_close_net_ret"
-    assert report["registry_dir"] == "artifacts/lgbm_research/BUNDLE-TEST"
+    assert report["registry_dir"] == _TEST_REGISTRY_DIR
 
 
 def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
@@ -259,6 +320,7 @@ def test_pipeline_blocks_when_final_training_universe_empty(monkeypatch):
         price=1.0,
         confirm_phrase=None,
         order_type="00",
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
@@ -303,6 +365,7 @@ def test_pipeline_blocks_before_training_when_feature_coverage_blocked(monkeypat
         price=1.0,
         confirm_phrase=None,
         order_type="00",
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
@@ -352,6 +415,7 @@ def test_pipeline_blocks_backtest_pass_with_leakage_fail(monkeypatch):
         price=1.0,
         confirm_phrase=None,
         order_type="00",
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
@@ -397,6 +461,7 @@ def test_pipeline_stops_when_service_policy_replay_blocks(monkeypatch):
         price=1.0,
         confirm_phrase=None,
         order_type="00",
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
@@ -442,6 +507,7 @@ def test_pipeline_blocks_backtest_pass_with_regression_flag(monkeypatch):
         price=1.0,
         confirm_phrase=None,
         order_type="00",
+        registry_dir=_TEST_REGISTRY_DIR,
     )
 
     assert report["status"] == "BLOCKED"
