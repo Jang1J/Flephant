@@ -155,7 +155,8 @@ class HotRunner:
     def _load_risk_reduce_bridge_config() -> dict[str, Any]:
         try:
             risk_cfg = config_load("risk_config.yaml", "risk_fast")
-        except Exception:
+        except Exception as e:
+            logger.warning("[hot_runner] RiskFast 실행 브리지 설정 로드 실패: %s", e)
             return {"enabled": False}
         if not isinstance(risk_cfg, dict):
             return {"enabled": False}
@@ -245,9 +246,19 @@ class HotRunner:
         if isinstance(configured_levels, set) and configured_levels and level not in configured_levels:
             return {"status": "SKIP", "reason": "risk_level_not_bridgeable"}
 
+        raw_affected = risk_eval.get("affected_tickers")
+        if isinstance(raw_affected, (str, int, float)):
+            affected_values = [raw_affected]
+        elif raw_affected is None:
+            affected_values = []
+        else:
+            try:
+                affected_values = list(raw_affected)
+            except TypeError:
+                affected_values = [raw_affected]
         affected = {
             str(ticker).zfill(6)
-            for ticker in risk_eval.get("affected_tickers", [])
+            for ticker in affected_values
             if str(ticker).strip()
         }
         if not affected:

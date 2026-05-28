@@ -794,11 +794,11 @@ def test_paper_auto_report_embeds_track_metadata(tmp_path: Path) -> None:
     assert report["params"]["required_bundle_id"] == "BUNDLE-TEST"
     assert report["params"]["tickers"] == ["005930"]
     assert report["params"]["execution_policy"] == {
-        "max_orders_per_cycle": 4,
-        "max_order_qty_per_order": 1,
-        "allow_position_pyramiding": False,
-        "min_holding_bars": 195,
-        "rebalance_cooldown_bars": 195,
+        "max_orders_per_cycle": trader._max_orders_per_cycle,
+        "max_order_qty_per_order": trader._max_order_qty_per_order,
+        "allow_position_pyramiding": trader._allow_position_pyramiding,
+        "min_holding_bars": trader._min_holding_bars,
+        "rebalance_cooldown_bars": trader._rebalance_cooldown_bars,
         "policy_source": "service_policy_replay",
     }
 
@@ -1911,6 +1911,7 @@ def test_paper_auto_fails_when_order_history_method_missing(tmp_path: Path) -> N
     assert cycle["execution"]["execution_report"]["status"] == "submitted"
     assert cycle["order_history_verification"]["status"] == "FAIL"
     assert cycle["order_history_verification"]["reason"] == "kis_client_no_get_order_history"
+    assert trader._last_order_cycle_by_ticker == {"005930": 0}
 
 
 def test_paper_auto_caps_qty_over_limit_before_execution(tmp_path: Path) -> None:

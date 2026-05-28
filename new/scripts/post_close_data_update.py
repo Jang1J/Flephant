@@ -102,8 +102,11 @@ def _stage_enabled(cfg: dict[str, Any], key: str, default: bool = True) -> bool:
 def _format_registry_template(raw: Any, *, target_end_date: str, stage: str) -> str:
     template = str(raw or "").strip()
     if not template:
-        template = "artifacts/lgbm_research/post_close/{target_end_date}/{stage}"
-    return template.format(target_end_date=target_end_date, stage=stage)
+        raise ValueError(f"post_close registry template is required for {stage}")
+    try:
+        return template.format(target_end_date=target_end_date, stage=stage)
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(f"invalid post_close registry template for {stage}: {e}") from e
 
 
 def _pit_snapshot_time() -> time:
@@ -354,7 +357,7 @@ def _parse_stdout_json(stdout: str) -> dict[str, Any] | None:
             return None
 
 
-def _run_stage(stage: StageSpec, timeout_sec: int) -> dict[str, Any]:
+def _run_stage(stage: StageSpec, timeout_sec: int, retry_after_sec: int) -> dict[str, Any]:
     if not stage.enabled:
         return {
             "status": "SKIP",
@@ -387,7 +390,7 @@ def _run_stage(stage: StageSpec, timeout_sec: int) -> dict[str, Any]:
             "error": f"timeout_after_{timeout_sec}s",
             "failure_class": "transient_stage_timeout",
             "retryable": True,
-            "retry_after_sec": 90,
+            "retry_after_sec": retry_after_sec,
             "stdout_tail": (e.stdout or "")[-4000:] if isinstance(e.stdout, str) else "",
             "stderr_tail": (e.stderr or "")[-4000:] if isinstance(e.stderr, str) else "",
             "latency_sec": (datetime.now(_KST) - started_at).total_seconds(),
@@ -443,12 +446,12 @@ def _stage_retryable(stage_result: dict[str, Any]) -> bool:
     return False
 
 
-def _stage_retry_after(stage_result: dict[str, Any], default_sec: int) -> int:
+def _stage_retry_after(stage_result: dict[str, Any], default_sec: int, max_sec: int) -> int:
     return safe_int(
         stage_result.get("retry_after_sec"),
         default=default_sec,
         min_value=0,
-        max_value=1800,
+        max_value=max_sec,
     )
 
 
@@ -850,12 +853,16 @@ def run_update(
     stop_on_failure = safe_bool(cfg.get("stop_on_stage_failure"), default=True)
     retry_cfg = _retry_cfg()
     retry_enabled = safe_bool(retry_cfg.get("enabled"), default=True)
-    max_attempts = safe_int(retry_cfg.get("max_attempts"), default=3, min_value=1, max_value=10)
+    max_attempts = safe_int(retry_cfg.get("max_attempts"), default=3, min_value=1)
     retry_backoff_sec = safe_int(
         retry_cfg.get("backoff_sec"),
         default=90,
         min_value=0,
-        max_value=1800,
+    )
+    retry_after_max_sec = safe_int(
+        retry_cfg.get("max_retry_after_sec"),
+        default=retry_backoff_sec,
+        min_value=retry_backoff_sec,
     )
     blockers: list[str] = []
     stage_attempts: dict[str, Any] = {}
@@ -876,7 +883,7 @@ def run_update(
                     }
                     attempts.append(stage_result)
                     break
-            stage_result = _run_stage(stage, timeout)
+            stage_result = _run_stage(stage, timeout, retry_backoff_sec)
             stage_result["attempt"] = attempt_index
             attempts.append(stage_result)
             if stage_result.get("status") == "PASS":
@@ -890,7 +897,11 @@ def run_update(
                 stage_result["retry_stopped_reason"] = "mode_b_window_closed"
                 stage_result["retry_window"] = retry_window
                 break
-            sleep_sec = min(_stage_retry_after(stage_result, retry_backoff_sec), retry_backoff_sec)
+            sleep_sec = _stage_retry_after(
+                stage_result,
+                retry_backoff_sec,
+                retry_after_max_sec,
+            )
             stage_result["next_retry_after_sec"] = sleep_sec
             if sleep_sec > 0:
                 time_module.sleep(sleep_sec)

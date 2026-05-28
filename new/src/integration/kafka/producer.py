@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_int
 
 logger = get_logger("kafka_producer")
 _KST = ZoneInfo("Asia/Seoul")
@@ -76,6 +78,15 @@ class KafkaEventProducer:
         self._producer: Any = None
         self._last_error = ""
         self._sequence_by_session: dict[str, int] = {}
+        self._sequence_lock = threading.Lock()
+        self._pending_lock = threading.Lock()
+        self._pending_futures: list[Any] = []
+        self._delivery_timeout_sec = safe_int(
+            os.environ.get("KAFKA_DELIVERY_TIMEOUT_SEC"),
+            default=10,
+            min_value=1,
+            max_value=60,
+        )
         try:
             from kafka import KafkaProducer
 
@@ -101,6 +112,43 @@ class KafkaEventProducer:
                 raise RuntimeError(f"Kafka producer required but unavailable: {e}") from e
             logger.warning("[kafka] Producer 연결 실패: %s. 이벤트 로깅만 수행.", e)
 
+    def _next_sequence_no(self, session_id: str) -> int:
+        sequence_lock = getattr(self, "_sequence_lock", None)
+        if sequence_lock is None:
+            sequence_lock = threading.Lock()
+            self._sequence_lock = sequence_lock
+        with sequence_lock:
+            sequence_by_session = getattr(self, "_sequence_by_session", None)
+            if not isinstance(sequence_by_session, dict):
+                sequence_by_session = {}
+                self._sequence_by_session = sequence_by_session
+            sequence_key = session_id or "__global__"
+            sequence_no = int(sequence_by_session.get(sequence_key, 0)) + 1
+            sequence_by_session[sequence_key] = sequence_no
+            return sequence_no
+
+    def _remember_future(self, future: Any) -> None:
+        pending_lock = getattr(self, "_pending_lock", None)
+        if pending_lock is None:
+            pending_lock = threading.Lock()
+            self._pending_lock = pending_lock
+        with pending_lock:
+            pending_futures = getattr(self, "_pending_futures", None)
+            if not isinstance(pending_futures, list):
+                pending_futures = []
+                self._pending_futures = pending_futures
+            pending_futures.append(future)
+
+    def _drain_pending_futures(self) -> list[Any]:
+        pending_lock = getattr(self, "_pending_lock", None)
+        if pending_lock is None:
+            pending_lock = threading.Lock()
+            self._pending_lock = pending_lock
+        with pending_lock:
+            pending_futures = list(getattr(self, "_pending_futures", []) or [])
+            self._pending_futures = []
+        return pending_futures
+
     def emit(
         self,
         event_type: str,
@@ -118,13 +166,7 @@ class KafkaEventProducer:
             logger.warning("[kafka] 알 수 없는 event_type: %s. 발행 중단.", event_type)
             return None
 
-        sequence_by_session = getattr(self, "_sequence_by_session", None)
-        if not isinstance(sequence_by_session, dict):
-            sequence_by_session = {}
-            self._sequence_by_session = sequence_by_session
-        sequence_key = session_id or "__global__"
-        sequence_no = int(sequence_by_session.get(sequence_key, 0)) + 1
-        sequence_by_session[sequence_key] = sequence_no
+        sequence_no = self._next_sequence_no(session_id)
 
         event: dict[str, Any] = {
             "event_id": str(uuid.uuid4()),
@@ -150,8 +192,7 @@ class KafkaEventProducer:
                         "[kafka] 비동기 발행 실패: %s — %s", event_type, exc,
                     )
                 )
-                if getattr(self, "_required", False) and hasattr(future, "get"):
-                    future.get(timeout=10)
+                self._remember_future(future)
                 logger.info(
                     "[kafka] 이벤트 발행: %s session=%s", event_type, session_id,
                 )
@@ -187,6 +228,15 @@ class KafkaEventProducer:
         if self._producer is not None:
             try:
                 self._producer.flush()
+                timeout_sec = safe_int(
+                    getattr(self, "_delivery_timeout_sec", 10),
+                    default=10,
+                    min_value=1,
+                    max_value=60,
+                )
+                for future in self._drain_pending_futures():
+                    if hasattr(future, "get"):
+                        future.get(timeout=timeout_sec)
             except Exception as e:
                 self._last_error = str(e)
                 if getattr(self, "_required", False):
@@ -197,7 +247,7 @@ class KafkaEventProducer:
         """Producer 정리. flush 후 종료."""
         if self._producer is not None:
             try:
-                self._producer.flush()
+                self.flush()
                 self._producer.close()
             except Exception as e:
                 self._last_error = str(e)

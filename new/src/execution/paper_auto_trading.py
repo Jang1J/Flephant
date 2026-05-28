@@ -597,15 +597,15 @@ class PaperAutoTrader:
         execution_status = execution_report.get("status")
         broker_blockers = self._broker_rejection_blockers(execution_report)
         ok_statuses = {"submitted", "filled", "partial_filled"}
-        order_history = self._order_history_verification(execution)
-        status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
-        if order_history.get("status") != "PASS":
-            status = "FAIL"
-        if status == "PASS":
+        if execution_status in ok_statuses and not broker_blockers:
             self._record_runtime_policy_submitted_orders(
                 final_decision.get("order_deltas", []),
                 cycle_index=cycle_index,
             )
+        order_history = self._order_history_verification(execution)
+        status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
+        if order_history.get("status") != "PASS":
+            status = "FAIL"
         return {
             "status": status,
             "cycle_index": cycle_index,

@@ -39,6 +39,10 @@ def _fake_config():
             "training_window_policy": "expanding_from_final_start",
             "raw_events_dir": "artifacts/raw/dual_source",
             "target_col_override": "label_195m_net_ret",
+            "registry_dirs": {
+                "live_data_readiness_train": "artifacts/lgbm_research/post_close/{target_end_date}/live_data_readiness",
+                "post_backfill_prelive": "artifacts/lgbm_research/post_close/{target_end_date}/post_backfill_prelive",
+            },
             "final_dataset_promotion": {
                 "enabled": True,
                 "update_risk_config": True,
@@ -158,7 +162,8 @@ def test_retry_rechecks_mode_b_window_before_second_attempt(monkeypatch):
     monkeypatch.setattr(mod, "_mode_b_window_state", lambda _now=None: next(windows))
     calls = {"run_stage": 0}
 
-    def fake_run_stage(stage, timeout):
+    def fake_run_stage(stage, timeout, retry_after_sec):
+        del retry_after_sec
         calls["run_stage"] += 1
         if calls["run_stage"] > 1:
             raise AssertionError("retry must not start after Mode B window closes")

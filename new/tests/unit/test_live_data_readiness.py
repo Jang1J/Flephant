@@ -202,7 +202,8 @@ def test_classify_exception_marks_dns_as_retryable():
 def test_dns_preflight_reports_retryable_resolution_failure(monkeypatch):
     readiness = _load_script_module()
 
-    def fake_getaddrinfo(host, port, type=None):
+    def fake_getaddrinfo(host, port, sock_type=None):
+        del sock_type
         if host == "bad.example":
             raise readiness.socket.gaierror("nodename nor servname provided")
         return [(None, None, None, None, ("127.0.0.1", port))]
@@ -939,6 +940,38 @@ def test_train_gate_blocks_production_registry_dir(monkeypatch, tmp_path):
         "20260508",
         require_train=True,
         train_registry_dir="artifacts/lgbm",
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["reason"] == "production_train_registry_dir_blocked"
+
+
+def test_train_gate_blocks_production_registry_descendant(monkeypatch, tmp_path):
+    readiness = _load_script_module()
+    monkeypatch.setattr(readiness, "_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(readiness, "REPO_ROOT", tmp_path)
+    for ticker in ("005930", "000660"):
+        _write_jsonl_day(tmp_path, ticker, "20260507", 301)
+        _write_jsonl_day(tmp_path, ticker, "20260508", 301)
+
+    monkeypatch.setattr(
+        readiness,
+        "config_load",
+        lambda _file_name, section=None: (
+            {"train_min_rows_per_day": 300, "require_all_tickers_for_train": True}
+            if section == "live_data_readiness"
+            else {"train_window_days": 1, "test_window_days": 1, "trading_minutes_per_day": 390}
+            if section == "walk_forward"
+            else {}
+        ),
+    )
+
+    result = readiness.run_train_if_ready(
+        ["005930", "000660"],
+        "20260507",
+        "20260508",
+        require_train=True,
+        train_registry_dir="artifacts/lgbm/research-child",
     )
 
     assert result["status"] == "FAIL"

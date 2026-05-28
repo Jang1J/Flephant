@@ -1294,9 +1294,19 @@ def run_train_if_ready(
         if not registry_dir.is_absolute():
             registry_dir = REPO_ROOT / registry_dir
         try:
-            uses_production_registry = registry_dir.resolve() == production_registry_dir.resolve()
+            resolved_registry_dir = registry_dir.resolve()
+            resolved_production_registry_dir = production_registry_dir.resolve()
+            uses_production_registry = (
+                resolved_registry_dir == resolved_production_registry_dir
+                or resolved_registry_dir.is_relative_to(resolved_production_registry_dir)
+            )
         except OSError:
-            uses_production_registry = registry_dir == production_registry_dir
+            registry_text = str(registry_dir)
+            production_text = str(production_registry_dir)
+            uses_production_registry = (
+                registry_text == production_text
+                or registry_text.startswith(f"{production_text}/")
+            )
         if uses_production_registry:
             status = "FAIL" if require_train else "SKIP"
             return {

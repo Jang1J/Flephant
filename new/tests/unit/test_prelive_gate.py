@@ -821,45 +821,44 @@ def test_bundle_balance_stage_passes_when_probe_stage_is_blocked(monkeypatch, tm
     gate = _load_script_module()
     bundle_id = "BUNDLE-REQUESTED"
     report_dir = tmp_path / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
-    (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").write_text(
-        json.dumps(
-            {
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rehearsal_report = {
+        "status": "BLOCKED",
+        "bundle_id": bundle_id,
+        "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        "external_kis_api": True,
+        "evidence_level": "external_kis_virtual",
+        "stage_statuses": {
+            "preflight": "BLOCKED",
+            "paper_auto_cycle": "SKIP",
+            "balance_reconciliation": "PASS",
+            "probe_order": "BLOCKED",
+            "order_history_requery": "BLOCKED",
+        },
+        "broker_evidence": {
+            "balance_reconciliation": {"status": "PASS"},
+            "probe_order": {
                 "status": "BLOCKED",
-                "bundle_id": bundle_id,
-                "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
-                "external_kis_api": True,
-                "evidence_level": "external_kis_virtual",
-                "stage_statuses": {
-                    "preflight": "BLOCKED",
-                    "paper_auto_cycle": "SKIP",
-                    "balance_reconciliation": "PASS",
-                    "probe_order": "BLOCKED",
-                    "order_history_requery": "BLOCKED",
-                },
-                "broker_evidence": {
-                    "balance_reconciliation": {"status": "PASS"},
-                    "probe_order": {
-                        "status": "BLOCKED",
-                        "blocker": {"error_code": "BROKER_MARKET_CLOSED"},
-                    },
-                    "order_history_requery": {"status": "BLOCKED"},
-                },
+                "blocker": {"error_code": "BROKER_MARKET_CLOSED"},
+            },
+            "order_history_requery": {"status": "BLOCKED"},
+        },
+        "stages": {
+            "preflight": {
                 "stages": {
-                    "preflight": {
-                        "stages": {
-                            "paper_evidence": {
-                                "evidence_guard": {"status": "PASS"},
-                            },
-                        },
+                    "paper_evidence": {
+                        "evidence_guard": {"status": "PASS"},
                     },
-                    "paper_auto_cycle": {"status": "SKIP"},
                 },
             },
-            ensure_ascii=False,
-        ),
+            "paper_auto_cycle": {"status": "SKIP"},
+        },
+    }
+    with (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").open(
+        "w",
         encoding="utf-8",
-    )
+    ) as fh:
+        json.dump(rehearsal_report, fh, ensure_ascii=False, indent=2)
     monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
 
     balance = gate._check_paper_balance(bundle_id)

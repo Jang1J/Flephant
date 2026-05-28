@@ -137,7 +137,7 @@ def test_daily_summary_filters_reports_by_bundle_id(tmp_path):
 def test_daily_summary_blocks_order_deltas_without_broker_execution(tmp_path):
     mod = _load_script("summarize_paper_auto_day")
     path = tmp_path / "MAIN_BASELINE" / "paper_auto_trade_20260528_153000.json"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "status": "PASS",
         "generated_at": "2026-05-28T15:30:00+09:00",

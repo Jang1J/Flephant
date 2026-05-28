@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
 
 from src.integration.grpc.server import serve  # noqa: E402
 from src.utils.config_loader import load as config_load  # noqa: E402
+from src.utils.safe_cast import safe_int  # noqa: E402
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -29,6 +30,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return bool(default)
     return raw in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    return safe_int(os.environ.get(name), default=default, min_value=min_value)
 
 
 def _default_bundle_id() -> str:
@@ -54,7 +59,7 @@ def _require_env_readiness() -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.environ.get("AI_GRPC_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("AI_GRPC_PORT", "50051")))
+    parser.add_argument("--port", type=int, default=_env_int("AI_GRPC_PORT", 50051, min_value=1))
     parser.add_argument(
         "--bundle-id",
         default=os.environ.get("AI_BUNDLE_ID", _default_bundle_id()),
@@ -62,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.environ.get("AI_GRPC_MAX_WORKERS", "8")),
+        default=_env_int("AI_GRPC_MAX_WORKERS", 8, min_value=1),
     )
     parser.add_argument(
         "--no-env-readiness-check",
@@ -119,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
     while not stopped:
         time.sleep(1)
     server.stop(grace=5)
-    print("[ai_grpc] stopped", flush=True)
+    print("[ai_grpc] 서버 중지 완료", flush=True)
     return 0
 
 

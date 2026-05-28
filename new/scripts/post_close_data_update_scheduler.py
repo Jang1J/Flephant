@@ -44,15 +44,19 @@ def _scheduler_cfg() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def _parse_hhmm(value: Any, default: str = "18:30") -> time:
-    raw = str(value or default).strip()
+def _parse_hhmm(value: Any) -> time:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("scheduler.run_time_kst is required")
     try:
         hour_raw, minute_raw = raw.split(":", 1)
-        hour = safe_int(hour_raw, default=18, min_value=0, max_value=23)
-        minute = safe_int(minute_raw, default=30, min_value=0, max_value=59)
-        return time(hour, minute)
-    except ValueError:
-        return time(18, 30)
+        hour = int(hour_raw)
+        minute = int(minute_raw)
+    except ValueError as e:
+        raise ValueError(f"invalid scheduler.run_time_kst {raw!r}") from e
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"invalid scheduler.run_time_kst {raw!r}")
+    return time(hour, minute)
 
 
 def _state_path() -> Path:
@@ -124,8 +128,22 @@ def evaluate_tick(now: datetime | None = None, state: dict[str, Any] | None = No
     """Return scheduler decision for the current tick without executing work."""
     cfg = _scheduler_cfg()
     current = (now or datetime.now(_KST)).astimezone(_KST)
-    run_time = _parse_hhmm(cfg.get("run_time_kst"))
     enabled = safe_bool(cfg.get("enabled"), default=True)
+    try:
+        run_time = _parse_hhmm(cfg.get("run_time_kst"))
+    except ValueError as e:
+        return {
+            "enabled": enabled,
+            "now": current.isoformat(),
+            "run_time_kst": str(cfg.get("run_time_kst") or ""),
+            "target_end_date": None,
+            "state_source": "config",
+            "last_target_end_date": None,
+            "last_status": None,
+            "should_run": False,
+            "reason": "scheduler_run_time_invalid",
+            "error": str(e),
+        }
     target_day = updater.latest_pit_safe_trading_day(current)
     target_end = updater._format_yyyymmdd(target_day)
     current_final = updater._current_final_dataset_end()

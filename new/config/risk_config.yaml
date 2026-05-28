@@ -1053,6 +1053,7 @@ post_close_data_update:
     enabled: true
     max_attempts: 3
     backoff_sec: 90
+    max_retry_after_sec: 1800
     retryable_failure_classes:
       - "transient_network_dns"
       - "transient_network_timeout"

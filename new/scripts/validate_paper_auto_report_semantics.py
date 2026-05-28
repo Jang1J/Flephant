@@ -301,14 +301,14 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
                     "pass_with_only_no_order_delta_cycles_evidence_limited"
                 )
         if cycles and order_delta_count > 0 and execution_cycles == 0:
-            if shadow_order_delta_cycles > 0:
+            if unexplained_order_delta_no_broker_cycles > 0:
+                summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
+            elif shadow_order_delta_cycles > 0:
                 summary["warnings"].append("shadow_only_order_deltas_not_broker_execution")
-            elif unexplained_order_delta_no_broker_cycles == 0:
+            else:
                 summary["blockers"].append(
                     "pass_with_order_deltas_no_broker_execution_explained_by_guard"
                 )
-            else:
-                summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
         if execution_cycles > 0 and hot_path_bar_readiness_missing_cycles > 0:
             summary["warnings"].append("hot_path_bar_readiness_missing_legacy_report")
     return summary

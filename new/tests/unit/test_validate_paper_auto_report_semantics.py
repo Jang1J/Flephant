@@ -26,7 +26,7 @@ def test_paper_auto_semantics_blocks_pass_with_zero_scores(tmp_path, monkeypatch
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260522_144359.json").write_text(
         """
 {
@@ -71,7 +71,7 @@ def test_paper_auto_semantics_passes_report_with_rankable_execution(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260522_090203.json").write_text(
         """
 {
@@ -130,7 +130,7 @@ def test_paper_auto_semantics_does_not_count_rejected_execution_as_broker_cycle(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260526_101200.json").write_text(
         """
 {
@@ -183,7 +183,7 @@ def test_paper_auto_semantics_allows_rankable_no_rebalance_pass(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260526_101500.json").write_text(
         """
 {
@@ -232,7 +232,7 @@ def test_paper_auto_semantics_does_not_count_shadow_as_broker_execution(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260526_101600.json").write_text(
         """
 {
@@ -291,7 +291,7 @@ def test_paper_auto_semantics_allows_explained_fda_veto_no_submit(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260528_153000.json").write_text(
         """
 {
@@ -353,7 +353,7 @@ def test_paper_auto_semantics_filters_by_generated_date(
     validator = _load_validator_module()
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
-    report_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "paper_auto_trade_20260522_144359.json").write_text(
         """
 {
@@ -428,7 +428,7 @@ def test_paper_auto_semantics_recursively_includes_track_reports(
     repo_root = tmp_path
     report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
     nested_dir = report_dir / "MAIN_BASELINE"
-    nested_dir.mkdir(parents=True)
+    nested_dir.mkdir(parents=True, exist_ok=True)
     (nested_dir / "paper_auto_trade_20260526_115108.json").write_text(
         """
 {
@@ -480,7 +480,7 @@ def test_paper_auto_semantics_blocks_when_generated_date_has_no_reports(
 ) -> None:
     validator = _load_validator_module()
     repo_root = tmp_path
-    (repo_root / "artifacts" / "reports" / "paper_auto_trading").mkdir(parents=True)
+    (repo_root / "artifacts" / "reports" / "paper_auto_trading").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
 
     report = validator.build_report(
@@ -506,7 +506,7 @@ def test_paper_auto_semantics_cli_accepts_no_write_report(
 ) -> None:
     validator = _load_validator_module()
     repo_root = tmp_path
-    (repo_root / "artifacts" / "reports" / "paper_auto_trading").mkdir(parents=True)
+    (repo_root / "artifacts" / "reports" / "paper_auto_trading").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
 
     rc = validator.main([

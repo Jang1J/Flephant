@@ -29,6 +29,7 @@ _KST = ZoneInfo("Asia/Seoul")
 _GENERATED_DIR = Path(__file__).resolve().parent / "generated"
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _SCRIPTS_DIR = _PROJECT_ROOT / "new" / "scripts"
+_PRELIVE_GATE_MODULE_LOCK = threading.Lock()
 
 
 class _PaperAutoSession:
@@ -396,15 +397,17 @@ def _kafka_status(kafka: Any) -> dict[str, Any]:
 
 def _parse_hhmm(value: Any, *, default_hour: int, default_minute: int) -> tuple[int, int]:
     raw = str(value or "").strip()
+    if not raw:
+        return default_hour, default_minute
     try:
         hour_raw, minute_raw = raw.split(":", 1)
         hour = int(hour_raw)
         minute = int(minute_raw)
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return hour, minute
-    except Exception:
-        pass
-    return default_hour, default_minute
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"invalid HH:MM value {raw!r}") from e
+    raise ValueError(f"invalid HH:MM value {raw!r}")
 
 
 def _remaining_market_cycles(
@@ -490,18 +493,19 @@ def _candidate_registry_dir(repo_root: Path, bundle_id: str) -> Path | None:
 
 def _load_prelive_gate_module() -> Any:
     module_name = "_elephant_grpc_prelive_gate"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        _SCRIPTS_DIR / "prelive_gate.py",
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("prelive_gate module spec could not be loaded")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    with _PRELIVE_GATE_MODULE_LOCK:
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            _SCRIPTS_DIR / "prelive_gate.py",
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("prelive_gate module spec could not be loaded")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
 
 
 def _paper_rehearsal_gate_from_strict(prelive: dict[str, Any]) -> dict[str, Any]:
@@ -813,6 +817,8 @@ def _make_grpc_paper_auto_trader(
                     "tickers": report.get("tickers", []),
                 },
             )
+            if self._grpc_kafka.status().get("required"):
+                self._grpc_kafka.flush()
 
         def _on_before_broker_submit(
             self,
@@ -847,6 +853,8 @@ def _make_grpc_paper_auto_trader(
                     "quant_mode": quant_output.get("mode"),
                 },
             )
+            if self._grpc_kafka.status().get("required"):
+                self._grpc_kafka.flush()
             self._grpc_pre_submit_decision_cycles.add(cycle_index + 1)
 
         def run_once(self, *, tickers: list[str], cycle_index: int = 0, risk_warnings: Any = None) -> dict[str, Any]:
@@ -1045,6 +1053,15 @@ def _make_servicer(
                 getattr(request, "tickers", []),
             )
             confirm_phrase = str(getattr(request, "confirm_phrase", ""))
+            if raw_requested_cycles < 0:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("negative_cycles_not_allowed")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="INVALID_ARGUMENT",
+                    reason="negative_cycles_not_allowed",
+                )
             requested_cycles_for_validation = (
                 raw_requested_cycles if raw_requested_cycles > 0 else default_cycles
             )
@@ -1078,7 +1095,17 @@ def _make_servicer(
                     status="MODEL_REGISTRY_NOT_READY",
                     reason="paper_candidate_registry_not_found",
                 )
-            market_guard = _market_start_guard(pa_cfg=pa_cfg)
+            try:
+                market_guard = _market_start_guard(pa_cfg=pa_cfg)
+            except ValueError as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_auto_trading_market_time_invalid:{e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="CONFIG_INVALID",
+                    reason=f"paper_auto_trading_market_time_invalid:{e}",
+                )
             if market_guard.get("status") != "PASS":
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 context.set_details(str(market_guard.get("reason", "")))
@@ -1088,10 +1115,20 @@ def _make_servicer(
                     status=str(market_guard.get("reason", "MARKET_NOT_OPEN")).upper(),
                     reason=str(market_guard.get("reason", "")),
                 )
-            remaining_cycles = _remaining_market_cycles(
-                interval_sec=requested_interval,
-                pa_cfg=pa_cfg,
-            )
+            try:
+                remaining_cycles = _remaining_market_cycles(
+                    interval_sec=requested_interval,
+                    pa_cfg=pa_cfg,
+                )
+            except ValueError as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_auto_trading_market_time_invalid:{e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="CONFIG_INVALID",
+                    reason=f"paper_auto_trading_market_time_invalid:{e}",
+                )
             if raw_requested_cycles > 0:
                 requested_cycles = min(raw_requested_cycles, remaining_cycles)
             else:

@@ -14,7 +14,6 @@ Environment=PYTHONPATH=/opt/elephant/Elephant_Lab/new
 Environment=PYTHONUNBUFFERED=1
 Environment=AI_GRPC_HOST=0.0.0.0
 Environment=AI_GRPC_PORT=50051
-Environment=AI_BUNDLE_ID=BUNDLE-20260521-POSTCLOSE
 Environment=AI_GRPC_MAX_WORKERS=8
 Environment=KAFKA_REQUIRED=true
 # Server-only credentials/config. Do not commit the file contents.

@@ -29,7 +29,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.llm_parser import parse_llm_json
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool, safe_float
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 
 logger = get_logger("fda")
 
@@ -167,7 +167,8 @@ class FDAAgent(AgentBase):
         """
         try:
             risk_cfg = config_load("risk_config.yaml", "risk_fast")
-        except Exception:
+        except Exception as e:
+            logger.warning("[fda] RiskFast 실행 브리지 설정 로드 실패: %s", e)
             return {"enabled": False}
         if not isinstance(risk_cfg, dict):
             return {"enabled": False}
@@ -533,7 +534,7 @@ class FDAAgent(AgentBase):
             ticker = str(delta.get("ticker", "")).zfill(6)
             side = str(delta.get("side", "")).lower()
             reason = str(delta.get("reason", "")).lower()
-            qty = int(delta.get("qty") or 0)
+            qty = safe_int(delta.get("qty"), default=0, min_value=0)
             if side != "sell" or reason != "risk_reduce" or qty <= 0:
                 return False
             if ticker not in affected:

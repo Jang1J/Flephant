@@ -71,20 +71,17 @@ def test_tick_runs_after_configured_time(monkeypatch):
     assert decision["target_end_date"] == "20260520"
 
 
-def test_malformed_run_time_falls_back_to_1830(monkeypatch):
+def test_malformed_run_time_fails_closed(monkeypatch):
     mod = _load_scheduler_module()
     cfg = _fake_config()
     cfg["post_close_data_update"]["scheduler"]["run_time_kst"] = "bad-time"
     monkeypatch.setattr(mod.updater, "config_load", lambda *args, **kwargs: cfg)
     kst = ZoneInfo("Asia/Seoul")
 
-    before = mod.evaluate_tick(datetime(2026, 5, 20, 18, 29, tzinfo=kst), {})
-    due = mod.evaluate_tick(datetime(2026, 5, 20, 18, 30, tzinfo=kst), {})
+    decision = mod.evaluate_tick(datetime(2026, 5, 20, 18, 30, tzinfo=kst), {})
 
-    assert before["should_run"] is False
-    assert before["reason"] == "before_configured_run_time"
-    assert due["should_run"] is True
-    assert due["reason"] == "due"
+    assert decision["should_run"] is False
+    assert decision["reason"] == "scheduler_run_time_invalid"
 
 
 def test_tick_skips_already_passed_target(monkeypatch):

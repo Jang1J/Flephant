@@ -74,6 +74,45 @@ def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
     }
 
 
+def test_kafka_required_emit_defers_delivery_wait_until_flush() -> None:
+    class _Future:
+        get_called = False
+
+        def add_errback(self, _callback) -> None:
+            return None
+
+        def get(self, timeout=None):
+            self.get_called = True
+            assert timeout == 10
+
+    class _Producer:
+        def __init__(self) -> None:
+            self.future = _Future()
+            self.flushed = False
+
+        def send(self, *_args, **_kwargs):
+            return self.future
+
+        def flush(self) -> None:
+            self.flushed = True
+
+    kafka_sender = _Producer()
+    producer = KafkaEventProducer.__new__(KafkaEventProducer)
+    producer._topic = "test-topic"
+    producer._producer = kafka_sender
+    producer._required = True
+    producer._sequence_by_session = {}
+    producer._last_error = ""
+    producer._delivery_timeout_sec = 10
+
+    producer.emit("AUTO_TRADING_STARTED", session_id="AI-SESSION")
+
+    assert kafka_sender.future.get_called is False
+    producer.flush()
+    assert kafka_sender.flushed is True
+    assert kafka_sender.future.get_called is True
+
+
 def test_kafka_status_reports_readiness_without_secret_values() -> None:
     producer = KafkaEventProducer.__new__(KafkaEventProducer)
     producer._topic = "paper-topic"
@@ -877,3 +916,19 @@ def test_remaining_market_cycles_blocks_after_close() -> None:
     )
 
     assert cycles == 0
+
+
+def test_market_time_config_rejects_malformed_value() -> None:
+    try:
+        grpc_server._remaining_market_cycles(
+            interval_sec=60,
+            pa_cfg={
+                "market_open_time": "bad-time",
+                "market_close_time": "15:30",
+            },
+            now=grpc_server.datetime(2026, 5, 27, 8, 30, tzinfo=grpc_server._KST),
+        )
+    except ValueError as e:
+        assert "invalid HH:MM" in str(e)
+    else:
+        raise AssertionError("malformed market time must fail closed")
