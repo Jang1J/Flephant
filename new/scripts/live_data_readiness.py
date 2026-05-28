@@ -15,6 +15,8 @@ import argparse
 import json
 import math
 import os
+import re
+import socket
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -201,6 +203,108 @@ def _has_fields(payload: dict[str, Any] | None, fields: tuple[str, ...]) -> bool
     if not isinstance(payload, dict):
         return False
     return all(payload.get(field) is not None for field in fields)
+
+
+def _sanitize_error(value: Exception | str) -> str:
+    text = str(value)
+    text = re.sub(r"(crtfc_key=)[^&\s)]+", r"\1***", text)
+    text = re.sub(r"(appkey=)[^&\s)]+", r"\1***", text, flags=re.IGNORECASE)
+    text = re.sub(r"(appsecret=)[^&\s)]+", r"\1***", text, flags=re.IGNORECASE)
+    return text
+
+
+def _classify_exception(value: Exception | str) -> dict[str, Any]:
+    text = _sanitize_error(value)
+    lowered = text.lower()
+    error_type = type(value).__name__ if isinstance(value, Exception) else "Error"
+    retry_after_sec = 90
+    if any(
+        token in lowered
+        for token in (
+            "failed to resolve",
+            "nameresolutionerror",
+            "getaddrinfo",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+        )
+    ):
+        failure_class = "transient_network_dns"
+        retryable = True
+    elif any(token in lowered for token in ("timed out", "timeout", "read timed out")):
+        failure_class = "transient_network_timeout"
+        retryable = True
+    elif any(token in lowered for token in ("too many requests", "rate limit", "429")):
+        failure_class = "transient_rate_limit"
+        retryable = True
+        retry_after_sec = 180
+    elif any(token in lowered for token in ("502", "503", "504", "bad gateway", "service unavailable")):
+        failure_class = "transient_external_5xx"
+        retryable = True
+    elif any(token in lowered for token in ("unauthorized", "forbidden", "invalid api", "401", "403")):
+        failure_class = "credential_or_permission"
+        retryable = False
+        retry_after_sec = 0
+    elif any(token in lowered for token in ("connection", "network", "ssl", "tls")):
+        failure_class = "transient_network"
+        retryable = True
+    else:
+        failure_class = "external_connector_error"
+        retryable = False
+        retry_after_sec = 0
+    return {
+        "error": text,
+        "error_type": error_type,
+        "failure_class": failure_class,
+        "retryable": retryable,
+        "retry_after_sec": retry_after_sec,
+    }
+
+
+_DNS_PREFLIGHT_HOSTS = [
+    "openapivts.koreainvestment.com",
+    "opendart.fss.or.kr",
+    "openapi.naver.com",
+    "ecos.bok.or.kr",
+    "query1.finance.yahoo.com",
+]
+
+
+def run_dns_preflight(hosts: list[str] | None = None) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    failures: list[str] = []
+    for host in hosts or _DNS_PREFLIGHT_HOSTS:
+        try:
+            addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            resolved = sorted({item[4][0] for item in addresses if item and item[4]})
+            checks[host] = _status(
+                bool(resolved),
+                {
+                    "resolved_address_count": len(resolved),
+                    "sample_addresses": resolved[:3],
+                },
+            )
+            if not resolved:
+                failures.append(host)
+        except Exception as e:
+            checks[host] = _status(False, _classify_exception(e))
+            failures.append(host)
+    retryable = bool(failures) and all(
+        bool((checks.get(host) or {}).get("retryable")) for host in failures
+    )
+    retry_after_values = [
+        int((checks.get(host) or {}).get("retry_after_sec") or 0)
+        for host in failures
+    ]
+    return _status(
+        not failures,
+        {
+            "hosts": checks,
+            "failure_hosts": failures,
+            "failure_class": "transient_network_dns" if failures else None,
+            "retryable": retryable,
+            "retry_after_sec": max(retry_after_values) if retry_after_values else 0,
+        },
+    )
 
 
 def _artifact_dates(tickers: list[str]) -> list[str]:
@@ -780,7 +884,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 },
             )
     except Exception as e:
-        result["kis_investor_daily"] = _status(False, {"error": str(e)})
+        result["kis_investor_daily"] = _status(False, _classify_exception(e))
 
     try:
         krx = KRXRestClient(auth=kis.auth)
@@ -815,7 +919,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 },
             )
     except Exception as e:
-        result["krx_investor_bridge"] = _status(False, {"error": str(e)})
+        result["krx_investor_bridge"] = _status(False, _classify_exception(e))
 
     try:
         dart = DARTRestClient()
@@ -841,7 +945,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 },
             )
     except Exception as e:
-        result["dart"] = _status(False, {"error": str(e)})
+        result["dart"] = _status(False, _classify_exception(e))
 
     try:
         naver = NaverNewsClient()
@@ -859,7 +963,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 {"item_count": len(news), "is_mock": getattr(naver, "_is_mock", None)},
             )
     except Exception as e:
-        result["naver"] = _status(False, {"error": str(e)})
+        result["naver"] = _status(False, _classify_exception(e))
 
     try:
         community = CommunityCrawler()
@@ -904,7 +1008,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 },
             )
     except Exception as e:
-        result["community"] = _status(False, {"error": str(e)})
+        result["community"] = _status(False, _classify_exception(e))
 
     try:
         blocked = _mock_blocked("kospi_batch_snapshot", allow_mock, {"source_mode": kis.mode})
@@ -922,7 +1026,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 },
             )
     except Exception as e:
-        result["kospi_batch_snapshot"] = _status(False, {"error": str(e)})
+        result["kospi_batch_snapshot"] = _status(False, _classify_exception(e))
 
     try:
         ecos = ECOSRestClient()
@@ -940,7 +1044,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 {"macro": macro, "is_mock": getattr(ecos, "_is_mock", None)},
             )
     except Exception as e:
-        result["ecos_macro"] = _status(False, {"error": str(e)})
+        result["ecos_macro"] = _status(False, _classify_exception(e))
 
     try:
         us_market = USMarketClient()
@@ -972,7 +1076,7 @@ def run_smoke(tickers: list[str], as_of_date: str, allow_mock: bool = False) -> 
                 {"indices": payload, "is_mock": is_mock},
             )
     except Exception as e:
-        result["us_overnight"] = _status(False, {"error": str(e)})
+        result["us_overnight"] = _status(False, _classify_exception(e))
 
     return result
 
@@ -1082,6 +1186,20 @@ def run_backfill(
                         {"ticker": padded, "date": day, "fetched_rows": fetched}
                     )
         ok = not artifact_missing_or_empty and not current_fetch_missing_or_short
+        transient_shortfall = (
+            not ok
+            and bool(current_fetch_missing_or_short)
+            and bool(circuit_breaker.get("triggered"))
+        )
+        failure_meta = (
+            {
+                "failure_class": "transient_data_fetch_shortfall",
+                "retryable": True,
+                "retry_after_sec": 90,
+            }
+            if transient_shortfall
+            else {}
+        )
         return _status(
             ok,
             {
@@ -1094,10 +1212,11 @@ def run_backfill(
                 "missing_or_empty_tickers": artifact_missing_or_empty,
                 "current_fetch_missing_or_short": current_fetch_missing_or_short,
                 "backfill_circuit_breaker": circuit_breaker,
+                **failure_meta,
             },
         )
     except Exception as e:
-        return _status(False, {"error": str(e)})
+        return _status(False, _classify_exception(e))
 
 
 def run_train_if_ready(
@@ -1105,6 +1224,7 @@ def run_train_if_ready(
     start_date: str,
     end_date: str,
     require_train: bool,
+    train_registry_dir: str | None = None,
 ) -> dict[str, Any]:
     wf = config_load("risk_config.yaml", "walk_forward")
     min_dates = int(wf["train_window_days"]) + int(wf["test_window_days"])
@@ -1159,9 +1279,43 @@ def run_train_if_ready(
 
     try:
         from src.models.lgbm_trainer import LGBMTrainer
+        from src.models.registry import ModelRegistry
 
         version = f"live_{end_date}"
-        train_result = LGBMTrainer().train(
+        registry_dir = Path(str(train_registry_dir)).expanduser() if train_registry_dir else None
+        production_registry_dir = REPO_ROOT / "artifacts" / "lgbm"
+        if registry_dir is None:
+            status = "FAIL" if require_train else "SKIP"
+            return {
+                "status": status,
+                "reason": "non_production_train_registry_dir_required",
+                "production_registry_dir": _repo_relative(production_registry_dir),
+            }
+        if not registry_dir.is_absolute():
+            registry_dir = REPO_ROOT / registry_dir
+        try:
+            resolved_registry_dir = registry_dir.resolve()
+            resolved_production_registry_dir = production_registry_dir.resolve()
+            uses_production_registry = (
+                resolved_registry_dir == resolved_production_registry_dir
+                or resolved_registry_dir.is_relative_to(resolved_production_registry_dir)
+            )
+        except OSError:
+            registry_text = str(registry_dir)
+            production_text = str(production_registry_dir)
+            uses_production_registry = (
+                registry_text == production_text
+                or registry_text.startswith(f"{production_text}/")
+            )
+        if uses_production_registry:
+            status = "FAIL" if require_train else "SKIP"
+            return {
+                "status": status,
+                "reason": "production_train_registry_dir_blocked",
+                "train_registry_dir": _repo_relative(registry_dir),
+            }
+
+        train_result = LGBMTrainer(registry=ModelRegistry(artifacts_dir=registry_dir)).train(
             tickers=tickers,
             start_date=start_date,
             end_date=end_date,
@@ -1176,12 +1330,13 @@ def run_train_if_ready(
             {
                 "result": train_result,
                 "version": version,
+                "train_registry_dir": _repo_relative(registry_dir),
                 "synthetic_fallback": synthetic,
                 "missing_tickers": missing_tickers,
             },
         )
     except Exception as e:
-        return _status(False, {"error": str(e)})
+        return _status(False, _classify_exception(e))
 
 
 def _write_report(report: dict[str, Any]) -> Path:
@@ -1208,6 +1363,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--all", action="store_true")
     p.add_argument("--require-train", action="store_true")
     p.add_argument(
+        "--train-registry-dir",
+        default="",
+        help="Non-production ModelRegistry directory required when train stage runs.",
+    )
+    p.add_argument(
         "--skip-existing-backfill",
         action="store_true",
         help="skip dates whose saved artifacts already satisfy live_data_readiness min rows",
@@ -1216,6 +1376,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-mock",
         action="store_true",
         help="allow mock connector PASS only for CI/demo, never for live readiness",
+    )
+    p.add_argument(
+        "--dns-preflight",
+        action="store_true",
+        help="resolve required external API hosts before running read-only connector stages",
     )
     return p.parse_args(argv)
 
@@ -1252,6 +1417,12 @@ def main(argv: list[str] | None = None) -> int:
             "stages": {},
         }
 
+        if bool(args.dns_preflight):
+            report["stages"]["dns_preflight"] = run_dns_preflight()
+            if report["stages"]["dns_preflight"].get("status") == "FAIL":
+                do_smoke = False
+                do_backfill = False
+                do_train = False
         if do_smoke:
             report["stages"]["smoke"] = run_smoke(
                 tickers, end_date, allow_mock=bool(args.allow_mock)
@@ -1265,28 +1436,60 @@ def main(argv: list[str] | None = None) -> int:
             )
         if do_train:
             report["stages"]["train"] = run_train_if_ready(
-                tickers, start_date, end_date, bool(args.require_train)
+                tickers,
+                start_date,
+                end_date,
+                bool(args.require_train),
+                str(args.train_registry_dir).strip() or None,
             )
 
         failures: list[str] = []
+        failure_details: dict[str, Any] = {}
+        failure_classes: list[str] = []
+        retryable_failures: list[str] = []
+        retry_after_values: list[int] = []
         for stage_name, stage_result in report["stages"].items():
             if stage_name == "smoke":
                 for name, item in stage_result.items():
                     if item.get("status") == "FAIL":
-                        failures.append(f"smoke.{name}")
+                        key = f"smoke.{name}"
+                        failures.append(key)
+                        failure_details[key] = item
+                        if item.get("failure_class"):
+                            failure_classes.append(str(item["failure_class"]))
+                        if safe_bool(item.get("retryable"), default=False):
+                            retryable_failures.append(key)
+                            retry_after_values.append(
+                                safe_int(item.get("retry_after_sec"), default=90, min_value=0)
+                            )
             elif stage_result.get("status") == "FAIL":
                 failures.append(stage_name)
+                failure_details[stage_name] = stage_result
+                if stage_result.get("failure_class"):
+                    failure_classes.append(str(stage_result["failure_class"]))
+                if safe_bool(stage_result.get("retryable"), default=False):
+                    retryable_failures.append(stage_name)
+                    retry_after_values.append(
+                        safe_int(stage_result.get("retry_after_sec"), default=90, min_value=0)
+                    )
 
         report["status"] = "FAIL" if failures else "PASS"
         report["failures"] = failures
+        report["failure_details"] = failure_details
+        report["failure_classes"] = sorted(set(failure_classes))
+        report["retryable"] = bool(failures) and len(retryable_failures) == len(failures)
+        report["retryable_failures"] = retryable_failures
+        report["retry_after_sec"] = max(retry_after_values) if retry_after_values else 0
         _write_report(report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1 if failures else 0
     except Exception as e:
+        error_detail = _classify_exception(e)
         report = {
             "status": "ERROR",
             "error_code": "LIVE_DATA_READINESS_ERROR",
-            "message": str(e),
+            "message": error_detail["error"],
+            **error_detail,
             "generated_at": datetime.now(_KST).isoformat(),
             "runtime": _runtime_metadata(),
             "stages": {},

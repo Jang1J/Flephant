@@ -313,6 +313,58 @@ def check_production_registry_state(
     state["version_count"] = (
         len(versions) if isinstance(versions, (dict, list)) else 0
     )
+    version_items: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(versions, dict):
+        for key, value in versions.items():
+            if isinstance(value, dict):
+                version_items.append((str(key), value))
+    elif isinstance(versions, list):
+        for value in versions:
+            if not isinstance(value, dict):
+                continue
+            version_id = str(value.get("version") or value.get("id") or "")
+            version_items.append((version_id, value))
+
+    inactive_drift: list[dict[str, Any]] = []
+    inactive_missing_artifacts: list[dict[str, Any]] = []
+    for version_id, item in version_items:
+        version = str(item.get("version") or item.get("id") or version_id)
+        if not version or version == active_version:
+            continue
+        status = str(item.get("status", "")).lower()
+        model_path = str(item.get("model_path") or "")
+        metadata_path = str(item.get("metadata_path") or "")
+        if version.startswith("live_") or status == "candidate":
+            inactive_drift.append({
+                "version": version,
+                "status": status or None,
+                "model_path": model_path or None,
+                "metadata_path": metadata_path or None,
+            })
+        for field, raw_path in (("model_path", model_path), ("metadata_path", metadata_path)):
+            if not raw_path:
+                continue
+            artifact_path = _resolve_repo_path(raw_path, root=root)
+            if not artifact_path.exists():
+                inactive_missing_artifacts.append({
+                    "check": "production_registry_state",
+                    "reason": "inactive_candidate_artifact_missing",
+                    "version": version,
+                    "field": field,
+                    "path": raw_path,
+                })
+    if inactive_drift:
+        state["inactive_candidate_drift_count"] = len(inactive_drift)
+        state["inactive_candidate_drift"] = inactive_drift[:10]
+    if inactive_missing_artifacts:
+        state["inactive_candidate_missing_artifact_count"] = len(inactive_missing_artifacts)
+        state["inactive_candidate_missing_artifacts"] = inactive_missing_artifacts[:10]
+        warnings.append({
+            "check": "production_registry_state",
+            "reason": "inactive_candidate_artifacts_missing",
+            "count": len(inactive_missing_artifacts),
+            "items": inactive_missing_artifacts[:10],
+        })
     if active_version and not allow_production_active:
         blockers.append({
             "check": "production_registry_state",

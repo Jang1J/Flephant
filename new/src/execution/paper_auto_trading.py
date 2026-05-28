@@ -114,6 +114,27 @@ class PaperAutoTrader:
             self._cfg.get("allow_market_order", False),
             default=False,
         )
+        service_policy_cfg = config_load("risk_config.yaml", "service_policy_replay") or {}
+        execution_cfg = config_load("risk_config.yaml", "execution") or {}
+        self._allow_position_pyramiding = safe_bool(
+            service_policy_cfg.get(
+                "allow_position_pyramiding",
+                execution_cfg.get("allow_position_pyramiding", False),
+            ),
+            default=False,
+        )
+        self._min_holding_bars = safe_int(
+            service_policy_cfg.get("min_holding_bars", 0),
+            default=0,
+            min_value=0,
+        )
+        self._rebalance_cooldown_bars = safe_int(
+            service_policy_cfg.get("rebalance_cooldown_bars", 0),
+            default=0,
+            min_value=0,
+        )
+        self._last_order_cycle_by_ticker: dict[str, int] = {}
+        self._holding_since_cycle_by_ticker: dict[str, int] = {}
         self._max_consecutive_read_error_skips = safe_int(
             self._cfg.get("max_consecutive_read_error_skips", 3),
             default=3,
@@ -134,6 +155,21 @@ class PaperAutoTrader:
         self._consecutive_read_errors = 0
         self._run_guard_passed = False
         self._last_bar_fetch_metadata: dict[str, Any] = {}
+
+    def _on_run_preflight_passed(self, report: dict[str, Any]) -> None:
+        """Hook for wrappers after run-level guards pass and before cycles."""
+        return None
+
+    def _on_before_broker_submit(
+        self,
+        *,
+        cycle_index: int,
+        final_decision: dict[str, Any],
+        hot_result: dict[str, Any],
+        order_guard: dict[str, Any],
+    ) -> None:
+        """Hook for wrappers that must publish/validate before broker submit."""
+        return None
 
     @property
     def confirm_start_phrase(self) -> str:
@@ -207,7 +243,9 @@ class PaperAutoTrader:
             return self._finish_report(report, write_report)
 
         cycle_reports: list[dict[str, Any]] = []
+        stop_reason: str | None = None
         self._run_guard_passed = True
+        self._on_run_preflight_passed(report)
         try:
             for idx in range(cycles_int):
                 try:
@@ -231,10 +269,22 @@ class PaperAutoTrader:
                 if idx == 0 and isinstance(cycle.get("account_state"), dict):
                     report["account_initial_state"] = dict(cycle["account_state"])
                 cycle_reports.append(cycle)
+                if self._is_terminal_market_skip(cycle):
+                    stop_reason = str(cycle.get("reason") or "market_session_skip")
+                    break
                 if cycle.get("status") == "FAIL":
                     break
                 if idx < cycles_int - 1:
                     self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
+        except KeyboardInterrupt:
+            logger.warning("[paper_auto_trading] interrupt 수신. report를 저장하고 안전 종료합니다.")
+            stop_reason = "paper_auto_interrupted"
+            cycle_reports.append(
+                self._interrupted_cycle_report(
+                    cycle_index=len(cycle_reports),
+                    started_at=self._now_kst().isoformat(),
+                )
+            )
         except Exception as e:
             logger.warning("[paper_auto_trading] run 예외로 fail-closed 처리: %s", e)
             cycle_reports.append(
@@ -250,6 +300,9 @@ class PaperAutoTrader:
 
         report["stages"]["cycles"] = {
             "status": "PASS" if all(c.get("status") != "FAIL" for c in cycle_reports) else "FAIL",
+            "requested_cycles": cycles_int,
+            "completed_cycles": len(cycle_reports),
+            "stop_reason": stop_reason,
             "items": cycle_reports,
         }
         report["status"] = self._overall_status(report)
@@ -274,9 +327,11 @@ class PaperAutoTrader:
         started_at = str(market_session_guard.get("now") or self._now_kst().isoformat())
         if market_session_guard["status"] != "PASS":
             return {
-                "status": "PASS" if market_session_guard.get("safe_skip") else "FAIL",
+                "status": "SKIP" if market_session_guard.get("safe_skip") else "FAIL",
                 "cycle_index": cycle_index,
                 "started_at": started_at,
+                "reason": market_session_guard.get("reason"),
+                "safe_skip": bool(market_session_guard.get("safe_skip")),
                 "market_session_guard": market_session_guard,
                 "execution": None,
             }
@@ -315,6 +370,10 @@ class PaperAutoTrader:
             balance.get("positions", []),
             latest_prices,
             portfolio_value,
+        )
+        self._sync_runtime_position_state(
+            current_positions=current_positions,
+            cycle_index=cycle_index,
         )
         hot_path_bar_readiness = self._hot_path_bar_readiness(
             bars_by_ticker,
@@ -393,6 +452,38 @@ class PaperAutoTrader:
 
         quant_signal_guard = self._quant_signal_guard(hot_result)
         if quant_signal_guard["status"] != "PASS":
+            if quant_signal_guard.get("reason") == "active_model_quant_scores_not_rankable":
+                return {
+                    "status": "SKIP",
+                    "safe_skip": True,
+                    "cycle_index": cycle_index,
+                    "started_at": started_at,
+                    "reason": "quant_signal_readiness",
+                    "cold_path_risk_warning_count": len(external_risk_warnings),
+                    "portfolio_value": portfolio_value,
+                    "n_bars": len(bars_batch),
+                    "quant_signal_guard": quant_signal_guard,
+                    "hot_path_bar_readiness": hot_path_bar_readiness,
+                    "account_state": account_state,
+                    "hot_result": hot_result,
+                    "broker_order_submitted": False,
+                    "execution": {
+                        "status": "SKIP",
+                        "broker_order_submitted": False,
+                        "reason": "quant_scores_not_rankable_no_broker_submit",
+                        "execution_report": {
+                            "status": "SKIP",
+                            "fills": [],
+                            "rejections": [],
+                            "orders": [],
+                        },
+                    },
+                    "order_history_verification": {
+                        "status": "SKIP",
+                        "safe_skip": True,
+                        "reason": "quant_scores_not_rankable_no_broker_submit",
+                    },
+                }
             return {
                 "status": "FAIL",
                 "cycle_index": cycle_index,
@@ -409,12 +500,26 @@ class PaperAutoTrader:
         final_decision["order_deltas"] = [
             dict(od) for od in list(final_decision.get("order_deltas", []))
         ]
+        runtime_policy_applied = self._apply_runtime_service_policy(
+            final_decision=final_decision,
+            current_positions=current_positions,
+            cycle_index=cycle_index,
+        )
         order_count_caps_applied = self._cap_order_count(final_decision)
         order_caps_applied = self._cap_order_quantities(final_decision)
         order_guard = self._order_guard(final_decision, hot_result=hot_result)
+        if (
+            runtime_policy_applied
+            and order_guard.get("status") == "SKIP"
+            and order_guard.get("safe_skip")
+        ):
+            order_guard = dict(order_guard)
+            order_guard["runtime_service_policy_applied"] = runtime_policy_applied
+            if not final_decision.get("order_deltas"):
+                order_guard["reason"] = "runtime_service_policy_filtered_all_orders"
         if order_guard["status"] != "PASS":
             return {
-                "status": "PASS" if order_guard.get("safe_skip") else "FAIL",
+                "status": "SKIP" if order_guard.get("safe_skip") else "FAIL",
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "cold_path_risk_warning_count": len(external_risk_warnings),
@@ -422,11 +527,19 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "quant_signal_guard": quant_signal_guard,
                 "order_guard": order_guard,
+                "runtime_service_policy_applied": runtime_policy_applied,
                 "order_count_caps_applied": order_count_caps_applied,
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
                 "execution": None,
             }
+
+        self._on_before_broker_submit(
+            cycle_index=cycle_index,
+            final_decision=final_decision,
+            hot_result=hot_result,
+            order_guard=order_guard,
+        )
 
         if not self._submit_orders:
             shadow_execution = {
@@ -454,6 +567,7 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "quant_signal_guard": quant_signal_guard,
                 "order_guard": order_guard,
+                "runtime_service_policy_applied": runtime_policy_applied,
                 "order_count_caps_applied": order_count_caps_applied,
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
@@ -483,6 +597,11 @@ class PaperAutoTrader:
         execution_status = execution_report.get("status")
         broker_blockers = self._broker_rejection_blockers(execution_report)
         ok_statuses = {"submitted", "filled", "partial_filled"}
+        if execution_status in ok_statuses and not broker_blockers:
+            self._record_runtime_policy_submitted_orders(
+                final_decision.get("order_deltas", []),
+                cycle_index=cycle_index,
+            )
         order_history = self._order_history_verification(execution)
         status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
         if order_history.get("status") != "PASS":
@@ -498,6 +617,7 @@ class PaperAutoTrader:
             "account_state": account_state,
             "quant_signal_guard": quant_signal_guard,
             "order_guard": order_guard,
+            "runtime_service_policy_applied": runtime_policy_applied,
             "order_count_caps_applied": order_count_caps_applied,
             "order_caps_applied": order_caps_applied,
             "hot_result": hot_result,
@@ -561,6 +681,34 @@ class PaperAutoTrader:
             "consecutive_read_errors": int(consecutive_read_errors),
             "max_consecutive_read_error_skips": self._max_consecutive_read_error_skips,
             "fail_closed": fail_closed,
+            "execution": None,
+        }
+
+    @staticmethod
+    def _is_terminal_market_skip(cycle: dict[str, Any]) -> bool:
+        if cycle.get("status") != "SKIP":
+            return False
+        guard = cycle.get("market_session_guard")
+        if not isinstance(guard, dict):
+            return False
+        return bool(guard.get("safe_skip")) and str(guard.get("reason") or "") in {
+            "outside_market_session",
+            "not_kospi_trading_day",
+        }
+
+    @staticmethod
+    def _interrupted_cycle_report(
+        *,
+        cycle_index: int,
+        started_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "status": "SKIP",
+            "cycle_index": int(cycle_index),
+            "started_at": started_at,
+            "reason": "paper_auto_interrupted",
+            "safe_skip": True,
+            "broker_order_submitted": False,
             "execution": None,
         }
 
@@ -647,13 +795,20 @@ class PaperAutoTrader:
         for ticker in tickers:
             padded = pad_ticker(str(ticker))
             bars = list(self._kis_client.inquire_minute_bar(padded, n_bars=warmup))
-            filtered_bars = self._filter_future_bars(bars, asof=asof)
+            filtered_bars, future_filter_meta = self._filter_future_bars(
+                bars,
+                asof=asof,
+                ticker=padded,
+            )
             topped_up, topup_meta = self._historical_warmup_topup(
                 padded,
                 filtered_bars,
                 warmup,
             )
             out[padded] = topped_up
+            if int(future_filter_meta.get("filtered_count", 0)) > 0:
+                metadata["future_bar_filtered"] = True
+            metadata["future_rows_kept_for_readiness"] = False
             metadata["live_rows_by_ticker"][padded] = len(filtered_bars)
             metadata["historical_topup_rows_by_ticker"][padded] = int(
                 topup_meta.get("historical_topup_count", 0)
@@ -667,6 +822,10 @@ class PaperAutoTrader:
             metadata["tickers"][padded] = {
                 "raw_live_bar_count": len(bars),
                 "live_bar_count": len(filtered_bars),
+                "future_bar_filtered_count": int(
+                    future_filter_meta.get("filtered_count", 0)
+                ),
+                "future_bar_filtered_rows": future_filter_meta.get("filtered_rows", []),
                 "historical_topup_count": int(topup_meta.get("historical_topup_count", 0)),
                 "final_bar_count": len(topped_up),
                 "topup_needed": len(filtered_bars) < warmup,
@@ -756,10 +915,30 @@ class PaperAutoTrader:
         bars: list[dict[str, Any]],
         *,
         asof: str | None,
-    ) -> list[dict[str, Any]]:
-        # Keep raw live rows so _hot_path_bar_readiness can fail closed on
-        # invalid/future bars before HotRunner or broker submission.
-        return list(bars)
+        ticker: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Drop forming/future KIS bars before readiness and HotRunner.
+
+        KIS can return the currently forming one-minute bar with a close timestamp
+        greater than the cycle asof. Keeping that row would either violate PIT or
+        repeatedly fail the run at the minute boundary. Invalid timestamps are
+        deliberately kept so _hot_path_bar_readiness still fails closed on them.
+        """
+        asof_ts = self._parse_bar_ts(asof) if asof is not None else self._now_kst()
+        filtered: list[dict[str, Any]] = []
+        future_rows: list[dict[str, str]] = []
+        padded = pad_ticker(str(ticker))
+        for bar in bars:
+            raw_ts = str(bar.get("ts_close") or "")
+            bar_ts = self._parse_bar_ts(raw_ts)
+            if bar_ts is not None and asof_ts is not None and bar_ts > asof_ts:
+                future_rows.append({"ticker": padded, "ts_close": raw_ts})
+                continue
+            filtered.append(bar)
+        return filtered, {
+            "filtered_count": len(future_rows),
+            "filtered_rows": future_rows[:10],
+        }
 
     def _historical_warmup_topup(
         self,
@@ -1294,6 +1473,223 @@ class PaperAutoTrader:
         logger.warning("[paper_auto_trading] 주문 개수 cap 적용: %s", cap_record)
         return [cap_record]
 
+    def _apply_runtime_service_policy(
+        self,
+        *,
+        final_decision: dict[str, Any],
+        current_positions: list[dict[str, Any]],
+        cycle_index: int,
+    ) -> list[dict[str, Any]]:
+        """Apply runtime execution policy before paper broker submission.
+
+        Service-policy replay already honors no-pyramiding, rebalance
+        cooldown, and min-holding constraints. Paper-auto must do the same
+        before broker submit so evidence does not drift from the policy being
+        validated.
+        """
+        raw_order_deltas = final_decision.get("order_deltas", [])
+        if not isinstance(raw_order_deltas, list):
+            return []
+
+        current_qty_by_ticker: dict[str, int] = {}
+        for pos in current_positions:
+            if not isinstance(pos, dict):
+                continue
+            ticker = pad_ticker(str(pos.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            current_qty_by_ticker[ticker] = safe_lossless_int(
+                pos.get("qty", 0),
+                default=0,
+                min_value=0,
+            )
+
+        kept: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
+        for idx, od in enumerate(raw_order_deltas):
+            if not isinstance(od, dict):
+                kept.append(od)
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            side = str(od.get("side", "")).lower()
+            reason = str(od.get("reason", "")).lower()
+            held_qty = current_qty_by_ticker.get(ticker, 0)
+            if side == "sell" and reason == "risk_reduce":
+                qty = safe_lossless_int(
+                    od.get("qty", 0),
+                    default=0,
+                    min_value=0,
+                )
+                if held_qty <= 0:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_requires_held_position",
+                        "policy": "risk_fast.execution_bridge.require_held_position",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
+                if qty <= 0:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_invalid_qty",
+                        "policy": "risk_fast.execution_bridge",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
+                if qty > held_qty:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": qty,
+                        "held_qty": held_qty,
+                        "reason": "risk_reduce_qty_exceeds_held_qty",
+                        "policy": "risk_fast.execution_bridge.require_held_position",
+                        "cycle_index": int(cycle_index),
+                    })
+                    continue
+                kept.append(od)
+                continue
+            last_order_cycle = self._last_order_cycle_by_ticker.get(ticker)
+            if (
+                last_order_cycle is not None
+                and self._rebalance_cooldown_bars > 0
+                and cycle_index - int(last_order_cycle) < self._rebalance_cooldown_bars
+            ):
+                dropped.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": safe_lossless_int(
+                        od.get("qty", 0),
+                        default=0,
+                        min_value=0,
+                    ),
+                    "held_qty": held_qty,
+                    "reason": "rebalance_cooldown_active",
+                    "policy": "service_policy_replay.rebalance_cooldown_bars",
+                    "required_bars": self._rebalance_cooldown_bars,
+                    "last_order_cycle": int(last_order_cycle),
+                    "cycle_index": int(cycle_index),
+                })
+                continue
+            if (
+                side == "sell"
+                and held_qty > 0
+                and self._min_holding_bars > 0
+            ):
+                holding_since = self._holding_since_cycle_by_ticker.get(
+                    ticker,
+                    cycle_index,
+                )
+                held_age = cycle_index - int(holding_since)
+                if held_age < self._min_holding_bars:
+                    dropped.append({
+                        "index": idx,
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": safe_lossless_int(
+                            od.get("qty", 0),
+                            default=0,
+                            min_value=0,
+                        ),
+                        "held_qty": held_qty,
+                        "reason": "min_holding_bars_active",
+                        "policy": "service_policy_replay.min_holding_bars",
+                        "required_bars": self._min_holding_bars,
+                        "holding_since_cycle": int(holding_since),
+                        "held_age_bars": int(held_age),
+                    })
+                    continue
+            if (
+                side == "buy"
+                and not self._allow_position_pyramiding
+                and held_qty > 0
+            ):
+                dropped.append({
+                    "index": idx,
+                    "ticker": ticker,
+                    "side": side,
+                    "qty": safe_lossless_int(
+                        od.get("qty", 0),
+                        default=0,
+                        min_value=0,
+                    ),
+                    "held_qty": held_qty,
+                    "reason": "position_pyramiding_disabled",
+                    "policy": "service_policy_replay.allow_position_pyramiding",
+                    "allowed": False,
+                })
+                continue
+            kept.append(od)
+
+        if not dropped:
+            return []
+
+        final_decision["order_deltas"] = kept
+        record = {
+            "policy": "service_policy_replay",
+            "allow_position_pyramiding": self._allow_position_pyramiding,
+            "min_holding_bars": self._min_holding_bars,
+            "rebalance_cooldown_bars": self._rebalance_cooldown_bars,
+            "original_count": len(raw_order_deltas),
+            "kept_count": len(kept),
+            "dropped_count": len(dropped),
+            "dropped": dropped,
+        }
+        final_decision.setdefault("paper_auto_runtime_service_policy_applied", [])
+        final_decision["paper_auto_runtime_service_policy_applied"].append(record)
+        logger.warning("[paper_auto_trading] runtime service policy 적용: %s", record)
+        return [record]
+
+    def _sync_runtime_position_state(
+        self,
+        *,
+        current_positions: list[dict[str, Any]],
+        cycle_index: int,
+    ) -> None:
+        current_tickers: set[str] = set()
+        for pos in current_positions:
+            if not isinstance(pos, dict):
+                continue
+            ticker = pad_ticker(str(pos.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            qty = safe_lossless_int(pos.get("qty", 0), default=0, min_value=0)
+            if qty <= 0:
+                continue
+            current_tickers.add(ticker)
+            self._holding_since_cycle_by_ticker.setdefault(ticker, cycle_index)
+
+        for ticker in list(self._holding_since_cycle_by_ticker):
+            if ticker not in current_tickers:
+                self._holding_since_cycle_by_ticker.pop(ticker, None)
+
+    def _record_runtime_policy_submitted_orders(
+        self,
+        order_deltas: list[dict[str, Any]],
+        *,
+        cycle_index: int,
+    ) -> None:
+        for od in order_deltas:
+            if not isinstance(od, dict):
+                continue
+            ticker = pad_ticker(str(od.get("ticker", "")))
+            if ticker == "000000" or not is_valid_ticker(ticker):
+                continue
+            side = str(od.get("side", "")).lower()
+            self._last_order_cycle_by_ticker[ticker] = cycle_index
+            if side == "buy":
+                self._holding_since_cycle_by_ticker.setdefault(ticker, cycle_index)
+
     @staticmethod
     def _order_count_cap_sort_key(item: tuple[int, dict[str, Any]]) -> tuple[float, float, float, str, int]:
         index, od = item
@@ -1545,7 +1941,20 @@ class PaperAutoTrader:
             bool(len(finite_scores) == 1 and abs(finite_scores[0]) > 1e-12)
             or bool(len(finite_scores) > 1 and len(set(finite_scores)) > 1)
         )
-        if len(finite_scores) != score_count or not rankable:
+        all_zero = bool(finite_scores) and all(abs(value) <= 1e-12 for value in finite_scores)
+        if len(finite_scores) != score_count or all_zero:
+            return {
+                "status": "FAIL",
+                "reason": "active_model_quant_scores_all_zero"
+                if all_zero
+                else "active_model_quant_scores_not_rankable",
+                "quant_mode": mode,
+                "score_count": score_count,
+                "finite_score_count": len(finite_scores),
+                "rankable": rankable,
+                "all_zero": all_zero,
+            }
+        if not rankable:
             return {
                 "status": "FAIL",
                 "reason": "active_model_quant_scores_not_rankable",
@@ -1553,6 +1962,7 @@ class PaperAutoTrader:
                 "score_count": score_count,
                 "finite_score_count": len(finite_scores),
                 "rankable": rankable,
+                "all_zero": all_zero,
             }
         return {
             "status": "PASS",
@@ -1561,6 +1971,7 @@ class PaperAutoTrader:
             "score_count": score_count,
             "finite_score_count": len(finite_scores),
             "rankable": rankable,
+            "all_zero": all_zero,
         }
 
     def _order_history_verification(self, execution: dict[str, Any]) -> dict[str, Any]:
@@ -1701,6 +2112,10 @@ class PaperAutoTrader:
                 "execution_policy": {
                     "max_orders_per_cycle": self._max_orders_per_cycle,
                     "max_order_qty_per_order": self._max_order_qty_per_order,
+                    "allow_position_pyramiding": self._allow_position_pyramiding,
+                    "min_holding_bars": self._min_holding_bars,
+                    "rebalance_cooldown_bars": self._rebalance_cooldown_bars,
+                    "policy_source": "service_policy_replay",
                 },
             },
             "stages": {},

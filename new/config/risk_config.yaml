@@ -129,6 +129,7 @@ paper_trading:
   max_probe_order_qty: 1
   allow_market_order: false
   evidence_max_age_sec: 86400
+  require_same_day_evidence: true
 
 paper_auto_trading:
   report_dir: "artifacts/reports/paper_auto_trading"
@@ -139,7 +140,7 @@ paper_auto_trading:
   require_virtual_mode: true
   require_prelive_pass: true
   require_active_model: true
-  default_max_cycles: 1
+  default_max_cycles: 390
   default_interval_sec: 60
   max_tickers: 30
   max_orders_per_cycle: 3
@@ -1048,10 +1049,26 @@ post_close_data_update:
   trigger_after_snapshot_time: "pit_safety.snapshot_hour:snapshot_minute"
   stage_timeout_sec: 3600
   stop_on_stage_failure: true
+  retry:
+    enabled: true
+    max_attempts: 3
+    backoff_sec: 90
+    max_retry_after_sec: 1800
+    retryable_failure_classes:
+      - "transient_network_dns"
+      - "transient_network_timeout"
+      - "transient_network"
+      - "transient_rate_limit"
+      - "transient_external_5xx"
+      - "transient_stage_timeout"
+      - "transient_data_fetch_shortfall"
   skip_existing_backfill: true
   raw_events_dir: "artifacts/raw/dual_source"
   target_col_override: "label_195m_net_ret"
   run_post_backfill_prelive_by_default: false
+  registry_dirs:
+    live_data_readiness_train: "artifacts/lgbm_research/post_close/{target_end_date}/live_data_readiness"
+    post_backfill_prelive: "artifacts/lgbm_research/post_close/{target_end_date}/post_backfill_prelive"
   final_dataset_promotion:
     enabled: true
     update_risk_config: true
@@ -1069,7 +1086,7 @@ post_close_data_update:
       - "news_score_t"
   scheduler:
     enabled: true
-    run_time_kst: "18:05"
+    run_time_kst: "18:30"
     poll_interval_sec: 60
     retry_failed_after_sec: 1800
     state_path: "artifacts/reports/post_close_data_update_scheduler/state.json"
@@ -1413,6 +1430,13 @@ system_os_metrics:
 # Sprint 2 S2-9 FDA Cold Path 구현 시 이 섹션에서 로드 필수. 하드코딩 금지.
 # PIT-Safety: divergence는 장전 배치 점수 기반 → 실시간 publish 안전.
 # ============================================================
+fda_decision_defaults:
+  approve_confidence: 1.0
+  veto_confidence: 0.5
+  metadata:
+    owner: "risk_policy"
+    rationale: "FDA 기본 approve/veto confidence는 코드 하드코딩 없이 config에서 로드한다."
+
 fda_uncertainty_link:
   mode_b_metadata:
     schema_version: "1.0.0"
@@ -1487,6 +1511,15 @@ risk_fast:
   volume_lookback_bars: 20          # 거래량 평균 계산 기준 봉 수
   min_bars_required: 2              # 규칙 평가 최소 bar 수
   narrative_max_chars: 300          # RiskSlow LLM 응답 narrative 최대 길이
+  execution_bridge:
+    enabled: true
+    risk_levels: ["high", "medium"]
+    fda_approve_risk_reduce_only: true
+    approve_confidence: 0.72
+    allow_critical_risk_reduce: false
+    suppress_rebalance_orders: true
+    require_held_position: true
+    rationale: "RiskFast 위험 감지는 전체 주문 차단만 하지 않고, 보유 중인 affected ticker에 한해 PM이 생성한 risk_reduce sell만 paper submit 가능하게 연결한다. FDA는 비중/주문을 수정하지 않고 risk_reduce-only patch를 approve/veto만 한다."
 
   # Cold Path RiskAgentFast (cold/risk_fast.py) 전용 임계값
   # Hot Path sidecar(위 섹션)와 별개. Cold Path 이벤트 기반 규칙.

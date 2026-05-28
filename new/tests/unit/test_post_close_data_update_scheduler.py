@@ -36,7 +36,7 @@ def _fake_config():
         "post_close_data_update": {
             "scheduler": {
                 "enabled": True,
-                "run_time_kst": "18:05",
+                "run_time_kst": "18:30",
                 "poll_interval_sec": 1,
                 "retry_failed_after_sec": 1800,
                 "db": {"enabled": False},
@@ -64,11 +64,24 @@ def test_tick_runs_after_configured_time(monkeypatch):
     monkeypatch.setattr(mod.updater, "config_load", lambda *args, **kwargs: _fake_config())
     kst = ZoneInfo("Asia/Seoul")
 
-    decision = mod.evaluate_tick(datetime(2026, 5, 20, 18, 5, tzinfo=kst), {})
+    decision = mod.evaluate_tick(datetime(2026, 5, 20, 18, 30, tzinfo=kst), {})
 
     assert decision["should_run"] is True
     assert decision["reason"] == "due"
     assert decision["target_end_date"] == "20260520"
+
+
+def test_malformed_run_time_fails_closed(monkeypatch):
+    mod = _load_scheduler_module()
+    cfg = _fake_config()
+    cfg["post_close_data_update"]["scheduler"]["run_time_kst"] = "bad-time"
+    monkeypatch.setattr(mod.updater, "config_load", lambda *args, **kwargs: cfg)
+    kst = ZoneInfo("Asia/Seoul")
+
+    decision = mod.evaluate_tick(datetime(2026, 5, 20, 18, 30, tzinfo=kst), {})
+
+    assert decision["should_run"] is False
+    assert decision["reason"] == "scheduler_run_time_invalid"
 
 
 def test_tick_skips_already_passed_target(monkeypatch):
@@ -99,7 +112,7 @@ def test_tick_reads_latest_pass_from_db_when_no_state(monkeypatch):
             return {
                 "target_end_date": target_end_date,
                 "status": "PASS",
-                "started_at": "2026-05-20T18:05:00+09:00",
+                "started_at": "2026-05-20T18:30:00+09:00",
                 "bundle_id": "BUNDLE-20260520-POSTCLOSE",
                 "report_path": "artifacts/reports/post_close_data_update/test.json",
             }

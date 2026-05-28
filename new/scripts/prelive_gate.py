@@ -1218,6 +1218,42 @@ def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, 
     }
 
 
+def _paper_auto_required_broker_evidence_state(
+    data: dict[str, Any],
+    *,
+    stage_name: str,
+    require_order_history_match: bool,
+) -> dict[str, Any]:
+    broker_evidence = data.get("broker_evidence")
+    if not isinstance(broker_evidence, dict):
+        return {
+            "status": "BLOCKED",
+            "reason": "broker_evidence_missing",
+            "required_stages": [],
+            "stage_statuses": {},
+        }
+    required = ["balance_reconciliation"]
+    if stage_name == "probe_order":
+        required = ["probe_order"]
+        if require_order_history_match:
+            required.append("order_history_requery")
+    statuses: dict[str, str] = {}
+    for name in required:
+        stage = broker_evidence.get(name)
+        statuses[name] = (
+            str(stage.get("status", "MISSING")).upper()
+            if isinstance(stage, dict)
+            else "MISSING"
+        )
+    passed = all(status == "PASS" for status in statuses.values())
+    return {
+        "status": "PASS" if passed else "BLOCKED",
+        "reason": None if passed else "required_broker_evidence_stage_not_pass",
+        "required_stages": required,
+        "stage_statuses": statuses,
+    }
+
+
 def _latest_paper_auto_bundle_report(
     bundle_id: str | None,
 ) -> tuple[Path | None, dict[str, Any] | None]:
@@ -1259,13 +1295,19 @@ def _paper_auto_bundle_stage(
         max_age_sec=_paper_evidence_max_age_sec(),
     )
     nested_evidence = _paper_auto_broker_evidence_nested_state(data)
+    required_nested_evidence = _paper_auto_required_broker_evidence_state(
+        data,
+        stage_name=stage_name,
+        require_order_history_match=require_order_history_match,
+    )
     evidence_guard = _paper_auto_evidence_guard(data)
     evidence_guard_pass = str(evidence_guard.get("status", "")).upper() == "PASS"
+    report_status_ok = data.get("status") == "PASS" or stage_name == "balance_reconciliation"
     passed = (
-        data.get("status") == "PASS"
+        report_status_ok
         and stage_statuses.get(stage_name) == "PASS"
         and freshness.get("status") == "PASS"
-        and nested_evidence.get("status") == "PASS"
+        and required_nested_evidence.get("status") == "PASS"
         and evidence_guard_pass
         and (
             not require_order_history_match
@@ -1289,6 +1331,7 @@ def _paper_auto_bundle_stage(
             "stage_statuses": stage_statuses,
             "freshness": freshness,
             "broker_evidence_nested": nested_evidence,
+            "required_broker_evidence_nested": required_nested_evidence,
             "evidence_guard": evidence_guard,
             "paper_auto_cycle_history_matched": history_matched,
         },

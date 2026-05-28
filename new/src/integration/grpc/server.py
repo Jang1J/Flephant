@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 import threading
 import uuid
@@ -27,6 +28,8 @@ _KST = ZoneInfo("Asia/Seoul")
 
 _GENERATED_DIR = Path(__file__).resolve().parent / "generated"
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_SCRIPTS_DIR = _PROJECT_ROOT / "new" / "scripts"
+_PRELIVE_GATE_MODULE_LOCK = threading.Lock()
 
 
 class _PaperAutoSession:
@@ -54,6 +57,10 @@ class _PaperAutoSession:
         self.ended_at: str = ""
         self.report_path: str = ""
         self.last_error: str = ""
+        self.orders_submitted: int = 0
+        self.orders_filled: int = 0
+        self.orders_rejected: int = 0
+        self.last_cycle_status: str = ""
 
     def start(
         self,
@@ -64,6 +71,7 @@ class _PaperAutoSession:
         interval_sec: int,
         tickers: list[str],
         confirm_phrase: str,
+        registry_dir: Path | str | None = None,
         root: Path | None = None,
     ) -> dict[str, Any]:
         """세션 시작. 이미 실행 중이면 거부."""
@@ -89,6 +97,10 @@ class _PaperAutoSession:
             self.ended_at = ""
             self.report_path = ""
             self.last_error = ""
+            self.orders_submitted = 0
+            self.orders_filled = 0
+            self.orders_rejected = 0
+            self.last_cycle_status = ""
             self.running = True
             self._stop_event.clear()
 
@@ -100,25 +112,57 @@ class _PaperAutoSession:
                     "interval_sec": interval_sec,
                     "tickers": tickers,
                     "confirm_phrase": confirm_phrase,
+                    "registry_dir": registry_dir,
                     "root": root,
                 },
                 daemon=True,
             )
 
-            self._kafka.emit(
-                "AUTO_TRADING_STARTED",
-                session_id=self.session_id,
-                request_id=self.request_id,
-                bundle_id=bundle_id,
-                payload={"cycles": cycles, "tickers": tickers},
-            )
+            try:
+                self._kafka.emit(
+                    "AUTO_TRADING_START_REQUESTED",
+                    session_id=self.session_id,
+                    request_id=self.request_id,
+                    bundle_id=bundle_id,
+                    payload={
+                        "cycles": cycles,
+                        "tickers": tickers,
+                        "phase": "ACCEPTED_NOT_RUNNING_YET",
+                        "worker_started": False,
+                        "preflight_passed": False,
+                    },
+                )
+            except Exception as e:
+                self.running = False
+                self.terminal_status = "FAILED"
+                self.stop_reason = "KAFKA_EMIT_FAILED"
+                self.ended_at = datetime.now(_KST).isoformat()
+                self.last_error = str(e)
+                return {
+                    "accepted": False,
+                    "status": "KAFKA_EMIT_FAILED",
+                    "reason": str(e),
+                    "session_id": "",
+                }
             self._thread.start()
             return {
                 "accepted": True,
-                "status": "STARTED",
+                "status": "START_REQUESTED",
                 "reason": "",
                 "session_id": self.session_id,
             }
+
+    def shutdown(self, *, timeout_sec: float = 5.0) -> None:
+        """Stop an active worker thread before process shutdown."""
+        thread: threading.Thread | None
+        with self._lock:
+            thread = self._thread
+            if self.running:
+                self._stop_event.set()
+                self.stop_requested = True
+                self.terminal_status = "STOPPING"
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout_sec)))
 
     def stop(self, session_id: str = "") -> dict[str, Any]:
         """세션 중지 요청."""
@@ -138,6 +182,16 @@ class _PaperAutoSession:
             self._stop_event.set()
             self.stop_requested = True
             self.terminal_status = "STOPPING"
+            try:
+                self._kafka.emit(
+                    "AUTO_TRADING_STOP_REQUESTED",
+                    session_id=self.session_id,
+                    request_id=self.request_id,
+                    bundle_id=self.bundle_id,
+                    payload={"stop_reason": "USER_REQUESTED"},
+                )
+            except Exception as e:
+                self.last_error = str(e)
             return {
                 "accepted": True,
                 "status": "STOPPING",
@@ -150,6 +204,7 @@ class _PaperAutoSession:
             return {
                 "running": self.running,
                 "session_id": self.session_id,
+                "request_id": self.request_id,
                 "status": "RUNNING" if self.running else "IDLE",
                 "completed_cycles": self.completed_cycles,
                 "total_cycles": self.total_cycles,
@@ -162,6 +217,10 @@ class _PaperAutoSession:
                 "ended_at": self.ended_at,
                 "report_path": self.report_path,
                 "last_error": self.last_error,
+                "orders_submitted": self.orders_submitted,
+                "orders_filled": self.orders_filled,
+                "orders_rejected": self.orders_rejected,
+                "last_cycle_status": self.last_cycle_status,
                 "kafka": _kafka_status(self._kafka),
             }
 
@@ -173,7 +232,8 @@ class _PaperAutoSession:
         interval_sec: int,
         tickers: list[str],
         confirm_phrase: str,
-        root: Path | None,
+        registry_dir: Path | str | None = None,
+        root: Path | None = None,
     ) -> None:
         """비동기 스레드에서 PaperAutoTrader.run()을 실행.
 
@@ -191,6 +251,7 @@ class _PaperAutoSession:
                 kafka=self._kafka,
                 session_ref=self,
                 required_bundle_id=bundle_id,
+                registry_dir=registry_dir,
                 sleep_fn=interruptible_sleep,
             )
 
@@ -220,14 +281,22 @@ class _PaperAutoSession:
                     or ""
                 )
 
+            event_type = (
+                "AUTO_TRADING_FAILED"
+                if str(self.terminal_status).upper() == "FAIL"
+                else "AUTO_TRADING_STOPPED"
+            )
             self._kafka.emit(
-                "AUTO_TRADING_STOPPED",
+                event_type,
                 session_id=self.session_id,
                 request_id=self.request_id,
                 bundle_id=bundle_id,
                 payload={
                     "completed_cycles": self.completed_cycles,
-                    "stop_reason": stop_reason,
+                    "stop_reason": (
+                        "FAIL_CLOSED" if event_type == "AUTO_TRADING_FAILED"
+                        else stop_reason
+                    ),
                     "terminal_status": self.terminal_status,
                     "report_path": self.report_path,
                 },
@@ -293,6 +362,23 @@ def _first_not_none(*values: Any) -> Any:
     return next((value for value in values if value is not None), None)
 
 
+def _decision_event_payload(
+    *,
+    cycle: int,
+    status: Any,
+    decision: dict[str, Any],
+    order_deltas: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "cycle": cycle,
+        "status": status,
+        "decision_id": decision.get("decision_id"),
+        "approved": decision.get("approved"),
+        "reason_code": decision.get("reason_code"),
+        "order_count": len(order_deltas),
+    }
+
+
 def _kafka_status(kafka: Any) -> dict[str, Any]:
     try:
         status = kafka.status()
@@ -304,8 +390,176 @@ def _kafka_status(kafka: Any) -> dict[str, Any]:
     return {
         "connected": bool(status.get("connected", False)),
         "topic": str(status.get("topic", "")),
+        "required": bool(status.get("required", False)),
         "last_error": str(status.get("last_error", "")),
     }
+
+
+def _parse_hhmm(value: Any, *, default_hour: int, default_minute: int) -> tuple[int, int]:
+    raw = str(value or "").strip()
+    if not raw:
+        return default_hour, default_minute
+    try:
+        hour_raw, minute_raw = raw.split(":", 1)
+        hour = int(hour_raw)
+        minute = int(minute_raw)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"invalid HH:MM value {raw!r}") from e
+    raise ValueError(f"invalid HH:MM value {raw!r}")
+
+
+def _remaining_market_cycles(
+    *,
+    interval_sec: int,
+    pa_cfg: dict[str, Any],
+    now: datetime | None = None,
+) -> int:
+    """Return remaining one-shot cycles until configured KOSPI paper close.
+
+    BE often sends cycles=0 to ask AI for the default. In operation, the safe
+    default is "run until today's configured close", not a one-cycle smoke.
+    """
+    current = (now or datetime.now(_KST)).astimezone(_KST)
+    open_hour, open_minute = _parse_hhmm(
+        pa_cfg.get("market_open_time", "09:00"),
+        default_hour=9,
+        default_minute=0,
+    )
+    close_hour, close_minute = _parse_hhmm(
+        pa_cfg.get("market_close_time", "15:30"),
+        default_hour=15,
+        default_minute=30,
+    )
+    open_dt = current.replace(
+        hour=open_hour, minute=open_minute, second=0, microsecond=0,
+    )
+    close_dt = current.replace(
+        hour=close_hour, minute=close_minute, second=0, microsecond=0,
+    )
+    start_dt = max(current, open_dt)
+    remaining_sec = (close_dt - start_dt).total_seconds()
+    if remaining_sec <= 0:
+        return 0
+    step = max(1, int(interval_sec or 60))
+    return max(1, int(remaining_sec // step))
+
+
+def _market_start_guard(
+    *,
+    pa_cfg: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = (now or datetime.now(_KST)).astimezone(_KST)
+    open_hour, open_minute = _parse_hhmm(
+        pa_cfg.get("market_open_time", "09:00"),
+        default_hour=9,
+        default_minute=0,
+    )
+    close_hour, close_minute = _parse_hhmm(
+        pa_cfg.get("market_close_time", "15:30"),
+        default_hour=15,
+        default_minute=30,
+    )
+    open_dt = current.replace(
+        hour=open_hour, minute=open_minute, second=0, microsecond=0,
+    )
+    close_dt = current.replace(
+        hour=close_hour, minute=close_minute, second=0, microsecond=0,
+    )
+    if current < open_dt:
+        return {
+            "status": "BLOCKED",
+            "reason": "market_not_open",
+            "market_open_at": open_dt.isoformat(),
+        }
+    if current >= close_dt:
+        return {
+            "status": "BLOCKED",
+            "reason": "market_closed",
+            "market_close_at": close_dt.isoformat(),
+        }
+    return {"status": "PASS"}
+
+
+def _candidate_registry_dir(repo_root: Path, bundle_id: str) -> Path | None:
+    if not bundle_id:
+        return None
+    path = repo_root / "artifacts" / "lgbm_paper_candidate" / bundle_id
+    registry = path / "registry.json"
+    return path if path.exists() and registry.exists() else None
+
+
+def _load_prelive_gate_module() -> Any:
+    module_name = "_elephant_grpc_prelive_gate"
+    with _PRELIVE_GATE_MODULE_LOCK:
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            _SCRIPTS_DIR / "prelive_gate.py",
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("prelive_gate module spec could not be loaded")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def _paper_rehearsal_gate_from_strict(prelive: dict[str, Any]) -> dict[str, Any]:
+    stages = prelive.get("stages") if isinstance(prelive, dict) else {}
+    stages = stages if isinstance(stages, dict) else {}
+    required_stages = [
+        "01_code_ssot",
+        "02_real_data_readiness",
+        "03_80_business_day_data",
+        "04_lgbm_real_train",
+        "06_paper_balance",
+        "07_paper_reconciliation",
+        "08_paper_probe_order",
+        "09_ops_risk",
+    ]
+    blockers: list[str] = []
+    for stage_name in required_stages:
+        stage = stages.get(stage_name)
+        if not isinstance(stage, dict) or stage.get("status") != "PASS":
+            blockers.append(stage_name)
+
+    strict_blockers = [
+        str(blocker)
+        for blocker in (prelive.get("blockers") or [])
+        if str(blocker).strip()
+    ]
+    allowed_strict_blockers = {"05_backtest_real_candidate"}
+    blockers.extend(sorted(set(strict_blockers) - allowed_strict_blockers))
+
+    stage_01 = stages.get("01_code_ssot")
+    if isinstance(stage_01, dict) and bool(stage_01.get("live_enabled")):
+        blockers.append("live_enabled_true")
+
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "scope": "paper-rehearsal",
+        "blockers": blockers,
+        "allowed_strict_blockers": sorted(allowed_strict_blockers),
+        "strict_prelive_status": prelive.get("status"),
+        "strict_prelive_blockers": strict_blockers,
+    }
+
+
+def _default_prelive_end_date(prelive_gate: Any) -> str:
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    expected = prelive_gate._parse_dataset_date(gate_cfg.get("expected_end_date"))
+    if expected is not None:
+        return expected.strftime("%Y%m%d")
+    return prelive_gate._previous_business_day().strftime("%Y%m%d")
+
+
+def _default_prelive_business_days(prelive_gate: Any) -> int:
+    gate_cfg = prelive_gate._final_dataset_gate_cfg()
+    return int(gate_cfg.get("rehearsal_business_days") or 80)
 
 
 def _normalize_start_tickers(raw_tickers: Any) -> tuple[list[str], list[str]]:
@@ -393,14 +647,12 @@ def _paper_cycle_events(
     decision = hot_result.get("final_decision")
     decision = decision if isinstance(decision, dict) else {}
     order_deltas = _dict_rows(decision.get("order_deltas"))
-    decision_payload = {
-        "cycle": cycle,
-        "status": result.get("status", ""),
-        "decision_id": decision.get("decision_id"),
-        "approved": decision.get("approved"),
-        "reason_code": decision.get("reason_code"),
-        "order_count": len(order_deltas),
-    }
+    decision_payload = _decision_event_payload(
+        cycle=cycle,
+        status=result.get("status", ""),
+        decision=decision,
+        order_deltas=order_deltas,
+    )
 
     execution = result.get("execution")
     execution = execution if isinstance(execution, dict) else {}
@@ -441,22 +693,21 @@ def _paper_cycle_events(
     for row in _dict_rows(report.get("rejections")):
         response = row.get("broker_response")
         response = response if isinstance(response, dict) else {}
-        events.append((
-            "PAPER_ORDER_FAILED",
-            {
-                **common,
-                "ticker": _event_ticker(row.get("ticker")),
-                "side": row.get("side"),
-                "quantity": row.get("qty"),
-                "price": _first_not_none(row.get("price"), response.get("price")),
-                "error_code": (
-                    row.get("error_code")
-                    or response.get("msg_cd")
-                    or response.get("rt_cd")
-                ),
-                "reason": row.get("reason"),
-            },
-        ))
+        failed_payload = {
+            **common,
+            "ticker": _event_ticker(row.get("ticker")),
+            "side": row.get("side"),
+            "quantity": row.get("qty"),
+            "price": _first_not_none(row.get("price"), response.get("price")),
+            "error_code": (
+                row.get("error_code")
+                or response.get("msg_cd")
+                or response.get("rt_cd")
+            ),
+            "reason": row.get("reason"),
+        }
+        events.append(("PAPER_ORDER_REJECTED", dict(failed_payload)))
+        events.append(("PAPER_ORDER_FAILED", failed_payload))
 
     confirmed_rows: list[dict[str, Any]] = []
     confirmed_order_ids: set[str] = set()
@@ -476,6 +727,18 @@ def _paper_cycle_events(
         for row in _dict_rows(query.get("matched_orders")):
             if str(row.get("status", "")).lower() in {"filled", "partial_filled"}:
                 add_confirmed_row(row)
+    if (
+        str(history.get("status") or "").upper() == "FAIL"
+        and submitted_rows
+    ):
+        events.append((
+            "PAPER_ORDER_VERIFICATION_FAILED",
+            {
+                **common,
+                "reason": history.get("reason") or "order_history_not_matched",
+                "submitted_count": len(submitted_rows),
+            },
+        ))
     if not confirmed_rows:
         for row in submitted_rows:
             if str(row.get("broker_status", "")).lower() in {"filled", "partial_filled"}:
@@ -483,8 +746,14 @@ def _paper_cycle_events(
 
     for row in confirmed_rows:
         order_no = _event_order_no(row)
+        status = str(row.get("status", "") or row.get("broker_status", "")).lower()
+        event_type = (
+            "PAPER_ORDER_PARTIALLY_FILLED"
+            if status == "partial_filled"
+            else "PAPER_ORDER_FILLED"
+        )
         events.append((
-            "PAPER_ORDER_FILLED",
+            event_type,
             {
                 **common,
                 "ticker": _event_ticker(row.get("ticker")),
@@ -513,13 +782,80 @@ def _make_grpc_paper_auto_trader(
     lazy import로 circular import 회피.
     """
     from src.execution.paper_auto_trading import PaperAutoTrader
+    from src.agents.hot.quant import QuantAgent
+    from src.data.dual_source_runner import load_latest_scores
+    from src.models.registry import ModelRegistry
+    from src.orchestration.hot_runner import HotRunner
 
     class _GrpcPaperAutoTrader(PaperAutoTrader):
 
         def __init__(self, *, _kafka: KafkaEventProducer, _session: _PaperAutoSession, **kw: Any) -> None:
+            registry_dir = kw.pop("registry_dir", None)
+            if registry_dir and "hot_runner" not in kw:
+                registry = ModelRegistry(artifacts_dir=Path(registry_dir))
+                quant = QuantAgent(
+                    registry=registry,
+                    dual_source_loader=load_latest_scores,
+                )
+                kw["hot_runner"] = HotRunner(quant=quant)
             super().__init__(**kw)
             self._grpc_kafka = _kafka
             self._grpc_session = _session
+            self._grpc_pre_submit_decision_cycles: set[int] = set()
+
+        def _on_run_preflight_passed(self, report: dict[str, Any]) -> None:
+            self._grpc_kafka.emit(
+                "AUTO_TRADING_STARTED",
+                session_id=self._grpc_session.session_id,
+                request_id=self._grpc_session.request_id,
+                bundle_id=self._grpc_session.bundle_id,
+                payload={
+                    "phase": "RUNNING",
+                    "worker_started": True,
+                    "preflight_passed": True,
+                    "cycles": report.get("cycles"),
+                    "tickers": report.get("tickers", []),
+                },
+            )
+            if self._grpc_kafka.status().get("required"):
+                self._grpc_kafka.flush()
+
+        def _on_before_broker_submit(
+            self,
+            *,
+            cycle_index: int,
+            final_decision: dict[str, Any],
+            hot_result: dict[str, Any],
+            order_guard: dict[str, Any],
+        ) -> None:
+            del order_guard
+            order_deltas = [
+                dict(od)
+                for od in list(final_decision.get("order_deltas", []))
+                if isinstance(od, dict)
+            ]
+            quant_output = hot_result.get("quant_output")
+            quant_output = quant_output if isinstance(quant_output, dict) else {}
+            payload = _decision_event_payload(
+                cycle=cycle_index + 1,
+                status="PRE_SUBMIT",
+                decision=final_decision,
+                order_deltas=order_deltas,
+            )
+            self._grpc_kafka.emit(
+                "DECISION_COMPLETED",
+                session_id=self._grpc_session.session_id,
+                request_id=self._grpc_session.request_id,
+                bundle_id=self._grpc_session.bundle_id,
+                payload={
+                    **payload,
+                    "phase": "PRE_BROKER_SUBMIT",
+                    "quant_mode": quant_output.get("mode"),
+                },
+            )
+            if self._grpc_kafka.status().get("required"):
+                self._grpc_kafka.flush()
+            self._grpc_pre_submit_decision_cycles.add(cycle_index + 1)
 
         def run_once(self, *, tickers: list[str], cycle_index: int = 0, risk_warnings: Any = None) -> dict[str, Any]:
             result = super().run_once(
@@ -528,25 +864,42 @@ def _make_grpc_paper_auto_trader(
                 risk_warnings=risk_warnings,
             )
 
-            with self._grpc_session._lock:
-                self._grpc_session.completed_cycles = cycle_index + 1
-                self._grpc_session.last_cycle_at = datetime.now(_KST).isoformat()
-
-            sid = self._grpc_session.session_id
-            bid = self._grpc_session.bundle_id
-            rid = self._grpc_session.request_id
             decision_payload, order_events = _paper_cycle_events(
                 result,
                 cycle=cycle_index + 1,
             )
-
-            self._grpc_kafka.emit(
-                "DECISION_COMPLETED",
-                session_id=sid,
-                request_id=rid,
-                bundle_id=bid,
-                payload=decision_payload,
+            submitted_count = sum(
+                1 for event_type, _payload in order_events
+                if event_type == "PAPER_ORDER_SUBMITTED"
             )
+            filled_count = sum(
+                1 for event_type, _payload in order_events
+                if event_type in {"PAPER_ORDER_FILLED", "PAPER_ORDER_PARTIALLY_FILLED"}
+            )
+            rejected_count = sum(
+                1 for event_type, _payload in order_events
+                if event_type == "PAPER_ORDER_REJECTED"
+            )
+            with self._grpc_session._lock:
+                self._grpc_session.completed_cycles = cycle_index + 1
+                self._grpc_session.last_cycle_at = datetime.now(_KST).isoformat()
+                self._grpc_session.last_cycle_status = str(result.get("status") or "")
+                self._grpc_session.orders_submitted += submitted_count
+                self._grpc_session.orders_filled += filled_count
+                self._grpc_session.orders_rejected += rejected_count
+
+            sid = self._grpc_session.session_id
+            bid = self._grpc_session.bundle_id
+            rid = self._grpc_session.request_id
+
+            if cycle_index + 1 not in self._grpc_pre_submit_decision_cycles:
+                self._grpc_kafka.emit(
+                    "DECISION_COMPLETED",
+                    session_id=sid,
+                    request_id=rid,
+                    bundle_id=bid,
+                    payload=decision_payload,
+                )
 
             for event_type, payload in order_events:
                 self._grpc_kafka.emit(
@@ -682,10 +1035,10 @@ def _make_servicer(
             try:
                 default_cycles = int(pa_cfg["default_max_cycles"])
                 default_interval = int(pa_cfg["default_interval_sec"])
-                requested_cycles = int(getattr(request, "cycles", 0) or default_cycles)
                 requested_interval = int(
                     getattr(request, "interval_sec", 0) or default_interval
                 )
+                raw_requested_cycles = int(getattr(request, "cycles", 0) or 0)
                 max_tickers = int(pa_cfg.get("max_tickers", 0) or 0)
             except Exception as e:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -700,9 +1053,21 @@ def _make_servicer(
                 getattr(request, "tickers", []),
             )
             confirm_phrase = str(getattr(request, "confirm_phrase", ""))
+            if raw_requested_cycles < 0:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("negative_cycles_not_allowed")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="INVALID_ARGUMENT",
+                    reason="negative_cycles_not_allowed",
+                )
+            requested_cycles_for_validation = (
+                raw_requested_cycles if raw_requested_cycles > 0 else default_cycles
+            )
             validation = _validate_paper_auto_start_args(
                 bundle_id=requested_bundle_id,
-                cycles=requested_cycles,
+                cycles=requested_cycles_for_validation,
                 interval_sec=requested_interval,
                 tickers=requested_tickers,
                 invalid_tickers=invalid_tickers,
@@ -719,6 +1084,92 @@ def _make_servicer(
                     status=str(validation["status"]),
                     reason=str(validation["reason"]),
                 )
+            repo_root = root or _PROJECT_ROOT
+            registry_dir = _candidate_registry_dir(repo_root, requested_bundle_id)
+            if registry_dir is None:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("paper_candidate_registry_not_found")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="MODEL_REGISTRY_NOT_READY",
+                    reason="paper_candidate_registry_not_found",
+                )
+            try:
+                market_guard = _market_start_guard(pa_cfg=pa_cfg)
+            except ValueError as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_auto_trading_market_time_invalid:{e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="CONFIG_INVALID",
+                    reason=f"paper_auto_trading_market_time_invalid:{e}",
+                )
+            if market_guard.get("status") != "PASS":
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(str(market_guard.get("reason", "")))
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status=str(market_guard.get("reason", "MARKET_NOT_OPEN")).upper(),
+                    reason=str(market_guard.get("reason", "")),
+                )
+            try:
+                remaining_cycles = _remaining_market_cycles(
+                    interval_sec=requested_interval,
+                    pa_cfg=pa_cfg,
+                )
+            except ValueError as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_auto_trading_market_time_invalid:{e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="CONFIG_INVALID",
+                    reason=f"paper_auto_trading_market_time_invalid:{e}",
+                )
+            if raw_requested_cycles > 0:
+                requested_cycles = min(raw_requested_cycles, remaining_cycles)
+            else:
+                requested_cycles = min(default_cycles, remaining_cycles)
+            if requested_cycles <= 0:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("market_session_not_open_or_no_remaining_cycles")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="MARKET_CLOSED",
+                    reason="market_session_not_open_or_no_remaining_cycles",
+                )
+            if bool(pa_cfg.get("require_prelive_pass", True)):
+                try:
+                    prelive_gate = _load_prelive_gate_module()
+                    strict_gate = prelive_gate.build_report(
+                        end_date=_default_prelive_end_date(prelive_gate),
+                        business_days=_default_prelive_business_days(prelive_gate),
+                        max_tickers=max_tickers,
+                        bundle_id=requested_bundle_id,
+                    )
+                    paper_gate = _paper_rehearsal_gate_from_strict(strict_gate)
+                except Exception as e:
+                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                    context.set_details(f"paper_rehearsal_gate_error:{e}")
+                    return pb2.StartPaperAutoTradingResponse(
+                        request_id=str(getattr(request, "request_id", "")),
+                        accepted=False,
+                        status="PAPER_REHEARSAL_GATE_ERROR",
+                        reason=f"paper_rehearsal_gate_error:{e}",
+                    )
+                if paper_gate.get("status") != "PASS":
+                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                    reason = ",".join(paper_gate.get("blockers") or [])
+                    return pb2.StartPaperAutoTradingResponse(
+                        request_id=str(getattr(request, "request_id", "")),
+                        accepted=False,
+                        status="PAPER_REHEARSAL_GATE_BLOCKED",
+                        reason=reason,
+                    )
             result = session.start(
                 request_id=str(getattr(request, "request_id", "")),
                 bundle_id=requested_bundle_id,
@@ -726,8 +1177,12 @@ def _make_servicer(
                 interval_sec=requested_interval,
                 tickers=list(validation["tickers"]),
                 confirm_phrase=confirm_phrase,
+                registry_dir=registry_dir,
                 root=root,
             )
+            if not bool(result["accepted"]):
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(str(result.get("reason", "")))
             return pb2.StartPaperAutoTradingResponse(
                 request_id=str(getattr(request, "request_id", "")),
                 accepted=bool(result["accepted"]),
@@ -770,6 +1225,15 @@ def _make_servicer(
                 kafka_topic=str(s["kafka"]["topic"]),
                 kafka_last_error=str(s["kafka"]["last_error"]),
                 last_error=str(s["last_error"]),
+                start_request_id=str(s["request_id"]),
+                orders_submitted=int(s["orders_submitted"]),
+                orders_filled=int(s["orders_filled"]),
+                orders_rejected=int(s["orders_rejected"]),
+                last_cycle_status=str(s["last_cycle_status"]),
+                kafka_required=bool(s["kafka"]["required"]),
+                kis_mode="virtual",
+                live_trading_allowed=False,
+                production_registry_mutated=False,
             )
 
     return AiBeBridgeServicer()
@@ -791,6 +1255,41 @@ def _ack_from_request(
     )
 
 
+class _ManagedGrpcServer:
+    """grpc.Server wrapper that also stops paper-auto and Kafka resources."""
+
+    def __init__(
+        self,
+        server: Any,
+        *,
+        session: _PaperAutoSession,
+        kafka: KafkaEventProducer,
+    ) -> None:
+        self._server = server
+        self._session = session
+        self._kafka = kafka
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._server, name)
+
+    def stop(self, grace: float | None = None) -> Any:
+        timeout = float(grace or 0)
+        self._session.shutdown(timeout_sec=max(0.0, timeout))
+        try:
+            self._kafka.flush()
+        finally:
+            self._kafka.close()
+        return self._server.stop(grace)
+
+    @property
+    def session(self) -> _PaperAutoSession:
+        return self._session
+
+    @property
+    def kafka(self) -> KafkaEventProducer:
+        return self._kafka
+
+
 def serve(
     *,
     host: str,
@@ -798,10 +1297,11 @@ def serve(
     bundle_id: str,
     root: Path | None = None,
     max_workers: int = 4,
+    kafka_required: bool = False,
 ) -> Any:
     """Start the AI gRPC server and return the grpc.Server instance."""
     grpc, pb2, pb2_grpc = _load_grpc_modules()
-    kafka = KafkaEventProducer()
+    kafka = KafkaEventProducer(required=kafka_required)
     session = _PaperAutoSession(kafka=kafka)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
     pb2_grpc.add_AiBeBridgeServiceServicer_to_server(
@@ -813,4 +1313,4 @@ def serve(
     )
     server.add_insecure_port(f"{host}:{int(port)}")
     server.start()
-    return server
+    return _ManagedGrpcServer(server, session=session, kafka=kafka)

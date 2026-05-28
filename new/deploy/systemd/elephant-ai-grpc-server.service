@@ -1,0 +1,38 @@
+[Unit]
+Description=Elephant Lab AI-BE gRPC bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=elephant
+Group=elephant
+WorkingDirectory=/opt/elephant/Elephant_Lab
+Environment=PYTHONPATH=/opt/elephant/Elephant_Lab/new
+Environment=PYTHONUNBUFFERED=1
+Environment=AI_GRPC_HOST=0.0.0.0
+Environment=AI_GRPC_PORT=50051
+Environment=AI_GRPC_MAX_WORKERS=8
+Environment=KAFKA_REQUIRED=true
+# Server-only credentials/config. Do not commit the file contents.
+EnvironmentFile=-/etc/elephant-lab/elephant.env
+ExecStart=/opt/anaconda3/envs/elephant/bin/python new/scripts/run_ai_grpc_server.py --require-kafka
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
+RuntimeDirectory=elephant-ai
+StateDirectory=elephant-ai
+LimitNOFILE=65535
+
+# Safety hardening. The gRPC bridge is paper/virtual only and writes reports.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/elephant/Elephant_Lab/artifacts /opt/elephant/Elephant_Lab/logs
+
+[Install]
+WantedBy=multi-user.target

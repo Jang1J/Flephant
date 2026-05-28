@@ -817,6 +817,64 @@ def test_bundle_paper_auto_evidence_requires_nested_broker_evidence(monkeypatch,
     assert result["broker_evidence_nested"]["reason"] == "broker_evidence_missing"
 
 
+def test_bundle_balance_stage_passes_when_probe_stage_is_blocked(monkeypatch, tmp_path):
+    gate = _load_script_module()
+    bundle_id = "BUNDLE-REQUESTED"
+    report_dir = tmp_path / "paper_auto_trading"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rehearsal_report = {
+        "status": "BLOCKED",
+        "bundle_id": bundle_id,
+        "generated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        "external_kis_api": True,
+        "evidence_level": "external_kis_virtual",
+        "stage_statuses": {
+            "preflight": "BLOCKED",
+            "paper_auto_cycle": "SKIP",
+            "balance_reconciliation": "PASS",
+            "probe_order": "BLOCKED",
+            "order_history_requery": "BLOCKED",
+        },
+        "broker_evidence": {
+            "balance_reconciliation": {"status": "PASS"},
+            "probe_order": {
+                "status": "BLOCKED",
+                "blocker": {"error_code": "BROKER_MARKET_CLOSED"},
+            },
+            "order_history_requery": {"status": "BLOCKED"},
+        },
+        "stages": {
+            "preflight": {
+                "stages": {
+                    "paper_evidence": {
+                        "evidence_guard": {"status": "PASS"},
+                    },
+                },
+            },
+            "paper_auto_cycle": {"status": "SKIP"},
+        },
+    }
+    with (report_dir / "paper_auto_service_rehearsal_20260512_020000.json").open(
+        "w",
+        encoding="utf-8",
+    ) as fh:
+        json.dump(rehearsal_report, fh, ensure_ascii=False, indent=2)
+    monkeypatch.setattr(gate, "_REPORT_ROOT", tmp_path)
+
+    balance = gate._check_paper_balance(bundle_id)
+    probe = gate._check_probe_order(bundle_id)
+
+    assert balance["status"] == "PASS"
+    assert balance["required_broker_evidence_nested"]["stage_statuses"] == {
+        "balance_reconciliation": "PASS"
+    }
+    assert probe["status"] == "BLOCKED"
+    assert probe["required_broker_evidence_nested"]["stage_statuses"] == {
+        "probe_order": "BLOCKED",
+        "order_history_requery": "BLOCKED",
+    }
+
+
 def test_bundle_paper_auto_evidence_blocks_wrong_bundle(monkeypatch, tmp_path):
     gate = _load_script_module()
     report_dir = tmp_path / "paper_auto_trading"

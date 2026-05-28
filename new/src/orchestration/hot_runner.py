@@ -39,6 +39,7 @@ from src.portfolio.portfolio_manager import PortfolioManager
 from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_decision_id
 from src.utils.logger import get_logger
+from src.utils.safe_cast import safe_bool, safe_float
 
 logger = get_logger("hot_runner")
 _KST = ZoneInfo("Asia/Seoul")
@@ -134,6 +135,7 @@ class HotRunner:
 
         # S4-4 stage-level profiler (공유 또는 전용 인스턴스)
         self._profiler: HotPathProfiler = profiler or HotPathProfiler()
+        self._risk_reduce_bridge_cfg = self._load_risk_reduce_bridge_config()
 
         self._latency_records: list[float] = []
         logger.info(
@@ -148,6 +150,40 @@ class HotRunner:
         except (TypeError, ValueError):
             return 50.0
         return max(1.0, sla_ms)
+
+    @staticmethod
+    def _load_risk_reduce_bridge_config() -> dict[str, Any]:
+        try:
+            risk_cfg = config_load("risk_config.yaml", "risk_fast")
+        except Exception as e:
+            logger.warning("[hot_runner] RiskFast 실행 브리지 설정 로드 실패: %s", e)
+            return {"enabled": False}
+        if not isinstance(risk_cfg, dict):
+            return {"enabled": False}
+        bridge = risk_cfg.get("execution_bridge")
+        if not isinstance(bridge, dict):
+            return {"enabled": False}
+        levels = bridge.get("risk_levels") or []
+        return {
+            "enabled": safe_bool(bridge.get("enabled"), default=False),
+            "risk_levels": {
+                str(level).strip().lower()
+                for level in levels
+                if str(level).strip()
+            },
+            "allow_critical_risk_reduce": safe_bool(
+                bridge.get("allow_critical_risk_reduce"),
+                default=False,
+            ),
+            "suppress_rebalance_orders": safe_bool(
+                bridge.get("suppress_rebalance_orders"),
+                default=True,
+            ),
+            "require_held_position": safe_bool(
+                bridge.get("require_held_position"),
+                default=True,
+            ),
+        }
 
     def _evaluate_risk_fast_with_deadline(
         self,
@@ -173,6 +209,135 @@ class HotRunner:
             raise TimeoutError(f"risk_fast_sidecar_timeout>{sla_ms:.0f}ms") from e
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+    def _maybe_replan_for_risk_reduce(
+        self,
+        *,
+        risk_eval: dict[str, Any],
+        current_positions: list[dict[str, Any]] | None,
+        latest_prices: dict[str, float] | None,
+        portfolio_value: float,
+        asof: str,
+    ) -> dict[str, Any]:
+        """RiskFast HIGH를 전체 veto가 아닌 보유 종목 축소 PM patch로 연결한다."""
+        bridge = self._risk_reduce_bridge_cfg
+        if not safe_bool(bridge.get("enabled"), default=False):
+            return {"status": "SKIP", "reason": "risk_reduce_bridge_disabled"}
+        level = str(risk_eval.get("risk_level") or "").lower()
+        severity = str(risk_eval.get("severity") or "").lower()
+        recommended_action = str(risk_eval.get("recommended_action") or "").lower()
+        triggered_rules = {
+            str(rule).strip().lower()
+            for rule in (risk_eval.get("triggered_rules") or [])
+            if str(rule).strip()
+        }
+        critical_or_halt = (
+            level == "critical"
+            or severity == "critical"
+            or recommended_action == "halt"
+            or "rule_top10_collapse" in triggered_rules
+        )
+        if critical_or_halt and not safe_bool(
+            bridge.get("allow_critical_risk_reduce"),
+            default=False,
+        ):
+            return {"status": "SKIP", "reason": "critical_risk_not_bridgeable"}
+        configured_levels = bridge.get("risk_levels")
+        if isinstance(configured_levels, set) and configured_levels and level not in configured_levels:
+            return {"status": "SKIP", "reason": "risk_level_not_bridgeable"}
+
+        raw_affected = risk_eval.get("affected_tickers")
+        if isinstance(raw_affected, (str, int, float)):
+            affected_values = [raw_affected]
+        elif raw_affected is None:
+            affected_values = []
+        else:
+            try:
+                affected_values = list(raw_affected)
+            except TypeError:
+                affected_values = [raw_affected]
+        affected = {
+            str(ticker).zfill(6)
+            for ticker in affected_values
+            if str(ticker).strip()
+        }
+        if not affected:
+            return {"status": "SKIP", "reason": "affected_tickers_missing"}
+
+        positions = [dict(pos) for pos in (current_positions or []) if isinstance(pos, dict)]
+        prices = latest_prices or {}
+        held_tickers: set[str] = set()
+        normalized_positions: list[dict[str, Any]] = []
+        for pos in positions:
+            ticker = str(pos.get("ticker", "")).zfill(6)
+            qty = safe_float(pos.get("qty"), default=0.0)
+            if not ticker or qty <= 0:
+                continue
+            weight = safe_float(pos.get("weight"), default=0.0)
+            if weight <= 0.0 and portfolio_value > 0:
+                price = safe_float(prices.get(ticker), default=0.0)
+                if price > 0.0:
+                    weight = (qty * price) / float(portfolio_value)
+                    pos["weight"] = weight
+            held_tickers.add(ticker)
+            normalized_positions.append(pos)
+
+        exit_tickers = sorted(affected & held_tickers)
+        if not exit_tickers:
+            return {
+                "status": "SKIP",
+                "reason": "affected_tickers_not_held",
+                "affected_tickers": sorted(affected),
+            }
+
+        target_weights: dict[str, float] = {}
+        for pos in normalized_positions:
+            ticker = str(pos.get("ticker", "")).zfill(6)
+            if ticker in exit_tickers:
+                target_weights[ticker] = 0.0
+                continue
+            if safe_bool(bridge.get("suppress_rebalance_orders"), default=True):
+                target_weights[ticker] = safe_float(pos.get("weight"), default=0.0)
+
+        pm_result = self._pm.plan(
+            target_weights=target_weights,
+            current_positions=normalized_positions,
+            latest_prices=prices,
+            portfolio_value=portfolio_value,
+            based_on_ts=asof,
+            cold_path_exits=exit_tickers,
+        )
+        order_deltas = list((pm_result.get("portfolio_patch") or {}).get("order_deltas") or [])
+        if not order_deltas:
+            return {
+                "status": "SKIP",
+                "reason": "risk_reduce_replan_no_order_deltas",
+                "affected_tickers": sorted(affected),
+                "exit_tickers": exit_tickers,
+                "pm_result": pm_result,
+            }
+        unsafe = [
+            delta for delta in order_deltas
+            if str(delta.get("side", "")).lower() != "sell"
+            or str(delta.get("reason", "")).lower() != "risk_reduce"
+        ]
+        if unsafe:
+            return {
+                "status": "BLOCKED",
+                "reason": "risk_reduce_replan_non_risk_reduce_delta",
+                "affected_tickers": sorted(affected),
+                "exit_tickers": exit_tickers,
+                "unsafe_order_deltas": unsafe,
+                "pm_result": pm_result,
+            }
+        return {
+            "status": "PASS",
+            "reason": "risk_fast_risk_reduce_replan",
+            "risk_level": level,
+            "affected_tickers": sorted(affected),
+            "exit_tickers": exit_tickers,
+            "pm_result": pm_result,
+        }
 
     # ================================================================== #
     # Lifecycle
@@ -534,6 +699,40 @@ class HotRunner:
                 risk_eval["affected_tickers"],
             )
 
+        risk_reduce_replan = self._maybe_replan_for_risk_reduce(
+            risk_eval=risk_eval,
+            current_positions=current_positions,
+            latest_prices=latest_prices,
+            portfolio_value=portfolio_value,
+            asof=asof,
+        )
+        if risk_reduce_replan.get("status") == "BLOCKED":
+            return self._fail_closed_result(
+                asof=asof,
+                t0=t0,
+                stage="risk_reduce_replan",
+                error=RuntimeError(str(risk_reduce_replan.get("reason"))),
+                n_bars_consumed=n_bars_consumed,
+                bar_errors=bar_errors,
+                stage_ms={
+                    "quant": quant_ms,
+                    "ppo": ppo_ms,
+                    "pm": pm_ms,
+                    "risk_fast": risk_fast_ms,
+                },
+                quant_output=quant_output,
+                anomalies=anomalies,
+                allocation=allocation,
+                pm_result=risk_reduce_replan.get("pm_result") or pm_result,
+                risk_eval=risk_eval,
+                ppo_guard_warnings=ppo_guard_warnings,
+                pm_guard_warnings=pm_guard_warnings,
+            )
+        if risk_reduce_replan.get("status") == "PASS":
+            pm_result = risk_reduce_replan["pm_result"]
+            portfolio_patch = pm_result["portfolio_patch"]
+            pm_guard_warnings = self._portfolio_manager_guard_warnings(pm_result)
+
         # 6. FDA Hot Path (risk_fast_eval 전달, S4-4 stage timer)
         combined_risk_warnings = list(risk_warnings or [])
         combined_risk_warnings.extend(ppo_guard_warnings)
@@ -617,6 +816,7 @@ class HotRunner:
             "ppo_guard_warnings": ppo_guard_warnings,
             "pm_guard_warnings": pm_guard_warnings,
             "risk_eval": risk_eval,
+            "risk_reduce_replan": risk_reduce_replan,
             "fda_result": fda_result,
             "final_decision": fda_result["final_decision"],
             "latency_ms": elapsed_ms,

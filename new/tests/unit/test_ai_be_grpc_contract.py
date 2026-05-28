@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from scripts.generate_ai_grpc_stubs import main as generate_ai_grpc_stubs
+from scripts import run_ai_grpc_server
 from src.integration.grpc.payloads import (
     build_ack_payload,
     build_health_payload,
@@ -52,6 +53,15 @@ def test_paper_auto_status_proto_exposes_operability_fields():
         "kafka_topic",
         "kafka_last_error",
         "last_error",
+        "start_request_id",
+        "orders_submitted",
+        "orders_filled",
+        "orders_rejected",
+        "last_cycle_status",
+        "kafka_required",
+        "kis_mode",
+        "live_trading_allowed",
+        "production_registry_mutated",
     ]:
         assert field in text
 
@@ -69,6 +79,8 @@ def test_ai_be_proto_stubs_generate_after_paper_auto_contract_change(tmp_path):
     assert "GetRecommendations" in generated_grpc
     assert "RecommendationItem" in generated
     assert "kafka_connected" in generated
+    assert "orders_submitted" in generated
+    assert "kafka_required" in generated
     assert "last_error" in generated
 
 
@@ -154,6 +166,33 @@ def test_health_payload_does_not_label_existing_active_version_as_mutation(tmp_p
 
     assert payload["production_active_version"] == "prod-existing"
     assert payload["production_registry_mutated"] is False
+
+
+def test_run_ai_grpc_server_defaults_to_operational_bundle(monkeypatch):
+    monkeypatch.setattr(
+        run_ai_grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "default_bundle_id": "BUNDLE-20260521-POSTCLOSE",
+        },
+    )
+
+    assert run_ai_grpc_server._default_bundle_id() == "BUNDLE-20260521-POSTCLOSE"
+
+
+def test_run_ai_grpc_server_env_preflight_is_fail_closed(monkeypatch):
+    monkeypatch.setattr(
+        run_ai_grpc_server,
+        "_env_readiness_report",
+        lambda: {"status": "FAIL", "guards": {"kis_mode_virtual": False}},
+    )
+
+    try:
+        run_ai_grpc_server._require_env_readiness()
+    except RuntimeError as e:
+        assert "env readiness failed" in str(e)
+    else:
+        raise AssertionError("server startup must fail closed when env readiness fails")
 
 
 def test_service_readiness_payload_does_not_enable_order_actions(tmp_path):

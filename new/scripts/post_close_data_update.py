@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time as time_module
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
@@ -83,6 +84,11 @@ def _post_close_cfg() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _retry_cfg() -> dict[str, Any]:
+    cfg = _post_close_cfg().get("retry", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
 def _promotion_cfg() -> dict[str, Any]:
     cfg = _post_close_cfg().get("final_dataset_promotion", {})
     return cfg if isinstance(cfg, dict) else {}
@@ -91,6 +97,16 @@ def _promotion_cfg() -> dict[str, Any]:
 def _stage_enabled(cfg: dict[str, Any], key: str, default: bool = True) -> bool:
     stages = cfg.get("stages", {}) or {}
     return safe_bool(stages.get(key), default=default)
+
+
+def _format_registry_template(raw: Any, *, target_end_date: str, stage: str) -> str:
+    template = str(raw or "").strip()
+    if not template:
+        raise ValueError(f"post_close registry template is required for {stage}")
+    try:
+        return template.format(target_end_date=target_end_date, stage=stage)
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(f"invalid post_close registry template for {stage}: {e}") from e
 
 
 def _pit_snapshot_time() -> time:
@@ -202,6 +218,18 @@ def build_stage_plan(
     raw_events_dir = str(cfg.get("raw_events_dir") or "artifacts/raw/dual_source")
     skip_existing = safe_bool(cfg.get("skip_existing_backfill"), default=True)
     target_col = str(cfg.get("target_col_override") or "label_195m_net_ret")
+    registry_templates = cfg.get("registry_dirs", {})
+    registry_templates = registry_templates if isinstance(registry_templates, dict) else {}
+    train_registry_dir = _format_registry_template(
+        registry_templates.get("live_data_readiness_train"),
+        target_end_date=end_date,
+        stage="live_data_readiness",
+    )
+    prelive_registry_dir = _format_registry_template(
+        registry_templates.get("post_backfill_prelive"),
+        target_end_date=end_date,
+        stage="post_backfill_prelive",
+    )
     post_backfill_raw = cfg.get("post_backfill_prelive", {})
     post_backfill_cfg = post_backfill_raw if isinstance(post_backfill_raw, dict) else {}
 
@@ -214,6 +242,9 @@ def build_stage_plan(
         "--max-tickers",
         str(max_tickers),
         "--require-train",
+        "--train-registry-dir",
+        train_registry_dir,
+        "--dns-preflight",
     ]
     if skip_existing:
         live_args.append("--skip-existing-backfill")
@@ -227,6 +258,8 @@ def build_stage_plan(
         str(max_tickers),
         "--target-col-override",
         target_col,
+        "--registry-dir",
+        prelive_registry_dir,
     ]
     if bundle_id:
         prelive_args.extend(["--bundle-id", bundle_id])
@@ -324,7 +357,7 @@ def _parse_stdout_json(stdout: str) -> dict[str, Any] | None:
             return None
 
 
-def _run_stage(stage: StageSpec, timeout_sec: int) -> dict[str, Any]:
+def _run_stage(stage: StageSpec, timeout_sec: int, retry_after_sec: int) -> dict[str, Any]:
     if not stage.enabled:
         return {
             "status": "SKIP",
@@ -355,6 +388,9 @@ def _run_stage(stage: StageSpec, timeout_sec: int) -> dict[str, Any]:
             "command": stage.command,
             "returncode": None,
             "error": f"timeout_after_{timeout_sec}s",
+            "failure_class": "transient_stage_timeout",
+            "retryable": True,
+            "retry_after_sec": retry_after_sec,
             "stdout_tail": (e.stdout or "")[-4000:] if isinstance(e.stdout, str) else "",
             "stderr_tail": (e.stderr or "")[-4000:] if isinstance(e.stderr, str) else "",
             "latency_sec": (datetime.now(_KST) - started_at).total_seconds(),
@@ -386,10 +422,37 @@ def _run_stage(stage: StageSpec, timeout_sec: int) -> dict[str, Any]:
             "bundle_id",
             "registry_mutated",
             "live_trading_allowed",
+            "failures",
+            "failure_details",
+            "failure_classes",
+            "failure_class",
+            "retryable",
+            "retry_after_sec",
         ):
             if key in stdout_json:
                 result[key] = stdout_json.get(key)
     return result
+
+
+def _stage_retryable(stage_result: dict[str, Any]) -> bool:
+    if safe_bool(stage_result.get("retryable"), default=False):
+        return True
+    failure_class = str(stage_result.get("failure_class") or "")
+    if failure_class.startswith("transient_"):
+        return True
+    classes = stage_result.get("failure_classes")
+    if isinstance(classes, list) and classes:
+        return all(str(item).startswith("transient_") for item in classes)
+    return False
+
+
+def _stage_retry_after(stage_result: dict[str, Any], default_sec: int, max_sec: int) -> int:
+    return safe_int(
+        stage_result.get("retry_after_sec"),
+        default=default_sec,
+        min_value=0,
+        max_value=max_sec,
+    )
 
 
 def _write_report(report: dict[str, Any]) -> Path:
@@ -788,15 +851,70 @@ def run_update(
         min_value=1,
     )
     stop_on_failure = safe_bool(cfg.get("stop_on_stage_failure"), default=True)
+    retry_cfg = _retry_cfg()
+    retry_enabled = safe_bool(retry_cfg.get("enabled"), default=True)
+    max_attempts = safe_int(retry_cfg.get("max_attempts"), default=3, min_value=1)
+    retry_backoff_sec = safe_int(
+        retry_cfg.get("backoff_sec"),
+        default=90,
+        min_value=0,
+    )
+    retry_after_max_sec = safe_int(
+        retry_cfg.get("max_retry_after_sec"),
+        default=retry_backoff_sec,
+        min_value=retry_backoff_sec,
+    )
     blockers: list[str] = []
+    stage_attempts: dict[str, Any] = {}
     for stage in enabled_plan:
-        stage_result = _run_stage(stage, timeout)
+        attempts: list[dict[str, Any]] = []
+        stage_result: dict[str, Any] = {}
+        for attempt_index in range(1, max_attempts + 1):
+            if attempt_index > 1:
+                retry_window = _mode_b_window_state(datetime.now(_KST))
+                if not retry_window["mode_ok"] or not retry_window["window_ok"]:
+                    stage_result = {
+                        "status": "BLOCKED",
+                        "command": stage.command,
+                        "returncode": None,
+                        "attempt": attempt_index,
+                        "reason": "mode_b_window_closed_before_retry",
+                        "retry_window": retry_window,
+                    }
+                    attempts.append(stage_result)
+                    break
+            stage_result = _run_stage(stage, timeout, retry_backoff_sec)
+            stage_result["attempt"] = attempt_index
+            attempts.append(stage_result)
+            if stage_result.get("status") == "PASS":
+                break
+            if not retry_enabled or attempt_index >= max_attempts:
+                break
+            if not _stage_retryable(stage_result):
+                break
+            retry_window = _mode_b_window_state(datetime.now(_KST))
+            if not retry_window["mode_ok"] or not retry_window["window_ok"]:
+                stage_result["retry_stopped_reason"] = "mode_b_window_closed"
+                stage_result["retry_window"] = retry_window
+                break
+            sleep_sec = _stage_retry_after(
+                stage_result,
+                retry_backoff_sec,
+                retry_after_max_sec,
+            )
+            stage_result["next_retry_after_sec"] = sleep_sec
+            if sleep_sec > 0:
+                time_module.sleep(sleep_sec)
+        if len(attempts) > 1:
+            stage_attempts[stage.name] = attempts
         report["stages"][stage.name] = stage_result
         if stage_result.get("status") != "PASS":
             blockers.append(stage.name)
             if stop_on_failure:
                 break
 
+    if stage_attempts:
+        report["stage_attempts"] = stage_attempts
     report["blockers"] = blockers
     report["status"] = "PASS" if not blockers else "BLOCKED"
     if report["status"] == "PASS":

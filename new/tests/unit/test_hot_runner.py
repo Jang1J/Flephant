@@ -755,6 +755,117 @@ def test_run_once_vetoes_pm_price_unavailable(runner: HotRunner) -> None:
     assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
 
 
+def test_run_once_risk_fast_replans_to_risk_reduce_only_sell(
+    runner: HotRunner,
+) -> None:
+    """RiskFast HIGH는 보유 affected ticker의 risk_reduce sell-only PM patch로 연결된다."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers)
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9, "000660": 0.8},
+        "ranking": ["005930", "000660"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.20, "000660": 0.20}}
+    }
+
+    def fake_evaluate(snapshot, ts):
+        return {
+            "risk_level": "high",
+            "severity": "high",
+            "fast_rule_match": "intraday_drop",
+            "triggered_rules": ["intraday_drop"],
+            "affected_tickers": ["005930"],
+            "recommended_action": "risk_reduce",
+            "stance": "veto_recommendation",
+            "rationale": "forced test",
+            "latency_ms": 0.0,
+        }
+
+    runner._risk_fast.evaluate = fake_evaluate  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[
+            {"ticker": "005930", "qty": 3, "available_qty": 3, "weight": 0.10},
+            {"ticker": "000660", "qty": 2, "available_qty": 2, "weight": 0.10},
+        ],
+        latest_prices={"005930": 50000.0, "000660": 100000.0},
+        portfolio_value=1_500_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["risk_reduce_replan"]["status"] == "PASS"
+    decision = result["final_decision"]
+    assert decision["approved"] is True
+    assert decision["reason_code"] == "NORMAL_APPROVE"
+    assert decision["order_deltas"] == [
+        {
+            "ticker": "005930",
+            "side": "sell",
+            "qty": 3,
+            "reason": "risk_reduce",
+            "delta_weight": -0.1,
+            "price": 50000.0,
+        }
+    ]
+    assert decision["risk_overrides"][0]["override"] == "approve_risk_reduce_only"
+
+
+def test_run_once_risk_fast_halt_does_not_replan_to_risk_reduce(
+    runner: HotRunner,
+) -> None:
+    """RiskFast halt/critical은 high로 직렬화되어도 risk_reduce bridge를 열지 않는다."""
+    runner.start()
+    tickers = ["005930", "000660"]
+    _prime_buffer(runner, tickers)
+    runner._quant.score_cross_section = lambda tickers, asof: {  # type: ignore[method-assign]
+        "mode": "active",
+        "scores": {"005930": 0.9, "000660": 0.8},
+        "ranking": ["005930", "000660"],
+    }
+    runner._quant.detect_anomalies = lambda tickers, asof: []  # type: ignore[method-assign]
+    runner._ppo.allocate = lambda **kwargs: {  # type: ignore[method-assign]
+        "allocation_plan": {"target_weights": {"005930": 0.20, "000660": 0.20}}
+    }
+
+    def fake_evaluate(snapshot, ts):
+        return {
+            "risk_level": "high",
+            "severity": "critical",
+            "fast_rule_match": [{"rule_id": "rule_top10_collapse", "matched_at": ts}],
+            "triggered_rules": ["rule_top10_collapse"],
+            "affected_tickers": ["005930"],
+            "recommended_action": "halt",
+            "stance": "halt",
+            "rationale": "forced critical test",
+            "latency_ms": 0.0,
+        }
+
+    runner._risk_fast.evaluate = fake_evaluate  # type: ignore[method-assign]
+    result = runner.run_once(
+        tickers=tickers,
+        bars_batch=[],
+        current_positions=[
+            {"ticker": "005930", "qty": 3, "available_qty": 3, "weight": 0.10},
+            {"ticker": "000660", "qty": 2, "available_qty": 2, "weight": 0.10},
+        ],
+        latest_prices={"005930": 50000.0, "000660": 100000.0},
+        portfolio_value=1_500_000.0,
+        asof="2026-04-20T10:05:00+09:00",
+        dependency_status=_deps_done(),
+    )
+
+    assert result["risk_reduce_replan"]["status"] == "SKIP"
+    assert result["risk_reduce_replan"]["reason"] == "critical_risk_not_bridgeable"
+    assert result["final_decision"]["approved"] is False
+    assert result["final_decision"]["reason_code"] == "RISK_FAST_TRIGGER"
+
+
 def test_run_once_vetoes_ppo_constraint_violation(runner: HotRunner) -> None:
     """PM이 PPO boundary violation을 보고하면 FDA는 해당 patch를 veto한다."""
     runner.start()

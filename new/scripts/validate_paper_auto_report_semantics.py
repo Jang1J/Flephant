@@ -170,6 +170,33 @@ def _cycle_is_shadow_execution(cycle: dict[str, Any]) -> bool:
     return "NOT_SUBMITTED_SHADOW" in statuses
 
 
+def _cycle_explained_no_submit_reason(cycle: dict[str, Any]) -> str:
+    if _cycle_is_shadow_execution(cycle):
+        return "shadow_only_order_deltas_not_broker_execution"
+    order_guard = cycle.get("order_guard") if isinstance(cycle.get("order_guard"), dict) else {}
+    guard_status = str(order_guard.get("status") or "").upper()
+    guard_reason = str(order_guard.get("reason") or "").strip()
+    if guard_status == "SKIP" and bool(order_guard.get("safe_skip")):
+        if guard_reason in {
+            "fda_veto",
+            "runtime_service_policy_filtered_all_orders",
+            "no_order_deltas",
+            "quant_scores_not_rankable_no_broker_submit",
+            "outside_market_session",
+            "market_session_skip",
+        }:
+            return guard_reason
+    status = str(cycle.get("status") or "").upper()
+    reason = str(cycle.get("reason") or "").strip()
+    if status == "SKIP" and reason in {
+        "outside_market_session",
+        "quant_signal_readiness",
+        "market_session_skip",
+    }:
+        return reason
+    return ""
+
+
 def _cycle_bar_readiness(cycle: dict[str, Any]) -> dict[str, Any] | None:
     readiness = cycle.get("hot_path_bar_readiness")
     return readiness if isinstance(readiness, dict) else None
@@ -188,6 +215,9 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
     fill_count = 0
     rejection_count = 0
     shadow_order_delta_cycles = 0
+    explained_no_submit_order_delta_cycles = 0
+    unexplained_order_delta_no_broker_cycles = 0
+    explained_no_submit_reasons: dict[str, int] = {}
     hot_path_bar_readiness_present_cycles = 0
     hot_path_bar_readiness_pass_cycles = 0
     for cycle in cycles:
@@ -211,6 +241,15 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             execution_cycles += 1
         if deltas and _cycle_is_shadow_execution(cycle):
             shadow_order_delta_cycles += 1
+        if deltas and not _cycle_has_broker_execution(cycle):
+            explained_reason = _cycle_explained_no_submit_reason(cycle)
+            if explained_reason:
+                explained_no_submit_order_delta_cycles += 1
+                explained_no_submit_reasons[explained_reason] = (
+                    explained_no_submit_reasons.get(explained_reason, 0) + 1
+                )
+            else:
+                unexplained_order_delta_no_broker_cycles += 1
         fill_count += _cycle_fill_count(cycle)
         rejection_count += _cycle_rejection_count(cycle)
         bar_readiness = _cycle_bar_readiness(cycle)
@@ -238,6 +277,9 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         "fill_count": fill_count,
         "rejection_count": rejection_count,
         "shadow_order_delta_cycles": shadow_order_delta_cycles,
+        "explained_no_submit_order_delta_cycles": explained_no_submit_order_delta_cycles,
+        "unexplained_order_delta_no_broker_cycles": unexplained_order_delta_no_broker_cycles,
+        "explained_no_submit_reasons": explained_no_submit_reasons,
         "hot_path_bar_readiness_present_cycles": hot_path_bar_readiness_present_cycles,
         "hot_path_bar_readiness_pass_cycles": hot_path_bar_readiness_pass_cycles,
         "hot_path_bar_readiness_missing_cycles": hot_path_bar_readiness_missing_cycles,
@@ -259,10 +301,14 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
                     "pass_with_only_no_order_delta_cycles_evidence_limited"
                 )
         if cycles and order_delta_count > 0 and execution_cycles == 0:
-            if shadow_order_delta_cycles > 0:
+            if unexplained_order_delta_no_broker_cycles > 0:
+                summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
+            elif shadow_order_delta_cycles > 0:
                 summary["warnings"].append("shadow_only_order_deltas_not_broker_execution")
             else:
-                summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
+                summary["blockers"].append(
+                    "pass_with_order_deltas_no_broker_execution_explained_by_guard"
+                )
         if execution_cycles > 0 and hot_path_bar_readiness_missing_cycles > 0:
             summary["warnings"].append("hot_path_bar_readiness_missing_legacy_report")
     return summary

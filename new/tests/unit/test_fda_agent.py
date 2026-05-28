@@ -39,9 +39,22 @@ def _valid_fda_config() -> dict[str, dict]:
             "veto_prior_boost": 0.15,
             "reason_code_on_boost": "NEWS_COMMUNITY_DIVERGENCE",
         },
+        "fda_decision_defaults": {
+            "approve_confidence": 0.83,
+            "veto_confidence": 0.37,
+        },
         "reason_code_catalog": {
             "status": "final",
             "candidates": list(_VALID_REASON_CODES),
+        },
+        "risk_fast": {
+            "execution_bridge": {
+                "enabled": True,
+                "risk_levels": ["high"],
+                "fda_approve_risk_reduce_only": True,
+                "approve_confidence": 0.61,
+                "allow_critical_risk_reduce": False,
+            }
         },
     }
 
@@ -196,6 +209,144 @@ def test_veto_risk_high_severity(fda: FDAAgent) -> None:
         portfolio_patch_ref="PP-001",
         risk_warnings=[{"ticker": "005930", "severity": "high", "reason": "spike"}],
     )
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "RISK_FAST_TRIGGER"
+
+
+def test_risk_fast_high_approves_risk_reduce_only_sell(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        target_weights={"005930": 0.0},
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "sell",
+                "qty": 1,
+                "reason": "risk_reduce",
+            }
+        ],
+        dependency_status={"news": "done", "risk": "done", "quant": "done"},
+        risk_fast_eval={
+            "risk_level": "high",
+            "triggered_rules": ["intraday_drop"],
+            "affected_tickers": ["005930"],
+        },
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is True
+    assert fd["reason_code"] == "NORMAL_APPROVE"
+    assert fd["order_deltas"][0]["reason"] == "risk_reduce"
+    assert fd["risk_overrides"][0]["override"] == "approve_risk_reduce_only"
+
+
+def test_risk_reduce_approval_confidence_loaded_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _valid_fda_config()
+    _patch_fda_config(monkeypatch, config)
+    agent = FDAAgent()
+
+    result = agent.decide(
+        portfolio_patch_ref="PP-001",
+        target_weights={"005930": 0.0},
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "sell",
+                "qty": 1,
+                "reason": "risk_reduce",
+            }
+        ],
+        dependency_status={"news": "done", "risk": "done", "quant": "done"},
+        risk_fast_eval={
+            "risk_level": "high",
+            "triggered_rules": ["intraday_drop"],
+            "affected_tickers": ["005930"],
+        },
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is True
+    assert fd["confidence"] == 0.61
+
+
+def test_default_decision_confidence_loaded_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _valid_fda_config()
+    _patch_fda_config(monkeypatch, config)
+    agent = FDAAgent()
+
+    approved = agent.decide(
+        portfolio_patch_ref="PP-001",
+        target_weights={"005930": 0.1},
+        order_deltas=[{"ticker": "005930", "side": "buy", "qty": 1, "reason": "rebalance"}],
+        dependency_status={"news": "done", "risk": "done", "quant": "done"},
+    )["final_decision"]
+    vetoed = agent.decide(
+        portfolio_patch_ref="PP-001",
+        dependency_status={"quant": "timeout"},
+    )["final_decision"]
+
+    assert approved["confidence"] == 0.83
+    assert vetoed["confidence"] == 0.37
+
+
+def test_risk_fast_halt_vetoes_even_risk_reduce_only_sell(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        target_weights={"005930": 0.0},
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "sell",
+                "qty": 1,
+                "reason": "risk_reduce",
+            }
+        ],
+        dependency_status={"news": "done", "risk": "done", "quant": "done"},
+        risk_fast_eval={
+            "risk_level": "high",
+            "severity": "critical",
+            "recommended_action": "halt",
+            "triggered_rules": ["rule_top10_collapse"],
+            "affected_tickers": ["005930"],
+        },
+    )
+
+    fd = result["final_decision"]
+    assert fd["approved"] is False
+    assert fd["reason_code"] == "RISK_FAST_TRIGGER"
+    assert "RiskFast high" in fd["veto_reason"]
+
+
+def test_risk_fast_high_vetoes_mixed_risk_reduce_and_buy(fda: FDAAgent) -> None:
+    result = fda.decide(
+        portfolio_patch_ref="PP-001",
+        order_deltas=[
+            {
+                "ticker": "005930",
+                "side": "sell",
+                "qty": 1,
+                "reason": "risk_reduce",
+            },
+            {
+                "ticker": "000660",
+                "side": "buy",
+                "qty": 1,
+                "reason": "rebalance",
+            },
+        ],
+        dependency_status={"news": "done", "risk": "done", "quant": "done"},
+        risk_fast_eval={
+            "risk_level": "high",
+            "triggered_rules": ["intraday_drop"],
+            "affected_tickers": ["005930"],
+        },
+    )
+
     fd = result["final_decision"]
     assert fd["approved"] is False
     assert fd["reason_code"] == "RISK_FAST_TRIGGER"
