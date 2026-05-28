@@ -404,6 +404,11 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
     )
     monkeypatch.setattr(
         grpc_server,
+        "_remaining_market_cycles",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        grpc_server,
         "_load_prelive_gate_module",
         lambda: _PreliveGate,
     )

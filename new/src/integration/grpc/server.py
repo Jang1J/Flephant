@@ -1030,15 +1030,7 @@ def _make_servicer(
                 requested_interval = int(
                     getattr(request, "interval_sec", 0) or default_interval
                 )
-                remaining_cycles = _remaining_market_cycles(
-                    interval_sec=requested_interval,
-                    pa_cfg=pa_cfg,
-                )
                 raw_requested_cycles = int(getattr(request, "cycles", 0) or 0)
-                if raw_requested_cycles > 0:
-                    requested_cycles = min(raw_requested_cycles, remaining_cycles)
-                else:
-                    requested_cycles = min(default_cycles, remaining_cycles)
                 max_tickers = int(pa_cfg.get("max_tickers", 0) or 0)
             except Exception as e:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
@@ -1048,23 +1040,17 @@ def _make_servicer(
                     accepted=False, status="CONFIG_INVALID",
                     reason=f"paper_auto_trading_config_invalid:{e}",
                 )
-            if requested_cycles <= 0:
-                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                context.set_details("market_session_not_open_or_no_remaining_cycles")
-                return pb2.StartPaperAutoTradingResponse(
-                    request_id=str(getattr(request, "request_id", "")),
-                    accepted=False,
-                    status="MARKET_CLOSED",
-                    reason="market_session_not_open_or_no_remaining_cycles",
-                )
             requested_bundle_id = str(getattr(request, "bundle_id", "") or bundle_id)
             requested_tickers, invalid_tickers = _normalize_start_tickers(
                 getattr(request, "tickers", []),
             )
             confirm_phrase = str(getattr(request, "confirm_phrase", ""))
+            requested_cycles_for_validation = (
+                raw_requested_cycles if raw_requested_cycles > 0 else default_cycles
+            )
             validation = _validate_paper_auto_start_args(
                 bundle_id=requested_bundle_id,
-                cycles=requested_cycles,
+                cycles=requested_cycles_for_validation,
                 interval_sec=requested_interval,
                 tickers=requested_tickers,
                 invalid_tickers=invalid_tickers,
@@ -1081,16 +1067,6 @@ def _make_servicer(
                     status=str(validation["status"]),
                     reason=str(validation["reason"]),
                 )
-            market_guard = _market_start_guard(pa_cfg=pa_cfg)
-            if market_guard.get("status") != "PASS":
-                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                context.set_details(str(market_guard.get("reason", "")))
-                return pb2.StartPaperAutoTradingResponse(
-                    request_id=str(getattr(request, "request_id", "")),
-                    accepted=False,
-                    status=str(market_guard.get("reason", "MARKET_NOT_OPEN")).upper(),
-                    reason=str(market_guard.get("reason", "")),
-                )
             repo_root = root or _PROJECT_ROOT
             registry_dir = _candidate_registry_dir(repo_root, requested_bundle_id)
             if registry_dir is None:
@@ -1101,6 +1077,33 @@ def _make_servicer(
                     accepted=False,
                     status="MODEL_REGISTRY_NOT_READY",
                     reason="paper_candidate_registry_not_found",
+                )
+            market_guard = _market_start_guard(pa_cfg=pa_cfg)
+            if market_guard.get("status") != "PASS":
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(str(market_guard.get("reason", "")))
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status=str(market_guard.get("reason", "MARKET_NOT_OPEN")).upper(),
+                    reason=str(market_guard.get("reason", "")),
+                )
+            remaining_cycles = _remaining_market_cycles(
+                interval_sec=requested_interval,
+                pa_cfg=pa_cfg,
+            )
+            if raw_requested_cycles > 0:
+                requested_cycles = min(raw_requested_cycles, remaining_cycles)
+            else:
+                requested_cycles = min(default_cycles, remaining_cycles)
+            if requested_cycles <= 0:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("market_session_not_open_or_no_remaining_cycles")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="MARKET_CLOSED",
+                    reason="market_session_not_open_or_no_remaining_cycles",
                 )
             if bool(pa_cfg.get("require_prelive_pass", True)):
                 try:
