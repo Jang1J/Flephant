@@ -314,6 +314,11 @@ def test_recommendations_payload_returns_read_only_ranked_items():
     assert item["risk_level"] == "low"
     assert item["expected_return"] == 0.0
     assert item["expected_return_available"] is False
+    assert "삼성전자(005930)" in item["reason"]
+    assert "랭킹 모델 score" in item["reason"]
+    assert "1위" in item["reason"]
+    assert "주문 권고가 아닌 참고용 신호" in item["reason"]
+    assert "MODEL_RANKING_SIGNAL" not in item["reason"]
     for forbidden in ["target_weights", "order_deltas", "quantity", "side"]:
         assert forbidden not in item
 

@@ -178,6 +178,7 @@ def _resolve_recommendation_config() -> dict[str, Any]:
         "expected_return_unavailable_reason": str(
             cfg["expected_return_unavailable_reason"],
         ),
+        "reason_ko_template": str(cfg["reason_ko_template"]),
     }
 
 
@@ -211,6 +212,43 @@ def _risk_level_for_confidence(confidence: float, cfg: dict[str, Any]) -> str:
     if confidence >= float(cfg["medium_min_confidence"]):
         return "medium"
     return "high"
+
+
+def _risk_level_ko(risk_level: str) -> str:
+    return {
+        "low": "낮음",
+        "medium": "보통",
+        "high": "높음",
+    }.get(str(risk_level), str(risk_level))
+
+
+def _recommendation_reason_ko(
+    *,
+    template: str,
+    stock_name: str,
+    ticker: str,
+    ranking: int,
+    score: float,
+    risk_level: str,
+    model_version: str,
+) -> str:
+    try:
+        return template.format(
+            stock_name=stock_name,
+            ticker=ticker,
+            ranking=int(ranking),
+            score=float(score),
+            risk_level=risk_level,
+            risk_level_ko=_risk_level_ko(risk_level),
+            model_version=model_version,
+        )
+    except (KeyError, ValueError, TypeError):
+        return (
+            f"{stock_name}({ticker})는 현재 1분봉 기반 랭킹 모델 score가 "
+            f"후보군 중 {int(ranking)}위로 산출되어 추천 목록에 포함됐습니다. "
+            "이 score는 보정된 기대수익률이 아니며, 주문 권고가 아닌 참고용 신호입니다. "
+            f"위험도 표시는 {_risk_level_ko(risk_level)}입니다."
+        )
 
 
 def _candidate_registry_dir(repo_root: Path, bundle_id: str) -> Path | None:
@@ -459,24 +497,33 @@ def build_recommendations_payload(
     confidences = confidences if isinstance(confidences, dict) else {}
     ranked = sorted(finite_scores.items(), key=lambda item: item[1], reverse=True)
     recommendations: list[dict[str, Any]] = []
-    reason = f"{cfg['reason_code']};{cfg['expected_return_unavailable_reason']}"
     for rank, (ticker, score) in enumerate(ranked[:resolved_top_k], start=1):
         try:
             confidence = float(confidences.get(ticker, 0.0))
         except Exception:
             confidence = 0.0
+        risk_level = _risk_level_for_confidence(confidence, cfg)
+        stock_name = names.get(ticker, ticker)
         recommendations.append({
             "recommendation_id": f"{response_request_id}-{rank}-{ticker}",
             "request_id": response_request_id,
             "stock_code": ticker,
             "ticker": ticker,
-            "stock_name": names.get(ticker, ticker),
+            "stock_name": stock_name,
             "ranking": rank,
             "score": score,
-            "reason": reason,
+            "reason": _recommendation_reason_ko(
+                template=str(cfg["reason_ko_template"]),
+                stock_name=stock_name,
+                ticker=ticker,
+                ranking=rank,
+                score=score,
+                risk_level=risk_level,
+                model_version=model_version,
+            ),
             "expected_return": 0.0,
             "expected_return_available": False,
-            "risk_level": _risk_level_for_confidence(confidence, cfg),
+            "risk_level": risk_level,
             "model_version": model_version,
             "bundle_id": response_bundle_id,
         })
