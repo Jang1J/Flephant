@@ -6,6 +6,7 @@ Pre-live gate를 통과한 뒤 Hot Path 산출물을 ExecutionGateway(paper)에 
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import time
 from datetime import datetime, time as dt_time
@@ -322,6 +323,9 @@ class PaperAutoTrader:
                 "cycle_index": cycle_index,
                 "started_at": started_at,
                 "reason": "run_once_requires_start_guard",
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    "run_once_requires_start_guard"
+                ),
             }
         market_session_guard = self._market_session_check()
         started_at = str(market_session_guard.get("now") or self._now_kst().isoformat())
@@ -334,6 +338,9 @@ class PaperAutoTrader:
                 "safe_skip": bool(market_session_guard.get("safe_skip")),
                 "market_session_guard": market_session_guard,
                 "execution": None,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    str(market_session_guard.get("reason") or "market_session_guard")
+                ),
             }
         padded = [pad_ticker(str(t)) for t in tickers]
         try:
@@ -396,6 +403,9 @@ class PaperAutoTrader:
                 "hot_path_bar_readiness": hot_path_bar_readiness,
                 "account_state": account_state,
                 "execution": None,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    "hot_path_bar_readiness"
+                ),
             }
 
         bars_batch = [
@@ -431,6 +441,9 @@ class PaperAutoTrader:
                 "hot_path_bar_readiness": hot_path_bar_readiness,
                 "account_state": account_state,
                 "hot_result": hot_result,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    str(hot_result.get("reason", "hot_runner_skipped"))
+                ),
             }
         if (
             hot_result.get("status") == "FAIL"
@@ -448,6 +461,9 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "hot_result": hot_result,
                 "execution": None,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    str(hot_result.get("failure_stage", "hot_runner_failed"))
+                ),
             }
 
         quant_signal_guard = self._quant_signal_guard(hot_result)
@@ -483,6 +499,9 @@ class PaperAutoTrader:
                         "safe_skip": True,
                         "reason": "quant_scores_not_rankable_no_broker_submit",
                     },
+                    "paper_order_path_evidence": self._no_order_path_evidence(
+                        "quant_scores_not_rankable_no_broker_submit"
+                    ),
                 }
             return {
                 "status": "FAIL",
@@ -494,6 +513,9 @@ class PaperAutoTrader:
                 "account_state": account_state,
                 "hot_result": hot_result,
                 "execution": None,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    "quant_signal_readiness"
+                ),
             }
 
         final_decision = dict(hot_result.get("final_decision") or {})
@@ -532,6 +554,9 @@ class PaperAutoTrader:
                 "order_caps_applied": order_caps_applied,
                 "hot_result": hot_result,
                 "execution": None,
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    str(order_guard.get("reason") or "order_guard_not_pass")
+                ),
             }
 
         self._on_before_broker_submit(
@@ -583,6 +608,9 @@ class PaperAutoTrader:
                     "safe_skip": True,
                     "reason": "shadow_only_no_broker_submit",
                 },
+                "paper_order_path_evidence": self._no_order_path_evidence(
+                    "shadow_only_no_broker_submit"
+                ),
             }
 
         gateway = ExecutionGateway(
@@ -603,6 +631,12 @@ class PaperAutoTrader:
                 cycle_index=cycle_index,
             )
         order_history = self._order_history_verification(execution)
+        paper_order_path_evidence = self._cycle_order_path_evidence(
+            execution=execution,
+            order_history=order_history,
+            broker_blockers=broker_blockers,
+            broker_order_submitted=True,
+        )
         status = "PASS" if execution_status in ok_statuses and not broker_blockers else "FAIL"
         if order_history.get("status") != "PASS":
             status = "FAIL"
@@ -627,6 +661,7 @@ class PaperAutoTrader:
             "execution": execution,
             "broker_blockers": broker_blockers,
             "order_history_verification": order_history,
+            "paper_order_path_evidence": paper_order_path_evidence,
         }
 
     @staticmethod
@@ -650,6 +685,15 @@ class PaperAutoTrader:
             "error": str(error),
             "fail_closed": True,
             "execution": None,
+            "paper_order_path_evidence": {
+                "status": "BLOCKED",
+                "evidence_type": "paper_auto_order",
+                "reason": reason,
+                "broker_order_submitted": False,
+                "broker_order_ids": [],
+                "matched_order_count": 0,
+                "failures": [{"reason": reason}],
+            },
         }
 
     def _read_error_cycle_report(
@@ -682,6 +726,11 @@ class PaperAutoTrader:
             "max_consecutive_read_error_skips": self._max_consecutive_read_error_skips,
             "fail_closed": fail_closed,
             "execution": None,
+            "paper_order_path_evidence": self._no_order_path_evidence(
+                "paper_auto_read_error_budget_exhausted"
+                if fail_closed
+                else "paper_auto_read_transient_error_skip"
+            ),
         }
 
     @staticmethod
@@ -710,6 +759,15 @@ class PaperAutoTrader:
             "safe_skip": True,
             "broker_order_submitted": False,
             "execution": None,
+            "paper_order_path_evidence": {
+                "status": "SKIP",
+                "evidence_type": "paper_auto_order",
+                "reason": "paper_auto_interrupted",
+                "broker_order_submitted": False,
+                "broker_order_ids": [],
+                "matched_order_count": 0,
+                "failures": [{"reason": "paper_auto_interrupted"}],
+            },
         }
 
     @staticmethod
@@ -2029,6 +2087,126 @@ class PaperAutoTrader:
             "status": "FAIL" if failures else "PASS",
             "queries": queries,
             "failures": failures,
+            "matched_order_count": sum(
+                safe_int(query.get("matched_order_count", 0), default=0, min_value=0)
+                for query in queries
+                if isinstance(query, dict)
+            ),
+            "broker_order_ids": [
+                str(query.get("query", {}).get("order_id"))
+                for query in queries
+                if isinstance(query, dict)
+                and query.get("query", {}).get("order_id")
+            ],
+        }
+
+    @staticmethod
+    def _broker_order_ids_from_execution(execution: dict[str, Any]) -> list[str]:
+        fills = list(execution.get("execution_report", {}).get("fills", []))
+        out: list[str] = []
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            raw = (
+                fill.get("broker_order_id")
+                or fill.get("order_id")
+                or (fill.get("broker_response") or {}).get("order_id")
+                or (fill.get("broker_response") or {}).get("ODNO")
+                or (fill.get("broker_response") or {}).get("odno")
+            )
+            if raw:
+                out.append(str(raw))
+        return out
+
+    @staticmethod
+    def _verified_order_ids_from_history(order_history: dict[str, Any]) -> set[str]:
+        verified: set[str] = set()
+        for query in order_history.get("queries", []) if isinstance(order_history, dict) else []:
+            if not isinstance(query, dict):
+                continue
+            raw_query = query.get("query")
+            if isinstance(raw_query, dict) and query.get("status") == "PASS":
+                order_id = raw_query.get("order_id")
+                if order_id:
+                    verified.add(str(order_id))
+            matched_orders = query.get("matched_orders")
+            for order in matched_orders if isinstance(matched_orders, list) else []:
+                if not isinstance(order, dict):
+                    continue
+                for key in ("order_id", "broker_order_id", "ODNO", "odno"):
+                    raw = order.get(key)
+                    if raw:
+                        verified.add(str(raw))
+                response = order.get("broker_response")
+                if isinstance(response, dict):
+                    for key in ("order_id", "broker_order_id", "ODNO", "odno"):
+                        raw = response.get(key)
+                        if raw:
+                            verified.add(str(raw))
+        return verified
+
+    @staticmethod
+    def _no_order_path_evidence(reason: str) -> dict[str, Any]:
+        return {
+            "status": "SKIP",
+            "evidence_type": "paper_auto_order",
+            "reason": reason,
+            "broker_order_submitted": False,
+            "broker_order_ids": [],
+            "matched_order_count": 0,
+            "unmatched_order_count": 0,
+            "failures": [{"reason": reason}],
+        }
+
+    def _cycle_order_path_evidence(
+        self,
+        *,
+        execution: dict[str, Any],
+        order_history: dict[str, Any],
+        broker_blockers: list[dict[str, Any]],
+        broker_order_submitted: bool,
+    ) -> dict[str, Any]:
+        broker_order_ids = sorted(set(self._broker_order_ids_from_execution(execution)))
+        verified_order_ids = self._verified_order_ids_from_history(order_history)
+        matched_count = safe_int(
+            order_history.get("matched_order_count", 0),
+            default=0,
+            min_value=0,
+        )
+        unmatched = [
+            order_id for order_id in broker_order_ids
+            if verified_order_ids and order_id not in verified_order_ids
+        ]
+        failures: list[dict[str, Any]] = []
+        if not broker_order_submitted:
+            failures.append({"reason": "broker_order_not_submitted"})
+        if not broker_order_ids:
+            failures.append({"reason": "broker_order_id_missing"})
+        if order_history.get("status") != "PASS":
+            failures.append({
+                "reason": "order_history_verification_not_pass",
+                "order_history_status": order_history.get("status"),
+            })
+        if matched_count <= 0:
+            failures.append({"reason": "matched_order_count_zero"})
+        if unmatched:
+            failures.append({"reason": "submitted_order_unmatched", "order_ids": unmatched})
+        if broker_blockers:
+            failures.append({"reason": "broker_blockers_present", "broker_blockers": broker_blockers})
+        status = "PASS" if not failures else "BLOCKED"
+        return {
+            "status": status,
+            "evidence_type": "paper_auto_order",
+            "broker_order_submitted": bool(broker_order_submitted),
+            "execution_status": (execution.get("execution_report") or {}).get("status"),
+            "order_history_status": order_history.get("status"),
+            "broker_order_ids": broker_order_ids,
+            "verified_order_ids": sorted(verified_order_ids),
+            "broker_order_id_count": len(broker_order_ids),
+            "matched_order_count": matched_count,
+            "unmatched_order_count": len(unmatched),
+            "broker_blockers": broker_blockers,
+            "failures": failures,
         }
 
     @staticmethod
@@ -2094,6 +2272,7 @@ class PaperAutoTrader:
             "status": "PENDING",
             "action": "paper_auto_trade",
             "generated_at": datetime.now(_KST).isoformat(),
+            "evidence": self._evidence_metadata(),
             "runtime": {
                 "kis_mode": str(getattr(self._kis_client, "mode", "unknown")).lower(),
                 "execution_mode": "paper",
@@ -2122,6 +2301,97 @@ class PaperAutoTrader:
             "failures": [],
         }
 
+    def _evidence_metadata(self) -> dict[str, Any]:
+        mode = str(getattr(self._kis_client, "mode", "unknown")).lower()
+        account_no = ""
+        product_code = ""
+        app_key = ""
+        auth = getattr(self._kis_client, "auth", None)
+        try:
+            if auth is not None and hasattr(auth, "get_kis_account_parts"):
+                account_no, product_code = auth.get_kis_account_parts()
+        except Exception as e:
+            _ = e
+        try:
+            if auth is not None and hasattr(auth, "get_kis_app_credentials"):
+                app_key, _app_secret = auth.get_kis_app_credentials()
+        except Exception as e:
+            _ = e
+        fingerprint = (
+            self._short_sha256(f"{mode}|{app_key}|{account_no}|{product_code}")
+            if app_key or account_no
+            else ""
+        )
+        account_hash = (
+            self._short_sha256(f"{account_no}|{product_code}") if account_no else ""
+        )
+        generated = datetime.now(_KST)
+        return {
+            "schema_version": "1.0.0",
+            "evidence_run_id": (
+                f"PATR-{generated.strftime('%Y%m%d%H%M%S%f')}-"
+                f"{fingerprint[:8] or 'unknown'}"
+            ),
+            "broker_env_fingerprint": fingerprint,
+            "account_hash": account_hash,
+            "account_last4": account_no[-4:] if len(account_no) >= 4 else "",
+            "account_product_code": product_code,
+        }
+
+    @staticmethod
+    def _short_sha256(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _aggregate_order_path_evidence(report: dict[str, Any]) -> dict[str, Any]:
+        cycles = ((report.get("stages") or {}).get("cycles") or {}).get("items", [])
+        evidence_items = [
+            cycle.get("paper_order_path_evidence")
+            for cycle in cycles
+            if isinstance(cycle, dict)
+            and isinstance(cycle.get("paper_order_path_evidence"), dict)
+        ]
+        pass_items = [item for item in evidence_items if item.get("status") == "PASS"]
+        submitted_items = [
+            item
+            for item in evidence_items
+            if item.get("broker_order_submitted")
+            or safe_int(item.get("broker_order_id_count", 0), default=0, min_value=0) > 0
+        ]
+        failures = [
+            failure
+            for item in submitted_items
+            for failure in item.get("failures", [])
+            if isinstance(failure, dict)
+        ]
+        broker_order_ids = sorted({
+            str(order_id)
+            for item in pass_items
+            for order_id in item.get("broker_order_ids", [])
+            if order_id
+        })
+        matched_count = sum(
+            safe_int(item.get("matched_order_count", 0), default=0, min_value=0)
+            for item in pass_items
+        )
+        status = "PASS" if pass_items and not failures else "BLOCKED"
+        reason = None
+        if not pass_items:
+            reason = "no_verified_paper_order_path_evidence"
+        elif failures:
+            reason = "submitted_order_path_failures_present"
+        return {
+            "status": status,
+            "evidence_type": "paper_auto_order",
+            "reason": reason,
+            "verified_cycle_count": len(pass_items),
+            "submitted_cycle_count": len(submitted_items),
+            "broker_order_id_count": len(broker_order_ids),
+            "broker_order_ids": broker_order_ids,
+            "matched_order_count": matched_count,
+            "failures": failures,
+        }
+
     @staticmethod
     def _parse_hhmm(value: Any, *, default: dt_time) -> dt_time:
         try:
@@ -2132,6 +2402,7 @@ class PaperAutoTrader:
             return default
 
     def _finish_report(self, report: dict[str, Any], write_report: bool) -> dict[str, Any]:
+        report["paper_order_path_evidence"] = self._aggregate_order_path_evidence(report)
         report["failures"] = self._collect_failures(report)
         if report["status"] == "PENDING":
             report["status"] = self._overall_status(report)

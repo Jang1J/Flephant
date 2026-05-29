@@ -28,6 +28,10 @@ from src.mode_b.service_policy_verifier import (  # noqa: E402
     service_policy_gate_pass,
     service_policy_universe_hash,
 )
+from src.ops.paper_order_path_evidence import (  # noqa: E402
+    find_fresh_paper_order_path_evidence,
+    summarize_paper_order_path_evidence,
+)
 from src.utils.safe_cast import safe_bool, safe_int  # noqa: E402
 from src.utils.ticker_utils import pad_ticker  # noqa: E402
 from src.utils.trading_calendar import (  # noqa: E402
@@ -1062,6 +1066,9 @@ def _paper_auto_bundle_ids(data: dict[str, Any]) -> set[str]:
 
 
 def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
+    order_path = data.get("paper_order_path_evidence")
+    if isinstance(order_path, dict):
+        return order_path.get("status") == "PASS"
     cycle_stage = ((data.get("stages") or {}).get("paper_auto_cycle") or {})
     cycle_stages = cycle_stage.get("stages") if isinstance(cycle_stage, dict) else None
     cycles = cycle_stages.get("cycles") if isinstance(cycle_stages, dict) else None
@@ -1141,7 +1148,10 @@ def _paper_evidence_max_age_sec() -> int:
     cfg = _load_yaml(NEW_ROOT / "config" / "risk_config.yaml")
     paper_cfg = cfg.get("paper_trading", {})
     return safe_int(
-        paper_cfg.get("evidence_max_age_sec", 86400),
+        paper_cfg.get(
+            "order_path_evidence_max_age_sec",
+            paper_cfg.get("evidence_max_age_sec", 86400),
+        ),
         default=86400,
         min_value=1,
     )
@@ -1199,12 +1209,23 @@ def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, 
         }
     required = (
         "balance_reconciliation",
-        "probe_order",
-        "order_history_requery",
+        "paper_order_path",
     )
     statuses: dict[str, str] = {}
     for name in required:
         stage = broker_evidence.get(name)
+        if name == "paper_order_path" and not isinstance(stage, dict):
+            probe = broker_evidence.get("probe_order")
+            history = broker_evidence.get("order_history_requery")
+            if isinstance(probe, dict) and isinstance(history, dict):
+                stage = {
+                    "status": (
+                        "PASS"
+                        if probe.get("status") == "PASS"
+                        and history.get("status") == "PASS"
+                        else "BLOCKED"
+                    )
+                }
         statuses[name] = (
             str(stage.get("status", "MISSING")).upper()
             if isinstance(stage, dict)
@@ -1234,12 +1255,25 @@ def _paper_auto_required_broker_evidence_state(
         }
     required = ["balance_reconciliation"]
     if stage_name == "probe_order":
-        required = ["probe_order"]
-        if require_order_history_match:
-            required.append("order_history_requery")
+        required = ["paper_order_path"]
     statuses: dict[str, str] = {}
     for name in required:
         stage = broker_evidence.get(name)
+        if name == "paper_order_path" and not isinstance(stage, dict):
+            probe = broker_evidence.get("probe_order")
+            history = broker_evidence.get("order_history_requery")
+            if isinstance(probe, dict) and isinstance(history, dict):
+                stage = {
+                    "status": (
+                        "PASS"
+                        if probe.get("status") == "PASS"
+                        and (
+                            not require_order_history_match
+                            or history.get("status") == "PASS"
+                        )
+                        else "BLOCKED"
+                    )
+                }
         statuses[name] = (
             str(stage.get("status", "MISSING")).upper()
             if isinstance(stage, dict)
@@ -1289,7 +1323,22 @@ def _paper_auto_bundle_stage(
     stage_statuses = data.get("stage_statuses", {})
     if not isinstance(stage_statuses, dict):
         stage_statuses = {}
-    history_matched = _paper_auto_cycle_history_matched(data)
+    order_path = summarize_paper_order_path_evidence(
+        data,
+        report_path=path,
+        root=REPO_ROOT,
+        bundle_id=bundle_id,
+        max_age_sec=_paper_evidence_max_age_sec(),
+    )
+    if order_path.get("status") == "PASS":
+        stage_statuses = dict(stage_statuses)
+        stage_statuses.setdefault("paper_order_path", "PASS")
+        stage_statuses.setdefault("probe_order", "PASS")
+        stage_statuses.setdefault("order_history_requery", "PASS")
+    history_matched = (
+        order_path.get("status") == "PASS"
+        or _paper_auto_cycle_history_matched(data)
+    )
     freshness = _fresh_generated_at_state(
         data.get("generated_at"),
         max_age_sec=_paper_evidence_max_age_sec(),
@@ -1333,6 +1382,7 @@ def _paper_auto_bundle_stage(
             "broker_evidence_nested": nested_evidence,
             "required_broker_evidence_nested": required_nested_evidence,
             "evidence_guard": evidence_guard,
+            "paper_order_path_evidence": order_path,
             "paper_auto_cycle_history_matched": history_matched,
         },
     )
@@ -1398,6 +1448,25 @@ def _check_paper_reconciliation(bundle_id: str | None = None) -> dict[str, Any]:
 def _check_probe_order(bundle_id: str | None = None) -> dict[str, Any]:
     requested_bundle_id = str(bundle_id or "").strip()
     if requested_bundle_id:
+        if _REPORT_ROOT.resolve() == (REPO_ROOT / "artifacts" / "reports").resolve():
+            order_path = find_fresh_paper_order_path_evidence(
+                root=REPO_ROOT,
+                bundle_id=requested_bundle_id,
+                max_age_sec=_paper_evidence_max_age_sec(),
+            )
+            if order_path.get("status") == "PASS":
+                return _stage(
+                    "PASS",
+                    "Fresh verified paper order-path evidence inspected; no blind probe submitted.",
+                    {
+                        "bundle_id": requested_bundle_id,
+                        "evidence_type": order_path.get("evidence_type"),
+                        "paper_order_path_evidence": order_path,
+                        "matched_order_count": order_path.get("matched_order_count", 0),
+                        "probe_order_deprecated": True,
+                        "replaced_by": "paper_order_path",
+                    },
+                )
         return _paper_auto_bundle_stage(
             requested_bundle_id,
             "probe_order",
@@ -1406,26 +1475,24 @@ def _check_probe_order(bundle_id: str | None = None) -> dict[str, Any]:
     path, data = _latest_paper_report("submit_probe_order")
     if not path or not data:
         return _stage("BLOCKED", "No paper probe order report was found.")
+    order_path = summarize_paper_order_path_evidence(
+        data,
+        report_path=path,
+        root=REPO_ROOT,
+        max_age_sec=_paper_evidence_max_age_sec(),
+    )
     execution = data.get("stages", {}).get("execution")
     order_history = data.get("stages", {}).get("order_history")
     matched_order_count = _matched_order_count(data)
-    status = (
-        "PASS"
-        if (
-            isinstance(execution, dict)
-            and execution.get("status") == "PASS"
-            and isinstance(order_history, dict)
-            and order_history.get("status") == "PASS"
-            and matched_order_count > 0
-        )
-        else "BLOCKED"
-    )
+    status = "PASS" if order_path.get("status") == "PASS" else "BLOCKED"
     return _stage(
         status,
-        "Latest paper probe order report inspected.",
+        "Latest paper order-path report inspected.",
         {
             "report_path": _repo_relative(path),
             "report_status": data.get("status"),
+            "evidence_type": order_path.get("evidence_type"),
+            "paper_order_path_evidence": order_path,
             "order_guard": data.get("stages", {}).get("order_guard"),
             "execution": execution,
             "order_history": order_history,

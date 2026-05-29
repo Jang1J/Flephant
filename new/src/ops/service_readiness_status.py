@@ -19,6 +19,9 @@ from src.mode_b.service_policy_verifier import (
     service_policy_gate_pass,
     service_policy_universe_hash,
 )
+from src.ops.paper_order_path_evidence import (
+    find_fresh_paper_order_path_evidence,
+)
 from src.utils.config_loader import load as config_load
 from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.ticker_utils import pad_ticker
@@ -497,6 +500,7 @@ def _broker_stage_statuses(data: dict[str, Any]) -> dict[str, Any]:
         "balance_reconciliation": "balance_reconciliation",
         "probe_order": "probe_order",
         "order_history": "order_history_requery",
+        "paper_order_path": "paper_order_path",
     }
     for evidence_key, status_key in aliases.items():
         stage = paper_evidence.get(evidence_key)
@@ -572,12 +576,23 @@ def _paper_auto_broker_evidence_nested_state(data: dict[str, Any]) -> dict[str, 
         }
     required = (
         "balance_reconciliation",
-        "probe_order",
-        "order_history_requery",
+        "paper_order_path",
     )
     statuses: dict[str, str] = {}
     for name in required:
         stage = broker_evidence.get(name)
+        if name == "paper_order_path" and not isinstance(stage, dict):
+            probe = broker_evidence.get("probe_order")
+            history = broker_evidence.get("order_history_requery")
+            if isinstance(probe, dict) and isinstance(history, dict):
+                stage = {
+                    "status": (
+                        "PASS"
+                        if probe.get("status") == "PASS"
+                        and history.get("status") == "PASS"
+                        else "BLOCKED"
+                    )
+                }
         statuses[name] = (
             str(stage.get("status", "MISSING")).upper()
             if isinstance(stage, dict)
@@ -698,7 +713,17 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
         for item in (balance, probe, order_history)
         if isinstance(item, dict)
     )
-    status = "PASS" if balance_ok and probe_ok and order_history_ok else "BLOCKED"
+    profile_fingerprint = (
+        str((balance.get("evidence") or {}).get("broker_env_fingerprint") or "")
+        if isinstance(balance, dict) and isinstance(balance.get("evidence"), dict)
+        else ""
+    )
+    order_path = find_fresh_paper_order_path_evidence(
+        root=root,
+        profile_fingerprint=profile_fingerprint or None,
+    )
+    order_path_ok = order_path.get("status") == "PASS"
+    status = "PASS" if balance_ok and order_path_ok else "BLOCKED"
     report_path = probe_path or balance_path or order_history_path
     return {
         "status": status,
@@ -710,8 +735,9 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
         "report_path": _repo_relative(report_path, root) if report_path else None,
         "stage_statuses": {
             "balance_reconciliation": "PASS" if balance_ok else "BLOCKED",
-            "probe_order": "PASS" if probe_ok else "BLOCKED",
-            "order_history_requery": "PASS" if order_history_ok else "BLOCKED",
+            "probe_order": "PASS" if order_path_ok else "BLOCKED",
+            "order_history_requery": "PASS" if order_path_ok else "BLOCKED",
+            "paper_order_path": "PASS" if order_path_ok else "BLOCKED",
         },
         "paper_trading_evidence": {
             "balance_reconciliation": {
@@ -721,12 +747,15 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
                 ),
             },
             "probe_order": {
-                "status": "PASS" if probe_ok else "BLOCKED",
+                "status": "PASS" if order_path_ok else "BLOCKED",
                 "report_path": _repo_relative(probe_path, root) if probe_path else None,
-                "blocker": _probe_order_blocker(probe) if not probe_ok else {},
+                "deprecated": True,
+                "replaced_by": "paper_order_path",
+                "evidence_type": order_path.get("evidence_type"),
+                "blocker": _probe_order_blocker(probe) if not order_path_ok else {},
             },
             "order_history": {
-                "status": "PASS" if order_history_ok else "BLOCKED",
+                "status": "PASS" if order_path_ok else "BLOCKED",
                 "report_path": (
                     _repo_relative(order_history_path, root)
                     if order_history_path
@@ -734,13 +763,21 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
                     if probe_history_ok and probe_path
                     else None
                 ),
-                "matched_order_count": max(probe_matched, history_matched),
+                "matched_order_count": max(
+                    safe_int(order_path.get("matched_order_count", 0), default=0, min_value=0),
+                    probe_matched,
+                    history_matched,
+                ),
             },
+            "paper_order_path": order_path,
         },
     }
 
 
 def _paper_auto_cycle_history_matched(data: dict[str, Any]) -> bool:
+    order_path = data.get("paper_order_path_evidence")
+    if isinstance(order_path, dict):
+        return order_path.get("status") == "PASS"
     cycle_stage = ((data.get("stages") or {}).get("paper_auto_cycle") or {})
     if not isinstance(cycle_stage, dict):
         return False
@@ -835,10 +872,42 @@ def _broker_evidence_state(root: Path, bundle_id: str) -> dict[str, Any]:
     paper_trading = _paper_trading_evidence_state(root)
     paper_cfg = config_load("risk_config.yaml", "paper_trading") or {}
     max_age_sec = safe_int(
-        paper_cfg.get("evidence_max_age_sec", 86400),
+        paper_cfg.get(
+            "order_path_evidence_max_age_sec",
+            paper_cfg.get("evidence_max_age_sec", 86400),
+        ),
         default=86400,
         min_value=1,
     )
+    order_path = find_fresh_paper_order_path_evidence(
+        root=root,
+        bundle_id=bundle_id,
+        max_age_sec=max_age_sec,
+    )
+    paper_stage_statuses = paper_trading.get("stage_statuses", {})
+    balance_ok = paper_stage_statuses.get("balance_reconciliation") == "PASS"
+    if order_path.get("status") == "PASS":
+        status = "PASS" if balance_ok else "BLOCKED"
+        return {
+            "status": status,
+            "external_kis_api": bool(order_path.get("external_kis_api")),
+            "evidence_level": "external_kis_virtual_order_path",
+            "report_path": order_path.get("report_path"),
+            "stage_statuses": {
+                "balance_reconciliation": "PASS" if balance_ok else "BLOCKED",
+                "probe_order": "PASS",
+                "order_history_requery": "PASS",
+                "paper_order_path": "PASS",
+            },
+            "freshness": order_path.get("freshness", {}),
+            "broker_evidence_nested": {"status": "PASS", "stage_statuses": {"paper_order_path": "PASS"}},
+            "evidence_guard": {"status": "PASS", "source": "paper_order_path"},
+            "bundle_match": bool(order_path.get("bundle_match", True)),
+            "bundle_ids": order_path.get("bundle_ids", []),
+            "paper_auto_cycle_history_matched": True,
+            "paper_order_path_evidence": order_path,
+            "paper_trading_evidence": paper_trading.get("paper_trading_evidence", {}),
+        }
     reports = _json_candidates(
         root,
         "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_*.json",
