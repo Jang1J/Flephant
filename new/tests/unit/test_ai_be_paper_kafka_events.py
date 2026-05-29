@@ -6,6 +6,7 @@ import uuid
 import src.integration.grpc.server as grpc_server
 from src.integration.grpc.server import (
     _PaperAutoSession,
+    _load_active_start_tickers,
     _normalize_start_tickers,
     _paper_cycle_events,
     _validate_paper_auto_start_args,
@@ -208,6 +209,32 @@ def test_start_validation_normalizes_tickers_and_accepts_valid_request() -> None
     )
 
     assert result == {"status": "PASS", "tickers": ["005930", "000660"]}
+
+
+def test_load_active_start_tickers_uses_universe_ssot(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "sectors": {
+                "반도체": {
+                    "stocks": [
+                        {"ticker": "5930", "status": "active"},
+                        {"ticker": "000660", "status": "active"},
+                        {"ticker": "035420", "status": "pending"},
+                    ],
+                },
+                "조선": {
+                    "stocks": [
+                        {"ticker": "329180", "status": "active"},
+                    ],
+                },
+            }
+        },
+    )
+
+    assert _load_active_start_tickers(30) == ["005930", "000660", "329180"]
+    assert _load_active_start_tickers(2) == ["005930", "000660"]
 
 
 def test_start_rpc_rejects_bad_confirm_before_session_start(monkeypatch) -> None:
@@ -475,6 +502,110 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
 
     assert response.accepted is True
     assert response.status == "START_REQUESTED"
+    assert calls["registry_dir"] == registry_dir
+
+
+def test_start_rpc_defaults_empty_tickers_to_active_universe(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+    calls: dict[str, object] = {}
+
+    class _Grpc:
+        class StatusCode:
+            INVALID_ARGUMENT = "INVALID_ARGUMENT"
+            FAILED_PRECONDITION = "FAILED_PRECONDITION"
+
+    class _Pb2Grpc:
+        class AiBeBridgeServiceServicer:
+            pass
+
+    class _Pb2:
+        class StartPaperAutoTradingResponse:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+    class _Context:
+        code = None
+        details = ""
+
+        def set_code(self, code) -> None:
+            self.code = code
+
+        def set_details(self, details: str) -> None:
+            self.details = details
+
+    class _Request:
+        request_id = "BE-REQ-EMPTY-TICKERS"
+        bundle_id = "BUNDLE-1"
+        cycles = 1
+        interval_sec = 60
+        tickers: list[str] = []
+        confirm_phrase = "PAPER_AUTO_OK"
+
+    def fake_config_load(path, *_args, **_kwargs):
+        if path == "universe_config.yaml":
+            return {
+                "sectors": {
+                    "반도체": {
+                        "stocks": [
+                            {"ticker": "005930", "status": "active"},
+                            {"ticker": "000660", "status": "active"},
+                            {"ticker": "042700", "status": "active"},
+                            {"ticker": "035420", "status": "pending"},
+                        ],
+                    }
+                }
+            }
+        return {
+            "default_max_cycles": 1,
+            "default_interval_sec": 60,
+            "confirm_start_phrase": "PAPER_AUTO_OK",
+            "max_tickers": 3,
+            "require_prelive_pass": False,
+        }
+
+    monkeypatch.setattr(grpc_server, "config_load", fake_config_load)
+    monkeypatch.setattr(
+        grpc_server,
+        "_market_start_guard",
+        lambda **_kwargs: {"status": "PASS"},
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_remaining_market_cycles",
+        lambda **_kwargs: 1,
+    )
+
+    def fake_start(**kwargs):
+        calls.update(kwargs)
+        return {
+            "accepted": True,
+            "status": "START_REQUESTED",
+            "session_id": "AI-SESSION",
+        }
+
+    monkeypatch.setattr(session, "start", fake_start)
+
+    servicer = grpc_server._make_servicer(
+        _Grpc,
+        _Pb2,
+        _Pb2Grpc,
+        bundle_id="BUNDLE-1",
+        root=tmp_path,
+        session=session,
+    )
+
+    response = servicer.StartPaperAutoTrading(_Request(), _Context())
+
+    assert response.accepted is True
+    assert response.status == "START_REQUESTED"
+    assert calls["tickers"] == ["005930", "000660", "042700"]
     assert calls["registry_dir"] == registry_dir
 
 

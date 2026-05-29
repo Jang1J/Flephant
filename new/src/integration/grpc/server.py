@@ -576,6 +576,21 @@ def _normalize_start_tickers(raw_tickers: Any) -> tuple[list[str], list[str]]:
     return tickers, invalid
 
 
+def _load_active_start_tickers(max_tickers: int) -> list[str]:
+    """Load the paper-auto default universe from the trade-universe SSOT."""
+    cfg = config_load("universe_config.yaml") or {}
+    tickers: list[str] = []
+    for sector in (cfg.get("sectors") or {}).values():
+        if not isinstance(sector, dict):
+            continue
+        for stock in sector.get("stocks", []) or []:
+            if not isinstance(stock, dict):
+                continue
+            if stock.get("status") == "active" and stock.get("ticker"):
+                tickers.append(pad_ticker(str(stock["ticker"])))
+    return tickers[:max_tickers] if max_tickers > 0 else tickers
+
+
 def _validate_paper_auto_start_args(
     *,
     bundle_id: str,
@@ -1052,6 +1067,10 @@ def _make_servicer(
             requested_tickers, invalid_tickers = _normalize_start_tickers(
                 getattr(request, "tickers", []),
             )
+            ticker_source = "request"
+            if not requested_tickers and not invalid_tickers:
+                requested_tickers = _load_active_start_tickers(max_tickers)
+                ticker_source = "universe_config"
             confirm_phrase = str(getattr(request, "confirm_phrase", ""))
             if raw_requested_cycles < 0:
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
@@ -1180,6 +1199,13 @@ def _make_servicer(
                 registry_dir=registry_dir,
                 root=root,
             )
+            if bool(result["accepted"]):
+                logger.info(
+                    "[grpc_server] StartPaperAutoTrading accepted: "
+                    "ticker_source=%s ticker_count=%d",
+                    ticker_source,
+                    len(validation["tickers"]),
+                )
             if not bool(result["accepted"]):
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 context.set_details(str(result.get("reason", "")))
