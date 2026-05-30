@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -40,6 +41,9 @@ class AuthManager:
     _shared_kis_token: str | None = None
     _shared_kis_token_expires_at: datetime | None = None
     _shared_kis_token_scope: tuple[str, str] | None = None
+    # 프로세스 단위 토큰 갱신 직렬화 Lock. 동시 다중 thread가 _fetch_kis_token을 중복
+    # 호출하여 KIS EGW00133(재발급 제한)을 트리거하는 race를 차단한다.
+    _token_lock: threading.Lock = threading.Lock()
 
     def __init__(self) -> None:
         self._kis_token = None
@@ -61,22 +65,35 @@ class AuthManager:
         return self._need_refresh() and not self._load_shared_kis_token()
 
     def get_kis_token(self) -> str:
-        """유효 KIS access_token. 만료 5분 전이면 auto refresh."""
+        """유효 KIS access_token. 만료 5분 전이면 auto refresh.
+
+        Thread-safe: refresh 분기는 클래스 레벨 _token_lock으로 직렬화.
+        Double-checked locking으로 캐시 hit fast-path는 lock 없이 통과.
+        """
         if self._need_refresh():
+            # Fast path: lock 없이 공유 캐시 시도. hit이면 즉시 return.
             if self._load_shared_kis_token():
                 if self._kis_token is None:
                     raise RuntimeError("[auth] 공유 KIS 토큰 로드 후에도 None. 내부 버그.")
                 return self._kis_token
 
-            token, expires_at = self._fetch_kis_token()
-            self._kis_token = token
-            self._kis_token_expires_at = expires_at
-            self._store_shared_kis_token(token, expires_at)
-            logger.info(
-                "KIS 토큰 발급 완료. 만료: %s, 마스킹: %s",
-                expires_at.isoformat(),
-                _mask_token(token),
-            )
+            # Slow path: 토큰 갱신 직렬화. 동시 다중 thread의 중복 fetch 차단.
+            with type(self)._token_lock:
+                # 락 획득 후 재확인 — 대기 중 다른 thread가 이미 갱신했을 수 있음.
+                if self._load_shared_kis_token():
+                    if self._kis_token is None:
+                        raise RuntimeError("[auth] 공유 KIS 토큰 로드 후에도 None. 내부 버그.")
+                    return self._kis_token
+
+                token, expires_at = self._fetch_kis_token()
+                self._kis_token = token
+                self._kis_token_expires_at = expires_at
+                self._store_shared_kis_token(token, expires_at)
+                logger.info(
+                    "KIS 토큰 발급 완료. 만료: %s, 마스킹: %s",
+                    expires_at.isoformat(),
+                    _mask_token(token),
+                )
 
         if self._kis_token is None:
             raise RuntimeError("[auth] KIS 토큰 발급 후에도 None. 내부 버그.")
