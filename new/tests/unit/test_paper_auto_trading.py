@@ -1921,6 +1921,7 @@ def test_paper_auto_caps_qty_over_limit_before_execution(tmp_path: Path) -> None
         hot_runner=FakeHotRunner(qty=3),
         report_dir=tmp_path,
         now_fn=_paper_session_now,
+        max_order_qty_per_order=1,
     )
 
     report = trader.run(
@@ -1961,6 +1962,7 @@ def test_paper_auto_caps_order_count_before_order_guard(tmp_path: Path) -> None:
         hot_runner=FakeMultiOrderHotRunner(),
         report_dir=tmp_path,
         now_fn=_paper_session_now,
+        max_order_qty_per_order=1,
     )
     trader._active_trade_universe = {  # noqa: SLF001
         "005930",
