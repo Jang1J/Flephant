@@ -378,7 +378,8 @@ def test_successful_mode_b_run_promotes_final_dataset_gate(monkeypatch, tmp_path
         encoding="utf-8",
     )
 
-    def fake_stage(stage, timeout):
+    def fake_stage(stage, timeout, retry_after_sec):
+        del retry_after_sec
         result = {"status": "PASS", "command": stage.command, "returncode": 0}
         if stage.name == "post_backfill_prelive":
             result["report_path"] = str(prelive_report)
@@ -489,7 +490,11 @@ def test_successful_data_run_without_prelive_blocks_ssot_promotion(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_run_stage",
-        lambda stage, timeout: {"status": "PASS", "command": stage.command, "returncode": 0},
+        lambda stage, timeout, retry_after_sec: {
+            "status": "PASS",
+            "command": stage.command,
+            "returncode": 0,
+        },
     )
 
     report = mod.run_update(

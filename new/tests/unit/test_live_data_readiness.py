@@ -202,8 +202,8 @@ def test_classify_exception_marks_dns_as_retryable():
 def test_dns_preflight_reports_retryable_resolution_failure(monkeypatch):
     readiness = _load_script_module()
 
-    def fake_getaddrinfo(host, port, sock_type=None):
-        del sock_type
+    def fake_getaddrinfo(host, port, type=None):
+        del type
         if host == "bad.example":
             raise readiness.socket.gaierror("nodename nor servname provided")
         return [(None, None, None, None, ("127.0.0.1", port))]
