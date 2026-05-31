@@ -36,6 +36,15 @@ def _empty_c12_metrics() -> dict[str, float]:
     }
 
 
+def _empty_daily_series() -> dict[str, Any]:
+    return {
+        "initial_capital": 0.0,
+        "daily_pnl": [],
+        "daily_returns": [],
+        "daily_equity": [],
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run C12 BacktestAgent for a Mode B candidate bundle",
@@ -117,6 +126,7 @@ def run_backtest(
             },
             "feature_quality": {},
             "folds": [],
+            **_empty_daily_series(),
             "error": str(e),
             "error_type": type(e).__name__,
         }

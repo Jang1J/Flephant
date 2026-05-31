@@ -802,7 +802,31 @@ def test_deterministic():
     # run_id / started_at / finished_at 제외
     assert result_a["metrics"] == result_b["metrics"], "metrics 불일치"
     assert result_a["daily_pnl"] == result_b["daily_pnl"], "daily_pnl 불일치"
+    assert result_a["daily_returns"] == result_b["daily_returns"], "daily_returns 불일치"
+    assert result_a["daily_equity"] == result_b["daily_equity"], "daily_equity 불일치"
     assert result_a["bar_count"] == result_b["bar_count"], "bar_count 불일치"
+
+
+def test_daily_series_matches_c12_sr_normalization():
+    """C12 daily_returns/equity는 daily_pnl + initial_capital에서 재구성 가능해야 한다."""
+    engine = _make_engine()
+    result = _run_engine(engine, universe=["005930", "000660"], date_range=_default_date_range(20))
+
+    initial_capital = float(result["initial_capital"])
+    daily_pnl = result["daily_pnl"]
+    daily_returns = result["daily_returns"]
+    daily_equity = result["daily_equity"]
+
+    assert initial_capital > 0.0
+    assert len(daily_pnl) == len(daily_returns) == len(daily_equity)
+    assert daily_returns == [pnl / initial_capital for pnl in daily_pnl]
+
+    equity = initial_capital
+    expected_equity = []
+    for pnl in daily_pnl:
+        equity += pnl
+        expected_equity.append(equity)
+    assert daily_equity == expected_equity
 
 
 # ────────────────────────────────────────────────────────────────────────

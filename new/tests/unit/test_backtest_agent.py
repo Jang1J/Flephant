@@ -56,7 +56,10 @@ def _make_engine_result(sr: float = 0.8, ic: float = 0.05) -> dict:
             "exogenous_rows": 100,
             "exogenous_non_neutral_rows": 80,
         },
+        "initial_capital": 100_000.0,
         "daily_pnl": [1000.0, -200.0, 500.0],
+        "daily_returns": [0.01, -0.002, 0.005],
+        "daily_equity": [101_000.0, 100_800.0, 101_300.0],
         "trade_log": [],
         "bar_count": 120,
     }
@@ -161,7 +164,8 @@ def test_backtest_agent_run_returns_c12_schema():
         "started_at", "completed_at", "verdict", "regression_severity",
         "regression_risk", "diagnostic_notes", "llm_reasoning_ref",
         "failure_case_cards", "regression_cases", "minute_bar_leakage_check",
-        "feature_quality",
+        "feature_quality", "initial_capital", "daily_pnl", "daily_returns",
+        "daily_equity",
     }
     missing = required_fields - set(result.keys())
     assert not missing, f"C12 필수 필드 누락: {missing}"
@@ -185,6 +189,10 @@ def test_backtest_agent_run_returns_c12_schema():
     assert isinstance(result["regression_cases"], list)
     assert result["feature_quality"]["dual_source_rows"] == 100
     assert result["feature_quality"]["exogenous_non_neutral_rows"] == 80
+    assert result["initial_capital"] == 100_000.0
+    assert result["daily_pnl"] == [1000.0, -200.0, 500.0]
+    assert result["daily_returns"] == [0.01, -0.002, 0.005]
+    assert result["daily_equity"] == [101_000.0, 100_800.0, 101_300.0]
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -240,6 +248,28 @@ def test_backtest_agent_run_handles_data_unavailable():
     assert isinstance(result["regression_risk"]["evidence"], list)
     assert result["minute_bar_leakage_check"]["verdict"] == "fail"
     assert result["feature_quality"] == {}
+    assert result["initial_capital"] == 0.0
+    assert result["daily_pnl"] == []
+    assert result["daily_returns"] == []
+    assert result["daily_equity"] == []
+
+
+def test_backtest_agent_unexpected_error_keeps_daily_series_schema():
+    """예상 밖 오류 fail-closed 경로도 C12 daily-series 필드를 유지한다."""
+    mock_engine = MagicMock()
+    mock_engine.run.side_effect = RuntimeError("boom")
+
+    agent = _make_agent(engine_mock=mock_engine)
+
+    with _mode_b_env():
+        with patch("src.agents.mode_b.backtest.config_load", side_effect=_config_load_with_real_universe()):
+            result = agent.run("BUNDLE-20260503-TESTTEST")
+
+    assert result["verdict"] == "fail"
+    assert result["initial_capital"] == 0.0
+    assert result["daily_pnl"] == []
+    assert result["daily_returns"] == []
+    assert result["daily_equity"] == []
 
 
 # ────────────────────────────────────────────────────────────────────────

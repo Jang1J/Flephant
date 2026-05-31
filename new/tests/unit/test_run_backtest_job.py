@@ -58,6 +58,10 @@ def test_run_backtest_fail_closed_on_agent_error(tmp_path):
     assert report["failure_case_cards"] == []
     assert report["regression_cases"] == []
     assert report["minute_bar_leakage_check"]["verdict"] == "fail"
+    assert report["initial_capital"] == 0.0
+    assert report["daily_pnl"] == []
+    assert report["daily_returns"] == []
+    assert report["daily_equity"] == []
 
 
 def test_main_returns_zero_only_for_pass(monkeypatch, tmp_path, capsys):

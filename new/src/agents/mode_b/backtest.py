@@ -12,7 +12,7 @@ from src.utils.config_loader import load as config_load
 from src.utils.id_factory import generate_backtest_id, generate_report_id
 from src.utils.logger import get_logger
 from src.utils.mode_guard import mode_b_only
-from src.utils.safe_cast import safe_bool, safe_int
+from src.utils.safe_cast import safe_bool, safe_float, safe_int
 
 logger = get_logger("backtest_agent")
 _KST = ZoneInfo("Asia/Seoul")
@@ -53,6 +53,16 @@ def _empty_metrics() -> dict[str, float]:
         "ir": 0.0,
         "mdd": 0.0,
         "sr": 0.0,
+    }
+
+
+def _empty_daily_series() -> dict[str, Any]:
+    """C12 daily-series fields are present even on fail-closed reports."""
+    return {
+        "initial_capital": 0.0,
+        "daily_pnl": [],
+        "daily_returns": [],
+        "daily_equity": [],
     }
 
 
@@ -97,6 +107,12 @@ class BacktestAgent(AgentBase):
             return self._engine
         from src.mode_b.validation_tools import BacktestEngine
         return BacktestEngine()
+
+    @staticmethod
+    def _normalize_float_series(values: Any) -> list[float]:
+        if not isinstance(values, list):
+            return []
+        return [safe_float(value, default=0.0) for value in values]
 
     def _check_forbidden_permissions(self) -> None:
         """C12 forbidden_permissions 6개 런타임 체크. Mode A 호출 차단."""
@@ -294,6 +310,7 @@ class BacktestAgent(AgentBase):
                 ),
                 "feature_quality": {},
                 "folds": [],
+                **_empty_daily_series(),
                 "error": str(e),
                 "error_code": getattr(e, "code", "UNKNOWN"),
             }
@@ -326,6 +343,7 @@ class BacktestAgent(AgentBase):
                 ),
                 "feature_quality": {},
                 "folds": [],
+                **_empty_daily_series(),
                 "error": str(e),
             }
             return self._attach_service_policy_evidence(report)
@@ -421,6 +439,18 @@ class BacktestAgent(AgentBase):
             "regression_cases": engine_result.get("regression_cases", []),
             "minute_bar_leakage_check": minute_bar_leakage_check,
             "feature_quality": engine_result.get("feature_quality", {}),
+            "initial_capital": safe_float(
+                engine_result.get("initial_capital"),
+                default=0.0,
+                min_value=0.0,
+            ),
+            "daily_pnl": self._normalize_float_series(engine_result.get("daily_pnl")),
+            "daily_returns": self._normalize_float_series(
+                engine_result.get("daily_returns")
+            ),
+            "daily_equity": self._normalize_float_series(
+                engine_result.get("daily_equity")
+            ),
             "service_policy_expected_date_range": engine_result.get(
                 "service_policy_expected_date_range",
                 {},

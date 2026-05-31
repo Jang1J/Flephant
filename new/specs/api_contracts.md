@@ -893,6 +893,10 @@ output:
       ir: "float"
       mdd: "float"
       sr: "float"
+    initial_capital: "float"             # C12 daily-series 기준 원금
+    daily_pnl: "[float]"                 # C13 aggregate daily dollar PnL, metrics SR/IR source
+    daily_returns: "[float]"             # daily_pnl / initial_capital, C12 DSR post-hoc input
+    daily_equity: "[float]"              # initial_capital + cumulative daily_pnl
     regime_breakdown:
       - regime: "bull|bear|sideways|volatile"
         sharpe: "float"
@@ -1069,7 +1073,10 @@ tools:
         ir: "float"
         mdd: "float"
         sr: "float"
+      initial_capital: "float"
       daily_pnl: "[float]"
+      daily_returns: "[float]"            # daily_pnl / initial_capital
+      daily_equity: "[float]"             # initial_capital + cumulative daily_pnl
       trade_log: "[{ticker, side, qty, price, ts, slippage}]"
       bar_count: "int"
     errors:

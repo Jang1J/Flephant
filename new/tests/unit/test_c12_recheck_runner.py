@@ -45,6 +45,10 @@ def test_c12_recheck_detects_current_embedded_schema(monkeypatch, tmp_path: Path
             "regression_risk": {"flagged": True, "severity": "high"},
             "minute_bar_leakage_check": {"verdict": "pass"},
             "feature_quality": {},
+            "initial_capital": 100_000.0,
+            "daily_pnl": [100.0],
+            "daily_returns": [0.001],
+            "daily_equity": [100_100.0],
             "service_policy_replay": {"status": "BLOCKED"},
         }),
         encoding="utf-8",
@@ -54,5 +58,6 @@ def test_c12_recheck_detects_current_embedded_schema(monkeypatch, tmp_path: Path
     report = mod.run_c12_recheck(bundle_id=bundle_id, run=False, write_report=False)
 
     assert report["latest_backtest"]["schema_current"] is True
+    assert report["latest_backtest"]["has_daily_series"] is True
     assert report["latest_backtest"]["deployable"] is False
     assert "c12_not_deployable" in report["blockers"]

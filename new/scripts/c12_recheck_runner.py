@@ -68,12 +68,19 @@ def _verify_backtest(bundle_id: str) -> dict[str, Any]:
             "schema_current": False,
             "deployable": False,
         }
+    daily_series_keys = {"initial_capital", "daily_pnl", "daily_returns", "daily_equity"}
+    schema_current = (
+        "feature_quality" in payload
+        and "service_policy_replay" in payload
+        and daily_series_keys.issubset(payload.keys())
+    )
     return {
         "status": "PASS" if prelive_gate._is_deployable_backtest_report(payload, bundle_id) else "BLOCKED",
         "report_path": prelive_gate._repo_relative(path),
-        "schema_current": "feature_quality" in payload and "service_policy_replay" in payload,
+        "schema_current": schema_current,
         "has_feature_quality": "feature_quality" in payload,
         "has_service_policy_replay": "service_policy_replay" in payload,
+        "has_daily_series": daily_series_keys.issubset(payload.keys()),
         "deployable": prelive_gate._is_deployable_backtest_report(payload, bundle_id),
         "verdict": payload.get("verdict"),
         "regression_risk": payload.get("regression_risk"),
