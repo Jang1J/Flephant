@@ -281,6 +281,14 @@ class BacktestEngine:
             daily_pnl.extend(fr["daily_pnl"])
             trade_log.extend(fr["trade_log"])
             bar_count += fr["bar_count"]
+        daily_returns = self._daily_returns_from_pnl(
+            daily_pnl,
+            initial_capital=self._initial_capital,
+        )
+        daily_equity = self._daily_equity_from_pnl(
+            daily_pnl,
+            initial_capital=self._initial_capital,
+        )
         backtest_data_sources = sorted(
             {str(fr.get("data_source", "synthetic_simulator")) for fr in fold_results}
         )
@@ -360,7 +368,10 @@ class BacktestEngine:
             "started_at": started_at,
             "finished_at": finished_at,
             "metrics": metrics,
+            "initial_capital": self._initial_capital,
             "daily_pnl": daily_pnl,
+            "daily_returns": daily_returns,
+            "daily_equity": daily_equity,
             "trade_log": trade_log,
             "bar_count": bar_count,
             "regression_evidence": regression_evidence,
@@ -880,6 +891,28 @@ class BacktestEngine:
             daily_pnl.append(equity - previous_equity)
             previous_equity = equity
         return daily_pnl or [0.0]
+
+    @staticmethod
+    def _daily_returns_from_pnl(
+        daily_pnl: list[float],
+        *,
+        initial_capital: float,
+    ) -> list[float]:
+        capital = max(float(initial_capital), 1.0)
+        return [float(pnl) / capital for pnl in daily_pnl]
+
+    @staticmethod
+    def _daily_equity_from_pnl(
+        daily_pnl: list[float],
+        *,
+        initial_capital: float,
+    ) -> list[float]:
+        equity = max(float(initial_capital), 1.0)
+        curve: list[float] = []
+        for pnl in daily_pnl:
+            equity += float(pnl)
+            curve.append(equity)
+        return curve
 
     def _run_single_fold_real_bars(
         self,
