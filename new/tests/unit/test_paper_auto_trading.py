@@ -2921,6 +2921,17 @@ def test_paper_auto_cli_maps_kis_profile_and_policy_overrides(
 ) -> None:
     script = _load_paper_auto_trade_script()
     calls: dict[str, Any] = {}
+    mapped_env_keys = [
+        "KIS_PAPER_APP_KEY",
+        "KIS_PAPER_APP_SECRET",
+        "KIS_PAPER_ACCOUNT_NUMBER",
+        "KIS_PAPER_ACCOUNT_PRODUCT_CODE",
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NUMBER",
+        "KIS_ACCOUNT_PRODUCT_CODE",
+    ]
+    previous_env = {key: script.os.environ.get(key) for key in mapped_env_keys}
 
     monkeypatch.setattr(
         script,
@@ -2950,28 +2961,35 @@ def test_paper_auto_cli_maps_kis_profile_and_policy_overrides(
 
     monkeypatch.setattr(script, "PaperAutoTrader", FakeTrader)
 
-    rc = script.main([
-        "--tickers",
-        "005930",
-        "--bundle-id",
-        "BUNDLE-TEST",
-        "--confirm-phrase",
-        "PAPER_AUTO_OK",
-        "--kis-profile",
-        "ACTIVE_SMALL",
-        "--max-orders-per-cycle",
-        "4",
-        "--max-order-qty-per-order",
-        "1",
-        "--shadow-only",
-        "--no-write-report",
-    ])
+    try:
+        rc = script.main([
+            "--tickers",
+            "005930",
+            "--bundle-id",
+            "BUNDLE-TEST",
+            "--confirm-phrase",
+            "PAPER_AUTO_OK",
+            "--kis-profile",
+            "ACTIVE_SMALL",
+            "--max-orders-per-cycle",
+            "4",
+            "--max-order-qty-per-order",
+            "1",
+            "--shadow-only",
+            "--no-write-report",
+        ])
 
-    assert rc == 0
-    assert calls["init"]["track_id"] == "ACTIVE_SMALL"
-    assert calls["init"]["max_orders_per_cycle"] == 4
-    assert calls["init"]["max_order_qty_per_order"] == 1
-    assert calls["init"]["submit_orders"] is False
-    assert script.os.environ["KIS_PAPER_ACCOUNT_NUMBER"] == "12345678"
-    out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "PASS"
+        assert rc == 0
+        assert calls["init"]["track_id"] == "ACTIVE_SMALL"
+        assert calls["init"]["max_orders_per_cycle"] == 4
+        assert calls["init"]["max_order_qty_per_order"] == 1
+        assert calls["init"]["submit_orders"] is False
+        assert script.os.environ["KIS_PAPER_ACCOUNT_NUMBER"] == "12345678"
+        out = json.loads(capsys.readouterr().out)
+        assert out["status"] == "PASS"
+    finally:
+        for key, value in previous_env.items():
+            if value is None:
+                script.os.environ.pop(key, None)
+            else:
+                script.os.environ[key] = value
