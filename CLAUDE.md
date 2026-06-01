@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트).
 장중 매 1분 퀀트 시그널 + 이벤트 시 LLM 에이전트 개입 + 장마감 후 자동 진화.
 
-현재 단계 (2026-05-21 15:35): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 non-live/paper-safe 경로 진행 중. `BUNDLE-20260518-195M0001` 기준 C12/backtest + service-policy + deploy dry-run + service readiness PASS. 장중 KIS virtual paper-auto 최신 PASS evidence는 `paper_auto_service_rehearsal_20260521_135439.json` (cold-risk report `community_live_risk_smoke_20260521_133807.json` 주입, warning_count=50, balance/reconciliation/probe/order-history/paper_auto_cycle PASS). 이후 14시대 10-cycle rehearsal은 KIS virtual host DNS/네트워크 장애로 최종 report 작성 전 중단됐으므로 PASS evidence로 사용 금지. 15:25 balance-only recovery PASS: `paper_trading_balance_reconciliation_20260521_152551.json`, positions `000660=4`, `005930=83`, `042700=14`, `058470=18`, `403870=18`, KIS virtual + live_enabled=false. `BUNDLE-20260520-FW249NDS`는 C12/service-policy/deploy dry-run은 PASS지만 prelive target `20260520`에서 BLOCKED: staged model metadata `train_end=20260515`, broker evidence bundle mismatch. 즉 최신 post-close final bundle은 아직 미확정이다. 18:05 KST heartbeat `resume-post-close-gates`로 post-close 재개 예약됨. BE는 read-only + paper-safe 연결 시도 가능. latest/champion 표시, order action, live action은 금지. 운영 baseline은 `249d expanding/fixed-from-anchor + OHLCV+Exog+News_DS(news_score_t only)`, community는 live Cold Path risk sidecar로 유지한다. production registry `active_version=null` + `live_trading_allowed=false` 유지.
+현재 단계 (2026-06-01 KST): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 non-live/paper-safe 경로 진행 중. `ai-1` 운영 baseline = `f2d2ebf` (#22 gRPC reason/universe + #23 C12 daily-series + #24 stale-test sync merge 완료). 열린 PR 없음. 2026-06-01 실제 raw archive 기반 Dual-Source 생성 + 30종목 KIS bars → Quant score 30개 → PPO Top-10 recommendation PASS. 현재 주간 목표는 BE 연결 live reliability pilot 준비이며, 우선순위는 operating path 정렬, 1분 cadence 병목(rolling/incremental bars cache), 4-gate/prelive evidence다. production registry `active_version=null` + `live_trading_allowed=false` 유지. `.env`는 사용자 승인 하 one-shot subshell source만 가능하며 원문 출력/저장 금지. 세부 최신 상태는 `PROGRESS.md` 상단 snapshot + 최신 세션 로그를 정본으로 본다.
 
 ## 파이프라인 v3 (2모드 × 5레이어)
 
@@ -160,13 +160,13 @@ Pre-Live Gate (Phase 3, 진행 중):
 
 ## 세션 운영
 
-- 세션 시작: `claude-progress.md` + `Codex-progress.md` (Codex 병행 시 최신 헤더 필수) + `feature_list.json` + `.claude/preamble/_elephant_preamble.md` 본문 Read
+- 세션 시작: `PROGRESS.md` (Claude+Codex 단일 공유 handoff, 상단 현재 snapshot + 최신 세션 로그) + `feature_list.json` + `.claude/preamble/_elephant_preamble.md` 본문 Read
 - 코드 전 상태 확인. 코딩부터 하지 않기. unrelated 전환 시 `/clear`
-- 세션 끝에 `claude-progress.md`에 done/next/blockers
+- 세션 끝에 `PROGRESS.md`에 done/next/blockers (헤더에 `[Claude]` 태그)
 - 실데이터 smoke: `.env` 사용자 승인 후 서브셸에서만 source. 키 원문 출력/저장 금지
 - 4-yes check (`rules/cross-check.md §4`): "Critical 0건" 표기는 격리 / subprocess / canonical env Full PASS / 외부 cross-check 4개 모두 yes일 때만 허용
-- Canonical env: `/opt/anaconda3/envs/elephant/bin/python` (numpy 1.26.4 / lightgbm 4.6.0 / SB3). 최신 세션에서는 focused paper/service tests `35 passed`, 5/21 readiness/deploy no-write PASS. 더 큰 regression 기준은 `Codex-progress.md` 최신 헤더를 우선한다.
+- Canonical env: `/opt/anaconda3/envs/elephant/bin/python` (numpy 1.26.4 / lightgbm 4.6.0 / SB3). 최신 세션에서는 focused paper/service tests `35 passed`, 5/21 readiness/deploy no-write PASS. 더 큰 regression 기준은 `PROGRESS.md` 최신 로그를 우선한다.
 - 현재 협업 기준 branch: `ai-1`. 최신 확인 head는 `b85e29c fix(mode-b): service-policy evidence gate hardening`.
 - PR #6 merge 반영 완료: `7372bf3 merge: PR #6 service-policy evidence gate 검증 추가`. deployer/scheduler service-policy evidence gate는 expected date range/universe binding 기준으로 hardening.
-- 개인 progress 파일(`Codex-progress.md`, `claude-progress.md`, `feature_list.json`)은 local handoff SSOT 성격이 강하다. 커밋/공유 여부는 사용자 지시에 따른다.
+- 공유 progress 파일(`PROGRESS.md`, `feature_list.json`)은 local handoff SSOT다 (`claude-progress.md`/`Codex-progress.md`는 2026-05-29 PROGRESS.md로 통합, 이제 redirect stub). 커밋/공유 여부는 사용자 지시에 따른다.
 - BE 연결은 read-only + paper-safe 범위만 허용. live trading enable, production registry mutation, 실계좌 주문 UI는 계속 금지.
