@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -241,6 +243,25 @@ class IncrementalPaperKIS(FakePaperKIS):
             }
             for i in range(n_bars)
         ]
+
+
+class ConcurrentPaperKIS(FakePaperKIS):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.02)
+            return super().inquire_minute_bar(ticker, n_bars)
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 class LateSessionPaperKIS(FakePaperKIS):
@@ -1216,6 +1237,29 @@ def test_paper_auto_fetch_recent_bars_uses_incremental_cache_after_warmup(
     assert cache_meta["tickers"]["005930"]["fetch_policy"] == "incremental"
 
 
+def test_paper_auto_fetch_recent_bars_uses_configured_parallel_cache(
+    tmp_path: Path,
+) -> None:
+    client = ConcurrentPaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._cfg["historical_warmup_topup"] = {"enabled": False}  # noqa: SLF001
+
+    bars = trader._fetch_recent_bars(  # noqa: SLF001
+        ["005930", "000660", "035420"],
+        asof="2026-05-12T09:59:00+09:00",
+    )
+
+    assert set(bars) == {"005930", "000660", "035420"}
+    assert client.max_active > 1
+    cache_meta = trader._last_bar_fetch_metadata["minute_bar_window_cache"]  # noqa: SLF001
+    assert cache_meta["parallel_fetch_workers"] == 10
+
+
 def test_paper_auto_non_contiguous_window_is_not_topped_up_into_pass(
     tmp_path: Path,
 ) -> None:
@@ -1231,7 +1275,7 @@ def test_paper_auto_non_contiguous_window_is_not_topped_up_into_pass(
         kis_client=client,
         hot_runner=hot_runner,
         report_dir=tmp_path,
-        now_fn=lambda: datetime(2026, 5, 12, 10, 1, 50, tzinfo=_KST),
+        now_fn=lambda: datetime(2026, 5, 12, 10, 2, 50, tzinfo=_KST),
     )
     trader._cfg["historical_warmup_topup"] = {  # noqa: SLF001
         "enabled": True,

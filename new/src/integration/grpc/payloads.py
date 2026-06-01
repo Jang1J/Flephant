@@ -465,11 +465,15 @@ def build_recommendations_payload(
 
     if bar_errors:
         diagnostics["bar_errors"] = bar_errors
-    if bar_errors and len(bar_errors) == len(selected_tickers):
+    if bar_errors:
         return _recommendation_blocked_payload(
             request_id=response_request_id,
             bundle_id=response_bundle_id,
-            reason="minute_bars_unavailable",
+            reason=(
+                "minute_bars_unavailable"
+                if len(bar_errors) == len(selected_tickers)
+                else "partial_minute_bars_unavailable"
+            ),
             asof=resolved_asof,
             model_version=model_version,
             diagnostics=diagnostics,

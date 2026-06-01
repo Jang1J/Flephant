@@ -379,6 +379,11 @@ class MinuteBarWindowCache:
         accepted: list[dict[str, Any]] = []
         future_rows: list[dict[str, str]] = []
         invalid_rows: list[dict[str, str]] = []
+        forming_rows: list[dict[str, str]] = []
+        forming_cutoff = asof_ts.replace(second=0, microsecond=0)
+        filter_forming_minute = (
+            asof_ts.second > 0 or asof_ts.microsecond > 0
+        )
         for row in rows:
             if not isinstance(row, dict):
                 invalid_rows.append({"ticker": ticker, "ts_close": "non_dict_bar"})
@@ -394,10 +399,19 @@ class MinuteBarWindowCache:
             if parsed > asof_ts:
                 future_rows.append({"ticker": ticker, "ts_close": raw_ts})
                 continue
+            if (
+                filter_forming_minute
+                and parsed.date() == asof_ts.date()
+                and parsed >= forming_cutoff
+            ):
+                forming_rows.append({"ticker": ticker, "ts_close": raw_ts})
+                continue
             accepted.append(normalized)
         return accepted, {
             "future_bar_filtered_count": len(future_rows),
             "future_bar_filtered_rows": future_rows[:10],
+            "forming_bar_filtered_count": len(forming_rows),
+            "forming_bar_filtered_rows": forming_rows[:10],
             "invalid_rows": invalid_rows[:10],
         }
 
