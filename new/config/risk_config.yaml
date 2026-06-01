@@ -149,7 +149,6 @@ paper_auto_trading:
   default_max_cycles: 390
   default_interval_sec: 60
   max_tickers: 30
-  minute_bar_parallel_fetch_workers: 10
   max_orders_per_cycle: 3
   max_order_qty_per_order: 2
   max_order_qty_per_order_prelive_cap: 2
@@ -196,7 +195,6 @@ minute_bar_window_cache:
   expected_bar_interval_sec: 60
   max_contiguity_gap_sec: 60
   force_cold_on_session_date_change: true
-  batch_fetch_budget_sec: 45
   rationale: "Mode A 1분 cadence용 KIS minute-bar rolling cache. cold는 quant_agent.warmup_bars+1, 이후 tail 6개만 fetch한다. freshness/gap/session 경계는 fail-closed 또는 cold refetch."
 
 mode_b_deploy:
