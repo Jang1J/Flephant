@@ -42,6 +42,7 @@ def _config(
     expected_bar_interval_sec: int = 60,
     max_contiguity_gap_sec: int = 60,
     parallel_fetch_workers: int = 1,
+    batch_fetch_budget_sec: float = 45.0,
 ) -> MinuteBarWindowCacheConfig:
     return MinuteBarWindowCacheConfig(
         window_size=window_size,
@@ -52,6 +53,7 @@ def _config(
         max_contiguity_gap_sec=max_contiguity_gap_sec,
         force_cold_on_session_date_change=True,
         parallel_fetch_workers=parallel_fetch_workers,
+        batch_fetch_budget_sec=batch_fetch_budget_sec,
     )
 
 
@@ -86,6 +88,24 @@ class ConcurrentMinuteClient:
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class DelayedMinuteClient:
+    def __init__(
+        self,
+        responses: dict[str, list[dict[str, Any]]],
+        delays: dict[str, float],
+    ) -> None:
+        self.responses = responses
+        self.delays = delays
+        self.calls: list[tuple[str, int]] = []
+        self._lock = threading.Lock()
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict[str, Any]]:
+        with self._lock:
+            self.calls.append((ticker, n_bars))
+        time.sleep(float(self.delays.get(ticker, 0.0)))
+        return list(self.responses.get(ticker, []))
 
 
 def test_cold_fetches_warmup_then_incremental_tail_only() -> None:
@@ -135,6 +155,43 @@ def test_parallel_workers_fetch_ticker_windows_without_changing_ordered_output()
     }
     assert list(result.windows) == ["005930", "000660", "035420"]
     assert result.metadata["parallel_fetch_workers"] == 3
+
+
+def test_parallel_batch_timeout_fails_slow_ticker_without_late_cache_write() -> None:
+    start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
+    client = DelayedMinuteClient(
+        responses={
+            "005930": _bars("005930", start, 61, close_base=100.0),
+            "000660": _bars("000660", start, 61, close_base=200.0),
+        },
+        delays={"005930": 0.0, "000660": 0.20},
+    )
+    cache = MinuteBarWindowCache(
+        client,
+        _config(
+            parallel_fetch_workers=2,
+            batch_fetch_budget_sec=0.05,
+        ),
+    )
+
+    started = time.perf_counter()
+    result = cache.get_windows(
+        ["005930", "000660"],
+        asof="2026-06-01T09:59:00+09:00",
+        min_bars=60,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.18
+    assert result.status == "PARTIAL"
+    assert set(result.windows) == {"005930"}
+    assert result.metadata["failed_tickers"] == {"000660": "fetch_timeout"}
+    assert result.metadata["tickers"]["000660"]["timeout_sec"] == 0.05
+
+    # The slow worker may finish after the parent returns; it must not seed cache.
+    time.sleep(0.25)
+    with cache._lock:
+        assert "000660" not in cache._windows
 
 
 def test_current_forming_minute_is_filtered_when_asof_has_seconds() -> None:
