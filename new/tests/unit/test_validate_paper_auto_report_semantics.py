@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -472,6 +473,174 @@ def test_paper_auto_semantics_recursively_includes_track_reports(
     assert report["reports"][0]["path"].endswith(
         "MAIN_BASELINE/paper_auto_trade_20260526_115108.json"
     )
+
+
+def _strict_cadence_cycle(
+    *,
+    cycle_index: int,
+    started_at: str,
+    fetch_policy: str,
+    fetch_n: int,
+    failed_tickers: dict[str, str] | None = None,
+) -> dict:
+    tickers = {
+        f"{idx:06d}": {
+            "fetch_policy": fetch_policy,
+            "fetch_n": fetch_n,
+            "reason": "ok",
+        }
+        for idx in range(1, 31)
+    }
+    return {
+        "status": "PASS",
+        "cycle_index": cycle_index,
+        "started_at": started_at,
+        "order_guard": {"status": "SKIP", "reason": "no_order_deltas"},
+        "execution": None,
+        "hot_path_bar_readiness": {
+            "status": "PASS",
+            "required_bars": 60,
+            "rows_by_ticker": {ticker: 60 for ticker in tickers},
+            "missing_bars_by_ticker": {},
+            "latest_bar_ts_by_ticker": {},
+            "future_rows": [],
+            "invalid_rows": [],
+            "stale_rows": [],
+            "contiguity_gaps": [],
+            "bar_warmup_topup": {
+                "minute_bar_window_cache": {
+                    "status": "PASS",
+                    "reason": "ok",
+                    "tickers": tickers,
+                    "failed_tickers": failed_tickers or {},
+                }
+            },
+        },
+        "hot_result": {
+            "quant_output": {
+                "mode": "active",
+                "scores": {"000001": 0.1, "000002": 0.2},
+            },
+            "final_decision": {"order_deltas": []},
+        },
+    }
+
+
+def test_paper_auto_semantics_strict_cadence_passes_clean_incremental_report(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading" / "DCD"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "paper_auto_trade_20260602_090300.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-06-02T09:03:00+09:00",
+                "runtime": {
+                    "kis_mode": "virtual",
+                    "live_enabled": False,
+                    "broker_submit_enabled": False,
+                    "shadow_only": True,
+                },
+                "params": {"required_bundle_id": "BUNDLE-TEST"},
+                "stages": {
+                    "cycles": {
+                        "items": [
+                            _strict_cadence_cycle(
+                                cycle_index=0,
+                                started_at="2026-06-02T09:00:05+09:00",
+                                fetch_policy="cold",
+                                fetch_n=61,
+                            ),
+                            _strict_cadence_cycle(
+                                cycle_index=1,
+                                started_at="2026-06-02T09:01:04+09:00",
+                                fetch_policy="incremental",
+                                fetch_n=6,
+                            ),
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260602",
+        strict_cadence=True,
+        require_shadow_only=True,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["reports"][0]["cadence"]["runtime_checks"]["shadow_only"] is True
+    assert report["reports"][0]["cadence"]["start_gaps_sec"] == [59.0]
+    assert report["reports"][0]["cadence"]["blockers"] == []
+
+
+def test_paper_auto_semantics_strict_cadence_blocks_cache_timeout_and_slow_gap(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "paper_auto_trade_20260602_090500.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-06-02T09:05:00+09:00",
+                "runtime": {
+                    "kis_mode": "virtual",
+                    "live_enabled": False,
+                    "broker_submit_enabled": False,
+                    "shadow_only": True,
+                },
+                "params": {"required_bundle_id": "BUNDLE-TEST"},
+                "stages": {
+                    "cycles": {
+                        "items": [
+                            _strict_cadence_cycle(
+                                cycle_index=0,
+                                started_at="2026-06-02T09:00:05+09:00",
+                                fetch_policy="cold",
+                                fetch_n=61,
+                            ),
+                            _strict_cadence_cycle(
+                                cycle_index=1,
+                                started_at="2026-06-02T09:01:40+09:00",
+                                fetch_policy="incremental",
+                                fetch_n=6,
+                                failed_tickers={"000001": "fetch_timeout"},
+                            ),
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260602",
+        strict_cadence=True,
+        require_shadow_only=True,
+    )
+
+    blockers = report["failures"][0]["blockers"]
+    assert report["status"] == "BLOCKED"
+    assert "cadence_cycle_1_cache_failed_tickers" in blockers
+    assert "cadence_cycle_1_fetch_timeout" in blockers
+    assert "cadence_cycle_start_gap_exceeds_limit" in blockers
 
 
 def test_paper_auto_semantics_blocks_when_generated_date_has_no_reports(
