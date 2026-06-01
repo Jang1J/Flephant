@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -101,6 +101,7 @@ class FakePaperKIS:
         }
 
     def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        start = datetime(2026, 5, 12, 9, 0, tzinfo=_KST)
         return [
             {
                 "ticker": ticker,
@@ -109,7 +110,7 @@ class FakePaperKIS:
                 "low": 69900 + i,
                 "close": 70000 + i,
                 "volume": 1000 + i,
-                "ts_close": f"2026-05-12T09:{i % 60:02d}:00+09:00",
+                "ts_close": (start + timedelta(minutes=i)).isoformat(),
             }
             for i in range(n_bars)
         ]
@@ -207,7 +208,7 @@ class InvalidTimestampPaperKIS(FakePaperKIS):
 
 class FutureTimestampPaperKIS(FakePaperKIS):
     def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
-        bars = super().inquire_minute_bar(ticker, n_bars)
+        bars = super().inquire_minute_bar(ticker, 60)
         bars[-1]["ts_close"] = "2026-05-26T10:01:00+09:00"
         return bars
 
@@ -217,6 +218,72 @@ class ShortWindowFutureTimestampPaperKIS(ShortWindowPaperKIS):
         bars = super().inquire_minute_bar(ticker, n_bars)
         bars[-1]["ts_close"] = "2026-05-26T10:01:00+09:00"
         return bars
+
+
+class IncrementalPaperKIS(FakePaperKIS):
+    def __init__(self) -> None:
+        super().__init__()
+        self.minute_calls: list[tuple[str, int]] = []
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        self.minute_calls.append((ticker, n_bars))
+        if n_bars >= 60:
+            return super().inquire_minute_bar(ticker, n_bars)
+        return [
+            {
+                "ticker": ticker,
+                "open": 80000 + i,
+                "high": 80100 + i,
+                "low": 79900 + i,
+                "close": 80000 + i,
+                "volume": 2000 + i,
+                "ts_close": f"2026-05-12T10:{i:02d}:00+09:00",
+            }
+            for i in range(n_bars)
+        ]
+
+
+class LateSessionPaperKIS(FakePaperKIS):
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "ticker": ticker,
+                "open": 70000 + i,
+                "high": 70100 + i,
+                "low": 69900 + i,
+                "close": 70000 + i,
+                "volume": 1000 + i,
+                "ts_close": f"2026-05-12T14:{30 + i:02d}:00+09:00"
+                if i < 30
+                else f"2026-05-12T15:{i - 30:02d}:00+09:00",
+            }
+            for i in range(n_bars)
+        ]
+
+
+class HoleWindowPaperKIS(FakePaperKIS):
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for minute in range(1, 60):
+            rows.append({
+                "ticker": ticker,
+                "open": 70000 + minute,
+                "high": 70100 + minute,
+                "low": 69900 + minute,
+                "close": 70000 + minute,
+                "volume": 1000 + minute,
+                "ts_close": f"2026-05-12T09:{minute:02d}:00+09:00",
+            })
+        rows.append({
+            "ticker": ticker,
+            "open": 80001,
+            "high": 80101,
+            "low": 79901,
+            "close": 80001,
+            "volume": 2001,
+            "ts_close": "2026-05-12T10:01:00+09:00",
+        })
+        return rows
 
 
 class FakeRealKIS(FakePaperKIS):
@@ -826,7 +893,7 @@ def test_paper_auto_tops_up_short_kis_window_with_past_artifact_bars(
 
     bars = trader._fetch_recent_bars(  # noqa: SLF001
         ["005930"],
-        asof="2026-05-26T10:00:00+09:00",
+        asof="2026-05-26T09:30:00+09:00",
     )["005930"]
 
     assert len(bars) == 60
@@ -870,7 +937,7 @@ def test_paper_auto_topup_continues_when_latest_file_is_cutoff_filtered(
 
     bars = trader._fetch_recent_bars(  # noqa: SLF001
         ["005930"],
-        asof="2026-05-26T10:00:00+09:00",
+        asof="2026-05-26T09:30:00+09:00",
     )["005930"]
 
     assert len(bars) == 60
@@ -963,22 +1030,16 @@ def test_paper_auto_executes_paper_order(tmp_path: Path) -> None:
     assert cycle["hot_path_bar_readiness"]["status"] == "PASS"
     assert cycle["hot_path_bar_readiness"]["required_bars"] == 60
     assert cycle["hot_path_bar_readiness"]["rows_by_ticker"] == {"005930": 60}
-    assert cycle["hot_path_bar_readiness"]["bar_warmup_topup"]["tickers"]["005930"] == {
-        "raw_live_bar_count": 60,
-        "live_bar_count": 60,
-        "future_bar_filtered_count": 0,
-        "future_bar_filtered_rows": [],
-        "historical_topup_count": 0,
-        "final_bar_count": 60,
-        "topup_needed": False,
-        "topup_applied": False,
-        "topup_enabled": False,
-        "cutoff_ts": None,
-        "files_scanned": [],
-        "files_used": [],
-        "max_files_per_ticker": None,
-        "reason": "live_window_sufficient",
-    }
+    ticker_meta = cycle["hot_path_bar_readiness"]["bar_warmup_topup"]["tickers"]["005930"]
+    assert ticker_meta["raw_live_bar_count"] == 61
+    assert ticker_meta["live_bar_count"] == 60
+    assert ticker_meta["future_bar_filtered_count"] == 0
+    assert ticker_meta["historical_topup_count"] == 0
+    assert ticker_meta["final_bar_count"] == 60
+    assert ticker_meta["topup_needed"] is False
+    assert ticker_meta["topup_applied"] is False
+    assert ticker_meta["topup_enabled"] is False
+    assert ticker_meta["reason"] == "live_window_sufficient"
     assert cycle["broker_order_submitted"] is True
     assert cycle["submitted_order_deltas"][0]["ticker"] == "005930"
     assert cycle["execution"]["execution_report"]["execution_mode"] == "paper"
@@ -1000,7 +1061,7 @@ def test_paper_auto_fails_closed_when_bar_readiness_missing(tmp_path: Path) -> N
         kis_client=client,
         hot_runner=hot_runner,
         report_dir=tmp_path,
-        now_fn=lambda: datetime(2026, 5, 26, 10, 0, tzinfo=_KST),
+        now_fn=lambda: datetime(2026, 5, 26, 9, 30, tzinfo=_KST),
     )
     trader._cfg["historical_warmup_topup"] = {"enabled": False}  # noqa: SLF001
 
@@ -1060,7 +1121,7 @@ def test_paper_auto_filters_future_live_bar_and_fails_closed_if_still_short(
         kis_client=client,
         hot_runner=hot_runner,
         report_dir=tmp_path,
-        now_fn=lambda: datetime(2026, 5, 26, 10, 0, tzinfo=_KST),
+        now_fn=_paper_session_now,
     )
     trader._cfg["historical_warmup_topup"] = {"enabled": False}  # noqa: SLF001
 
@@ -1097,7 +1158,7 @@ def test_paper_auto_tops_up_after_filtering_future_live_bar(tmp_path: Path) -> N
         kis_client=client,
         hot_runner=FakeHotRunner(),
         report_dir=tmp_path,
-        now_fn=lambda: datetime(2026, 5, 26, 10, 0, tzinfo=_KST),
+        now_fn=lambda: datetime(2026, 5, 26, 9, 30, tzinfo=_KST),
     )
     trader._cfg["historical_warmup_topup"] = {  # noqa: SLF001
         "enabled": True,
@@ -1126,6 +1187,76 @@ def test_paper_auto_tops_up_after_filtering_future_live_bar(tmp_path: Path) -> N
     assert topup_meta["historical_topup_rows_by_ticker"] == {"005930": 31}
     assert topup_meta["tickers"]["005930"]["future_bar_filtered_count"] == 1
     assert client.orders
+
+
+def test_paper_auto_fetch_recent_bars_uses_incremental_cache_after_warmup(
+    tmp_path: Path,
+) -> None:
+    client = IncrementalPaperKIS()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=FakeHotRunner(),
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+
+    first = trader._fetch_recent_bars(  # noqa: SLF001
+        ["005930"],
+        asof="2026-05-12T09:59:00+09:00",
+    )
+    second = trader._fetch_recent_bars(  # noqa: SLF001
+        ["005930"],
+        asof="2026-05-12T10:01:00+09:00",
+    )
+
+    assert len(first["005930"]) == 60
+    assert len(second["005930"]) == 60
+    assert client.minute_calls == [("005930", 61), ("005930", 6)]
+    cache_meta = trader._last_bar_fetch_metadata["minute_bar_window_cache"]  # noqa: SLF001
+    assert cache_meta["tickers"]["005930"]["fetch_policy"] == "incremental"
+
+
+def test_paper_auto_non_contiguous_window_is_not_topped_up_into_pass(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _write_warmup_parquet(
+        data_dir / "005930" / "bars_1m_20260509.parquet",
+        "005930",
+        rows=60,
+    )
+    client = HoleWindowPaperKIS()
+    hot_runner = FakeHotRunner()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=lambda: datetime(2026, 5, 12, 10, 1, 50, tzinfo=_KST),
+    )
+    trader._cfg["historical_warmup_topup"] = {  # noqa: SLF001
+        "enabled": True,
+        "data_dir": str(data_dir),
+        "max_files_per_ticker": 1,
+    }
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["reason"] == "hot_path_bar_readiness"
+    readiness = cycle["hot_path_bar_readiness"]
+    assert readiness["contiguity_gaps"]
+    topup_meta = readiness["bar_warmup_topup"]["tickers"]["005930"]
+    assert topup_meta["reason"] == "non_contiguous_window"
+    assert topup_meta["historical_topup_count"] == 0
+    assert hot_runner.start_calls == 0
+    assert client.orders == []
 
 
 def test_paper_auto_shadow_only_does_not_submit_broker_order(tmp_path: Path) -> None:
@@ -1569,7 +1700,7 @@ def test_paper_auto_respects_active_kill_switch(tmp_path: Path) -> None:
 
 
 def test_paper_auto_checks_market_session_each_cycle(tmp_path: Path) -> None:
-    client = FakePaperKIS()
+    client = LateSessionPaperKIS()
     times = iter([
         datetime(2026, 5, 12, 15, 29, tzinfo=_KST),
         datetime(2026, 5, 12, 15, 29, tzinfo=_KST),

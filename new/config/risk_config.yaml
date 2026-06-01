@@ -185,6 +185,15 @@ grpc_recommendations:
   expected_return_unavailable_reason: "expected_return_unavailable_not_calibrated"
   reason_ko_template: "{stock_name}({ticker})는 현재 1분봉 기반 랭킹 모델 score가 후보군 중 {ranking}위로 산출되어 추천 목록에 포함됐습니다. 이 score는 보정된 기대수익률이 아니며, 주문 권고가 아닌 참고용 신호입니다. 위험도 표시는 {risk_level_ko}입니다."
 
+minute_bar_window_cache:
+  incremental_fetch_bars: 6
+  freshness_max_lag_sec: 120
+  gap_refetch_sec: 300
+  expected_bar_interval_sec: 60
+  max_contiguity_gap_sec: 60
+  force_cold_on_session_date_change: true
+  rationale: "Mode A 1분 cadence용 KIS minute-bar rolling cache. cold는 quant_agent.warmup_bars+1, 이후 tail 6개만 fetch한다. freshness/gap/session 경계는 fail-closed 또는 cold refetch."
+
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"
   confirm_deploy_phrase: "DEPLOY_CANDIDATE_OK"

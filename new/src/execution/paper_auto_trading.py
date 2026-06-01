@@ -16,6 +16,10 @@ from zoneinfo import ZoneInfo
 
 from src.agents.hot.quant import QuantAgent
 from src.connectors.kis_rest import KISAPIError, KISRestClient
+from src.data.minute_bar_window_cache import (
+    MinuteBarWindowCache,
+    load_minute_bar_window_cache_config,
+)
 from src.data.dual_source_runner import load_latest_scores
 from src.execution.execution_gateway import ExecutionGateway
 from src.execution.kill_switch import KillSwitch
@@ -54,6 +58,7 @@ class PaperAutoTrader:
         max_orders_per_cycle: int | None = None,
         max_order_qty_per_order: int | None = None,
         submit_orders: bool = True,
+        minute_bar_cache: MinuteBarWindowCache | None = None,
     ) -> None:
         self._cfg = config_load("risk_config.yaml", "paper_auto_trading")
         default_report_dir = Path(str(self._cfg["report_dir"]))
@@ -156,6 +161,11 @@ class PaperAutoTrader:
         self._consecutive_read_errors = 0
         self._run_guard_passed = False
         self._last_bar_fetch_metadata: dict[str, Any] = {}
+        self._minute_bar_cache = minute_bar_cache or MinuteBarWindowCache(
+            self._kis_client,
+            load_minute_bar_window_cache_config(window_size=self._required_warmup_bars()),
+            now_fn=self._now_kst,
+        )
 
     def _on_run_preflight_passed(self, report: dict[str, Any]) -> None:
         """Hook for wrappers after run-level guards pass and before cycles."""
@@ -850,21 +860,55 @@ class PaperAutoTrader:
             "topup_file_scan_count_by_ticker": {},
             "tickers": {},
         }
+        cache_result = self._minute_bar_cache.get_windows(
+            tickers,
+            asof=asof or self._now_kst().isoformat(),
+            min_bars=None,
+        )
+        cache_meta = cache_result.metadata
+        metadata["minute_bar_window_cache"] = cache_meta
+        stale_or_invalid_reasons = {
+            str(ticker): str(reason)
+            for ticker, reason in cache_meta.get("failed_tickers", {}).items()
+            if str(reason) in {
+                "stale_latest_bar",
+                "invalid_ts",
+                "fetch_error",
+                "no_valid_bars",
+                "non_contiguous_window",
+            }
+        }
         for ticker in tickers:
             padded = pad_ticker(str(ticker))
-            bars = list(self._kis_client.inquire_minute_bar(padded, n_bars=warmup))
-            filtered_bars, future_filter_meta = self._filter_future_bars(
-                bars,
-                asof=asof,
-                ticker=padded,
+            filtered_bars = list(cache_result.windows.get(padded, []))
+            ticker_cache_meta = (
+                cache_meta.get("tickers", {}).get(padded, {})
+                if isinstance(cache_meta.get("tickers"), dict)
+                else {}
             )
-            topped_up, topup_meta = self._historical_warmup_topup(
-                padded,
-                filtered_bars,
-                warmup,
-            )
+            if padded in stale_or_invalid_reasons:
+                topped_up: list[dict[str, Any]] = []
+                topup_meta = {
+                    "topup_enabled": topup_enabled,
+                    "historical_topup_count": 0,
+                    "files_scanned": [],
+                    "files_used": [],
+                    "files_scanned_count": 0,
+                    "max_files_per_ticker": None,
+                    "cutoff_ts": None,
+                    "reason": stale_or_invalid_reasons[padded],
+                }
+            else:
+                topped_up, topup_meta = self._historical_warmup_topup(
+                    padded,
+                    filtered_bars,
+                    warmup,
+                )
             out[padded] = topped_up
-            if int(future_filter_meta.get("filtered_count", 0)) > 0:
+            future_filtered_count = int(
+                ticker_cache_meta.get("future_bar_filtered_count", 0)
+            )
+            if future_filtered_count > 0:
                 metadata["future_bar_filtered"] = True
             metadata["future_rows_kept_for_readiness"] = False
             metadata["live_rows_by_ticker"][padded] = len(filtered_bars)
@@ -878,12 +922,19 @@ class PaperAutoTrader:
                 topup_meta.get("files_scanned_count", 0)
             )
             metadata["tickers"][padded] = {
-                "raw_live_bar_count": len(bars),
+                "raw_live_bar_count": int(ticker_cache_meta.get("fetched_rows", 0)),
                 "live_bar_count": len(filtered_bars),
-                "future_bar_filtered_count": int(
-                    future_filter_meta.get("filtered_count", 0)
+                "future_bar_filtered_count": future_filtered_count,
+                "future_bar_filtered_rows": ticker_cache_meta.get(
+                    "future_bar_filtered_rows",
+                    [],
                 ),
-                "future_bar_filtered_rows": future_filter_meta.get("filtered_rows", []),
+                "cache_fetch_policy": ticker_cache_meta.get("fetch_policy"),
+                "cache_fetch_n": ticker_cache_meta.get("fetch_n"),
+                "cache_latest_age_sec": ticker_cache_meta.get("latest_age_sec"),
+                "cache_freshness_status": ticker_cache_meta.get("freshness_status"),
+                "cache_reason": ticker_cache_meta.get("reason"),
+                "cache_invalid_rows": ticker_cache_meta.get("invalid_rows", []),
                 "historical_topup_count": int(topup_meta.get("historical_topup_count", 0)),
                 "final_bar_count": len(topped_up),
                 "topup_needed": len(filtered_bars) < warmup,
@@ -919,6 +970,8 @@ class PaperAutoTrader:
         latest_bar_ts_by_ticker: dict[str, str | None] = {}
         future_rows: list[dict[str, str]] = []
         invalid_rows: list[dict[str, str]] = []
+        stale_rows: list[dict[str, str]] = []
+        contiguity_gaps: list[dict[str, Any]] = []
         if required_bars <= 0:
             return {
                 "status": "FAIL",
@@ -952,9 +1005,41 @@ class PaperAutoTrader:
                 max(parsed_ts).isoformat() if parsed_ts else None
             )
 
+        cache_meta = dict(self._last_bar_fetch_metadata or {}).get("minute_bar_window_cache")
+        if isinstance(cache_meta, dict):
+            failed_tickers = cache_meta.get("failed_tickers")
+            failed_tickers = failed_tickers if isinstance(failed_tickers, dict) else {}
+            ticker_cache_meta = cache_meta.get("tickers")
+            ticker_cache_meta = ticker_cache_meta if isinstance(ticker_cache_meta, dict) else {}
+            for raw_ticker, reason in failed_tickers.items():
+                ticker = pad_ticker(str(raw_ticker))
+                detail = ticker_cache_meta.get(ticker)
+                detail = detail if isinstance(detail, dict) else {}
+                if str(reason) == "stale_latest_bar":
+                    stale_rows.append({
+                        "ticker": ticker,
+                        "latest_ts": str(detail.get("latest_ts") or ""),
+                    })
+                if str(reason) == "non_contiguous_window":
+                    for gap in detail.get("contiguity_gaps", []):
+                        if isinstance(gap, dict):
+                            contiguity_gaps.append({"ticker": ticker, **gap})
+                for row in detail.get("invalid_rows", []):
+                    if isinstance(row, dict):
+                        invalid_rows.append({
+                            "ticker": pad_ticker(str(row.get("ticker") or ticker)),
+                            "ts_close": str(row.get("ts_close") or ""),
+                        })
+
         status = (
             "PASS"
-            if not missing_bars_by_ticker and not future_rows and not invalid_rows
+            if (
+                not missing_bars_by_ticker
+                and not future_rows
+                and not invalid_rows
+                and not stale_rows
+                and not contiguity_gaps
+            )
             else "FAIL"
         )
         return {
@@ -965,6 +1050,8 @@ class PaperAutoTrader:
             "latest_bar_ts_by_ticker": latest_bar_ts_by_ticker,
             "future_rows": future_rows,
             "invalid_rows": invalid_rows,
+            "stale_rows": stale_rows,
+            "contiguity_gaps": contiguity_gaps,
             "bar_warmup_topup": dict(self._last_bar_fetch_metadata or {}),
         }
 

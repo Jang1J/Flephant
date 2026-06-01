@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from scripts.generate_ai_grpc_stubs import main as generate_ai_grpc_stubs
 from scripts import run_ai_grpc_server
+from src.data.minute_bar_window_cache import (
+    MinuteBarWindowCache,
+    MinuteBarWindowCacheConfig,
+)
 from src.integration.grpc.payloads import (
     build_ack_payload,
     build_health_payload,
@@ -15,6 +21,7 @@ from src.integration.grpc.payloads import (
 
 ROOT = Path(__file__).resolve().parents[3]
 PROTO = ROOT / "new" / "proto" / "elephant_ai_bridge.proto"
+REC_ASOF = "2026-05-26T10:00:00+09:00"
 
 
 def test_ai_be_proto_declares_grpc_replacements_for_http_bridge():
@@ -279,6 +286,21 @@ class _FakeMarketDataClient:
         return bars
 
 
+def _minute_cache(client: object) -> MinuteBarWindowCache:
+    return MinuteBarWindowCache(
+        client,
+        MinuteBarWindowCacheConfig(
+            window_size=60,
+            incremental_fetch_bars=6,
+            freshness_max_lag_sec=120,
+            gap_refetch_sec=300,
+            expected_bar_interval_sec=60,
+            max_contiguity_gap_sec=90,
+            force_cold_on_session_date_change=True,
+        ),
+    )
+
+
 class _PartialFailingMarketDataClient(_FakeMarketDataClient):
     def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
         if ticker == "000660":
@@ -286,10 +308,86 @@ class _PartialFailingMarketDataClient(_FakeMarketDataClient):
         return super().inquire_minute_bar(ticker, n_bars=n_bars)
 
 
+class _IncrementalMarketDataClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
+        self.calls.append((ticker, n_bars))
+        if n_bars >= 60:
+            return [
+                {
+                    "ticker": ticker,
+                    "ts_close": (
+                        datetime(2026, 5, 26, 9, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+                        + timedelta(minutes=idx)
+                    ).isoformat(),
+                    "open": 100.0 + idx,
+                    "high": 101.0 + idx,
+                    "low": 99.0 + idx,
+                    "close": 100.5 + idx,
+                    "volume": 1000 + idx,
+                }
+                for idx in range(n_bars)
+            ]
+        return [
+            {
+                "ticker": ticker,
+                "ts_close": f"2026-05-26T10:{idx:02d}:00+09:00",
+                "open": 200.0 + idx,
+                "high": 201.0 + idx,
+                "low": 199.0 + idx,
+                "close": 200.5 + idx,
+                "volume": 2000 + idx,
+            }
+            for idx in range(n_bars)
+        ]
+
+
+class _FutureBarMarketDataClient(_FakeMarketDataClient):
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
+        bars = super().inquire_minute_bar(ticker, n_bars=n_bars)
+        bars.append({
+            "ticker": ticker,
+            "ts_close": "2026-05-26T10:01:00+09:00",
+            "open": 999.0,
+            "high": 999.0,
+            "low": 999.0,
+            "close": 999.0,
+            "volume": 999,
+        })
+        return bars
+
+
+class _ScriptedMarketDataClient:
+    def __init__(self, responses: list[list[dict]]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, int]] = []
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
+        self.calls.append((ticker, n_bars))
+        if not self.responses:
+            return []
+        return list(self.responses.pop(0))
+
+
+def _grpc_bar(ticker: str, ts_close: str, close: float) -> dict:
+    return {
+        "ticker": ticker,
+        "ts_close": ts_close,
+        "open": close,
+        "high": close + 1.0,
+        "low": close - 1.0,
+        "close": close,
+        "volume": 1000,
+    }
+
+
 def test_recommendations_payload_returns_read_only_ranked_items():
     payload = build_recommendations_payload(
         request_id="REQ-REC",
         bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
         tickers=["005930", "000660"],
         top_k=1,
         include_diagnostics=True,
@@ -327,6 +425,7 @@ def test_recommendations_payload_treats_string_ticker_as_single_ticker():
     payload = build_recommendations_payload(
         request_id="REQ-STRING-TICKER",
         bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
         tickers="005930",
         top_k=1,
         quant_agent=_FakeRecommendationQuant(),
@@ -340,6 +439,7 @@ def test_recommendations_payload_treats_string_ticker_as_single_ticker():
 def test_recommendations_payload_uses_stable_default_bundle_when_request_empty():
     payload = build_recommendations_payload(
         request_id="REQ-DEFAULT-BUNDLE",
+        asof=REC_ASOF,
         tickers=["005930"],
         top_k=1,
         quant_agent=_StableBundleRecommendationQuant(),
@@ -355,6 +455,7 @@ def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
     payload = build_recommendations_payload(
         request_id="REQ-PARTIAL-BARS",
         bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
         tickers=["005930", "000660"],
         include_diagnostics=True,
         quant_agent=_FakeRecommendationQuant(),
@@ -367,10 +468,100 @@ def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
     assert "000660" in diagnostics["bar_errors"]
 
 
+def test_recommendations_payload_uses_minute_bar_cache_incremental_fetches() -> None:
+    client = _IncrementalMarketDataClient()
+    cache = _minute_cache(client)
+
+    first = build_recommendations_payload(
+        request_id="REQ-CACHE-1",
+        bundle_id="BUNDLE-TEST",
+        asof="2026-05-26T09:59:00+09:00",
+        tickers=["005930"],
+        top_k=1,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        minute_bar_cache=cache,
+    )
+    second = build_recommendations_payload(
+        request_id="REQ-CACHE-2",
+        bundle_id="BUNDLE-TEST",
+        asof="2026-05-26T10:01:00+09:00",
+        tickers=["005930"],
+        top_k=1,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        minute_bar_cache=cache,
+    )
+
+    assert first["status"] == "PASS"
+    assert second["status"] == "PASS"
+    assert client.calls == [("005930", 61), ("005930", 6)]
+    diagnostics = json.loads(second["diagnostics_json"])
+    assert diagnostics["minute_bar_window_cache"]["tickers"]["005930"]["fetch_policy"] == "incremental"
+
+
+def test_recommendations_payload_filters_t_plus_one_before_quant() -> None:
+    quant = _FakeRecommendationQuant()
+    payload = build_recommendations_payload(
+        request_id="REQ-FUTURE-BAR",
+        bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
+        tickers=["005930"],
+        top_k=1,
+        include_diagnostics=True,
+        quant_agent=quant,
+        market_data_client=_FutureBarMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert all(bar["ts_close"] <= REC_ASOF for bar in quant.bars)
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert (
+        diagnostics["minute_bar_window_cache"]["tickers"]["005930"][
+            "future_bar_filtered_count"
+        ]
+        == 1
+    )
+
+
+def test_recommendations_payload_blocks_non_contiguous_minute_window() -> None:
+    quant = _FakeRecommendationQuant()
+    hole_window = [
+        *[
+            _grpc_bar(
+                "005930",
+                f"2026-05-26T09:{minute:02d}:00+09:00",
+                100.0 + minute,
+            )
+            for minute in range(1, 60)
+        ],
+        _grpc_bar("005930", "2026-05-26T10:01:00+09:00", 201.0),
+    ]
+
+    payload = build_recommendations_payload(
+        request_id="REQ-HOLE-BLOCKED",
+        bundle_id="BUNDLE-TEST",
+        asof="2026-05-26T10:01:50+09:00",
+        tickers=["005930"],
+        include_diagnostics=True,
+        quant_agent=quant,
+        market_data_client=_ScriptedMarketDataClient([hole_window]),
+    )
+
+    assert payload["status"] == "BLOCKED"
+    assert payload["reason"] == "minute_bars_unavailable"
+    assert quant.bars == []
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert diagnostics["bar_errors"] == {"005930": "non_contiguous_window"}
+    ticker_meta = diagnostics["minute_bar_window_cache"]["tickers"]["005930"]
+    assert ticker_meta["contiguity_status"] == "FAIL"
+
+
 def test_recommendations_payload_keeps_partial_invalid_scores_as_diagnostics():
     payload = build_recommendations_payload(
         request_id="REQ-PARTIAL-SCORES",
         bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
         tickers=["005930", "000660"],
         include_diagnostics=True,
         quant_agent=_InvalidScoreRecommendationQuant(),
@@ -387,6 +578,7 @@ def test_recommendations_payload_blocks_when_quant_is_not_active():
     payload = build_recommendations_payload(
         request_id="REQ-BLOCKED",
         bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
         tickers=["005930", "000660"],
         include_diagnostics=True,
         quant_agent=_BlockedRecommendationQuant(),
