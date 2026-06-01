@@ -258,6 +258,43 @@ def test_direct_cold_non_contiguous_window_fails_closed() -> None:
     assert result.metadata["failed_tickers"] == {"005930": "non_contiguous_window"}
 
 
+def test_cold_cross_date_response_fails_closed_without_seeding_cache() -> None:
+    day1_tail = _bars(
+        "005930",
+        datetime(2026, 6, 1, 14, 2, tzinfo=_KST),
+        58,
+        close_base=100.0,
+    )
+    day2_head = _bars(
+        "005930",
+        datetime(2026, 6, 2, 9, 0, tzinfo=_KST),
+        2,
+        close_base=200.0,
+    )
+    day2_retry = _bars(
+        "005930",
+        datetime(2026, 6, 2, 9, 0, tzinfo=_KST),
+        3,
+        close_base=200.0,
+    )
+    client = ScriptedMinuteClient([day1_tail + day2_head, day2_retry])
+    cache = MinuteBarWindowCache(client, _config())
+
+    first = cache.get_windows(["005930"], asof="2026-06-02T09:01:00+09:00", min_bars=1)
+    second = cache.get_windows(["005930"], asof="2026-06-02T09:02:00+09:00", min_bars=1)
+
+    assert first.status == "FAIL"
+    assert first.windows == {}
+    assert first.metadata["failed_tickers"] == {"005930": "non_contiguous_window"}
+    assert second.status == "PASS"
+    assert client.calls == [("005930", 61), ("005930", 61)]
+    ticker_meta = second.metadata["tickers"]["005930"]
+    assert ticker_meta["fetch_policy"] == "cold"
+    assert ticker_meta["cached_rows_before"] == 0
+    assert second.windows["005930"][0]["ts_close"] == "2026-06-02T09:00:00+09:00"
+    assert second.windows["005930"][-1]["ts_close"] == "2026-06-02T09:02:00+09:00"
+
+
 def test_incremental_hole_recovers_when_cold_retry_is_contiguous() -> None:
     start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
     raw = _bars("005930", start, 62)

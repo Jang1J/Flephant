@@ -301,8 +301,6 @@ class MinuteBarWindowCache:
         merge_input = accepted if fetch_policy != "incremental" else [*cached, *accepted]
         merged, duplicate_replaced_count = self._dedupe_sort_cap(merge_input)
         meta["duplicate_replaced_count"] = duplicate_replaced_count
-        with self._lock:
-            self._windows[ticker] = merged
 
         self._update_window_health_metadata(merged, asof_ts, meta)
         reason = self._window_failure_reason(merged, meta, min_bars)
@@ -319,6 +317,9 @@ class MinuteBarWindowCache:
             with self._lock:
                 merged = list(self._windows.get(ticker, []))
             reason = retry_reason
+        elif reason == "ok":
+            with self._lock:
+                self._windows[ticker] = merged
         meta["reason"] = reason
         meta["returned_rows"] = len(merged) if reason == "ok" else 0
         if reason != "ok":
@@ -454,10 +455,12 @@ class MinuteBarWindowCache:
         meta["accepted_rows"] = len(accepted)
         merged, duplicate_replaced_count = self._dedupe_sort_cap(accepted)
         meta["duplicate_replaced_count"] = duplicate_replaced_count
-        with self._lock:
-            self._windows[ticker] = merged
         self._update_window_health_metadata(merged, asof_ts, meta)
-        return self._window_failure_reason(merged, meta, min_bars)
+        reason = self._window_failure_reason(merged, meta, min_bars)
+        if reason == "ok":
+            with self._lock:
+                self._windows[ticker] = merged
+        return reason
 
     def _update_window_health_metadata(
         self,
