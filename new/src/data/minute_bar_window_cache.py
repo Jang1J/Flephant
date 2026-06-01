@@ -1,11 +1,10 @@
 """PIT-safe rolling cache for KIS one-minute bar windows."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import threading
-import time
 from typing import Any, Callable, Literal, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
@@ -31,7 +30,6 @@ class MinuteBarWindowCacheConfig:
     max_contiguity_gap_sec: int
     force_cold_on_session_date_change: bool
     parallel_fetch_workers: int = 1
-    batch_fetch_budget_sec: float = 45.0
 
 
 @dataclass(frozen=True)
@@ -101,11 +99,6 @@ def load_minute_bar_window_cache_config(
             parallel_fetch_workers,
             default=1,
             min_value=1,
-        ),
-        batch_fetch_budget_sec=safe_float(
-            cfg.get("batch_fetch_budget_sec", 45.0),
-            default=45.0,
-            min_value=0.1,
         ),
     )
 
@@ -219,50 +212,36 @@ class MinuteBarWindowCache:
             }
 
         results: dict[str, tuple[list[dict[str, Any]], dict[str, Any], str]] = {}
-        budget_sec = float(self.config.batch_fetch_budget_sec)
-        deadline_monotonic = time.monotonic() + budget_sec
-        pool = ThreadPoolExecutor(max_workers=workers)
-        future_to_ticker = {
-            pool.submit(
-                self._fetch_update_window,
-                ticker=ticker,
-                asof_ts=asof_ts,
-                min_bars=min_bars,
-                deadline_monotonic=deadline_monotonic,
-            ): ticker
-            for ticker in tickers
-        }
-        pending = set(future_to_ticker)
-        try:
-            for future in as_completed(future_to_ticker, timeout=budget_sec):
-                pending.discard(future)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_ticker = {
+                pool.submit(
+                    self._fetch_update_window,
+                    ticker=ticker,
+                    asof_ts=asof_ts,
+                    min_bars=min_bars,
+                ): ticker
+                for ticker in tickers
+            }
+            for future in as_completed(future_to_ticker):
                 ticker = future_to_ticker[future]
                 try:
                     results[ticker] = future.result()
                 except Exception as e:
                     results[ticker] = (
                         [],
-                        self._failure_meta(
-                            reason="fetch_error",
-                            error=str(e),
-                        ),
+                        {
+                            "reason": "fetch_error",
+                            "error": str(e),
+                            "fetch_policy": "unknown",
+                            "effective_fetch_policy": "unknown",
+                            "fetch_n": 0,
+                            "cached_rows_before": 0,
+                            "fetched_rows": 0,
+                            "accepted_rows": 0,
+                            "returned_rows": 0,
+                        },
                         "fetch_error",
                     )
-        except TimeoutError:
-            pass
-        finally:
-            for future in pending:
-                ticker = future_to_ticker[future]
-                future.cancel()
-                results[ticker] = (
-                    [],
-                    self._failure_meta(
-                        reason="fetch_timeout",
-                        timeout_sec=budget_sec,
-                    ),
-                    "fetch_timeout",
-                )
-            pool.shutdown(wait=False, cancel_futures=True)
         return results
 
     def _fetch_update_window(
@@ -271,7 +250,6 @@ class MinuteBarWindowCache:
         ticker: str,
         asof_ts: datetime,
         min_bars: int | None,
-        deadline_monotonic: float | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
         with self._lock:
             cached = list(self._windows.get(ticker, []))
@@ -313,10 +291,6 @@ class MinuteBarWindowCache:
             meta["reason"] = "fetch_error"
             meta["error"] = str(e)
             return [], meta, "fetch_error"
-        if self._deadline_expired(deadline_monotonic):
-            meta["reason"] = "fetch_timeout"
-            meta["timeout_sec"] = float(self.config.batch_fetch_budget_sec)
-            return [], meta, "fetch_timeout"
         fetched = fetched if isinstance(fetched, list) else []
         meta["fetched_rows"] = len(fetched)
 
@@ -339,16 +313,11 @@ class MinuteBarWindowCache:
                 asof_ts=asof_ts,
                 min_bars=min_bars,
                 meta=meta,
-                deadline_monotonic=deadline_monotonic,
             )
             with self._lock:
                 merged = list(self._windows.get(ticker, []))
             reason = retry_reason
         elif reason == "ok":
-            if self._deadline_expired(deadline_monotonic):
-                meta["reason"] = "fetch_timeout"
-                meta["timeout_sec"] = float(self.config.batch_fetch_budget_sec)
-                return [], meta, "fetch_timeout"
             with self._lock:
                 self._windows[ticker] = merged
         meta["reason"] = reason
@@ -478,15 +447,10 @@ class MinuteBarWindowCache:
         asof_ts: datetime,
         min_bars: int | None,
         meta: dict[str, Any],
-        deadline_monotonic: float | None,
     ) -> str:
         meta["fetch_policy"] = "cold_retry_after_hole"
         meta["effective_fetch_policy"] = "cold_retry_after_hole"
         meta["fetch_n"] = int(self._cold_fetch_bars())
-        if self._deadline_expired(deadline_monotonic):
-            meta["reason"] = "fetch_timeout"
-            meta["timeout_sec"] = float(self.config.batch_fetch_budget_sec)
-            return "fetch_timeout"
         try:
             fetched = self._client.inquire_minute_bar(
                 ticker,
@@ -498,10 +462,6 @@ class MinuteBarWindowCache:
             with self._lock:
                 self._windows[ticker] = []
             return "fetch_error"
-        if self._deadline_expired(deadline_monotonic):
-            meta["reason"] = "fetch_timeout"
-            meta["timeout_sec"] = float(self.config.batch_fetch_budget_sec)
-            return "fetch_timeout"
         fetched = fetched if isinstance(fetched, list) else []
         meta["fetched_rows"] = len(fetched)
         accepted, filter_meta = self._pit_clean_rows(ticker, fetched, asof_ts)
@@ -512,40 +472,9 @@ class MinuteBarWindowCache:
         self._update_window_health_metadata(merged, asof_ts, meta)
         reason = self._window_failure_reason(merged, meta, min_bars)
         if reason == "ok":
-            if self._deadline_expired(deadline_monotonic):
-                meta["reason"] = "fetch_timeout"
-                meta["timeout_sec"] = float(self.config.batch_fetch_budget_sec)
-                return "fetch_timeout"
             with self._lock:
                 self._windows[ticker] = merged
         return reason
-
-    @staticmethod
-    def _deadline_expired(deadline_monotonic: float | None) -> bool:
-        return deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
-
-    def _failure_meta(
-        self,
-        *,
-        reason: str,
-        error: str | None = None,
-        timeout_sec: float | None = None,
-    ) -> dict[str, Any]:
-        meta: dict[str, Any] = {
-            "reason": reason,
-            "fetch_policy": "unknown",
-            "effective_fetch_policy": "unknown",
-            "fetch_n": 0,
-            "cached_rows_before": 0,
-            "fetched_rows": 0,
-            "accepted_rows": 0,
-            "returned_rows": 0,
-        }
-        if error is not None:
-            meta["error"] = error
-        if timeout_sec is not None:
-            meta["timeout_sec"] = float(timeout_sec)
-        return meta
 
     def _update_window_health_metadata(
         self,
@@ -627,7 +556,6 @@ class MinuteBarWindowCache:
             "expected_bar_interval_sec": int(self.config.expected_bar_interval_sec),
             "max_contiguity_gap_sec": int(self.config.max_contiguity_gap_sec),
             "parallel_fetch_workers": int(self.config.parallel_fetch_workers),
-            "batch_fetch_budget_sec": float(self.config.batch_fetch_budget_sec),
             "force_cold_on_session_date_change": bool(
                 self.config.force_cold_on_session_date_change
             ),

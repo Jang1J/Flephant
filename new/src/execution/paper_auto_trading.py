@@ -50,7 +50,6 @@ class PaperAutoTrader:
         hot_runner: HotRunner | None = None,
         report_dir: Path | str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
-        monotonic_fn: Callable[[], float] | None = None,
         now_fn: Callable[[], datetime] | None = None,
         required_bundle_id: str | None = None,
         kill_switch: KillSwitch | None = None,
@@ -74,7 +73,6 @@ class PaperAutoTrader:
             log_path=self._report_dir / "paper_auto_execution_audit.jsonl"
         )
         self._sleep = sleep_fn or time.sleep
-        self._monotonic = monotonic_fn or time.monotonic
         self._now = now_fn or (lambda: datetime.now(_KST))
         self._required_bundle_id = str(required_bundle_id or "").strip() or None
         self._track_id = str(track_id or "").strip()
@@ -266,10 +264,8 @@ class PaperAutoTrader:
         stop_reason: str | None = None
         self._run_guard_passed = True
         self._on_run_preflight_passed(report)
-        interval = safe_float(interval_sec, default=0.0, min_value=0.0)
         try:
             for idx in range(cycles_int):
-                cycle_started_mono = self._monotonic()
                 try:
                     cycle = self.run_once(
                         tickers=tickers,
@@ -297,8 +293,7 @@ class PaperAutoTrader:
                 if cycle.get("status") == "FAIL":
                     break
                 if idx < cycles_int - 1:
-                    next_cycle_due = cycle_started_mono + interval
-                    self._sleep(max(0.0, next_cycle_due - self._monotonic()))
+                    self._sleep(safe_float(interval_sec, default=0.0, min_value=0.0))
         except KeyboardInterrupt:
             logger.warning("[paper_auto_trading] interrupt 수신. report를 저장하고 안전 종료합니다.")
             stop_reason = "paper_auto_interrupted"
@@ -886,7 +881,6 @@ class PaperAutoTrader:
                 "stale_latest_bar",
                 "invalid_ts",
                 "fetch_error",
-                "fetch_timeout",
                 "no_valid_bars",
                 "non_contiguous_window",
             }

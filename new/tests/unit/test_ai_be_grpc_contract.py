@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -287,12 +286,7 @@ class _FakeMarketDataClient:
         return bars
 
 
-def _minute_cache(
-    client: object,
-    *,
-    parallel_fetch_workers: int = 1,
-    batch_fetch_budget_sec: float = 45.0,
-) -> MinuteBarWindowCache:
+def _minute_cache(client: object) -> MinuteBarWindowCache:
     return MinuteBarWindowCache(
         client,
         MinuteBarWindowCacheConfig(
@@ -303,8 +297,6 @@ def _minute_cache(
             expected_bar_interval_sec=60,
             max_contiguity_gap_sec=90,
             force_cold_on_session_date_change=True,
-            parallel_fetch_workers=parallel_fetch_workers,
-            batch_fetch_budget_sec=batch_fetch_budget_sec,
         ),
     )
 
@@ -313,13 +305,6 @@ class _PartialFailingMarketDataClient(_FakeMarketDataClient):
     def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
         if ticker == "000660":
             raise RuntimeError("transient minute bar failure")
-        return super().inquire_minute_bar(ticker, n_bars=n_bars)
-
-
-class _SlowTickerMarketDataClient(_FakeMarketDataClient):
-    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict]:
-        if ticker == "000660":
-            time.sleep(0.20)
         return super().inquire_minute_bar(ticker, n_bars=n_bars)
 
 
@@ -482,31 +467,6 @@ def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
     assert payload["recommendations"] == []
     diagnostics = json.loads(payload["diagnostics_json"])
     assert "000660" in diagnostics["bar_errors"]
-
-
-def test_recommendations_payload_blocks_partial_fetch_timeout() -> None:
-    payload = build_recommendations_payload(
-        request_id="REQ-TIMEOUT-BARS",
-        bundle_id="BUNDLE-TEST",
-        asof=REC_ASOF,
-        tickers=["005930", "000660"],
-        include_diagnostics=True,
-        quant_agent=_FakeRecommendationQuant(),
-        minute_bar_cache=_minute_cache(
-            _SlowTickerMarketDataClient(),
-            parallel_fetch_workers=2,
-            batch_fetch_budget_sec=0.05,
-        ),
-    )
-
-    assert payload["status"] == "BLOCKED"
-    assert payload["reason"] == "partial_minute_bars_unavailable"
-    assert payload["recommendations"] == []
-    diagnostics = json.loads(payload["diagnostics_json"])
-    assert diagnostics["bar_errors"] == {"000660": "fetch_timeout"}
-    timeout_meta = diagnostics["minute_bar_window_cache"]["tickers"]["000660"]
-    assert timeout_meta["reason"] == "fetch_timeout"
-    assert timeout_meta["timeout_sec"] == 0.05
 
 
 def test_recommendations_payload_uses_minute_bar_cache_incremental_fetches() -> None:
