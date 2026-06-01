@@ -462,8 +462,9 @@ def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
         market_data_client=_PartialFailingMarketDataClient(),
     )
 
-    assert payload["status"] == "PASS"
-    assert payload["recommendations"]
+    assert payload["status"] == "BLOCKED"
+    assert payload["reason"] == "partial_minute_bars_unavailable"
+    assert payload["recommendations"] == []
     diagnostics = json.loads(payload["diagnostics_json"])
     assert "000660" in diagnostics["bar_errors"]
 
@@ -541,7 +542,7 @@ def test_recommendations_payload_blocks_non_contiguous_minute_window() -> None:
     payload = build_recommendations_payload(
         request_id="REQ-HOLE-BLOCKED",
         bundle_id="BUNDLE-TEST",
-        asof="2026-05-26T10:01:50+09:00",
+        asof="2026-05-26T10:02:50+09:00",
         tickers=["005930"],
         include_diagnostics=True,
         quant_agent=quant,
