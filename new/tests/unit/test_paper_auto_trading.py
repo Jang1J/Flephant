@@ -12,6 +12,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.connectors.kis_rest import KISAPIError
+from src.data.minute_bar_window_cache import (
+    MinuteBarWindowCache,
+    MinuteBarWindowCacheConfig,
+)
 from src.execution import paper_auto_trading as paper_auto_module
 from src.execution.kill_switch import KillSwitch
 from src.execution.paper_auto_trading import PaperAutoTrader
@@ -305,6 +309,13 @@ class HoleWindowPaperKIS(FakePaperKIS):
             "ts_close": "2026-05-12T10:01:00+09:00",
         })
         return rows
+
+
+class SlowTickerPaperKIS(FakePaperKIS):
+    def inquire_minute_bar(self, ticker: str, n_bars: int) -> list[dict[str, Any]]:
+        if ticker == "000660":
+            time.sleep(0.20)
+        return super().inquire_minute_bar(ticker, n_bars)
 
 
 class FakeRealKIS(FakePaperKIS):
@@ -1299,6 +1310,63 @@ def test_paper_auto_non_contiguous_window_is_not_topped_up_into_pass(
     topup_meta = readiness["bar_warmup_topup"]["tickers"]["005930"]
     assert topup_meta["reason"] == "non_contiguous_window"
     assert topup_meta["historical_topup_count"] == 0
+    assert hot_runner.start_calls == 0
+    assert client.orders == []
+
+
+def test_paper_auto_fetch_timeout_is_not_topped_up_into_pass(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _write_warmup_parquet(
+        data_dir / "000660" / "bars_1m_20260509.parquet",
+        "000660",
+        rows=60,
+    )
+    client = SlowTickerPaperKIS()
+    hot_runner = FakeHotRunner()
+    trader = PaperAutoTrader(
+        kis_client=client,
+        hot_runner=hot_runner,
+        report_dir=tmp_path,
+        now_fn=_paper_session_now,
+    )
+    trader._minute_bar_cache = MinuteBarWindowCache(  # noqa: SLF001
+        client,
+        MinuteBarWindowCacheConfig(
+            window_size=60,
+            incremental_fetch_bars=6,
+            freshness_max_lag_sec=120,
+            gap_refetch_sec=300,
+            expected_bar_interval_sec=60,
+            max_contiguity_gap_sec=60,
+            force_cold_on_session_date_change=True,
+            parallel_fetch_workers=2,
+            batch_fetch_budget_sec=0.05,
+        ),
+    )
+    trader._cfg["historical_warmup_topup"] = {  # noqa: SLF001
+        "enabled": True,
+        "data_dir": str(data_dir),
+        "max_files_per_ticker": 1,
+    }
+
+    report = trader.run(
+        tickers=["005930", "000660"],
+        cycles=1,
+        interval_sec=0,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    cycle = report["stages"]["cycles"]["items"][0]
+    assert report["status"] == "FAIL"
+    assert cycle["reason"] == "hot_path_bar_readiness"
+    readiness = cycle["hot_path_bar_readiness"]
+    topup_meta = readiness["bar_warmup_topup"]["tickers"]["000660"]
+    assert topup_meta["reason"] == "fetch_timeout"
+    assert topup_meta["historical_topup_count"] == 0
+    assert readiness["bar_warmup_topup"]["minute_bar_window_cache"]["failed_tickers"] == {
+        "000660": "fetch_timeout"
+    }
     assert hot_runner.start_calls == 0
     assert client.orders == []
 
