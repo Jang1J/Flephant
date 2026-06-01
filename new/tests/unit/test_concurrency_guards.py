@@ -81,9 +81,7 @@ def test_rate_limiter_concurrent_acquire_no_negative_tokens():
 def test_auth_manager_concurrent_refresh_invokes_fetch_once(monkeypatch):
     """여러 thread가 동시에 get_kis_token 호출해도 _fetch_kis_token이 1회만 일어난다."""
     # 클래스 레벨 공유 캐시 초기화 (다른 테스트와 격리)
-    AuthManager._shared_kis_token = None
-    AuthManager._shared_kis_token_expires_at = None
-    AuthManager._shared_kis_token_scope = None
+    AuthManager._shared_token_data = None
 
     fetch_count_box = {"v": 0}
     fetch_lock = threading.Lock()
@@ -116,9 +114,7 @@ def test_auth_manager_concurrent_refresh_invokes_fetch_once(monkeypatch):
     )
 
     # Cleanup
-    AuthManager._shared_kis_token = None
-    AuthManager._shared_kis_token_expires_at = None
-    AuthManager._shared_kis_token_scope = None
+    AuthManager._shared_token_data = None
 
 
 # ----------------------------------------------------------------------------
