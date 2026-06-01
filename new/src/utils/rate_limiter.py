@@ -10,6 +10,30 @@ from src.utils.logger import get_logger
 logger = get_logger("rate_limiter")
 
 
+# 가드 2: process 단위 shared RateLimiter instance cache.
+# 같은 source 이름은 항상 같은 instance 반환 → 여러 KISRestClient가 같은 token bucket 공유.
+# Dependency injection 패턴 유지(rate_limiter 인자 명시 시 그것 사용)는 테스트 격리용으로 유지.
+_SHARED_INSTANCES: dict[str, "RateLimiter"] = {}
+_SHARED_INSTANCES_LOCK = threading.Lock()
+
+
+def get_shared_rate_limiter(source: str) -> "RateLimiter":
+    """Process 단위 shared RateLimiter instance를 반환한다.
+
+    여러 thread / 여러 client가 같은 source로 호출해도 동일 instance를 공유한다.
+    이로써 process-wide rate limit이 보장되어 KIS account-level rate 초과 위험을 차단.
+    """
+    instance = _SHARED_INSTANCES.get(source)
+    if instance is not None:
+        return instance
+    with _SHARED_INSTANCES_LOCK:
+        instance = _SHARED_INSTANCES.get(source)
+        if instance is None:
+            instance = RateLimiter(source)
+            _SHARED_INSTANCES[source] = instance
+        return instance
+
+
 class RateLimitExceeded(Exception):
     """토큰 부족 + max_wait 초과 시 발생."""
 

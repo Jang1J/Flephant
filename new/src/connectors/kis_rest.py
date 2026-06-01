@@ -17,6 +17,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -28,7 +29,7 @@ from src.utils.auth import AuthManager
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.pit_guard import PITViolationError, is_pit_safe
-from src.utils.rate_limiter import RateLimiter
+from src.utils.rate_limiter import RateLimiter, get_shared_rate_limiter
 from src.utils.safe_cast import safe_bool
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
@@ -108,9 +109,14 @@ class KISRestClient(BaseConnector):
         self._circuit_open_duration_sec = float(circuit_cfg.get("open_duration_sec", 60))
         self._circuit_consecutive_failures = 0
         self._circuit_opened_at: float | None = None
+        # 가드 3: 공유 상태(request_count / error_count / circuit breaker) mutation 보호용 lock.
+        # HTTP 호출은 lock 밖에서 진행. lock scope는 check-and-set + counter increment만.
+        self._state_lock = threading.Lock()
 
         self.auth = auth or AuthManager()
-        self.rate_limiter = rate_limiter or RateLimiter("kis_rest")
+        # 가드 2: 명시 주입(테스트용) 없으면 process 단위 shared RateLimiter 사용.
+        # 모든 KISRestClient instance가 같은 token bucket을 공유하여 전역 rate cap 보장.
+        self.rate_limiter = rate_limiter or get_shared_rate_limiter("kis_rest")
         self.mode = self.auth.get_mode()
 
         # connector_mock 파라미터 로드 (불변 원칙 5: 하드코딩 금지)
@@ -638,7 +644,9 @@ class KISRestClient(BaseConnector):
         for attempt in range(self._max_retries):
             try:
                 self.rate_limiter.wait_and_acquire()
-                self._request_count += 1
+                # 가드 3: counter increment를 lock으로 보호 (HTTP 호출은 lock 밖).
+                with self._state_lock:
+                    self._request_count += 1
                 logger.info(
                     "[kis_rest] API 호출 시작. path=%s tr_id=%s params=%s attempt=%d",
                     path,
@@ -658,7 +666,9 @@ class KISRestClient(BaseConnector):
                 self._record_call_success()
                 return body
             except Exception as e:
-                self._error_count += 1
+                # 가드 3: error counter increment를 lock으로 보호.
+                with self._state_lock:
+                    self._error_count += 1
                 last_err = e
                 safe_error = self._sanitize_error_text(str(e))
                 if self._is_non_retryable_kis_error(e):
@@ -700,7 +710,9 @@ class KISRestClient(BaseConnector):
         for attempt in range(self._max_retries):
             try:
                 self.rate_limiter.wait_and_acquire()
-                self._request_count += 1
+                # 가드 3: counter increment를 lock으로 보호 (HTTP 호출은 lock 밖).
+                with self._state_lock:
+                    self._request_count += 1
                 logger.info(
                     "[kis_rest] API POST 시작. path=%s tr_id=%s payload=%s attempt=%d",
                     path,
@@ -720,7 +732,9 @@ class KISRestClient(BaseConnector):
                 self._record_call_success()
                 return body
             except Exception as e:
-                self._error_count += 1
+                # 가드 3: error counter increment를 lock으로 보호.
+                with self._state_lock:
+                    self._error_count += 1
                 last_err = e
                 safe_error = self._sanitize_error_text(str(e))
                 if self._is_non_retryable_kis_error(e):
@@ -910,36 +924,47 @@ class KISRestClient(BaseConnector):
             return None
 
     def _check_circuit(self) -> None:
-        if not self._circuit_enabled or self._circuit_opened_at is None:
-            return
-        elapsed = time.monotonic() - self._circuit_opened_at
-        remaining = self._circuit_open_duration_sec - elapsed
-        if remaining > 0:
-            raise KISAPIError(
-                "[kis_rest] circuit breaker OPEN",
-                retry_after_sec=remaining,
+        # 가드 3: circuit state check-and-set 구간을 lock으로 보호.
+        with self._state_lock:
+            if not self._circuit_enabled or self._circuit_opened_at is None:
+                return
+            elapsed = time.monotonic() - self._circuit_opened_at
+            remaining = self._circuit_open_duration_sec - elapsed
+            if remaining > 0:
+                raise KISAPIError(
+                    "[kis_rest] circuit breaker OPEN",
+                    retry_after_sec=remaining,
+                )
+            self._circuit_opened_at = None
+            self._circuit_consecutive_failures = max(
+                0,
+                self._circuit_failure_threshold - 1,
             )
-        self._circuit_opened_at = None
-        self._circuit_consecutive_failures = max(
-            0,
-            self._circuit_failure_threshold - 1,
-        )
 
     def _record_call_success(self) -> None:
-        self._circuit_consecutive_failures = 0
-        self._circuit_opened_at = None
+        # 가드 3: circuit state reset을 lock으로 보호.
+        with self._state_lock:
+            self._circuit_consecutive_failures = 0
+            self._circuit_opened_at = None
 
     def _record_call_failure(self, error: Exception | None) -> None:
         if not self._circuit_enabled:
             return
         if error is not None and self._is_non_retryable_kis_error(error):
             return
-        self._circuit_consecutive_failures += 1
-        if self._circuit_consecutive_failures >= self._circuit_failure_threshold:
-            self._circuit_opened_at = time.monotonic()
+        # 가드 3: failure counter increment + threshold check + opened_at set를 lock으로 보호.
+        # logger.warning은 lock 밖에서 처리 (lock scope 최소화).
+        opened = False
+        with self._state_lock:
+            self._circuit_consecutive_failures += 1
+            if self._circuit_consecutive_failures >= self._circuit_failure_threshold:
+                self._circuit_opened_at = time.monotonic()
+                opened = True
+            failures_snapshot = self._circuit_consecutive_failures
+        if opened:
             logger.warning(
                 "[kis_rest] circuit breaker OPEN. consecutive_failures=%d threshold=%d",
-                self._circuit_consecutive_failures,
+                failures_snapshot,
                 self._circuit_failure_threshold,
             )
 

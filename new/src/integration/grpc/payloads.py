@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -180,6 +180,7 @@ def _resolve_recommendation_config() -> dict[str, Any]:
             cfg["expected_return_unavailable_reason"],
         ),
         "reason_ko_template": str(cfg["reason_ko_template"]),
+        "parallel_fetch_workers": int(cfg["parallel_fetch_workers"]),
     }
 
 
@@ -401,13 +402,16 @@ def build_recommendations_payload(
         # BarBuffer 미접근 구간이므로 thread-safety 부담 없음.
         # 종목당 inquire_minute_bar 호출은 KISRestClient + RateLimiter + AuthManager
         # 공유 인스턴스를 거치지만, 셋 다 Lock 도입으로 동시성 안전 (별도 패치 참조).
+        # 가드 5: as_completed로 완료 순서대로 수집 → 느린 future 하나에 blocking 안 됨.
+        # Phase 2 feed는 selected_tickers 순서 보존으로 cross-sectional scoring 결정성 유지.
         fetch_results: dict[str, list[dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=cfg["parallel_fetch_workers"]) as pool:
             future_to_ticker = {
                 pool.submit(client.inquire_minute_bar, t, warmup_bars): t
                 for t in selected_tickers
             }
-            for future, ticker in future_to_ticker.items():
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
                 try:
                     fetch_results[ticker] = future.result()
                 except Exception as e:
