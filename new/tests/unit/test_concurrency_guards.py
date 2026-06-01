@@ -155,17 +155,17 @@ def test_kis_client_state_lock_protects_circuit_failure_counter(monkeypatch):
     )
 
 
-def test_kis_client_state_lock_protects_check_circuit_concurrent_reads():
+def test_kis_client_state_lock_protects_check_circuit_concurrent_reads(monkeypatch):
     """다수 thread가 동시 _check_circuit 호출해도 inconsistent state 노출 없음.
 
     이 테스트는 race가 있으면 raise OR pass가 불일치할 수 있어 statistically 검증.
+    monkeypatch.setenv는 함수 종료 시 자동 복원되어 다른 test로의 env leak을 차단.
     """
-    import os
-    os.environ.setdefault("KIS_PAPER_APP_KEY", "test")
-    os.environ.setdefault("KIS_PAPER_APP_SECRET", "test")
-    os.environ.setdefault("KIS_PAPER_ACCOUNT_NUMBER", "12345678")
-    os.environ.setdefault("KIS_PAPER_ACCOUNT_PRODUCT_CODE", "01")
-    os.environ.setdefault("KIS_MODE", "virtual")
+    monkeypatch.setenv("KIS_PAPER_APP_KEY", "test")
+    monkeypatch.setenv("KIS_PAPER_APP_SECRET", "test")
+    monkeypatch.setenv("KIS_PAPER_ACCOUNT_NUMBER", "12345678")
+    monkeypatch.setenv("KIS_PAPER_ACCOUNT_PRODUCT_CODE", "01")
+    monkeypatch.setenv("KIS_MODE", "virtual")
 
     client = KISRestClient()
     # circuit이 막 열린 상황 시뮬레이션
@@ -356,7 +356,7 @@ def test_concurrent_build_recommendations_payload_isolated():
 
     # 각 호출은 unique request_id 부여 (UUID 기반이라 충돌 없어야 함)
     request_ids = [r.get("request_id") for r in results]
-    assert len(set(request_ids)) == 10, f"request_ids must be unique, got duplicates"
+    assert len(set(request_ids)) == 10, "request_ids must be unique, got duplicates"
 
     # 각 호출은 자기 bundle_id를 응답에 그대로 반영 (cross-request 오염 없음)
     for r in results:

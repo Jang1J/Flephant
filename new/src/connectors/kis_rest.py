@@ -109,9 +109,15 @@ class KISRestClient(BaseConnector):
         self._circuit_open_duration_sec = float(circuit_cfg.get("open_duration_sec", 60))
         self._circuit_consecutive_failures = 0
         self._circuit_opened_at: float | None = None
+        # 가드 3-b: cooldown 종료 직후 HALF_OPEN 단일 probe 직렬화.
+        # True인 동안 다른 thread는 OPEN처럼 거부되어 broker 복구 직후 burst를 차단.
+        self._circuit_half_open_probe_in_flight: bool = False
         # 가드 3: 공유 상태(request_count / error_count / circuit breaker) mutation 보호용 lock.
         # HTTP 호출은 lock 밖에서 진행. lock scope는 check-and-set + counter increment만.
         self._state_lock = threading.Lock()
+        # 가드 6: mock 모드 random.Random 동시 접근 보호 (random.Random은 thread-safe 아님).
+        # build_recommendations_payload가 ThreadPoolExecutor로 30종목 병렬 호출 시 결정성 유지.
+        self._rng_lock = threading.Lock()
 
         self.auth = auth or AuthManager()
         # 가드 2: 명시 주입(테스트용) 없으면 process 단위 shared RateLimiter 사용.
@@ -212,13 +218,21 @@ class KISRestClient(BaseConnector):
         """
         results: list[dict[str, Any]] = []
         now_str = datetime.now(_KST).isoformat()
-        for ticker in tickers:
+        # 가드 6: random.Random은 thread-safe 아님. 종목별 난수 3개씩 lock 안에서 일괄 생성.
+        with self._rng_lock:
+            rand_payload = [
+                (
+                    self._rng.randint(-500, 500),
+                    round(self._rng.uniform(-0.02, 0.02), 6),
+                    self._rng.randint(self._mock_volume_min, self._mock_volume_max),
+                )
+                for _ in tickers
+            ]
+        for idx, ticker in enumerate(tickers):
             padded = pad_ticker(ticker)
             base_price = self._base_price + (int(padded) % self._price_modulo)
-            last_price = base_price + self._rng.randint(-500, 500)
-            # ±2% 범위 변동률
-            day_change_pct = round(self._rng.uniform(-0.02, 0.02), 6)
-            volume = self._rng.randint(self._mock_volume_min, self._mock_volume_max)
+            delta, day_change_pct, volume = rand_payload[idx]
+            last_price = base_price + delta
             turnover = float(last_price * volume)
             results.append({
                 "ticker": padded,
@@ -566,12 +580,15 @@ class KISRestClient(BaseConnector):
 
     def _mock_inquire_price(self, ticker: str) -> dict[str, Any]:
         base_price = self._base_price + (int(ticker) % self._price_modulo)
-        delta = self._rng.randint(-500, 500)
+        # 가드 6: random.Random은 thread-safe 아님. ThreadPoolExecutor 병렬 호출 시 보호.
+        with self._rng_lock:
+            delta = self._rng.randint(-500, 500)
+            volume = self._rng.randint(self._mock_volume_min, self._mock_volume_max)
         now_str = datetime.now(_KST).isoformat()
         return {
             "ticker": ticker,
             "current_price": base_price + delta,
-            "volume": self._rng.randint(self._mock_volume_min, self._mock_volume_max),
+            "volume": volume,
             "ts_close": now_str,
             "ingest_ts": now_str,
             "completeness": "full",
@@ -586,17 +603,28 @@ class KISRestClient(BaseConnector):
         bars: list[dict[str, Any]] = []
         price = base
         prev_close = base
+        # 가드 6: random.Random은 thread-safe 아님. n_bars 분량 난수를 lock 안에서 일괄 생성.
+        with self._rng_lock:
+            close_deltas = [self._rng.randint(-200, 200) for _ in range(n_bars)]
+            high_deltas = [
+                self._rng.randint(self._mock_change_min, self._mock_change_max)
+                for _ in range(n_bars)
+            ]
+            low_deltas = [
+                self._rng.randint(self._mock_change_min, self._mock_change_max)
+                for _ in range(n_bars)
+            ]
+            volumes = [
+                self._rng.randint(self._mock_bid_size_min, self._mock_bid_size_max)
+                for _ in range(n_bars)
+            ]
         for i in range(n_bars):
             ts = now - timedelta(minutes=n_bars - 1 - i)
             open_p = price
-            close_p = price + self._rng.randint(-200, 200)
-            high_p = max(open_p, close_p) + self._rng.randint(
-                self._mock_change_min, self._mock_change_max
-            )
-            low_p = min(open_p, close_p) - self._rng.randint(
-                self._mock_change_min, self._mock_change_max
-            )
-            volume = self._rng.randint(self._mock_bid_size_min, self._mock_bid_size_max)
+            close_p = price + close_deltas[i]
+            high_p = max(open_p, close_p) + high_deltas[i]
+            low_p = min(open_p, close_p) - low_deltas[i]
+            volume = volumes[i]
             # C1 required_features: vwap / turnover / change / ingest_ts / completeness
             vwap = (open_p + high_p + low_p + close_p) / 4.0
             turnover = float(vwap * volume)
@@ -672,6 +700,8 @@ class KISRestClient(BaseConnector):
                 last_err = e
                 safe_error = self._sanitize_error_text(str(e))
                 if self._is_non_retryable_kis_error(e):
+                    # 가드 3-b: non-retryable raise 전 HALF_OPEN probe permit을 반드시 반납.
+                    self._record_call_failure(e)
                     raise KISAPIError(safe_error) from e
                 if attempt < self._max_retries - 1:
                     wait_sec = self._retry_wait_seconds(e, attempt)
@@ -738,6 +768,8 @@ class KISRestClient(BaseConnector):
                 last_err = e
                 safe_error = self._sanitize_error_text(str(e))
                 if self._is_non_retryable_kis_error(e):
+                    # 가드 3-b: non-retryable raise 전 HALF_OPEN probe permit을 반드시 반납.
+                    self._record_call_failure(e)
                     raise KISAPIError(safe_error) from e
                 if attempt < self._max_retries - 1:
                     wait_sec = self._retry_wait_seconds(e, attempt)
@@ -935,22 +967,33 @@ class KISRestClient(BaseConnector):
                     "[kis_rest] circuit breaker OPEN",
                     retry_after_sec=remaining,
                 )
-            self._circuit_opened_at = None
-            self._circuit_consecutive_failures = max(
-                0,
-                self._circuit_failure_threshold - 1,
-            )
+            # 가드 3-b: cooldown 종료. 동시 N개 thread가 몰리면 첫 thread만 HALF_OPEN probe
+            # 허용하고 나머지는 OPEN처럼 거부. probe의 success/failure가 기록되기 전까지
+            # _circuit_opened_at은 유지하여 broker 복구 직후 burst를 차단.
+            if self._circuit_half_open_probe_in_flight:
+                raise KISAPIError(
+                    "[kis_rest] circuit breaker HALF_OPEN (probe in flight)",
+                    retry_after_sec=0.1,
+                )
+            self._circuit_half_open_probe_in_flight = True
 
     def _record_call_success(self) -> None:
         # 가드 3: circuit state reset을 lock으로 보호.
         with self._state_lock:
             self._circuit_consecutive_failures = 0
             self._circuit_opened_at = None
+            # HALF_OPEN probe 성공 → CLOSED 복귀
+            self._circuit_half_open_probe_in_flight = False
 
     def _record_call_failure(self, error: Exception | None) -> None:
         if not self._circuit_enabled:
             return
+        # non-retryable error는 broker가 정상 응답한 client 오류이므로 circuit count는
+        # 증가시키지 않는다. 다만 HALF_OPEN probe permit은 종료되었으므로 flag는 반드시 reset.
+        # (reset 누락 시 probe in flight 상태로 영구 잠겨 다음 thread들이 영구 거부됨)
         if error is not None and self._is_non_retryable_kis_error(error):
+            with self._state_lock:
+                self._circuit_half_open_probe_in_flight = False
             return
         # 가드 3: failure counter increment + threshold check + opened_at set를 lock으로 보호.
         # logger.warning은 lock 밖에서 처리 (lock scope 최소화).
@@ -960,6 +1003,8 @@ class KISRestClient(BaseConnector):
             if self._circuit_consecutive_failures >= self._circuit_failure_threshold:
                 self._circuit_opened_at = time.monotonic()
                 opened = True
+            # HALF_OPEN probe 실패 → 다음 cooldown 사이클로 reset (다시 OPEN 상태)
+            self._circuit_half_open_probe_in_flight = False
             failures_snapshot = self._circuit_consecutive_failures
         if opened:
             logger.warning(
@@ -1302,8 +1347,12 @@ class KISRestClient(BaseConnector):
         return None
 
     def _mock_investor_row(self, ticker: str, date: str) -> dict[str, Any]:
-        foreign = float(self._rng.randint(-2_000_000_000, 2_000_000_000))
-        institutional = float(self._rng.randint(-2_000_000_000, 2_000_000_000))
+        # 가드 6: random.Random은 thread-safe 아님. 두 난수를 lock 안에서 일괄 생성.
+        with self._rng_lock:
+            foreign_int = self._rng.randint(-2_000_000_000, 2_000_000_000)
+            institutional_int = self._rng.randint(-2_000_000_000, 2_000_000_000)
+        foreign = float(foreign_int)
+        institutional = float(institutional_int)
         retail = -(foreign + institutional)
         return {
             "ticker": ticker,

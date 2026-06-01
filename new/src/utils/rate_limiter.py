@@ -97,7 +97,7 @@ class RateLimiter:
                 self._tokens -= tokens
                 return True
             logger.warning(
-                "토큰 부족: source=%s, 요청=%d, 잔여=%.2f",
+                "[rate_limiter] 토큰 부족: source=%s, 요청=%d, 잔여=%.2f",
                 self.source,
                 tokens,
                 self._tokens,
