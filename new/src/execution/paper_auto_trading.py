@@ -163,7 +163,14 @@ class PaperAutoTrader:
         self._last_bar_fetch_metadata: dict[str, Any] = {}
         self._minute_bar_cache = minute_bar_cache or MinuteBarWindowCache(
             self._kis_client,
-            load_minute_bar_window_cache_config(window_size=self._required_warmup_bars()),
+            load_minute_bar_window_cache_config(
+                window_size=self._required_warmup_bars(),
+                parallel_fetch_workers=safe_int(
+                    self._cfg.get("minute_bar_parallel_fetch_workers", 1),
+                    default=1,
+                    min_value=1,
+                ),
+            ),
             now_fn=self._now_kst,
         )
 
