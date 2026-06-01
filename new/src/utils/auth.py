@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -37,9 +38,14 @@ class AuthManager:
 
     _kis_token: str | None
     _kis_token_expires_at: datetime | None
-    _shared_kis_token: str | None = None
-    _shared_kis_token_expires_at: datetime | None = None
-    _shared_kis_token_scope: tuple[str, str] | None = None
+    # 공유 토큰 캐시는 (token, expires_at, scope) 단일 tuple로 묶어 atomic read/write 보장.
+    # 3개 변수로 나누면 한 thread가 write 도중 다른 thread가 partial state를 read하여
+    # 일관성 깨지는 race가 발생할 수 있다 (Gemini bot review에서 지적된 사항).
+    # Python에서 단일 reference 할당은 GIL로 atomic이라 tuple 통째로 교체하면 consistent snapshot이 보장된다.
+    _shared_token_data: tuple[str, datetime, tuple[str, str]] | None = None
+    # 프로세스 단위 토큰 갱신 직렬화 Lock. 동시 다중 thread가 _fetch_kis_token을 중복
+    # 호출하여 KIS EGW00133(재발급 제한)을 트리거하는 race를 차단한다.
+    _token_lock: threading.Lock = threading.Lock()
 
     def __init__(self) -> None:
         self._kis_token = None
@@ -61,22 +67,35 @@ class AuthManager:
         return self._need_refresh() and not self._load_shared_kis_token()
 
     def get_kis_token(self) -> str:
-        """유효 KIS access_token. 만료 5분 전이면 auto refresh."""
+        """유효 KIS access_token. 만료 5분 전이면 auto refresh.
+
+        Thread-safe: refresh 분기는 클래스 레벨 _token_lock으로 직렬화.
+        Double-checked locking으로 캐시 hit fast-path는 lock 없이 통과.
+        """
         if self._need_refresh():
+            # Fast path: lock 없이 공유 캐시 시도. hit이면 즉시 return.
             if self._load_shared_kis_token():
                 if self._kis_token is None:
                     raise RuntimeError("[auth] 공유 KIS 토큰 로드 후에도 None. 내부 버그.")
                 return self._kis_token
 
-            token, expires_at = self._fetch_kis_token()
-            self._kis_token = token
-            self._kis_token_expires_at = expires_at
-            self._store_shared_kis_token(token, expires_at)
-            logger.info(
-                "KIS 토큰 발급 완료. 만료: %s, 마스킹: %s",
-                expires_at.isoformat(),
-                _mask_token(token),
-            )
+            # Slow path: 토큰 갱신 직렬화. 동시 다중 thread의 중복 fetch 차단.
+            with type(self)._token_lock:
+                # 락 획득 후 재확인 — 대기 중 다른 thread가 이미 갱신했을 수 있음.
+                if self._load_shared_kis_token():
+                    if self._kis_token is None:
+                        raise RuntimeError("[auth] 공유 KIS 토큰 로드 후에도 None. 내부 버그.")
+                    return self._kis_token
+
+                token, expires_at = self._fetch_kis_token()
+                self._kis_token = token
+                self._kis_token_expires_at = expires_at
+                self._store_shared_kis_token(token, expires_at)
+                logger.info(
+                    "KIS 토큰 발급 완료. 만료: %s, 마스킹: %s",
+                    expires_at.isoformat(),
+                    _mask_token(token),
+                )
 
         if self._kis_token is None:
             raise RuntimeError("[auth] KIS 토큰 발급 후에도 None. 내부 버그.")
@@ -172,13 +191,16 @@ class AuthManager:
         return (self.get_mode(), app_key)
 
     def _load_shared_kis_token(self) -> bool:
-        """동일 프로세스의 다른 AuthManager가 발급한 KIS 토큰 재사용."""
+        """동일 프로세스의 다른 AuthManager가 발급한 KIS 토큰 재사용.
+
+        단일 tuple 읽기로 (token, expires_at, scope) snapshot을 atomic하게 받아온다.
+        """
         cls = type(self)
-        token = cls._shared_kis_token
-        expires_at = cls._shared_kis_token_expires_at
-        if token is None or expires_at is None:
+        data = cls._shared_token_data
+        if data is None:
             return False
-        if cls._shared_kis_token_scope != self._kis_token_scope():
+        token, expires_at, scope = data
+        if scope != self._kis_token_scope():
             return False
         now = datetime.now(tz=timezone.utc)
         if (expires_at - now).total_seconds() < self.refresh_margin_sec:
@@ -188,11 +210,12 @@ class AuthManager:
         return True
 
     def _store_shared_kis_token(self, token: str, expires_at: datetime) -> None:
-        """KIS OAuth 재발급 제한 회피를 위한 프로세스 단위 메모리 캐시."""
+        """KIS OAuth 재발급 제한 회피를 위한 프로세스 단위 메모리 캐시.
+
+        (token, expires_at, scope)를 단일 tuple로 묶어 한 번에 할당하여 atomic 보장.
+        """
         cls = type(self)
-        cls._shared_kis_token = token
-        cls._shared_kis_token_expires_at = expires_at
-        cls._shared_kis_token_scope = self._kis_token_scope()
+        cls._shared_token_data = (token, expires_at, self._kis_token_scope())
 
     def _fetch_kis_token(self) -> tuple[str, datetime]:
         """KIS OAuth POST /oauth2/tokenP 호출. 재시도 3회 포함.

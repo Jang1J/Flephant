@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import threading
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -39,6 +41,7 @@ def _config(
     gap_refetch_sec: int = 300,
     expected_bar_interval_sec: int = 60,
     max_contiguity_gap_sec: int = 60,
+    parallel_fetch_workers: int = 1,
 ) -> MinuteBarWindowCacheConfig:
     return MinuteBarWindowCacheConfig(
         window_size=window_size,
@@ -48,6 +51,7 @@ def _config(
         expected_bar_interval_sec=expected_bar_interval_sec,
         max_contiguity_gap_sec=max_contiguity_gap_sec,
         force_cold_on_session_date_change=True,
+        parallel_fetch_workers=parallel_fetch_workers,
     )
 
 
@@ -61,6 +65,27 @@ class ScriptedMinuteClient:
         if not self.responses:
             return []
         return list(self.responses.pop(0))
+
+
+class ConcurrentMinuteClient:
+    def __init__(self, responses: dict[str, list[dict[str, Any]]]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, int]] = []
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def inquire_minute_bar(self, ticker: str, n_bars: int = 60) -> list[dict[str, Any]]:
+        with self._lock:
+            self.calls.append((ticker, n_bars))
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.02)
+            return list(self.responses.get(ticker, []))
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 def test_cold_fetches_warmup_then_incremental_tail_only() -> None:
@@ -84,6 +109,32 @@ def test_cold_fetches_warmup_then_incremental_tail_only() -> None:
     assert second.windows["005930"][-1]["ts_close"] == "2026-06-01T10:01:00+09:00"
     assert second.windows["005930"][-1]["change"] == 1.0
     assert second.metadata["tickers"]["005930"]["fetch_policy"] == "incremental"
+
+
+def test_parallel_workers_fetch_ticker_windows_without_changing_ordered_output() -> None:
+    start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
+    client = ConcurrentMinuteClient({
+        "005930": _bars("005930", start, 61, close_base=100.0),
+        "000660": _bars("000660", start, 61, close_base=200.0),
+        "035420": _bars("035420", start, 61, close_base=300.0),
+    })
+    cache = MinuteBarWindowCache(client, _config(parallel_fetch_workers=3))
+
+    result = cache.get_windows(
+        ["005930", "000660", "035420"],
+        asof="2026-06-01T09:59:00+09:00",
+        min_bars=60,
+    )
+
+    assert result.status == "PASS"
+    assert client.max_active > 1
+    assert set(client.calls) == {
+        ("005930", 61),
+        ("000660", 61),
+        ("035420", 61),
+    }
+    assert list(result.windows) == ["005930", "000660", "035420"]
+    assert result.metadata["parallel_fetch_workers"] == 3
 
 
 def test_config_tune_covers_188_second_cycle_gap_with_incremental_fetch() -> None:
@@ -317,3 +368,30 @@ def test_session_date_boundary_forces_cold_refetch() -> None:
     assert result.status == "PASS"
     assert client.calls == [("005930", 61), ("005930", 61)]
     assert result.metadata["tickers"]["005930"]["fetch_policy"] == "cold_session_boundary"
+
+
+def test_asof_rollback_forces_cold_refetch_without_serving_future_cache() -> None:
+    start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
+    later_window = _bars("005930", start + timedelta(minutes=1), 60, close_base=101.0)
+    earlier_window = _bars("005930", start, 60, close_base=100.0)
+    client = ScriptedMinuteClient([later_window, earlier_window])
+    cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=300))
+
+    first = cache.get_windows(
+        ["005930"],
+        asof="2026-06-01T10:00:00+09:00",
+        min_bars=60,
+    )
+    rollback = cache.get_windows(
+        ["005930"],
+        asof="2026-06-01T09:59:00+09:00",
+        min_bars=60,
+    )
+
+    assert first.status == "PASS"
+    assert rollback.status == "PASS"
+    assert client.calls == [("005930", 61), ("005930", 61)]
+    assert rollback.metadata["tickers"]["005930"]["fetch_policy"] == "cold_asof_rollback"
+    returned_ts = [row["ts_close"] for row in rollback.windows["005930"]]
+    assert "2026-06-01T10:00:00+09:00" not in returned_ts
+    assert rollback.windows["005930"][-1]["ts_close"] == "2026-06-01T09:59:00+09:00"

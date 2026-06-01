@@ -90,9 +90,7 @@ def test_get_kis_token_reuses_shared_cache_across_instances(monkeypatch):
     monkeypatch.setenv("KIS_MODE", "virtual")
     monkeypatch.setenv("KIS_APP_KEY", "shared_key")
     monkeypatch.setenv("KIS_APP_SECRET", "shared_secret")
-    monkeypatch.setattr(AuthManager, "_shared_kis_token", None)
-    monkeypatch.setattr(AuthManager, "_shared_kis_token_expires_at", None)
-    monkeypatch.setattr(AuthManager, "_shared_kis_token_scope", None)
+    monkeypatch.setattr(AuthManager, "_shared_token_data", None)
 
     expires_at = datetime.now(tz=timezone.utc) + timedelta(hours=1)
     first = AuthManager()
@@ -139,9 +137,7 @@ def test_kis_token_rate_limit_retries_without_leaking_secret(monkeypatch):
     monkeypatch.setenv("KIS_MODE", "virtual")
     monkeypatch.setenv("KIS_APP_KEY", "app-key")
     monkeypatch.setenv("KIS_APP_SECRET", "super-secret")
-    monkeypatch.setattr(AuthManager, "_shared_kis_token", None)
-    monkeypatch.setattr(AuthManager, "_shared_kis_token_expires_at", None)
-    monkeypatch.setattr(AuthManager, "_shared_kis_token_scope", None)
+    monkeypatch.setattr(AuthManager, "_shared_token_data", None)
 
     responses = [
         {

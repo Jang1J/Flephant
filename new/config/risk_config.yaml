@@ -184,6 +184,9 @@ grpc_recommendations:
   reason_code: "MODEL_RANKING_SIGNAL"
   expected_return_unavailable_reason: "expected_return_unavailable_not_calibrated"
   reason_ko_template: "{stock_name}({ticker})는 현재 1분봉 기반 랭킹 모델 score가 후보군 중 {ranking}위로 산출되어 추천 목록에 포함됐습니다. 이 score는 보정된 기대수익률이 아니며, 주문 권고가 아닌 참고용 신호입니다. 위험도 표시는 {risk_level_ko}입니다."
+  # 가드 1: 30종목 KIS bar fetch 병렬화 worker 수. ThreadPoolExecutor(max_workers=N).
+  # 하드코딩 회피 + 운영 중 조정 가능. KIS rate limit / shared limiter와 함께 운영.
+  parallel_fetch_workers: 10
 
 minute_bar_window_cache:
   incremental_fetch_bars: 6

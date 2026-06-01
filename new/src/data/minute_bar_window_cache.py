@@ -1,6 +1,7 @@
 """PIT-safe rolling cache for KIS one-minute bar windows."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import threading
@@ -28,6 +29,7 @@ class MinuteBarWindowCacheConfig:
     expected_bar_interval_sec: int
     max_contiguity_gap_sec: int
     force_cold_on_session_date_change: bool
+    parallel_fetch_workers: int = 1
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,11 @@ class MinuteBarWindowResult:
     metadata: dict[str, Any]
 
 
-def load_minute_bar_window_cache_config(*, window_size: int) -> MinuteBarWindowCacheConfig:
+def load_minute_bar_window_cache_config(
+    *,
+    window_size: int,
+    parallel_fetch_workers: int | None = None,
+) -> MinuteBarWindowCacheConfig:
     """Load cache policy from risk_config.yaml without embedding magic values."""
     cfg = config_load("risk_config.yaml", "minute_bar_window_cache") or {}
     required_keys = [
@@ -89,6 +95,11 @@ def load_minute_bar_window_cache_config(*, window_size: int) -> MinuteBarWindowC
             cfg["force_cold_on_session_date_change"],
             default=True,
         ),
+        parallel_fetch_workers=safe_int(
+            parallel_fetch_workers,
+            default=1,
+            min_value=1,
+        ),
     )
 
 
@@ -107,6 +118,7 @@ class MinuteBarWindowCache:
         self._now = now_fn or (lambda: datetime.now(_KST))
         self._windows: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.RLock()
+        self._batch_lock = threading.Lock()
 
     def clear(self, ticker: str | None = None) -> None:
         with self._lock:
@@ -139,18 +151,22 @@ class MinuteBarWindowCache:
         windows: dict[str, list[dict[str, Any]]] = {}
         failed: dict[str, str] = {}
 
-        with self._lock:
-            for ticker in requested:
-                ticker_window, ticker_meta, reason = self._fetch_update_window(
-                    ticker=ticker,
-                    asof_ts=asof_ts,
-                    min_bars=min_bars,
-                )
-                metadata["tickers"][ticker] = ticker_meta
-                if reason != "ok":
-                    failed[ticker] = reason
-                    continue
-                windows[ticker] = ticker_window
+        with self._batch_lock:
+            ticker_results = self._fetch_update_windows(
+                requested,
+                asof_ts=asof_ts,
+                min_bars=min_bars,
+            )
+        for ticker in requested:
+            ticker_window, ticker_meta, reason = ticker_results.get(
+                ticker,
+                ([], {"reason": "not_evaluated"}, "not_evaluated"),
+            )
+            metadata["tickers"][ticker] = ticker_meta
+            if reason != "ok":
+                failed[ticker] = reason
+                continue
+            windows[ticker] = ticker_window
 
         metadata["failed_tickers"] = failed
         if not requested:
@@ -175,6 +191,59 @@ class MinuteBarWindowCache:
             metadata=metadata,
         )
 
+    def _fetch_update_windows(
+        self,
+        tickers: list[str],
+        *,
+        asof_ts: datetime,
+        min_bars: int | None,
+    ) -> dict[str, tuple[list[dict[str, Any]], dict[str, Any], str]]:
+        if not tickers:
+            return {}
+        workers = max(1, min(int(self.config.parallel_fetch_workers), len(tickers)))
+        if workers == 1:
+            return {
+                ticker: self._fetch_update_window(
+                    ticker=ticker,
+                    asof_ts=asof_ts,
+                    min_bars=min_bars,
+                )
+                for ticker in tickers
+            }
+
+        results: dict[str, tuple[list[dict[str, Any]], dict[str, Any], str]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_ticker = {
+                pool.submit(
+                    self._fetch_update_window,
+                    ticker=ticker,
+                    asof_ts=asof_ts,
+                    min_bars=min_bars,
+                ): ticker
+                for ticker in tickers
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception as e:
+                    results[ticker] = (
+                        [],
+                        {
+                            "reason": "fetch_error",
+                            "error": str(e),
+                            "fetch_policy": "unknown",
+                            "effective_fetch_policy": "unknown",
+                            "fetch_n": 0,
+                            "cached_rows_before": 0,
+                            "fetched_rows": 0,
+                            "accepted_rows": 0,
+                            "returned_rows": 0,
+                        },
+                        "fetch_error",
+                    )
+        return results
+
     def _fetch_update_window(
         self,
         *,
@@ -182,7 +251,8 @@ class MinuteBarWindowCache:
         asof_ts: datetime,
         min_bars: int | None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-        cached = list(self._windows.get(ticker, []))
+        with self._lock:
+            cached = list(self._windows.get(ticker, []))
         cached_latest = self._latest_valid_ts(cached)
         fetch_policy = self._fetch_policy(cached, cached_latest, asof_ts)
         fetch_n = (
@@ -231,7 +301,8 @@ class MinuteBarWindowCache:
         merge_input = accepted if fetch_policy != "incremental" else [*cached, *accepted]
         merged, duplicate_replaced_count = self._dedupe_sort_cap(merge_input)
         meta["duplicate_replaced_count"] = duplicate_replaced_count
-        self._windows[ticker] = merged
+        with self._lock:
+            self._windows[ticker] = merged
 
         self._update_window_health_metadata(merged, asof_ts, meta)
         reason = self._window_failure_reason(merged, meta, min_bars)
@@ -245,7 +316,8 @@ class MinuteBarWindowCache:
                 min_bars=min_bars,
                 meta=meta,
             )
-            merged = list(self._windows.get(ticker, []))
+            with self._lock:
+                merged = list(self._windows.get(ticker, []))
             reason = retry_reason
         meta["reason"] = reason
         meta["returned_rows"] = len(merged) if reason == "ok" else 0
@@ -266,6 +338,8 @@ class MinuteBarWindowCache:
             and cached_latest.date() != asof_ts.date()
         ):
             return "cold_session_boundary"
+        if cached_latest > asof_ts:
+            return "cold_asof_rollback"
         if (asof_ts - cached_latest) > timedelta(seconds=self.config.gap_refetch_sec):
             return "cold_gap_refetch"
         return "incremental"
@@ -370,7 +444,8 @@ class MinuteBarWindowCache:
         except Exception as e:
             meta["reason"] = "fetch_error"
             meta["error"] = str(e)
-            self._windows[ticker] = []
+            with self._lock:
+                self._windows[ticker] = []
             return "fetch_error"
         fetched = fetched if isinstance(fetched, list) else []
         meta["fetched_rows"] = len(fetched)
@@ -379,7 +454,8 @@ class MinuteBarWindowCache:
         meta["accepted_rows"] = len(accepted)
         merged, duplicate_replaced_count = self._dedupe_sort_cap(accepted)
         meta["duplicate_replaced_count"] = duplicate_replaced_count
-        self._windows[ticker] = merged
+        with self._lock:
+            self._windows[ticker] = merged
         self._update_window_health_metadata(merged, asof_ts, meta)
         return self._window_failure_reason(merged, meta, min_bars)
 
@@ -462,6 +538,7 @@ class MinuteBarWindowCache:
             "gap_refetch_sec": int(self.config.gap_refetch_sec),
             "expected_bar_interval_sec": int(self.config.expected_bar_interval_sec),
             "max_contiguity_gap_sec": int(self.config.max_contiguity_gap_sec),
+            "parallel_fetch_workers": int(self.config.parallel_fetch_workers),
             "force_cold_on_session_date_change": bool(
                 self.config.force_cold_on_session_date_change
             ),

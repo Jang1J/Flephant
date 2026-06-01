@@ -188,6 +188,7 @@ def _resolve_recommendation_config() -> dict[str, Any]:
             cfg["expected_return_unavailable_reason"],
         ),
         "reason_ko_template": str(cfg["reason_ko_template"]),
+        "parallel_fetch_workers": int(cfg["parallel_fetch_workers"]),
     }
 
 
@@ -350,6 +351,7 @@ def build_recommendations_payload(
         warmup_bars = int(config_load("risk_config.yaml", "quant_agent")["warmup_bars"])
         minute_bar_cache_config = load_minute_bar_window_cache_config(
             window_size=warmup_bars,
+            parallel_fetch_workers=int(cfg["parallel_fetch_workers"]),
         )
     except Exception as e:
         diagnostics["config_error"] = str(e)
