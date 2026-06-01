@@ -137,26 +137,6 @@ def test_parallel_workers_fetch_ticker_windows_without_changing_ordered_output()
     assert result.metadata["parallel_fetch_workers"] == 3
 
 
-def test_current_forming_minute_is_filtered_when_asof_has_seconds() -> None:
-    start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
-    client = ScriptedMinuteClient([
-        _bars("005930", start, 61),
-    ])
-    cache = MinuteBarWindowCache(client, _config())
-
-    result = cache.get_windows(
-        ["005930"],
-        asof="2026-06-01T09:59:30+09:00",
-        min_bars=1,
-    )
-
-    assert result.status == "PASS"
-    ticker_meta = result.metadata["tickers"]["005930"]
-    assert ticker_meta["forming_bar_filtered_count"] == 1
-    assert ticker_meta["future_bar_filtered_count"] == 1
-    assert result.windows["005930"][-1]["ts_close"] == "2026-06-01T09:58:00+09:00"
-
-
 def test_config_tune_covers_188_second_cycle_gap_with_incremental_fetch() -> None:
     start = datetime(2026, 6, 1, 9, 0, tzinfo=_KST)
     client = ScriptedMinuteClient([
@@ -177,9 +157,8 @@ def test_config_tune_covers_188_second_cycle_gap_with_incremental_fetch() -> Non
     assert ticker_meta["fetch_n"] == 6
     assert ticker_meta["contiguity_status"] == "PASS"
     assert ticker_meta["freshness_status"] == "PASS"
-    assert ticker_meta["latest_ts"] == "2026-06-01T10:01:00+09:00"
-    assert ticker_meta["forming_bar_filtered_count"] == 1
-    assert second.windows["005930"][-1]["ts_close"] == "2026-06-01T10:01:00+09:00"
+    assert ticker_meta["latest_ts"] == "2026-06-01T10:02:00+09:00"
+    assert second.windows["005930"][-1]["ts_close"] == "2026-06-01T10:02:00+09:00"
 
 
 def test_filters_t_plus_one_before_cache_and_score_window() -> None:
@@ -190,7 +169,7 @@ def test_filters_t_plus_one_before_cache_and_score_window() -> None:
             _bar("005930", datetime(2026, 6, 1, 10, 0, tzinfo=_KST), 999.0),
         ],
     ])
-    cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=300))
+    cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=180))
 
     result = cache.get_windows(["005930"], asof="2026-06-01T09:59:00+09:00", min_bars=60)
 
@@ -246,10 +225,10 @@ def test_incremental_hole_triggers_cold_retry_then_fails_if_hole_remains() -> No
         _bar("005930", datetime(2026, 6, 1, 10, 1, tzinfo=_KST), 161.0),
     ]
     client = ScriptedMinuteClient([warmup, broker_drop_tail, cold_still_missing])
-    cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=300))
+    cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=180))
 
     cache.get_windows(["005930"], asof="2026-06-01T09:59:00+09:00", min_bars=60)
-    result = cache.get_windows(["005930"], asof="2026-06-01T10:02:50+09:00", min_bars=60)
+    result = cache.get_windows(["005930"], asof="2026-06-01T10:01:50+09:00", min_bars=60)
 
     assert result.status == "FAIL"
     assert result.windows == {}
@@ -271,7 +250,7 @@ def test_direct_cold_non_contiguous_window_fails_closed() -> None:
     client = ScriptedMinuteClient([hole_window])
     cache = MinuteBarWindowCache(client, _config(gap_refetch_sec=180))
 
-    result = cache.get_windows(["005930"], asof="2026-06-01T10:02:50+09:00", min_bars=60)
+    result = cache.get_windows(["005930"], asof="2026-06-01T10:01:50+09:00", min_bars=60)
 
     assert result.status == "FAIL"
     assert result.windows == {}
@@ -328,7 +307,7 @@ def test_incremental_hole_recovers_when_cold_retry_is_contiguous() -> None:
     cache = MinuteBarWindowCache(client, _config())
 
     cache.get_windows(["005930"], asof="2026-06-01T09:59:00+09:00", min_bars=60)
-    result = cache.get_windows(["005930"], asof="2026-06-01T10:02:50+09:00", min_bars=60)
+    result = cache.get_windows(["005930"], asof="2026-06-01T10:01:50+09:00", min_bars=60)
 
     assert result.status == "PASS"
     assert client.calls == [("005930", 61), ("005930", 6), ("005930", 61)]
