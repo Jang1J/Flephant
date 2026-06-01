@@ -22,6 +22,8 @@ def test_kospi_calendar_skips_2026_market_holidays():
     assert is_kospi_trading_day(date(2026, 5, 1)) is False
     assert is_kospi_trading_day(date(2026, 5, 5)) is False
     assert is_kospi_trading_day(date(2026, 5, 6)) is True
+    assert is_kospi_trading_day(date(2026, 6, 3)) is False
+    assert is_kospi_trading_day(date(2026, 7, 17)) is False
     assert is_kospi_trading_day(date(2026, 8, 17)) is False
     assert is_kospi_trading_day(date(2026, 9, 23)) is False
     assert is_kospi_trading_day(date(2026, 9, 24)) is False

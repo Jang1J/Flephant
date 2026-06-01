@@ -188,6 +188,15 @@ grpc_recommendations:
   # 하드코딩 회피 + 운영 중 조정 가능. KIS rate limit / shared limiter와 함께 운영.
   parallel_fetch_workers: 10
 
+minute_bar_window_cache:
+  incremental_fetch_bars: 6
+  freshness_max_lag_sec: 120
+  gap_refetch_sec: 300
+  expected_bar_interval_sec: 60
+  max_contiguity_gap_sec: 60
+  force_cold_on_session_date_change: true
+  rationale: "Mode A 1분 cadence용 KIS minute-bar rolling cache. cold는 quant_agent.warmup_bars+1, 이후 tail 6개만 fetch한다. freshness/gap/session 경계는 fail-closed 또는 cold refetch."
+
 mode_b_deploy:
   report_dir: "artifacts/reports/deploy"
   confirm_deploy_phrase: "DEPLOY_CANDIDATE_OK"
@@ -2151,6 +2160,8 @@ dqr:
     - "2026-05-01"  # 근로자의 날 (KRX 휴장)
     - "2026-05-05"  # 어린이날
     - "2026-05-25"  # 부처님오신날
+    - "2026-06-03"  # 지방선거일 (KRX 휴장)
+    - "2026-07-17"  # 제헌절 (KRX 휴장)
     - "2026-08-17"  # 광복절 대체휴일
     - "2026-09-23"  # 추석 전날 (2026 추석 연휴 9/23~9/25, 2026-05-12 audit C-D1 fix)
     - "2026-09-24"  # 추석 전날

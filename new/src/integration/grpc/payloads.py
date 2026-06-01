@@ -9,19 +9,27 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.data.minute_bar_window_cache import (
+    MinuteBarWindowCache,
+    MinuteBarWindowCacheConfig,
+    load_minute_bar_window_cache_config,
+)
 from src.ops.service_readiness_status import build_service_status
 from src.utils.config_loader import load as config_load
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPO_ROOT = Path(__file__).resolve().parents[4]
+_RECOMMENDATION_BAR_CACHE: MinuteBarWindowCache | None = None
+_RECOMMENDATION_BAR_CACHE_CONFIG: MinuteBarWindowCacheConfig | None = None
+_RECOMMENDATION_BAR_CACHE_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -286,6 +294,27 @@ def _make_recommendation_market_client() -> Any:
     return KISRestClient()
 
 
+def _recommendation_minute_bar_cache(
+    *,
+    config: MinuteBarWindowCacheConfig,
+    market_data_client: Any | None,
+    minute_bar_cache: MinuteBarWindowCache | None,
+) -> MinuteBarWindowCache:
+    if minute_bar_cache is not None:
+        return minute_bar_cache
+    if market_data_client is not None:
+        return MinuteBarWindowCache(market_data_client, config)
+    global _RECOMMENDATION_BAR_CACHE, _RECOMMENDATION_BAR_CACHE_CONFIG
+    with _RECOMMENDATION_BAR_CACHE_LOCK:
+        if _RECOMMENDATION_BAR_CACHE is None or _RECOMMENDATION_BAR_CACHE_CONFIG != config:
+            _RECOMMENDATION_BAR_CACHE = MinuteBarWindowCache(
+                _make_recommendation_market_client(),
+                config,
+            )
+            _RECOMMENDATION_BAR_CACHE_CONFIG = config
+        return _RECOMMENDATION_BAR_CACHE
+
+
 def build_recommendations_payload(
     *,
     request_id: str = "",
@@ -297,6 +326,7 @@ def build_recommendations_payload(
     root: Path | None = None,
     quant_agent: Any | None = None,
     market_data_client: Any | None = None,
+    minute_bar_cache: MinuteBarWindowCache | None = None,
 ) -> dict[str, Any]:
     """Build read-only model recommendations for BE dashboard use.
 
@@ -319,6 +349,10 @@ def build_recommendations_payload(
         if not requested_bundle_id:
             raise ValueError("grpc_recommendations.default_bundle_id_required")
         warmup_bars = int(config_load("risk_config.yaml", "quant_agent")["warmup_bars"])
+        minute_bar_cache_config = load_minute_bar_window_cache_config(
+            window_size=warmup_bars,
+            parallel_fetch_workers=int(cfg["parallel_fetch_workers"]),
+        )
     except Exception as e:
         diagnostics["config_error"] = str(e)
         return _recommendation_blocked_payload(
@@ -393,48 +427,29 @@ def build_recommendations_payload(
             include_diagnostics=include_diagnostics,
         )
 
+    resolved_asof = requested_asof or _now_iso()
     try:
-        client = market_data_client or _make_recommendation_market_client()
-        latest_ts: list[str] = []
-        bar_errors: dict[str, str] = {}
-
-        # Phase 1: 30종목 KIS REST 동시 호출 (I/O 병렬화).
-        # BarBuffer 미접근 구간이므로 thread-safety 부담 없음.
-        # 종목당 inquire_minute_bar 호출은 KISRestClient + RateLimiter + AuthManager
-        # 공유 인스턴스를 거치지만, 셋 다 Lock 도입으로 동시성 안전 (별도 패치 참조).
-        # 가드 5: as_completed로 완료 순서대로 수집 → 느린 future 하나에 blocking 안 됨.
-        # Phase 2 feed는 selected_tickers 순서 보존으로 cross-sectional scoring 결정성 유지.
-        fetch_results: dict[str, list[dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=cfg["parallel_fetch_workers"]) as pool:
-            future_to_ticker = {
-                pool.submit(client.inquire_minute_bar, t, warmup_bars): t
-                for t in selected_tickers
-            }
-            for future in as_completed(future_to_ticker):
-                ticker = future_to_ticker[future]
-                try:
-                    fetch_results[ticker] = future.result()
-                except Exception as e:
-                    bar_errors[ticker] = str(e)
-
-        # Phase 2: 순차 feed. BarBuffer.push는 thread-safe하지 않으므로 main thread 단일 호출.
-        # selected_tickers 순서를 보존하여 기존 동작과 동일한 latest_ts/quant 상태를 생성한다.
+        cache = _recommendation_minute_bar_cache(
+            config=minute_bar_cache_config,
+            market_data_client=market_data_client,
+            minute_bar_cache=minute_bar_cache,
+        )
+        cache_result = cache.get_windows(
+            selected_tickers,
+            asof=resolved_asof,
+            min_bars=warmup_bars,
+        )
+        diagnostics["minute_bar_window_cache"] = cache_result.metadata
+        bar_errors: dict[str, str] = {
+            str(ticker): str(reason)
+            for ticker, reason in cache_result.metadata.get("failed_tickers", {}).items()
+        }
         for ticker in selected_tickers:
-            bars = fetch_results.get(ticker)
-            if bars is None:
-                # Phase 1에서 이미 bar_errors에 기록됨
-                continue
-            if not isinstance(bars, list) or len(bars) < warmup_bars:
-                bar_errors[ticker] = f"insufficient_bars:{len(bars) if isinstance(bars, list) else 0}"
-                continue
-            for bar in bars:
+            for bar in cache_result.windows.get(ticker, []):
                 if not isinstance(bar, dict):
                     continue
                 row = dict(bar)
                 row["ticker"] = ticker
-                ts_close = str(row.get("ts_close") or row.get("ts") or "").strip()
-                if ts_close:
-                    latest_ts.append(ts_close)
                 quant.on_bar(row)
     except Exception as e:
         diagnostics["market_data_error"] = str(e)
@@ -442,7 +457,7 @@ def build_recommendations_payload(
             request_id=response_request_id,
             bundle_id=response_bundle_id,
             reason="market_data_unavailable",
-            asof=requested_asof,
+            asof=resolved_asof,
             model_version=model_version,
             diagnostics=diagnostics,
             include_diagnostics=include_diagnostics,
@@ -455,13 +470,12 @@ def build_recommendations_payload(
             request_id=response_request_id,
             bundle_id=response_bundle_id,
             reason="minute_bars_unavailable",
-            asof=requested_asof,
+            asof=resolved_asof,
             model_version=model_version,
             diagnostics=diagnostics,
             include_diagnostics=include_diagnostics,
         )
 
-    resolved_asof = requested_asof or (max(latest_ts) if latest_ts else "")
     if not resolved_asof:
         return _recommendation_blocked_payload(
             request_id=response_request_id,

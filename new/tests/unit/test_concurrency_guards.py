@@ -295,10 +295,11 @@ def _make_mock_market_client():
     mock = MagicMock()
 
     def fake_bars(ticker, n_bars=60):
+        start = datetime(2026, 6, 1, 8, 59)
         return [
             {
                 "ticker": ticker,
-                "ts_close": f"2026-06-01T09:{i:02d}:00+09:00",
+                "ts_close": (start + timedelta(minutes=i)).isoformat() + "+09:00",
                 "open": 70000,
                 "high": 70100,
                 "low": 69900,
@@ -333,6 +334,7 @@ def test_concurrent_build_recommendations_payload_isolated():
             # (실제 gRPC server도 매 요청마다 새로 만드는 패턴과 동일)
             payload = build_recommendations_payload(
                 bundle_id=bundle_id,
+                asof="2026-06-01T09:59:00+09:00",
                 tickers=["005930"],
                 include_diagnostics=False,
                 quant_agent=_make_mock_quant_agent(bundle_id),
@@ -360,6 +362,7 @@ def test_concurrent_build_recommendations_payload_isolated():
 
     # 각 호출은 자기 bundle_id를 응답에 그대로 반영 (cross-request 오염 없음)
     for r in results:
+        assert r.get("status") == "PASS"
         response_bundle_id = r.get("bundle_id", "")
         assert response_bundle_id == bundle_id, (
             f"unexpected bundle_id in response: {response_bundle_id} (expected {bundle_id})"
