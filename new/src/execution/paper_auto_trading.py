@@ -881,6 +881,7 @@ class PaperAutoTrader:
                 "stale_latest_bar",
                 "invalid_ts",
                 "fetch_error",
+                "fetch_timeout",
                 "no_valid_bars",
                 "non_contiguous_window",
             }
