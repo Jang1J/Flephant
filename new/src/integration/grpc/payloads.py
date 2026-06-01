@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -179,6 +180,7 @@ def _resolve_recommendation_config() -> dict[str, Any]:
             cfg["expected_return_unavailable_reason"],
         ),
         "reason_ko_template": str(cfg["reason_ko_template"]),
+        "parallel_fetch_workers": int(cfg["parallel_fetch_workers"]),
     }
 
 
@@ -395,11 +397,32 @@ def build_recommendations_payload(
         client = market_data_client or _make_recommendation_market_client()
         latest_ts: list[str] = []
         bar_errors: dict[str, str] = {}
+
+        # Phase 1: 30종목 KIS REST 동시 호출 (I/O 병렬화).
+        # BarBuffer 미접근 구간이므로 thread-safety 부담 없음.
+        # 종목당 inquire_minute_bar 호출은 KISRestClient + RateLimiter + AuthManager
+        # 공유 인스턴스를 거치지만, 셋 다 Lock 도입으로 동시성 안전 (별도 패치 참조).
+        # 가드 5: as_completed로 완료 순서대로 수집 → 느린 future 하나에 blocking 안 됨.
+        # Phase 2 feed는 selected_tickers 순서 보존으로 cross-sectional scoring 결정성 유지.
+        fetch_results: dict[str, list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=cfg["parallel_fetch_workers"]) as pool:
+            future_to_ticker = {
+                pool.submit(client.inquire_minute_bar, t, warmup_bars): t
+                for t in selected_tickers
+            }
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    fetch_results[ticker] = future.result()
+                except Exception as e:
+                    bar_errors[ticker] = str(e)
+
+        # Phase 2: 순차 feed. BarBuffer.push는 thread-safe하지 않으므로 main thread 단일 호출.
+        # selected_tickers 순서를 보존하여 기존 동작과 동일한 latest_ts/quant 상태를 생성한다.
         for ticker in selected_tickers:
-            try:
-                bars = client.inquire_minute_bar(ticker, n_bars=warmup_bars)
-            except Exception as e:
-                bar_errors[ticker] = str(e)
+            bars = fetch_results.get(ticker)
+            if bars is None:
+                # Phase 1에서 이미 bar_errors에 기록됨
                 continue
             if not isinstance(bars, list) or len(bars) < warmup_bars:
                 bar_errors[ticker] = f"insufficient_bars:{len(bars) if isinstance(bars, list) else 0}"
