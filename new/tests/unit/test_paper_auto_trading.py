@@ -902,6 +902,51 @@ def test_paper_auto_report_embeds_track_metadata(tmp_path: Path) -> None:
     }
 
 
+def test_paper_auto_interval_is_start_to_start_not_fixed_delay(tmp_path: Path) -> None:
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return clock["t"]
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    trader = PaperAutoTrader(
+        kis_client=FakePaperKIS(),
+        hot_runner=FakeHotRunner(),
+        report_dir=tmp_path,
+        sleep_fn=sleep,
+        monotonic_fn=monotonic,
+        now_fn=_paper_session_now,
+    )
+    runtimes = [20.0, 70.0, 5.0]
+
+    def fake_run_once(
+        *,
+        tickers: list[str],
+        cycle_index: int = 0,
+        risk_warnings: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        del tickers, risk_warnings
+        clock["t"] += runtimes[cycle_index]
+        return {"status": "PASS", "cycle_index": cycle_index, "account_state": {}}
+
+    trader.run_once = fake_run_once  # type: ignore[method-assign]
+
+    report = trader.run(
+        tickers=["005930"],
+        cycles=3,
+        interval_sec=60,
+        confirm_phrase=trader.confirm_start_phrase,
+        write_report=False,
+    )
+
+    assert report["status"] == "PASS"
+    assert sleeps == [40.0, 0.0]
+
+
 def test_paper_auto_tops_up_short_kis_window_with_past_artifact_bars(
     tmp_path: Path,
 ) -> None:
