@@ -514,12 +514,14 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
         ({}, {"safe_to_enable_live_actions": True}, "live_actions_enabled"),
     ],
 )
+@pytest.mark.parametrize("require_prelive_pass", [True, False])
 def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
     monkeypatch,
     tmp_path,
     readiness_overrides,
     contract_overrides,
     expected_reason,
+    require_prelive_pass,
 ) -> None:
     registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
     registry_dir.mkdir(parents=True)
@@ -567,7 +569,7 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
             "default_interval_sec": 60,
             "confirm_start_phrase": "PAPER_AUTO_OK",
             "max_tickers": 30,
-            "require_prelive_pass": True,
+            "require_prelive_pass": require_prelive_pass,
         },
     )
     monkeypatch.setattr(
@@ -746,6 +748,23 @@ def test_start_rpc_defaults_empty_tickers_to_active_universe(
         grpc_server,
         "_remaining_market_cycles",
         lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "build_service_status",
+        lambda **_kwargs: {
+            "status": "PASS",
+            "deploy_quality": "PASS",
+            "broker_evidence": "PASS",
+            "read_only": True,
+            "external_api_called": False,
+            "live_trading_allowed": False,
+            "registry_mutated": False,
+            "be_contract": {
+                "safe_to_enable_order_actions": True,
+                "safe_to_enable_live_actions": False,
+            },
+        },
     )
 
     def fake_start(**kwargs):

@@ -1214,30 +1214,29 @@ def _make_servicer(
                     status="MARKET_CLOSED",
                     reason="market_session_not_open_or_no_remaining_cycles",
                 )
-            if bool(pa_cfg.get("require_prelive_pass", True)):
-                try:
-                    paper_gate = _paper_start_gate_from_service_readiness(
-                        bundle_id=requested_bundle_id,
-                        repo_root=repo_root,
-                        candidate_registry_dir=registry_dir,
-                    )
-                except Exception as e:
-                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                    context.set_details(f"paper_start_gate_error:{e}")
-                    return pb2.StartPaperAutoTradingResponse(
-                        request_id=str(getattr(request, "request_id", "")),
-                        accepted=False,
-                        status="PAPER_START_GATE_ERROR",
-                        reason=f"paper_start_gate_error:{e}",
-                    )
-                if paper_gate.get("status") != "PASS":
-                    reason = ",".join(paper_gate.get("blockers") or [])
-                    return pb2.StartPaperAutoTradingResponse(
-                        request_id=str(getattr(request, "request_id", "")),
-                        accepted=False,
-                        status="PAPER_START_GATE_BLOCKED",
-                        reason=reason,
-                    )
+            try:
+                paper_gate = _paper_start_gate_from_service_readiness(
+                    bundle_id=requested_bundle_id,
+                    repo_root=repo_root,
+                    candidate_registry_dir=registry_dir,
+                )
+            except Exception as e:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details(f"paper_start_gate_error:{e}")
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="PAPER_START_GATE_ERROR",
+                    reason=f"paper_start_gate_error:{e}",
+                )
+            if paper_gate.get("status") != "PASS":
+                reason = ",".join(paper_gate.get("blockers") or [])
+                return pb2.StartPaperAutoTradingResponse(
+                    request_id=str(getattr(request, "request_id", "")),
+                    accepted=False,
+                    status="PAPER_START_GATE_BLOCKED",
+                    reason=reason,
+                )
             result = session.start(
                 request_id=str(getattr(request, "request_id", "")),
                 bundle_id=requested_bundle_id,
