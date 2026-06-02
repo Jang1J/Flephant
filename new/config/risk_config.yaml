@@ -149,7 +149,7 @@ paper_auto_trading:
   default_max_cycles: 390
   default_interval_sec: 60
   max_tickers: 30
-  minute_bar_parallel_fetch_workers: 10
+  minute_bar_parallel_fetch_workers: 1
   max_orders_per_cycle: 3
   max_order_qty_per_order: 2
   max_order_qty_per_order_prelive_cap: 2

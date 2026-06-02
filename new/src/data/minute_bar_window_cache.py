@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 import threading
 import time
 from typing import Any, Callable, Literal, Protocol, Sequence
@@ -30,6 +30,8 @@ class MinuteBarWindowCacheConfig:
     expected_bar_interval_sec: int
     max_contiguity_gap_sec: int
     force_cold_on_session_date_change: bool
+    session_open_time: str
+    session_close_time: str
     parallel_fetch_workers: int = 1
     batch_fetch_budget_sec: float = 45.0
 
@@ -86,6 +88,15 @@ def load_minute_bar_window_cache_config(
         default=expected_bar_interval_sec,
         min_value=expected_bar_interval_sec,
     )
+    paper_auto_cfg = config_load("risk_config.yaml", "paper_auto_trading") or {}
+    missing_session_keys = [
+        key for key in ("market_open_time", "market_close_time")
+        if key not in paper_auto_cfg
+    ]
+    if missing_session_keys:
+        raise ValueError(
+            f"paper_auto_trading missing required session keys: {missing_session_keys}"
+        )
     return MinuteBarWindowCacheConfig(
         window_size=safe_int(window_size, default=1, min_value=1),
         incremental_fetch_bars=incremental_fetch_bars,
@@ -97,6 +108,8 @@ def load_minute_bar_window_cache_config(
             cfg["force_cold_on_session_date_change"],
             default=True,
         ),
+        session_open_time=str(paper_auto_cfg["market_open_time"]),
+        session_close_time=str(paper_auto_cfg["market_close_time"]),
         parallel_fetch_workers=safe_int(
             parallel_fetch_workers,
             default=1,
@@ -276,7 +289,7 @@ class MinuteBarWindowCache:
         with self._lock:
             cached = list(self._windows.get(ticker, []))
         cached_latest = self._latest_valid_ts(cached)
-        fetch_policy = self._fetch_policy(cached, cached_latest, asof_ts)
+        fetch_policy = self._fetch_policy(cached, cached_latest, asof_ts, min_bars)
         fetch_n = (
             self._cold_fetch_bars()
             if fetch_policy != "incremental"
@@ -362,8 +375,11 @@ class MinuteBarWindowCache:
         cached: list[dict[str, Any]],
         cached_latest: datetime | None,
         asof_ts: datetime,
+        min_bars: int | None,
     ) -> str:
-        if len(cached) < self.config.window_size or cached_latest is None:
+        if cached_latest is None:
+            return "cold"
+        if min_bars is not None and len(cached) < int(min_bars):
             return "cold"
         if (
             self.config.force_cold_on_session_date_change
@@ -585,6 +601,8 @@ class MinuteBarWindowCache:
             gap_sec = (next_ts - prev_ts).total_seconds()
             if gap_sec <= self.config.max_contiguity_gap_sec:
                 continue
+            if self._is_session_boundary_gap(prev_ts, next_ts):
+                continue
             gaps.append({
                 "prev_ts": prev_ts.isoformat(),
                 "next_ts": next_ts.isoformat(),
@@ -597,6 +615,38 @@ class MinuteBarWindowCache:
                 "max_contiguity_gap_sec": int(self.config.max_contiguity_gap_sec),
             })
         return gaps
+
+    def _is_session_boundary_gap(self, prev_ts: datetime, next_ts: datetime) -> bool:
+        """Treat KOSPI overnight/weekend close-to-open gaps as market-time contiguous.
+
+        KIS minute history can return the previous session tail followed by the
+        current session open during early cold fetches. That gap is PIT-safe and
+        expected; arbitrary cross-date holes still fail closed.
+        """
+        if next_ts.date() <= prev_ts.date():
+            return False
+        open_time = self._parse_hhmm(self.config.session_open_time)
+        close_time = self._parse_hhmm(self.config.session_close_time)
+        prev_time = prev_ts.timetz().replace(tzinfo=None)
+        next_session_open = datetime.combine(
+            next_ts.date(),
+            open_time,
+            tzinfo=next_ts.tzinfo,
+        )
+        open_grace_sec = max(
+            self.config.expected_bar_interval_sec,
+            self.config.max_contiguity_gap_sec,
+        )
+        return prev_time >= close_time and (
+            next_session_open
+            <= next_ts
+            <= next_session_open + timedelta(seconds=open_grace_sec)
+        )
+
+    @staticmethod
+    def _parse_hhmm(raw: str) -> dt_time:
+        hour, minute = str(raw).split(":", maxsplit=1)
+        return dt_time(hour=int(hour), minute=int(minute))
 
     @staticmethod
     def _recompute_change(rows: list[dict[str, Any]]) -> None:

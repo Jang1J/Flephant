@@ -330,7 +330,15 @@ def _strict_cadence_summary(
         }
         cycle_summaries.append(cycle_summary)
 
-        if status != "PASS":
+        explained_no_submit_reason = _cycle_explained_no_submit_reason(raw_cycle)
+        shadow_skip_allowed = (
+            require_shadow_only
+            and status == "SKIP"
+            and bool(explained_no_submit_reason)
+            and runtime_checks["broker_submit_disabled"]
+            and runtime_checks["shadow_only"]
+        )
+        if status != "PASS" and not shadow_skip_allowed:
             blockers.append(f"cadence_cycle_{cycle_index}_status_not_pass")
         if readiness is None:
             blockers.append(f"cadence_cycle_{cycle_index}_bar_readiness_missing")
@@ -412,6 +420,11 @@ def _summarize_report(
     cycles = (((report.get("stages") or {}).get("cycles") or {}).get("items") or [])
     if not isinstance(cycles, list):
         cycles = []
+    runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
+    shadow_only_runtime = (
+        runtime.get("shadow_only") is True
+        and runtime.get("broker_submit_enabled") is False
+    )
     score_nonempty_cycles = 0
     score_rankable_cycles = 0
     warmup_or_blocked_cycles = 0
@@ -514,6 +527,10 @@ def _summarize_report(
                 summary["blockers"].append("pass_with_order_deltas_without_broker_execution")
             elif shadow_order_delta_cycles > 0:
                 summary["warnings"].append("shadow_only_order_deltas_not_broker_execution")
+            elif shadow_only_runtime:
+                summary["warnings"].append(
+                    "shadow_only_order_deltas_explained_by_guard"
+                )
             else:
                 summary["blockers"].append(
                     "pass_with_order_deltas_no_broker_execution_explained_by_guard"
