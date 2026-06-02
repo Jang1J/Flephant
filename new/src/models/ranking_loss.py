@@ -103,14 +103,19 @@ def make_lgbm_dataset(
     feature_cols: list[str],
     label_col: str = "relevance",
     group_col: str = "ts_close",
+    sample_weight=None,
 ):
-    """panel → lgb.Dataset (X, label, group).
+    """panel → lgb.Dataset (X, label, group, weight).
 
     Args:
       panel: MultiIndex (ticker, ts_close) DataFrame. DatasetBuilder 출력.
       feature_cols: 학습에 쓸 피처 컬럼 list.
       label_col: integer relevance grade 컬럼 (default 'relevance').
       group_col: cross-sectional query 기준 (default 'ts_close').
+      sample_weight: row별 학습 가중치 (np.ndarray 또는 None).
+        None이면 unweighted (LambdaRank default). compute_recency_weights()
+        출력을 그대로 전달 가능. 정책: train fold만 weighted, validation은
+        unweighted 유지 (호출자 책임).
 
     Returns: lgb.Dataset
     """
@@ -128,12 +133,81 @@ def make_lgbm_dataset(
     y = y_raw.astype(int)
     group = compute_group_sizes(panel, group_col=group_col)
 
-    ds = lgb.Dataset(X, label=y, group=group, free_raw_data=False)
+    if sample_weight is not None and len(sample_weight) != len(panel):
+        raise ValueError(
+            f"sample_weight 길이 mismatch: panel={len(panel)}, "
+            f"weight={len(sample_weight)}"
+        )
+
+    ds = lgb.Dataset(
+        X, label=y, group=group, weight=sample_weight, free_raw_data=False,
+    )
+    weight_info = "weighted" if sample_weight is not None else "unweighted"
     logger.info(
-        "[ranking_loss] Dataset 생성: %d rows, %d groups, %d features",
-        len(panel), len(group), len(feature_cols),
+        "[ranking_loss] Dataset 생성: %d rows, %d groups, %d features (%s)",
+        len(panel), len(group), len(feature_cols), weight_info,
     )
     return ds
+
+
+def compute_recency_weights(
+    panel,
+    *,
+    half_life_days: int | None,
+    ts_col: str = "ts_close",
+):
+    """ts_close 기반 exponential decay sample_weight 계산.
+
+    가중치 = exp(-ln(2) × age_days / half_life_days).
+    가장 최근 row weight=1.0, half_life_days 전 row weight=0.5.
+
+    Args:
+      panel: MultiIndex (ticker, ts_close) DataFrame 또는 ts_col 컬럼 보유 DataFrame.
+      half_life_days: 반감기 일수.
+        None 또는 0 이하이면 None 반환 (unweighted).
+        primary grid: None / 15 / 30 / 45 / 60 / 90 / 120
+        (walk-forward train_window_days=60 기준).
+        sensitivity grid: 180 / 365 (final-window 추가 확인용).
+      ts_col: 시간 컬럼 (index 또는 column 모두 처리).
+
+    Returns:
+      np.ndarray (float, len(panel)) 또는 None (unweighted).
+
+    설계 (불변 원칙 5 하드코딩 금지):
+      half_life_days는 호출자가 risk_config.yaml 또는 ablation grid에서 로드해 전달.
+      여기서는 계산만 담당.
+
+    Raises:
+      KeyError: ts_col이 panel column 또는 index에 없음.
+    """
+    from src.utils.safe_cast import safe_int
+
+    # operator/yaml 입력 safe 정규화: 문자열("false"/"")/None/음수 모두 0으로 fallback
+    # → 아래 half_life_days <= 0 분기에서 unweighted(None) 반환 (불변 원칙: safe_* 정규화).
+    half_life_days = safe_int(half_life_days, default=0, min_value=0)
+    if half_life_days <= 0:
+        return None
+
+    import numpy as np
+    import pandas as pd
+
+    if ts_col in panel.columns:
+        ts_values = panel[ts_col]
+    elif ts_col in panel.index.names:
+        ts_values = panel.index.get_level_values(ts_col)
+    else:
+        raise KeyError(f"ts_col='{ts_col}' panel column 또는 index에 없음")
+
+    # DatetimeIndex로 강제 변환: column(Series) / index 양쪽 모두 안전 처리.
+    # pd.Series of Timestamp는 .total_seconds() 미지원이므로 DatetimeIndex 경유 필요.
+    ts_index = pd.DatetimeIndex(pd.to_datetime(ts_values))
+    latest_ts = ts_index.max()
+    age_days = (latest_ts - ts_index).total_seconds() / 86400.0
+    decay_rate = np.log(2.0) / float(half_life_days)
+    weights = np.exp(-decay_rate * age_days)
+    # np.asarray로 명시적 1D numpy float array 반환 (lgb.Dataset weight 호환 보장).
+    # np.exp(pd.DatetimeIndex 연산 결과)가 pandas Index 반환할 수 있어 강제 변환.
+    return np.asarray(weights, dtype=float)
 
 
 # ====================================================================== #
