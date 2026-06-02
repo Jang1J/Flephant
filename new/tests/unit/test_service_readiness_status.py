@@ -825,6 +825,91 @@ def test_service_status_blocks_paper_trading_only_even_if_history_pass(
     )
 
 
+def test_service_status_enables_paper_order_actions_when_ready(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    bundle_id = "BUNDLE-TEST"
+    monkeypatch.setattr(
+        service_readiness_status,
+        "_service_policy_gate_pass",
+        lambda backtest, bundle_id, **kwargs: True,
+    )
+    _write_json(
+        tmp_path / "artifacts/lgbm/registry.json",
+        {"active_version": None, "versions": []},
+    )
+    _write_json(
+        tmp_path / "artifacts/lgbm_paper/registry.json",
+        {"active_version": "paper-v1", "versions": [{"version": "paper-v1"}]},
+    )
+    _write_json(
+        tmp_path / f"artifacts/reports/backtest/backtest_{bundle_id}_20260514.json",
+        {
+            "bundle_id": bundle_id,
+            "verdict": "pass",
+            "regression_risk": {"flagged": False, "severity": "low"},
+            "minute_bar_leakage_check": {"verdict": "pass"},
+            "feature_quality": {
+                "dual_source_rows": 10,
+                "dual_source_non_neutral_rows": 10,
+                "exogenous_rows": 10,
+                "exogenous_non_neutral_rows": 10,
+            },
+            "service_policy_replay": {"status": "PASS"},
+            "candidate_model_metadata": _final_dataset_metadata(),
+        },
+    )
+    _write_json(
+        tmp_path
+        / "artifacts/reports/paper_auto_trading/paper_auto_service_rehearsal_20260514.json",
+        {
+            "status": "PASS",
+            "bundle_id": bundle_id,
+            "external_kis_api": True,
+            "evidence_level": "external_kis_virtual",
+            **_external_broker_evidence_fields(),
+            "stage_statuses": {
+                "paper_auto_cycle": "PASS",
+                "balance_reconciliation": "PASS",
+                "probe_order": "PASS",
+                "order_history_requery": "PASS",
+            },
+            "stages": {
+                "paper_auto_cycle": {
+                    "status": "PASS",
+                    "stages": {
+                        "active_model_guard": {"bundle_id": bundle_id},
+                        "cycles": {
+                            "items": [{
+                                "status": "PASS",
+                                "hot_path_bar_readiness": {"status": "PASS"},
+                                "order_history_verification": {
+                                    "status": "PASS",
+                                    "queries": [{"matched_order_count": 1}],
+                                },
+                            }],
+                        },
+                    },
+                },
+            },
+        },
+    )
+
+    payload = service_readiness_status.build_service_status(
+        bundle_id=bundle_id,
+        root=tmp_path,
+    )
+
+    assert payload["status"] == "PASS"
+    assert payload["deploy_quality"] == "PASS"
+    assert payload["broker_evidence"] == "PASS"
+    assert payload["live_trading_allowed"] is False
+    assert payload["registry_mutated"] is False
+    assert payload["be_contract"]["safe_to_enable_order_actions"] is True
+    assert payload["be_contract"]["safe_to_enable_live_actions"] is False
+
+
 def test_broker_evidence_prefers_external_pass_over_newer_internal_fake(
     tmp_path: Path,
 ) -> None:
