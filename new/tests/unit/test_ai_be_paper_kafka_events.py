@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 import src.integration.grpc.server as grpc_server
 from src.integration.grpc.server import (
     _PaperAutoSession,
@@ -498,9 +500,26 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
     assert calls["registry_dir"] == registry_dir
 
 
+@pytest.mark.parametrize(
+    ("readiness_overrides", "contract_overrides", "expected_reason"),
+    [
+        (
+            {"broker_evidence": "BLOCKED"},
+            {"safe_to_enable_order_actions": False},
+            "broker_evidence_not_pass,order_actions_not_enabled",
+        ),
+        ({"status": "PARTIAL"}, {}, "service_readiness_not_pass"),
+        ({"live_trading_allowed": True}, {}, "live_trading_allowed_true"),
+        ({"registry_mutated": True}, {}, "registry_mutated_true"),
+        ({}, {"safe_to_enable_live_actions": True}, "live_actions_enabled"),
+    ],
+)
 def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
     monkeypatch,
     tmp_path,
+    readiness_overrides,
+    contract_overrides,
+    expected_reason,
 ) -> None:
     registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
     registry_dir.mkdir(parents=True)
@@ -561,22 +580,25 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
         "_remaining_market_cycles",
         lambda **_kwargs: 1,
     )
+    readiness = {
+        "status": "PASS",
+        "deploy_quality": "PASS",
+        "broker_evidence": "PASS",
+        "read_only": True,
+        "external_api_called": False,
+        "live_trading_allowed": False,
+        "registry_mutated": False,
+        "be_contract": {
+            "safe_to_enable_order_actions": True,
+            "safe_to_enable_live_actions": False,
+        },
+    }
+    readiness.update(readiness_overrides)
+    readiness["be_contract"].update(contract_overrides)
     monkeypatch.setattr(
         grpc_server,
         "build_service_status",
-        lambda **_kwargs: {
-            "status": "PASS",
-            "deploy_quality": "PASS",
-            "broker_evidence": "BLOCKED",
-            "read_only": True,
-            "external_api_called": False,
-            "live_trading_allowed": False,
-            "registry_mutated": False,
-            "be_contract": {
-                "safe_to_enable_order_actions": False,
-                "safe_to_enable_live_actions": False,
-            },
-        },
+        lambda **_kwargs: readiness,
     )
     monkeypatch.setattr(session, "start", lambda **_kwargs: (_ for _ in ()).throw(
         AssertionError("session.start must not run when paper start gate is blocked")
@@ -596,10 +618,57 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
 
     assert response.accepted is False
     assert response.status == "PAPER_START_GATE_BLOCKED"
-    assert response.reason == "broker_evidence_not_pass,order_actions_not_enabled"
+    assert response.reason == expected_reason
     assert context.code is None
     assert context.details == ""
     assert kafka.events == []
+
+
+@pytest.mark.parametrize(
+    ("readiness_overrides", "contract_overrides", "expected_blocker"),
+    [
+        ({"status": "PARTIAL"}, {}, "service_readiness_not_pass"),
+        ({"live_trading_allowed": True}, {}, "live_trading_allowed_true"),
+        ({"registry_mutated": True}, {}, "registry_mutated_true"),
+        ({}, {"safe_to_enable_live_actions": True}, "live_actions_enabled"),
+    ],
+)
+def test_paper_start_gate_blocks_safety_invariants(
+    monkeypatch,
+    tmp_path,
+    readiness_overrides,
+    contract_overrides,
+    expected_blocker,
+) -> None:
+    readiness = {
+        "status": "PASS",
+        "deploy_quality": "PASS",
+        "broker_evidence": "PASS",
+        "read_only": True,
+        "external_api_called": False,
+        "live_trading_allowed": False,
+        "registry_mutated": False,
+        "be_contract": {
+            "safe_to_enable_order_actions": True,
+            "safe_to_enable_live_actions": False,
+        },
+    }
+    readiness.update(readiness_overrides)
+    readiness["be_contract"].update(contract_overrides)
+    monkeypatch.setattr(
+        grpc_server,
+        "build_service_status",
+        lambda **_kwargs: readiness,
+    )
+
+    gate = grpc_server._paper_start_gate_from_service_readiness(
+        bundle_id="BUNDLE-1",
+        repo_root=tmp_path,
+        candidate_registry_dir=tmp_path / "registry",
+    )
+
+    assert gate["status"] == "BLOCKED"
+    assert expected_blocker in gate["blockers"]
 
 
 def test_start_rpc_defaults_empty_tickers_to_active_universe(
