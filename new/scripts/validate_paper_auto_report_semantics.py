@@ -40,6 +40,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Accepted for CLI consistency; this validator is read-only unless --write-report is set.",
     )
+    parser.add_argument(
+        "--strict-cadence",
+        action="store_true",
+        help="Apply 30-stock cadence proof checks to matching reports.",
+    )
+    parser.add_argument("--min-cycles", type=int, default=2)
+    parser.add_argument("--expected-ticker-count", type=int, default=30)
+    parser.add_argument("--expected-cold-fetch-n", type=int, default=61)
+    parser.add_argument("--expected-incremental-fetch-n", type=int, default=6)
+    parser.add_argument("--incremental-after-cycle", type=int, default=1)
+    parser.add_argument("--max-cycle-start-gap-sec", type=float, default=75.0)
+    parser.add_argument("--require-shadow-only", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -202,7 +214,201 @@ def _cycle_bar_readiness(cycle: dict[str, Any]) -> dict[str, Any] | None:
     return readiness if isinstance(readiness, dict) else None
 
 
-def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
+def _parse_dt(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _cycle_cache_meta(cycle: dict[str, Any]) -> dict[str, Any]:
+    bar_readiness = _cycle_bar_readiness(cycle) or {}
+    topup = bar_readiness.get("bar_warmup_topup")
+    topup = topup if isinstance(topup, dict) else {}
+    cache_meta = topup.get("minute_bar_window_cache")
+    return cache_meta if isinstance(cache_meta, dict) else {}
+
+
+def _strict_cadence_summary(
+    *,
+    report: dict[str, Any],
+    cycles: list[Any],
+    min_cycles: int,
+    expected_ticker_count: int,
+    expected_cold_fetch_n: int,
+    expected_incremental_fetch_n: int,
+    incremental_after_cycle: int,
+    max_cycle_start_gap_sec: float,
+    require_shadow_only: bool,
+) -> dict[str, Any]:
+    blockers: list[str] = []
+    warnings: list[str] = []
+    cycle_summaries: list[dict[str, Any]] = []
+
+    runtime = report.get("runtime") if isinstance(report.get("runtime"), dict) else {}
+    runtime_checks = {
+        "kis_mode_virtual": str(runtime.get("kis_mode") or "") == "virtual",
+        "live_enabled_false": runtime.get("live_enabled") is False,
+        "broker_submit_disabled": runtime.get("broker_submit_enabled") is False,
+        "shadow_only": runtime.get("shadow_only") is True,
+    }
+    if not runtime_checks["kis_mode_virtual"]:
+        blockers.append("cadence_runtime_not_kis_virtual")
+    if not runtime_checks["live_enabled_false"]:
+        blockers.append("cadence_runtime_live_enabled_not_false")
+    if require_shadow_only and not runtime_checks["broker_submit_disabled"]:
+        blockers.append("cadence_runtime_broker_submit_enabled")
+    if require_shadow_only and not runtime_checks["shadow_only"]:
+        blockers.append("cadence_runtime_not_shadow_only")
+
+    if len(cycles) < max(1, int(min_cycles)):
+        blockers.append("cadence_insufficient_cycles")
+
+    started_at_values: list[tuple[int, datetime]] = []
+    previous_cycle_index: int | None = None
+    for idx, raw_cycle in enumerate(cycles):
+        if not isinstance(raw_cycle, dict):
+            blockers.append(f"cadence_cycle_{idx}_not_object")
+            continue
+        raw_cycle_index = raw_cycle.get("cycle_index")
+        if raw_cycle_index is None:
+            cycle_index = idx
+        else:
+            try:
+                cycle_index = int(raw_cycle_index)
+            except (TypeError, ValueError):
+                cycle_index = idx
+                blockers.append(f"cadence_cycle_{idx}_cycle_index_invalid")
+        if previous_cycle_index is not None and cycle_index != previous_cycle_index + 1:
+            blockers.append("cadence_cycle_index_non_contiguous")
+        previous_cycle_index = cycle_index
+        started_at = _parse_dt(raw_cycle.get("started_at"))
+        if started_at is not None:
+            started_at_values.append((cycle_index, started_at))
+        else:
+            blockers.append(f"cadence_cycle_{cycle_index}_started_at_missing_or_invalid")
+        status = str(raw_cycle.get("status") or "").upper()
+        readiness = _cycle_bar_readiness(raw_cycle)
+        readiness_status = str((readiness or {}).get("status") or "").upper()
+        cache_meta = _cycle_cache_meta(raw_cycle)
+        cache_tickers = cache_meta.get("tickers")
+        cache_tickers = cache_tickers if isinstance(cache_tickers, dict) else {}
+        failed_tickers = cache_meta.get("failed_tickers")
+        failed_tickers = failed_tickers if isinstance(failed_tickers, dict) else {}
+        policies = {
+            str(ticker): str(meta.get("fetch_policy") or "")
+            for ticker, meta in cache_tickers.items()
+            if isinstance(meta, dict)
+        }
+        fetch_ns = {
+            str(ticker): meta.get("fetch_n")
+            for ticker, meta in cache_tickers.items()
+            if isinstance(meta, dict)
+        }
+        reasons = {
+            str(ticker): str(meta.get("reason") or "")
+            for ticker, meta in cache_tickers.items()
+            if isinstance(meta, dict)
+        }
+        cycle_summary = {
+            "cycle_index": cycle_index,
+            "status": status,
+            "started_at": raw_cycle.get("started_at"),
+            "bar_readiness_status": readiness_status,
+            "cache_status": cache_meta.get("status"),
+            "cache_reason": cache_meta.get("reason"),
+            "ticker_count": len(cache_tickers),
+            "failed_tickers": failed_tickers,
+            "fetch_policy_counts": {
+                policy: list(policies.values()).count(policy)
+                for policy in sorted(set(policies.values()))
+            },
+            "fetch_n_values": sorted({str(value) for value in fetch_ns.values()}),
+        }
+        cycle_summaries.append(cycle_summary)
+
+        if status != "PASS":
+            blockers.append(f"cadence_cycle_{cycle_index}_status_not_pass")
+        if readiness is None:
+            blockers.append(f"cadence_cycle_{cycle_index}_bar_readiness_missing")
+        elif readiness_status != "PASS":
+            blockers.append(f"cadence_cycle_{cycle_index}_bar_readiness_not_pass")
+        if not cache_meta:
+            blockers.append(f"cadence_cycle_{cycle_index}_cache_meta_missing")
+            continue
+        if str(cache_meta.get("status") or "").upper() != "PASS":
+            blockers.append(f"cadence_cycle_{cycle_index}_cache_status_not_pass")
+        if failed_tickers:
+            blockers.append(f"cadence_cycle_{cycle_index}_cache_failed_tickers")
+        if len(cache_tickers) != int(expected_ticker_count):
+            blockers.append(f"cadence_cycle_{cycle_index}_ticker_count_mismatch")
+        if "fetch_timeout" in set(failed_tickers.values()) or "fetch_timeout" in set(reasons.values()):
+            blockers.append(f"cadence_cycle_{cycle_index}_fetch_timeout")
+
+        expected_policy = "incremental" if cycle_index >= int(incremental_after_cycle) else "cold"
+        expected_fetch_n = (
+            int(expected_incremental_fetch_n)
+            if expected_policy == "incremental"
+            else int(expected_cold_fetch_n)
+        )
+        if cache_tickers:
+            bad_policy = [
+                ticker for ticker, policy in policies.items() if policy != expected_policy
+            ]
+            bad_fetch_n = [
+                ticker
+                for ticker, value in fetch_ns.items()
+                if str(value) != str(expected_fetch_n)
+            ]
+            if bad_policy:
+                blockers.append(f"cadence_cycle_{cycle_index}_{expected_policy}_policy_mismatch")
+            if bad_fetch_n:
+                blockers.append(f"cadence_cycle_{cycle_index}_fetch_n_mismatch")
+
+    start_gaps: list[float] = []
+    for (left_index, left), (right_index, right) in zip(
+        started_at_values,
+        started_at_values[1:],
+    ):
+        if right_index != left_index + 1:
+            continue
+        gap = (right - left).total_seconds()
+        start_gaps.append(float(gap))
+        if gap > float(max_cycle_start_gap_sec):
+            blockers.append("cadence_cycle_start_gap_exceeds_limit")
+
+    return {
+        "strict_enabled": True,
+        "runtime_checks": runtime_checks,
+        "min_cycles": int(min_cycles),
+        "expected_ticker_count": int(expected_ticker_count),
+        "expected_cold_fetch_n": int(expected_cold_fetch_n),
+        "expected_incremental_fetch_n": int(expected_incremental_fetch_n),
+        "incremental_after_cycle": int(incremental_after_cycle),
+        "max_cycle_start_gap_sec": float(max_cycle_start_gap_sec),
+        "start_gaps_sec": start_gaps,
+        "cycles": cycle_summaries,
+        "blockers": sorted(set(blockers)),
+        "warnings": warnings,
+    }
+
+
+def _summarize_report(
+    path: Path,
+    report: dict[str, Any],
+    *,
+    strict_cadence: bool = False,
+    min_cycles: int = 2,
+    expected_ticker_count: int = 30,
+    expected_cold_fetch_n: int = 61,
+    expected_incremental_fetch_n: int = 6,
+    incremental_after_cycle: int = 1,
+    max_cycle_start_gap_sec: float = 75.0,
+    require_shadow_only: bool = False,
+) -> dict[str, Any]:
     cycles = (((report.get("stages") or {}).get("cycles") or {}).get("items") or [])
     if not isinstance(cycles, list):
         cycles = []
@@ -283,6 +489,9 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         "hot_path_bar_readiness_present_cycles": hot_path_bar_readiness_present_cycles,
         "hot_path_bar_readiness_pass_cycles": hot_path_bar_readiness_pass_cycles,
         "hot_path_bar_readiness_missing_cycles": hot_path_bar_readiness_missing_cycles,
+        "cadence": {
+            "strict_enabled": False,
+        },
         "blockers": [],
         "warnings": [],
     }
@@ -311,6 +520,21 @@ def _summarize_report(path: Path, report: dict[str, Any]) -> dict[str, Any]:
                 )
         if execution_cycles > 0 and hot_path_bar_readiness_missing_cycles > 0:
             summary["warnings"].append("hot_path_bar_readiness_missing_legacy_report")
+    if strict_cadence:
+        cadence = _strict_cadence_summary(
+            report=report,
+            cycles=cycles,
+            min_cycles=min_cycles,
+            expected_ticker_count=expected_ticker_count,
+            expected_cold_fetch_n=expected_cold_fetch_n,
+            expected_incremental_fetch_n=expected_incremental_fetch_n,
+            incremental_after_cycle=incremental_after_cycle,
+            max_cycle_start_gap_sec=max_cycle_start_gap_sec,
+            require_shadow_only=require_shadow_only,
+        )
+        summary["cadence"] = cadence
+        summary["blockers"].extend(cadence["blockers"])
+        summary["warnings"].extend(cadence["warnings"])
     return summary
 
 
@@ -320,6 +544,14 @@ def build_report(
     report_dir: str | Path = "artifacts/reports/paper_auto_trading",
     pattern: str = "paper_auto_trade_*.json",
     generated_date: str = "",
+    strict_cadence: bool = False,
+    min_cycles: int = 2,
+    expected_ticker_count: int = 30,
+    expected_cold_fetch_n: int = 61,
+    expected_incremental_fetch_n: int = 6,
+    incremental_after_cycle: int = 1,
+    max_cycle_start_gap_sec: float = 75.0,
+    require_shadow_only: bool = False,
 ) -> dict[str, Any]:
     base_dir = Path(report_dir)
     if not base_dir.is_absolute():
@@ -336,7 +568,18 @@ def build_report(
                 continue
             if not _matches_generated_date(path, report, generated_date):
                 continue
-            summary = _summarize_report(path, report)
+            summary = _summarize_report(
+                path,
+                report,
+                strict_cadence=strict_cadence,
+                min_cycles=min_cycles,
+                expected_ticker_count=expected_ticker_count,
+                expected_cold_fetch_n=expected_cold_fetch_n,
+                expected_incremental_fetch_n=expected_incremental_fetch_n,
+                incremental_after_cycle=incremental_after_cycle,
+                max_cycle_start_gap_sec=max_cycle_start_gap_sec,
+                require_shadow_only=require_shadow_only,
+            )
             report_summaries.append(summary)
             if summary["blockers"]:
                 failures.append(summary)
@@ -364,6 +607,16 @@ def build_report(
         "pattern": pattern,
         "scan_mode": "recursive",
         "generated_date": str(generated_date or ""),
+        "strict_cadence": {
+            "enabled": bool(strict_cadence),
+            "min_cycles": int(min_cycles),
+            "expected_ticker_count": int(expected_ticker_count),
+            "expected_cold_fetch_n": int(expected_cold_fetch_n),
+            "expected_incremental_fetch_n": int(expected_incremental_fetch_n),
+            "incremental_after_cycle": int(incremental_after_cycle),
+            "max_cycle_start_gap_sec": float(max_cycle_start_gap_sec),
+            "require_shadow_only": bool(require_shadow_only),
+        },
         "report_count": len(report_summaries),
         "failure_count": len(failures),
         "failures": failures,
@@ -397,6 +650,14 @@ def main(argv: list[str] | None = None) -> int:
         report_dir=args.report_dir,
         pattern=str(args.pattern),
         generated_date=str(args.generated_date),
+        strict_cadence=bool(args.strict_cadence),
+        min_cycles=int(args.min_cycles),
+        expected_ticker_count=int(args.expected_ticker_count),
+        expected_cold_fetch_n=int(args.expected_cold_fetch_n),
+        expected_incremental_fetch_n=int(args.expected_incremental_fetch_n),
+        incremental_after_cycle=int(args.incremental_after_cycle),
+        max_cycle_start_gap_sec=float(args.max_cycle_start_gap_sec),
+        require_shadow_only=bool(args.require_shadow_only),
     )
     if args.write_report:
         _write_report(report)
