@@ -554,15 +554,13 @@ def _paper_start_gate_from_service_readiness(
     *,
     bundle_id: str,
     repo_root: Path,
-    candidate_registry_dir: Path | None,
+    candidate_registry_dir: Path,
 ) -> dict[str, Any]:
     readiness = build_service_status(bundle_id=bundle_id, root=repo_root)
     contract = readiness.get("be_contract")
     contract = contract if isinstance(contract, dict) else {}
     blockers: list[str] = []
 
-    if candidate_registry_dir is None:
-        blockers.append("paper_candidate_registry_not_found")
     if readiness.get("status") != "PASS":
         blockers.append("service_readiness_not_pass")
     if readiness.get("deploy_quality") != "PASS":

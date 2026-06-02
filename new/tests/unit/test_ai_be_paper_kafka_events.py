@@ -449,12 +449,14 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
         "_remaining_market_cycles",
         lambda **_kwargs: 1,
     )
+
+    def mock_load_prelive_gate_module():
+        raise AssertionError("Start RPC must not rebuild strict prelive gate")
+
     monkeypatch.setattr(
         grpc_server,
         "_load_prelive_gate_module",
-        lambda: (_ for _ in ()).throw(
-            AssertionError("Start RPC must not rebuild strict prelive gate")
-        ),
+        mock_load_prelive_gate_module,
     )
     monkeypatch.setattr(
         grpc_server,
@@ -602,9 +604,13 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
         "build_service_status",
         lambda **_kwargs: readiness,
     )
-    monkeypatch.setattr(session, "start", lambda **_kwargs: (_ for _ in ()).throw(
-        AssertionError("session.start must not run when paper start gate is blocked")
-    ))
+
+    def mock_start(**_kwargs):
+        raise AssertionError(
+            "session.start must not run when paper start gate is blocked"
+        )
+
+    monkeypatch.setattr(session, "start", mock_start)
 
     servicer = grpc_server._make_servicer(
         _Grpc,
