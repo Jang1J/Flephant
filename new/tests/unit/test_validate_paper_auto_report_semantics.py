@@ -643,6 +643,158 @@ def test_paper_auto_semantics_strict_cadence_blocks_cache_timeout_and_slow_gap(
     assert "cadence_cycle_start_gap_exceeds_limit" in blockers
 
 
+def test_paper_auto_semantics_strict_cadence_preserves_zero_cycle_index() -> None:
+    validator = _load_validator_module()
+
+    summary = validator._strict_cadence_summary(
+        report={
+            "runtime": {
+                "kis_mode": "virtual",
+                "live_enabled": False,
+                "broker_submit_enabled": False,
+                "shadow_only": True,
+            }
+        },
+        cycles=[
+            "not-a-cycle",
+            _strict_cadence_cycle(
+                cycle_index=0,
+                started_at="2026-06-02T09:00:05+09:00",
+                fetch_policy="cold",
+                fetch_n=61,
+            ),
+        ],
+        min_cycles=1,
+        expected_ticker_count=30,
+        expected_cold_fetch_n=61,
+        expected_incremental_fetch_n=6,
+        incremental_after_cycle=1,
+        max_cycle_start_gap_sec=75,
+        require_shadow_only=True,
+    )
+
+    assert summary["cycles"][0]["cycle_index"] == 0
+    assert "cadence_cycle_1_incremental_policy_mismatch" not in summary["blockers"]
+    assert "cadence_cycle_1_fetch_n_mismatch" not in summary["blockers"]
+
+
+def test_paper_auto_semantics_strict_cadence_blocks_missing_started_at(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    missing_started_at_cycle = _strict_cadence_cycle(
+        cycle_index=1,
+        started_at="2026-06-02T09:01:04+09:00",
+        fetch_policy="incremental",
+        fetch_n=6,
+    )
+    missing_started_at_cycle.pop("started_at")
+    (report_dir / "paper_auto_trade_20260602_090500.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-06-02T09:05:00+09:00",
+                "runtime": {
+                    "kis_mode": "virtual",
+                    "live_enabled": False,
+                    "broker_submit_enabled": False,
+                    "shadow_only": True,
+                },
+                "params": {"required_bundle_id": "BUNDLE-TEST"},
+                "stages": {
+                    "cycles": {
+                        "items": [
+                            _strict_cadence_cycle(
+                                cycle_index=0,
+                                started_at="2026-06-02T09:00:05+09:00",
+                                fetch_policy="cold",
+                                fetch_n=61,
+                            ),
+                            missing_started_at_cycle,
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260602",
+        strict_cadence=True,
+        require_shadow_only=True,
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert (
+        "cadence_cycle_1_started_at_missing_or_invalid"
+        in report["failures"][0]["blockers"]
+    )
+
+
+def test_paper_auto_semantics_strict_cadence_reports_missing_cycle_without_gap_fp(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "paper_auto_trade_20260602_090500.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-06-02T09:05:00+09:00",
+                "runtime": {
+                    "kis_mode": "virtual",
+                    "live_enabled": False,
+                    "broker_submit_enabled": False,
+                    "shadow_only": True,
+                },
+                "params": {"required_bundle_id": "BUNDLE-TEST"},
+                "stages": {
+                    "cycles": {
+                        "items": [
+                            _strict_cadence_cycle(
+                                cycle_index=0,
+                                started_at="2026-06-02T09:00:05+09:00",
+                                fetch_policy="cold",
+                                fetch_n=61,
+                            ),
+                            _strict_cadence_cycle(
+                                cycle_index=2,
+                                started_at="2026-06-02T09:02:20+09:00",
+                                fetch_policy="incremental",
+                                fetch_n=6,
+                            ),
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260602",
+        strict_cadence=True,
+        require_shadow_only=True,
+    )
+
+    blockers = report["failures"][0]["blockers"]
+    assert report["status"] == "BLOCKED"
+    assert "cadence_cycle_index_non_contiguous" in blockers
+    assert "cadence_cycle_start_gap_exceeds_limit" not in blockers
+
+
 def test_paper_auto_semantics_blocks_when_generated_date_has_no_reports(
     tmp_path,
     monkeypatch,

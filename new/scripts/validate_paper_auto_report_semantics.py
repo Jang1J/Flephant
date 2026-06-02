@@ -267,15 +267,29 @@ def _strict_cadence_summary(
     if len(cycles) < max(1, int(min_cycles)):
         blockers.append("cadence_insufficient_cycles")
 
-    started_at_values: list[datetime] = []
+    started_at_values: list[tuple[int, datetime]] = []
+    previous_cycle_index: int | None = None
     for idx, raw_cycle in enumerate(cycles):
         if not isinstance(raw_cycle, dict):
             blockers.append(f"cadence_cycle_{idx}_not_object")
             continue
-        cycle_index = int(raw_cycle.get("cycle_index", idx) or idx)
+        raw_cycle_index = raw_cycle.get("cycle_index")
+        if raw_cycle_index is None:
+            cycle_index = idx
+        else:
+            try:
+                cycle_index = int(raw_cycle_index)
+            except (TypeError, ValueError):
+                cycle_index = idx
+                blockers.append(f"cadence_cycle_{idx}_cycle_index_invalid")
+        if previous_cycle_index is not None and cycle_index != previous_cycle_index + 1:
+            blockers.append("cadence_cycle_index_non_contiguous")
+        previous_cycle_index = cycle_index
         started_at = _parse_dt(raw_cycle.get("started_at"))
         if started_at is not None:
-            started_at_values.append(started_at)
+            started_at_values.append((cycle_index, started_at))
+        else:
+            blockers.append(f"cadence_cycle_{cycle_index}_started_at_missing_or_invalid")
         status = str(raw_cycle.get("status") or "").upper()
         readiness = _cycle_bar_readiness(raw_cycle)
         readiness_status = str((readiness or {}).get("status") or "").upper()
@@ -355,7 +369,12 @@ def _strict_cadence_summary(
                 blockers.append(f"cadence_cycle_{cycle_index}_fetch_n_mismatch")
 
     start_gaps: list[float] = []
-    for left, right in zip(started_at_values, started_at_values[1:]):
+    for (left_index, left), (right_index, right) in zip(
+        started_at_values,
+        started_at_values[1:],
+    ):
+        if right_index != left_index + 1:
+            continue
         gap = (right - left).total_seconds()
         start_gaps.append(float(gap))
         if gap > float(max_cycle_start_gap_sec):
