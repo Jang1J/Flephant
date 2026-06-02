@@ -1293,7 +1293,7 @@ def test_paper_auto_fetch_recent_bars_uses_incremental_cache_after_warmup(
     assert cache_meta["tickers"]["005930"]["fetch_policy"] == "incremental"
 
 
-def test_paper_auto_fetch_recent_bars_uses_configured_parallel_cache(
+def test_paper_auto_fetch_recent_bars_uses_configured_cache_workers(
     tmp_path: Path,
 ) -> None:
     client = ConcurrentPaperKIS()
@@ -1311,9 +1311,9 @@ def test_paper_auto_fetch_recent_bars_uses_configured_parallel_cache(
     )
 
     assert set(bars) == {"005930", "000660", "035420"}
-    assert client.max_active > 1
+    assert client.max_active == 1
     cache_meta = trader._last_bar_fetch_metadata["minute_bar_window_cache"]  # noqa: SLF001
-    assert cache_meta["parallel_fetch_workers"] == 10
+    assert cache_meta["parallel_fetch_workers"] == 1
 
 
 def test_paper_auto_non_contiguous_window_is_not_topped_up_into_pass(
@@ -1384,6 +1384,8 @@ def test_paper_auto_fetch_timeout_is_not_topped_up_into_pass(tmp_path: Path) -> 
             expected_bar_interval_sec=60,
             max_contiguity_gap_sec=60,
             force_cold_on_session_date_change=True,
+            session_open_time="09:00",
+            session_close_time="15:30",
             parallel_fetch_workers=2,
             batch_fetch_budget_sec=0.05,
         ),

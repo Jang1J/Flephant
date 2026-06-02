@@ -303,6 +303,8 @@ def _minute_cache(
             expected_bar_interval_sec=60,
             max_contiguity_gap_sec=90,
             force_cold_on_session_date_change=True,
+            session_open_time="09:00",
+            session_close_time="15:30",
             parallel_fetch_workers=parallel_fetch_workers,
             batch_fetch_budget_sec=batch_fetch_budget_sec,
         ),

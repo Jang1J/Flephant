@@ -584,6 +584,72 @@ def test_paper_auto_semantics_strict_cadence_passes_clean_incremental_report(
     assert report["reports"][0]["cadence"]["blockers"] == []
 
 
+def test_paper_auto_semantics_strict_cadence_allows_shadow_fda_veto_skips(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    validator = _load_validator_module()
+    repo_root = tmp_path
+    report_dir = repo_root / "artifacts" / "reports" / "paper_auto_trading" / "DCD"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "paper_auto_trade_20260602_091500.json"
+    cycle0 = _strict_cadence_cycle(
+        cycle_index=0,
+        started_at="2026-06-02T09:15:05+09:00",
+        fetch_policy="cold",
+        fetch_n=61,
+    )
+    cycle1 = _strict_cadence_cycle(
+        cycle_index=1,
+        started_at="2026-06-02T09:16:05+09:00",
+        fetch_policy="incremental",
+        fetch_n=6,
+    )
+    for cycle in (cycle0, cycle1):
+        cycle["status"] = "SKIP"
+        cycle["order_guard"] = {
+            "status": "SKIP",
+            "safe_skip": True,
+            "reason": "fda_veto",
+        }
+        cycle["hot_result"]["final_decision"]["approved"] = False
+        cycle["hot_result"]["final_decision"]["reason_code"] = "RISK_FAST_TRIGGER"
+        cycle["hot_result"]["final_decision"]["order_deltas"] = [
+            {"ticker": "005930", "side": "buy", "qty": 1}
+        ]
+    report_path.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "generated_at": "2026-06-02T09:17:00+09:00",
+                "runtime": {
+                    "kis_mode": "virtual",
+                    "live_enabled": False,
+                    "broker_submit_enabled": False,
+                    "shadow_only": True,
+                },
+                "params": {"required_bundle_id": "BUNDLE-TEST"},
+                "stages": {"cycles": {"items": [cycle0, cycle1]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validator, "REPO_ROOT", repo_root)
+
+    report = validator.build_report(
+        bundle_id="BUNDLE-TEST",
+        generated_date="20260602",
+        strict_cadence=True,
+        require_shadow_only=True,
+    )
+
+    assert report["status"] == "PASS"
+    summary = report["reports"][0]
+    assert summary["explained_no_submit_reasons"] == {"fda_veto": 2}
+    assert summary["cadence"]["blockers"] == []
+    assert summary["warnings"] == ["shadow_only_order_deltas_explained_by_guard"]
+
+
 def test_paper_auto_semantics_strict_cadence_blocks_cache_timeout_and_slow_gap(
     tmp_path,
     monkeypatch,
