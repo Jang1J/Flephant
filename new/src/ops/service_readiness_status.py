@@ -1038,20 +1038,24 @@ def build_service_status(
     )
     live_trading_allowed = False
     registry_mutated = False
+    read_only = True
+    external_api_called = False
     safe_to_enable_order_actions = (
         ssot_readiness == "PASS"
         and deploy_quality == "PASS"
         and broker_status == "PASS"
         and not live_trading_allowed
         and not registry_mutated
+        and read_only
+        and not external_api_called
     )
     return {
         "schema_version": "1.0.0",
         "status": ssot_readiness,
         "generated_at": datetime.now(_KST).isoformat(),
         "bundle_id": bundle_id,
-        "read_only": True,
-        "external_api_called": False,
+        "read_only": read_only,
+        "external_api_called": external_api_called,
         "registry_mutated": registry_mutated,
         "ssot_readiness": ssot_readiness,
         "deploy_quality": deploy_quality,
