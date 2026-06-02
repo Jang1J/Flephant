@@ -1036,6 +1036,15 @@ def build_service_status(
         if backtest.get("report_path")
         else "BLOCKED"
     )
+    live_trading_allowed = False
+    registry_mutated = False
+    safe_to_enable_order_actions = (
+        ssot_readiness == "PASS"
+        and deploy_quality == "PASS"
+        and broker_status == "PASS"
+        and not live_trading_allowed
+        and not registry_mutated
+    )
     return {
         "schema_version": "1.0.0",
         "status": ssot_readiness,
@@ -1043,11 +1052,11 @@ def build_service_status(
         "bundle_id": bundle_id,
         "read_only": True,
         "external_api_called": False,
-        "registry_mutated": False,
+        "registry_mutated": registry_mutated,
         "ssot_readiness": ssot_readiness,
         "deploy_quality": deploy_quality,
         "broker_evidence": broker_status,
-        "live_trading_allowed": False,
+        "live_trading_allowed": live_trading_allowed,
         "production_registry": _registry_state(repo_root, "artifacts/lgbm/registry.json"),
         "paper_registry": _registry_state(repo_root, "artifacts/lgbm_paper/registry.json"),
         "c12_backtest": backtest,
@@ -1071,7 +1080,7 @@ def build_service_status(
         "kis_broker_evidence": broker,
         "be_contract": {
             "safe_to_show_dashboard": True,
-            "safe_to_enable_order_actions": False,
+            "safe_to_enable_order_actions": safe_to_enable_order_actions,
             "safe_to_enable_live_actions": False,
             "status_endpoint_semantics": "read_only_local_artifact_status",
         },

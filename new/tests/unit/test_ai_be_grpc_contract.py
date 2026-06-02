@@ -12,6 +12,7 @@ from src.data.minute_bar_window_cache import (
     MinuteBarWindowCache,
     MinuteBarWindowCacheConfig,
 )
+from src.integration.grpc import payloads as grpc_payloads
 from src.integration.grpc.payloads import (
     build_ack_payload,
     build_health_payload,
@@ -214,6 +215,45 @@ def test_service_readiness_payload_does_not_enable_order_actions(tmp_path):
     assert payload["bundle_id"] == "BUNDLE-TEST"
     assert payload["live_trading_allowed"] is False
     assert payload["safe_to_enable_order_actions"] is False
+    assert payload["safe_to_enable_live_actions"] is False
+    assert json.loads(payload["details_json"])["read_only"] is True
+
+
+def test_service_readiness_payload_enables_paper_order_actions_when_ready(monkeypatch):
+    def fake_build_service_status(*, bundle_id, root):
+        return {
+            "status": "PASS",
+            "generated_at": "2026-06-02T09:30:00+09:00",
+            "bundle_id": bundle_id,
+            "deploy_quality": "PASS",
+            "broker_evidence": "PASS",
+            "live_trading_allowed": False,
+            "registry_mutated": False,
+            "read_only": True,
+            "be_contract": {
+                "safe_to_show_dashboard": True,
+                "safe_to_enable_order_actions": True,
+                "safe_to_enable_live_actions": False,
+            },
+        }
+
+    monkeypatch.setattr(
+        grpc_payloads,
+        "build_service_status",
+        fake_build_service_status,
+    )
+
+    payload = build_service_readiness_payload(
+        request_id="REQ-READY",
+        bundle_id="BUNDLE-TEST",
+        include_details=True,
+        root=Path("."),
+    )
+
+    assert payload["status"] == "PASS"
+    assert payload["bundle_id"] == "BUNDLE-TEST"
+    assert payload["live_trading_allowed"] is False
+    assert payload["safe_to_enable_order_actions"] is True
     assert payload["safe_to_enable_live_actions"] is False
     assert json.loads(payload["details_json"])["read_only"] is True
 
