@@ -19,6 +19,7 @@ from src.integration.grpc.payloads import (
     build_service_readiness_payload,
 )
 from src.integration.kafka.producer import KafkaEventProducer
+from src.ops.service_readiness_status import build_service_status
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
 from src.utils.ticker_utils import pad_ticker
@@ -546,6 +547,58 @@ def _paper_rehearsal_gate_from_strict(prelive: dict[str, Any]) -> dict[str, Any]
         "allowed_strict_blockers": sorted(allowed_strict_blockers),
         "strict_prelive_status": prelive.get("status"),
         "strict_prelive_blockers": strict_blockers,
+    }
+
+
+def _paper_start_gate_from_service_readiness(
+    *,
+    bundle_id: str,
+    repo_root: Path,
+    candidate_registry_dir: Path | None,
+) -> dict[str, Any]:
+    readiness = build_service_status(bundle_id=bundle_id, root=repo_root)
+    contract = readiness.get("be_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    blockers: list[str] = []
+
+    if candidate_registry_dir is None:
+        blockers.append("paper_candidate_registry_not_found")
+    if readiness.get("status") != "PASS":
+        blockers.append("service_readiness_not_pass")
+    if readiness.get("deploy_quality") != "PASS":
+        blockers.append("deploy_quality_not_pass")
+    if readiness.get("broker_evidence") != "PASS":
+        blockers.append("broker_evidence_not_pass")
+    if readiness.get("read_only") is not True:
+        blockers.append("readiness_not_read_only")
+    if readiness.get("external_api_called") is not False:
+        blockers.append("readiness_external_api_called")
+    if not bool(contract.get("safe_to_enable_order_actions")):
+        blockers.append("order_actions_not_enabled")
+    if bool(readiness.get("live_trading_allowed")):
+        blockers.append("live_trading_allowed_true")
+    if bool(contract.get("safe_to_enable_live_actions")):
+        blockers.append("live_actions_enabled")
+    if bool(readiness.get("registry_mutated")):
+        blockers.append("registry_mutated_true")
+
+    return {
+        "status": "PASS" if not blockers else "BLOCKED",
+        "scope": "paper-start",
+        "blockers": blockers,
+        "readiness_status": readiness.get("status"),
+        "deploy_quality": readiness.get("deploy_quality"),
+        "broker_evidence": readiness.get("broker_evidence"),
+        "read_only": readiness.get("read_only"),
+        "external_api_called": readiness.get("external_api_called"),
+        "live_trading_allowed": readiness.get("live_trading_allowed"),
+        "registry_mutated": readiness.get("registry_mutated"),
+        "safe_to_enable_order_actions": bool(
+            contract.get("safe_to_enable_order_actions")
+        ),
+        "safe_to_enable_live_actions": bool(
+            contract.get("safe_to_enable_live_actions")
+        ),
     }
 
 
@@ -1163,30 +1216,26 @@ def _make_servicer(
                 )
             if bool(pa_cfg.get("require_prelive_pass", True)):
                 try:
-                    prelive_gate = _load_prelive_gate_module()
-                    strict_gate = prelive_gate.build_report(
-                        end_date=_default_prelive_end_date(prelive_gate),
-                        business_days=_default_prelive_business_days(prelive_gate),
-                        max_tickers=max_tickers,
+                    paper_gate = _paper_start_gate_from_service_readiness(
                         bundle_id=requested_bundle_id,
+                        repo_root=repo_root,
+                        candidate_registry_dir=registry_dir,
                     )
-                    paper_gate = _paper_rehearsal_gate_from_strict(strict_gate)
                 except Exception as e:
                     context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                    context.set_details(f"paper_rehearsal_gate_error:{e}")
+                    context.set_details(f"paper_start_gate_error:{e}")
                     return pb2.StartPaperAutoTradingResponse(
                         request_id=str(getattr(request, "request_id", "")),
                         accepted=False,
-                        status="PAPER_REHEARSAL_GATE_ERROR",
-                        reason=f"paper_rehearsal_gate_error:{e}",
+                        status="PAPER_START_GATE_ERROR",
+                        reason=f"paper_start_gate_error:{e}",
                     )
                 if paper_gate.get("status") != "PASS":
-                    context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                     reason = ",".join(paper_gate.get("blockers") or [])
                     return pb2.StartPaperAutoTradingResponse(
                         request_id=str(getattr(request, "request_id", "")),
                         accepted=False,
-                        status="PAPER_REHEARSAL_GATE_BLOCKED",
+                        status="PAPER_START_GATE_BLOCKED",
                         reason=reason,
                     )
             result = session.start(

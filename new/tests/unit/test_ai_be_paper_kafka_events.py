@@ -426,32 +426,6 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
         tickers = ["005930"]
         confirm_phrase = "PAPER_AUTO_OK"
 
-    class _PreliveGate:
-        @staticmethod
-        def _final_dataset_gate_cfg() -> dict:
-            return {"expected_end_date": "20260521", "rehearsal_business_days": 253}
-
-        @staticmethod
-        def _parse_dataset_date(_value):
-            return grpc_server.datetime(2026, 5, 21, tzinfo=grpc_server._KST).date()
-
-        @staticmethod
-        def build_report(**_kwargs) -> dict:
-            return {
-                "status": "BLOCKED",
-                "blockers": ["05_backtest_real_candidate"],
-                "stages": {
-                    "01_code_ssot": {"status": "PASS", "live_enabled": False},
-                    "02_real_data_readiness": {"status": "PASS"},
-                    "03_80_business_day_data": {"status": "PASS"},
-                    "04_lgbm_real_train": {"status": "PASS"},
-                    "06_paper_balance": {"status": "PASS"},
-                    "07_paper_reconciliation": {"status": "PASS"},
-                    "08_paper_probe_order": {"status": "PASS"},
-                    "09_ops_risk": {"status": "PASS"},
-                },
-            }
-
     monkeypatch.setattr(
         grpc_server,
         "config_load",
@@ -476,7 +450,26 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
     monkeypatch.setattr(
         grpc_server,
         "_load_prelive_gate_module",
-        lambda: _PreliveGate,
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Start RPC must not rebuild strict prelive gate")
+        ),
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "build_service_status",
+        lambda **_kwargs: {
+            "status": "PASS",
+            "deploy_quality": "PASS",
+            "broker_evidence": "PASS",
+            "read_only": True,
+            "external_api_called": False,
+            "live_trading_allowed": False,
+            "registry_mutated": False,
+            "be_contract": {
+                "safe_to_enable_order_actions": True,
+                "safe_to_enable_live_actions": False,
+            },
+        },
     )
 
     def fake_start(**kwargs):
@@ -503,6 +496,110 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
     assert response.accepted is True
     assert response.status == "START_REQUESTED"
     assert calls["registry_dir"] == registry_dir
+
+
+def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    kafka = _RecordingKafka()
+    session = _PaperAutoSession(kafka=kafka)
+
+    class _Grpc:
+        class StatusCode:
+            INVALID_ARGUMENT = "INVALID_ARGUMENT"
+            FAILED_PRECONDITION = "FAILED_PRECONDITION"
+
+    class _Pb2Grpc:
+        class AiBeBridgeServiceServicer:
+            pass
+
+    class _Pb2:
+        class StartPaperAutoTradingResponse:
+            def __init__(self, **kwargs) -> None:
+                self.__dict__.update(kwargs)
+
+    class _Context:
+        code = None
+        details = ""
+
+        def set_code(self, code) -> None:
+            self.code = code
+
+        def set_details(self, details: str) -> None:
+            self.details = details
+
+    class _Request:
+        request_id = "BE-REQ-BLOCKED"
+        bundle_id = "BUNDLE-1"
+        cycles = 1
+        interval_sec = 60
+        tickers = ["005930"]
+        confirm_phrase = "PAPER_AUTO_OK"
+
+    monkeypatch.setattr(
+        grpc_server,
+        "config_load",
+        lambda *_args, **_kwargs: {
+            "default_max_cycles": 1,
+            "default_interval_sec": 60,
+            "confirm_start_phrase": "PAPER_AUTO_OK",
+            "max_tickers": 30,
+            "require_prelive_pass": True,
+        },
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_market_start_guard",
+        lambda **_kwargs: {"status": "PASS"},
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "_remaining_market_cycles",
+        lambda **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        grpc_server,
+        "build_service_status",
+        lambda **_kwargs: {
+            "status": "PASS",
+            "deploy_quality": "PASS",
+            "broker_evidence": "BLOCKED",
+            "read_only": True,
+            "external_api_called": False,
+            "live_trading_allowed": False,
+            "registry_mutated": False,
+            "be_contract": {
+                "safe_to_enable_order_actions": False,
+                "safe_to_enable_live_actions": False,
+            },
+        },
+    )
+    monkeypatch.setattr(session, "start", lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("session.start must not run when paper start gate is blocked")
+    ))
+
+    servicer = grpc_server._make_servicer(
+        _Grpc,
+        _Pb2,
+        _Pb2Grpc,
+        bundle_id="BUNDLE-1",
+        root=tmp_path,
+        session=session,
+    )
+    context = _Context()
+
+    response = servicer.StartPaperAutoTrading(_Request(), context)
+
+    assert response.accepted is False
+    assert response.status == "PAPER_START_GATE_BLOCKED"
+    assert response.reason == "broker_evidence_not_pass,order_actions_not_enabled"
+    assert context.code is None
+    assert context.details == ""
+    assert kafka.events == []
 
 
 def test_start_rpc_defaults_empty_tickers_to_active_universe(
