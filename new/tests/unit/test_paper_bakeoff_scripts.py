@@ -146,6 +146,51 @@ def test_runner_dry_run_uses_manifest_without_external_call(tmp_path: Path) -> N
     assert report["safety"]["env_read"] is False
 
 
+def test_runner_marks_candidate_blocked_when_subprocess_setup_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module("run_paper_bakeoff_20260604")
+    manifest = {
+        "date": "20260604",
+        "candidates": [
+            {
+                "bundle_id": "BUNDLE-TEST",
+                "track_id": "TRACK-TEST",
+                "registry_exists": True,
+                "registry_dir": "artifacts/lgbm_paper_candidate/BUNDLE-TEST",
+                "report_dir": str(tmp_path / "reports"),
+                "stdout_stderr_path": str(tmp_path / "reports" / "stdout_stderr.log"),
+                "args": {
+                    "bundle_id": "BUNDLE-TEST",
+                    "registry_dir": "artifacts/lgbm_paper_candidate/BUNDLE-TEST",
+                    "report_dir": str(tmp_path / "reports"),
+                    "track_id": "TRACK-TEST",
+                },
+            },
+        ],
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def raise_os_error(*_args, **_kwargs):
+        raise OSError("exec denied")
+
+    monkeypatch.setattr(module.subprocess, "run", raise_os_error)
+
+    report = module.run_bakeoff(
+        manifest_path=manifest_path,
+        dry_run=False,
+        python="/missing/python",
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert report["results"][0]["status"] == "BLOCKED"
+    assert report["results"][0]["reason"] == "runner_exception:OSError"
+    assert report["results"][0]["error_type"] == "OSError"
+    assert report["safety"]["env_read"] is False
+
+
 def test_validate_bakeoff_accepts_strict_shadow_report(tmp_path: Path, monkeypatch) -> None:
     module = _load_module("validate_paper_bakeoff_report")
     monkeypatch.setitem(module.build_report.__globals__, "REPO_ROOT", tmp_path)
@@ -217,3 +262,36 @@ def test_summarize_bakeoff_outputs_row_from_validation(tmp_path: Path, monkeypat
     assert summary["rows"][0]["bundle"] == bundle_id
     assert summary["rows"][0]["warm_incremental_rate"] == 1.0
     assert summary["rows"][0]["broker_submits"] == 0
+
+
+def test_summarize_bakeoff_reads_nested_failure_blockers() -> None:
+    module = _load_module("summarize_paper_bakeoff")
+    validation = {
+        "status": "BLOCKED",
+        "date": "20260604",
+        "candidate_reports": [
+            {
+                "bundle_id": "BUNDLE-BLOCKED",
+                "status": "BLOCKED",
+                "failures": [
+                    {
+                        "path": "artifacts/reports/paper.json",
+                        "reason": "strict_cadence_failed",
+                        "blockers": ["missing_cycle", "gap_exceeded"],
+                    },
+                    {
+                        "error_type": "ValueError",
+                        "error": "bad report",
+                    },
+                ],
+            },
+        ],
+    }
+
+    summary = module.build_summary(validation)
+
+    blockers = summary["rows"][0]["blockers"]
+    assert "strict_cadence_failed" in blockers
+    assert "missing_cycle" in blockers
+    assert "gap_exceeded" in blockers
+    assert "ValueError:bad report" in blockers

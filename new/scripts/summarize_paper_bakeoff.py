@@ -63,6 +63,43 @@ def _p50(values: list[float]) -> float | None:
     return float(ordered[len(ordered) // 2])
 
 
+def _append_unique(values: list[str], raw: Any) -> None:
+    if raw is None:
+        return
+    text = str(raw).strip()
+    if text and text not in values:
+        values.append(text)
+
+
+def _candidate_blockers(candidate_report: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    raw_blockers = candidate_report.get("blockers")
+    if isinstance(raw_blockers, list):
+        for item in raw_blockers:
+            _append_unique(blockers, item)
+    _append_unique(blockers, candidate_report.get("reason"))
+
+    failures = candidate_report.get("failures")
+    if isinstance(failures, list):
+        for failure in failures:
+            if isinstance(failure, dict):
+                _append_unique(blockers, failure.get("reason"))
+                nested_blockers = failure.get("blockers")
+                if isinstance(nested_blockers, list):
+                    for item in nested_blockers:
+                        _append_unique(blockers, item)
+                if not failure.get("reason") and not nested_blockers:
+                    error_type = failure.get("error_type")
+                    error = failure.get("error")
+                    if error_type and error:
+                        _append_unique(blockers, f"{error_type}:{error}")
+                    else:
+                        _append_unique(blockers, error_type or error)
+            else:
+                _append_unique(blockers, failure)
+    return blockers
+
+
 def build_summary(validation: dict[str, Any]) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for candidate_report in validation.get("candidate_reports", []):
@@ -105,10 +142,8 @@ def build_summary(validation: dict[str, Any]) -> dict[str, Any]:
             "fda_veto": (report.get("explained_no_submit_reasons") or {}).get("fda_veto", 0),
             "broker_submits": report.get("execution_cycles", 0),
             "verdict": "PASS" if candidate_report.get("status") == "PASS" else "BLOCKED",
-            "blockers": ";".join(candidate_report.get("blockers", []) or []),
+            "blockers": ";".join(_candidate_blockers(candidate_report)),
         }
-        if candidate_report.get("reason"):
-            row["blockers"] = str(candidate_report["reason"])
         rows.append(row)
     return {
         "schema_version": "1.0.0",

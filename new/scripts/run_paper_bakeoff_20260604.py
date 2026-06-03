@@ -109,16 +109,27 @@ def _run_candidate(
         result.update({"status": "DRY_RUN", "reason": "", "returncode": 0})
         return result
 
-    report_dir.mkdir(parents=True, exist_ok=True)
-    with stdout_path.open("w", encoding="utf-8") as out:
-        completed = subprocess.run(
-            cmd,
-            cwd=ROOT,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with stdout_path.open("w", encoding="utf-8") as out:
+            completed = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        result.update({
+            "returncode": None,
+            "status": "BLOCKED",
+            "reason": f"runner_exception:{type(e).__name__}",
+            "error_type": type(e).__name__,
+            "error": str(e),
+        })
+        return result
     result["returncode"] = int(completed.returncode)
     result["status"] = "PASS" if completed.returncode == 0 else "BLOCKED"
     result["reason"] = "" if completed.returncode == 0 else "paper_auto_trade_exit_nonzero"

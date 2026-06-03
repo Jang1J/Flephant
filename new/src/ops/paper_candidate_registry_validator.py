@@ -24,18 +24,37 @@ def _resolve_artifact_path(raw: Any, *, repo_root: Path, registry_dir: Path) -> 
         return None
     path = Path(str(raw))
     if path.is_absolute():
-        return path.resolve(strict=False)
+        return _safe_resolve(path)
     repo_path = repo_root / path
-    if repo_path.exists():
-        return repo_path.resolve(strict=False)
-    return (registry_dir / path.name).resolve(strict=False)
+    if _safe_exists(repo_path):
+        return _safe_resolve(repo_path)
+    return _safe_resolve(registry_dir / path.name)
+
+
+def _safe_resolve(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return path.absolute()
+
+
+def _safe_exists(path: Path) -> bool:
+    exists, _ = _safe_exists_result(path)
+    return exists
+
+
+def _safe_exists_result(path: Path) -> tuple[bool, str | None]:
+    try:
+        return path.exists(), None
+    except OSError as e:
+        return False, type(e).__name__
 
 
 def _is_under(path: Path, root: Path) -> bool:
     try:
-        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        _safe_resolve(path).relative_to(_safe_resolve(root))
         return True
-    except ValueError:
+    except (ValueError, OSError):
         return False
 
 
@@ -69,7 +88,7 @@ def validate_paper_candidate_registry(
     warnings: list[str] = []
     registry_path = registry_dir / "registry.json"
 
-    if not registry_path.exists():
+    if not _safe_exists(registry_path):
         blockers.append("paper_candidate_registry_not_found")
         return {
             "status": "BLOCKED",
@@ -143,11 +162,21 @@ def validate_paper_candidate_registry(
             registry_dir=registry_dir,
         ):
             blockers.append("paper_candidate_metadata_path_outside_allowed_roots")
-        model_exists = bool(model_path and model_path.exists())
-        metadata_exists = bool(metadata_path and metadata_path.exists())
-        if not model_exists:
+        model_error = None
+        metadata_error = None
+        if model_path:
+            model_exists, model_error = _safe_exists_result(model_path)
+        if metadata_path:
+            metadata_exists, metadata_error = _safe_exists_result(metadata_path)
+        if model_error:
+            blockers.append("paper_candidate_model_path_os_error")
+            warnings.append(f"paper_candidate_model_path_error:{model_error}")
+        elif not model_exists:
             blockers.append("paper_candidate_model_file_missing")
-        if not metadata_exists:
+        if metadata_error:
+            blockers.append("paper_candidate_metadata_path_os_error")
+            warnings.append(f"paper_candidate_metadata_path_error:{metadata_error}")
+        elif not metadata_exists:
             blockers.append("paper_candidate_metadata_file_missing")
         metadata: dict[str, Any] | None = None
         if metadata_exists and metadata_path:

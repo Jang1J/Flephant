@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -773,6 +774,28 @@ def test_paper_candidate_registry_blocks_artifact_paths_outside_allowed_roots(tm
 
     assert result["status"] == "BLOCKED"
     assert "paper_candidate_model_path_outside_allowed_roots" in result["blockers"]
+
+
+def test_paper_candidate_registry_reports_path_os_error(monkeypatch, tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    original_exists = Path.exists
+
+    def fake_exists(path):
+        if path.name == "v1.pkl":
+            raise OSError("permission denied")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_model_path_os_error" in result["blockers"]
+    assert "paper_candidate_model_file_missing" not in result["blockers"]
 
 
 def test_paper_candidate_registry_blocks_invalid_metadata_json(tmp_path) -> None:
