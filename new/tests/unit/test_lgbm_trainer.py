@@ -485,3 +485,104 @@ def test_train_no_folds_raises(synthetic_data: Path) -> None:
             end_date="20260107",
             version="baseline",
         )
+
+
+# ====================================================================== #
+# sample_weight_half_life 진입부 정규화 + metadata 노출
+# ====================================================================== #
+
+
+@pytest.mark.parametrize("bad_input", [True, False])
+def test_normalize_sample_weight_half_life_rejects_bool(bad_input: bool) -> None:
+    """bool 입력은 int(True)=1 (1일 half-life) 오해석을 차단하기 위해 None으로 정규화."""
+    assert trainer_module._normalize_sample_weight_half_life(bad_input) is None
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, None),
+        (0, None),
+        (-30, None),
+        ("", None),
+        ("abc", None),
+        ("false", None),
+        (30, 30),
+        (30.5, 30),
+        ("60", 60),
+    ],
+)
+def test_normalize_sample_weight_half_life_normalizes_misc(
+    raw: object, expected: int | None,
+) -> None:
+    """비정상 입력은 None, 정수 변환 가능한 입력은 그대로 통과."""
+    assert trainer_module._normalize_sample_weight_half_life(raw) == expected
+
+
+def test_train_records_half_life_metadata_unweighted(
+    trainer_small: LGBMTrainer,
+) -> None:
+    """sample_weight_half_life=None일 때 metadata에 unweighted로 기록."""
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="baseline-unweighted-meta",
+    )
+
+    assert result["sample_weight_half_life"] is None
+    weighting = result["training_weighting"]
+    assert weighting["type"] == "unweighted"
+    assert weighting["half_life_days"] is None
+    assert weighting["validation_unweighted"] is True
+
+    # registry metadata도 동일 정보를 가지고 있어야 candidate 재현 가능.
+    _model, metadata = trainer_small.registry.load_latest()
+    assert metadata["sample_weight_half_life"] is None
+    assert metadata["training_weighting"]["type"] == "unweighted"
+
+
+def test_train_records_half_life_metadata_weighted(
+    trainer_small: LGBMTrainer,
+) -> None:
+    """sample_weight_half_life=30일 때 metadata에 exponential_decay + 30 기록.
+
+    candidate metadata만 보고도 half-life를 재현할 수 있어야 한다는 정책.
+    """
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="weighted-h30-meta",
+        sample_weight_half_life=30,
+    )
+
+    assert result["sample_weight_half_life"] == 30
+    weighting = result["training_weighting"]
+    assert weighting["type"] == "exponential_decay"
+    assert weighting["half_life_days"] == 30
+    assert weighting["validation_unweighted"] is True
+
+    _model, metadata = trainer_small.registry.load_latest()
+    assert metadata["sample_weight_half_life"] == 30
+    assert metadata["training_weighting"]["type"] == "exponential_decay"
+    assert metadata["training_weighting"]["half_life_days"] == 30
+
+
+def test_train_bool_input_normalized_to_unweighted(
+    trainer_small: LGBMTrainer,
+) -> None:
+    """train(sample_weight_half_life=True)이 1일 half-life로 통과되지 않고 unweighted로 정규화.
+
+    int(True)=1을 그대로 받으면 1일 반감기 + 다일 panel 조건에서 모든 sample_weight가
+    0에 가까워져 학습이 의미를 잃는다. 진입부에서 None으로 강제 후 unweighted baseline.
+    """
+    result = trainer_small.train(
+        tickers=["000001", "000002", "000003", "000004"],
+        start_date="20260101",
+        end_date="20260107",
+        version="bool-input-guard",
+        sample_weight_half_life=True,  # type: ignore[arg-type]
+    )
+    assert result["sample_weight_half_life"] is None
+    assert result["training_weighting"]["type"] == "unweighted"

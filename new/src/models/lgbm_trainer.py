@@ -30,6 +30,7 @@ from src.models.metrics import MetricsBundle
 from src.models.ranking_loss import (
     get_lightgbm,
     build_lgbm_params,
+    compute_recency_weights,
     get_training_control,
     make_lgbm_dataset,
 )
@@ -37,7 +38,21 @@ from src.models.registry import ModelRegistry
 from src.models.splitter import WalkForwardSplitter
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
-from src.utils.safe_cast import safe_bool
+from src.utils.safe_cast import safe_bool, safe_int
+
+
+def _normalize_sample_weight_half_life(value: Any) -> int | None:
+    """sample_weight_half_life 입력 정규화 (train API 진입부 가드).
+
+    - bool 입력 (True/False)은 False로 처리 → None (int(True)=1로 오해석 차단).
+    - None / 0 / 음수 / 비정상 입력은 None.
+    - 정수 또는 정수 변환 가능한 입력은 그대로 사용.
+    """
+    if isinstance(value, bool):
+        # int(True)=1이 1일 half-life로 오해석되는 경로 차단.
+        return None
+    normalized = safe_int(value, default=0, min_value=0)
+    return normalized if normalized > 0 else None
 
 logger = get_logger("lgbm_trainer")
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -154,8 +169,17 @@ class LGBMTrainer:
         bundle_id: str | None = None,
         is_latest: bool = True,
         target_col_override: str | None = None,
+        sample_weight_half_life: int | None = None,
     ) -> dict[str, Any]:
         """전체 파이프라인 실행. 학습된 booster를 registry에 save.
+
+        Args:
+          sample_weight_half_life: recency weighting 반감기 (일).
+            None이면 unweighted (default, simple daily retrain 흐름 호환).
+            primary grid: 15/30/45/60/90/120 (walk-forward train_window_days=60 기준).
+            sensitivity grid: 180/365 (final-window 추가 확인용).
+            정책: train fold만 weighted, validation은 unweighted 유지.
+            ablation 결과는 candidate evidence only, champion/active 승격 X.
 
         Returns:
           {
@@ -166,8 +190,12 @@ class LGBMTrainer:
             "fold_metrics": [{...}, ...],
             "n_train_rows": int,
             "n_val_rows": int,
+            "sample_weight_half_life": int | None,
+            "training_weighting": dict,
           }
         """
+        # public API 진입부 가드: bool/malformed input을 1일 half-life로 오해석하는 경로 차단.
+        sample_weight_half_life = _normalize_sample_weight_half_life(sample_weight_half_life)
         resolved_bundle_id = str(bundle_id).strip() if bundle_id is not None else None
         resolved_bundle_id = resolved_bundle_id or None
         effective_is_latest = bool(is_latest)
@@ -259,6 +287,7 @@ class LGBMTrainer:
                 tc,
                 lgb,
                 target_col=effective_target_col,
+                sample_weight_half_life=sample_weight_half_life,
             )
             fold_metrics.append({"fold": fold_idx, **metrics})
             best_iteration = int(getattr(booster, "best_iteration", 0) or 0)
@@ -299,6 +328,7 @@ class LGBMTrainer:
             params,
             lgb,
             num_boost_round=final_num_boost_round,
+            sample_weight_half_life=sample_weight_half_life,
         )
         trade_classifier = self._train_trade_no_trade_classifier(
             final_train_panel,
@@ -364,6 +394,18 @@ class LGBMTrainer:
             "training_control": tc,
             "metric_scope": metric_scope,
             "trade_no_trade_classifier": trade_classifier,
+            # 실험 재현성 영역: half-life는 모델 결과를 바꾸는 핵심 파라미터이므로
+            # candidate metadata에 명시 필드로 저장 (None이면 unweighted baseline).
+            "sample_weight_half_life": sample_weight_half_life,
+            "training_weighting": {
+                "type": (
+                    "exponential_decay"
+                    if sample_weight_half_life is not None
+                    else "unweighted"
+                ),
+                "half_life_days": sample_weight_half_life,
+                "validation_unweighted": True,
+            },
         }
         pkl_path = self.registry.save(
             final_booster,
@@ -401,6 +443,16 @@ class LGBMTrainer:
             "target_horizon_kind": target_horizon_kind,
             "metric_scope": metric_scope,
             "trade_no_trade_classifier": trade_classifier,
+            "sample_weight_half_life": sample_weight_half_life,
+            "training_weighting": {
+                "type": (
+                    "exponential_decay"
+                    if sample_weight_half_life is not None
+                    else "unweighted"
+                ),
+                "half_life_days": sample_weight_half_life,
+                "validation_unweighted": True,
+            },
         }
 
     # ================================================================== #
@@ -705,9 +757,21 @@ class LGBMTrainer:
         tc: dict[str, int],
         lgb,
         target_col: str,
+        sample_weight_half_life: int | None = None,
     ):
-        """단일 fold 학습 + validation 메트릭 계산."""
-        train_ds = make_lgbm_dataset(train_panel, feature_cols=self.feature_cols)
+        """단일 fold 학습 + validation 메트릭 계산.
+
+        정책: train fold만 recency weighted, validation은 unweighted 유지.
+        """
+        train_weights = compute_recency_weights(
+            train_panel,
+            half_life_days=sample_weight_half_life,
+        )
+        train_ds = make_lgbm_dataset(
+            train_panel,
+            feature_cols=self.feature_cols,
+            sample_weight=train_weights,
+        )
         val_ds = make_lgbm_dataset(val_panel, feature_cols=self.feature_cols)
 
         # lgb.train valid_sets는 train_ds 먼저, val_ds 두번째.
@@ -766,11 +830,20 @@ class LGBMTrainer:
         lgb,
         *,
         num_boost_round: int,
+        sample_weight_half_life: int | None = None,
     ):
-        """Train deploy candidate booster on the full requested panel window."""
+        """Train deploy candidate booster on the full requested panel window.
+
+        정책: 최종 booster도 sample_weight_half_life에 따라 weighted.
+        """
+        train_weights = compute_recency_weights(
+            final_train_panel,
+            half_life_days=sample_weight_half_life,
+        )
         train_ds = make_lgbm_dataset(
             final_train_panel,
             feature_cols=self.feature_cols,
+            sample_weight=train_weights,
         )
         return lgb.train(
             params,
