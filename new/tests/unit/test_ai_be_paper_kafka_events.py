@@ -1,7 +1,9 @@
 """Tests for the paper-auto Kafka event contract consumed by BE."""
 from __future__ import annotations
 
+import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +35,45 @@ class _RecordingKafka:
             "topic": "test-topic",
             "last_error": "no broker in unit test",
         }
+
+
+def _write_paper_candidate_registry(tmp_path, bundle_id: str = "BUNDLE-1"):
+    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / bundle_id
+    registry_dir.mkdir(parents=True)
+    (registry_dir / "v1.pkl").write_bytes(b"pickle-placeholder")
+    (registry_dir / "v1_metadata.json").write_text(
+        json.dumps(
+            {
+                "bundle_id": bundle_id,
+                "feature_cols": ["feat_1m_close_robust_z"],
+                "feature_manifest": {"feature_cols": ["feat_1m_close_robust_z"]},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (registry_dir / "registry.json").write_text(
+        (
+            "{"
+            '"schema_version":"1.0.0",'
+            '"active_version":"v1",'
+            '"paper_only_registry":true,'
+            '"live_trading_allowed":false,'
+            '"versions":[{'
+            '"version":"v1",'
+            f'"bundle_id":"{bundle_id}",'
+            '"model_path":"v1.pkl",'
+            '"metadata_path":"v1_metadata.json",'
+            '"live_trading_allowed":false,'
+            '"feature_cols":["feat_1m_close_robust_z"],'
+            '"feature_manifest":{"feature_cols":["feat_1m_close_robust_z"]}'
+            "}]"
+            "}"
+        ),
+        encoding="utf-8",
+    )
+    return registry_dir
 
 
 def test_kafka_envelope_contains_ids_and_nested_payload() -> None:
@@ -389,9 +430,7 @@ def test_start_rpc_passes_candidate_registry_and_allows_paper_gate(
     monkeypatch,
     tmp_path,
 ) -> None:
-    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
-    registry_dir.mkdir(parents=True)
-    (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    registry_dir = _write_paper_candidate_registry(tmp_path)
     kafka = _RecordingKafka()
     session = _PaperAutoSession(kafka=kafka)
     calls: dict[str, object] = {}
@@ -525,9 +564,7 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
     expected_reason,
     require_prelive_pass,
 ) -> None:
-    registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
-    registry_dir.mkdir(parents=True)
-    (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    registry_dir = _write_paper_candidate_registry(tmp_path)
     kafka = _RecordingKafka()
     session = _PaperAutoSession(kafka=kafka)
 
@@ -665,6 +702,11 @@ def test_paper_start_gate_blocks_safety_invariants(
     readiness["be_contract"].update(contract_overrides)
     monkeypatch.setattr(
         grpc_server,
+        "validate_paper_candidate_registry",
+        lambda **_kwargs: {"status": "PASS", "blockers": [], "warnings": []},
+    )
+    monkeypatch.setattr(
+        grpc_server,
         "build_service_status",
         lambda **_kwargs: readiness,
     )
@@ -679,13 +721,138 @@ def test_paper_start_gate_blocks_safety_invariants(
     assert expected_blocker in gate["blockers"]
 
 
-def test_start_rpc_defaults_empty_tickers_to_active_universe(
+def test_paper_start_gate_blocks_invalid_candidate_registry(
     monkeypatch,
     tmp_path,
 ) -> None:
     registry_dir = tmp_path / "artifacts" / "lgbm_paper_candidate" / "BUNDLE-1"
     registry_dir.mkdir(parents=True)
     (registry_dir / "registry.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        grpc_server,
+        "build_service_status",
+        lambda **_kwargs: {
+            "status": "PASS",
+            "deploy_quality": "PASS",
+            "broker_evidence": "PASS",
+            "read_only": True,
+            "external_api_called": False,
+            "live_trading_allowed": False,
+            "registry_mutated": False,
+            "be_contract": {
+                "safe_to_enable_order_actions": True,
+                "safe_to_enable_live_actions": False,
+            },
+        },
+    )
+
+    gate = grpc_server._paper_start_gate_from_service_readiness(
+        bundle_id="BUNDLE-1",
+        repo_root=tmp_path,
+        candidate_registry_dir=registry_dir,
+    )
+
+    assert gate["status"] == "BLOCKED"
+    assert "paper_candidate_registry_not_paper_only" in gate["blockers"]
+    assert "paper_candidate_registry_active_version_missing" in gate["blockers"]
+
+
+def test_paper_candidate_registry_blocks_artifact_paths_outside_allowed_roots(tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    outside_model = tmp_path.parent / f"outside-model-{uuid.uuid4()}.pkl"
+    outside_model.write_bytes(b"pickle-placeholder")
+    registry_path = registry_dir / "registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["versions"][0]["model_path"] = str(outside_model)
+    registry_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_model_path_outside_allowed_roots" in result["blockers"]
+
+
+def test_paper_candidate_registry_reports_path_os_error(monkeypatch, tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    original_exists = Path.exists
+
+    def fake_exists(path):
+        if path.name == "v1.pkl":
+            raise OSError("permission denied")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_model_path_os_error" in result["blockers"]
+    assert "paper_candidate_model_file_missing" not in result["blockers"]
+
+
+def test_paper_candidate_registry_blocks_invalid_metadata_json(tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    (registry_dir / "v1_metadata.json").write_text("{", encoding="utf-8")
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_metadata_invalid_json" in result["blockers"]
+
+
+def test_paper_candidate_registry_blocks_metadata_bundle_mismatch(tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    metadata_path = registry_dir / "v1_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["bundle_id"] = "BUNDLE-OTHER"
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_metadata_bundle_mismatch" in result["blockers"]
+
+
+def test_paper_candidate_registry_blocks_feature_column_mismatch(tmp_path) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
+    metadata_path = registry_dir / "v1_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["feature_cols"] = ["other_feature"]
+    metadata["feature_manifest"] = {"feature_cols": ["other_feature"]}
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = grpc_server.validate_paper_candidate_registry(
+        repo_root=tmp_path,
+        bundle_id="BUNDLE-1",
+        registry_dir=registry_dir,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "paper_candidate_metadata_feature_cols_mismatch" in result["blockers"]
+    assert "paper_candidate_metadata_feature_manifest_mismatch" in result["blockers"]
+
+
+def test_start_rpc_defaults_empty_tickers_to_active_universe(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    registry_dir = _write_paper_candidate_registry(tmp_path)
     kafka = _RecordingKafka()
     session = _PaperAutoSession(kafka=kafka)
     calls: dict[str, object] = {}

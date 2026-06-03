@@ -19,6 +19,7 @@ from src.integration.grpc.payloads import (
     build_service_readiness_payload,
 )
 from src.integration.kafka.producer import KafkaEventProducer
+from src.ops.paper_candidate_registry_validator import validate_paper_candidate_registry
 from src.ops.service_readiness_status import build_service_status
 from src.utils.config_loader import load as config_load
 from src.utils.logger import get_logger
@@ -556,10 +557,15 @@ def _paper_start_gate_from_service_readiness(
     repo_root: Path,
     candidate_registry_dir: Path,
 ) -> dict[str, Any]:
+    registry_check = validate_paper_candidate_registry(
+        repo_root=repo_root,
+        bundle_id=bundle_id,
+        registry_dir=candidate_registry_dir,
+    )
     readiness = build_service_status(bundle_id=bundle_id, root=repo_root)
     contract = readiness.get("be_contract")
     contract = contract if isinstance(contract, dict) else {}
-    blockers: list[str] = []
+    blockers: list[str] = list(registry_check.get("blockers") or [])
 
     if readiness.get("status") != "PASS":
         blockers.append("service_readiness_not_pass")
@@ -584,6 +590,7 @@ def _paper_start_gate_from_service_readiness(
         "status": "PASS" if not blockers else "BLOCKED",
         "scope": "paper-start",
         "blockers": blockers,
+        "registry": registry_check,
         "readiness_status": readiness.get("status"),
         "deploy_quality": readiness.get("deploy_quality"),
         "broker_evidence": readiness.get("broker_evidence"),
