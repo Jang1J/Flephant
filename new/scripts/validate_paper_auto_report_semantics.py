@@ -19,6 +19,13 @@ KST = ZoneInfo("Asia/Seoul")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _repo_relative(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate local paper-auto report PASS semantics",
@@ -482,7 +489,7 @@ def _summarize_report(
     )
     required_bundle_id = ((report.get("params") or {}).get("required_bundle_id") or "")
     summary = {
-        "path": str(path.relative_to(REPO_ROOT)),
+        "path": _repo_relative(path),
         "status": report.get("status"),
         "generated_at": report.get("generated_at"),
         "required_bundle_id": required_bundle_id,
@@ -602,7 +609,7 @@ def build_report(
                 failures.append(summary)
         except Exception as e:
             failures.append({
-                "path": str(path.relative_to(REPO_ROOT)),
+                "path": _repo_relative(path),
                 "error_type": type(e).__name__,
                 "error": str(e),
             })
@@ -610,7 +617,7 @@ def build_report(
         failures.append({
             "reason": "paper_auto_report_missing",
             "bundle_id": bundle_id,
-            "report_dir": str(base_dir.relative_to(REPO_ROOT)),
+            "report_dir": _repo_relative(base_dir),
             "pattern": pattern,
             "generated_date": str(generated_date or ""),
         })
@@ -620,7 +627,7 @@ def build_report(
         "action": "validate_paper_auto_report_semantics",
         "generated_at": datetime.now(KST).isoformat(),
         "bundle_id": bundle_id,
-        "report_dir": str(base_dir.relative_to(REPO_ROOT)),
+        "report_dir": _repo_relative(base_dir),
         "pattern": pattern,
         "scan_mode": "recursive",
         "generated_date": str(generated_date or ""),
@@ -654,7 +661,7 @@ def _write_report(report: dict[str, Any]) -> Path:
     suffix = report["bundle_id"] or "ALL"
     path = out_dir / f"paper_auto_semantics_{suffix}_{ts}.json"
     report["report_path"] = str(path)
-    report["report_path_relative"] = str(path.relative_to(REPO_ROOT))
+    report["report_path_relative"] = _repo_relative(path)
     with path.open("w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     return path
