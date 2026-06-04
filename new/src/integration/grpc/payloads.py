@@ -182,10 +182,15 @@ def _resolve_recommendation_config() -> dict[str, Any]:
     max_top_k = int(cfg["max_top_k"])
     risk_level_cfg = cfg.get("risk_level")
     risk_level_cfg = risk_level_cfg if isinstance(risk_level_cfg, dict) else {}
-    market_data_mode = os.getenv(
-        "AI_RECOMMENDATION_MARKET_DATA_MODE",
-        str(cfg.get("market_data_mode", "auto")),
-    ).strip().lower()
+    config_market_data_mode = (
+        str(cfg.get("market_data_mode") or "auto").strip().lower() or "auto"
+    )
+    market_data_mode_env = os.getenv("AI_RECOMMENDATION_MARKET_DATA_MODE")
+    market_data_mode = (
+        config_market_data_mode
+        if market_data_mode_env is None or market_data_mode_env.strip() == ""
+        else market_data_mode_env.strip().lower()
+    )
     if market_data_mode not in {"auto", "mock", "virtual", "real"}:
         raise ValueError(
             "grpc_recommendations.market_data_mode must be one of "

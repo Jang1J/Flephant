@@ -533,6 +533,27 @@ def test_recommendations_payload_can_use_recommendation_only_mock_market_data(
     assert diagnostics["minute_bar_window_cache"]["failed_tickers"] == {}
 
 
+def test_recommendations_payload_empty_market_data_env_falls_back_to_config(
+    monkeypatch,
+):
+    monkeypatch.setenv("AI_RECOMMENDATION_MARKET_DATA_MODE", "")
+
+    payload = build_recommendations_payload(
+        request_id="REQ-REC-EMPTY-MARKET-MODE",
+        bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
+        tickers=["005930"],
+        top_k=1,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        market_data_client=_FakeMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert diagnostics["market_data_mode"] == "auto"
+
+
 def test_recommendations_payload_allows_partial_bar_failures_when_enough_to_fill_top_k():
     payload = build_recommendations_payload(
         request_id="REQ-PARTIAL-BARS",

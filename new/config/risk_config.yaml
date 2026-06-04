@@ -777,8 +777,8 @@ dynamic_universe:
 # 참조 출처: connector_design.md 방법론 3 + KIS/DART/Naver 공식 제한 문서
 rate_limits:
   kis_rest:
-    req_per_sec: 2
-    burst: 2
+    req_per_sec: 20
+    burst: 50
   kis_ws:
     req_per_sec: 1        # WebSocket은 연결 단위
     burst: 1
