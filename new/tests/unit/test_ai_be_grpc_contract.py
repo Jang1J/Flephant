@@ -508,9 +508,90 @@ def test_recommendations_payload_uses_stable_default_bundle_when_request_empty()
     assert payload["recommendations"][0]["bundle_id"] == "BUNDLE-20260521-POSTCLOSE"
 
 
-def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
+def test_recommendations_payload_can_use_recommendation_only_mock_market_data(
+    monkeypatch,
+):
+    monkeypatch.setenv("AI_RECOMMENDATION_MARKET_DATA_MODE", "mock")
+
+    payload = build_recommendations_payload(
+        request_id="REQ-REC-MOCK-MARKET",
+        bundle_id="BUNDLE-TEST",
+        asof=datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+        tickers=["005930", "000660"],
+        top_k=2,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert [item["ticker"] for item in payload["recommendations"]] == [
+        "005930",
+        "000660",
+    ]
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert diagnostics["market_data_mode"] == "mock"
+    assert diagnostics["minute_bar_window_cache"]["failed_tickers"] == {}
+
+
+def test_recommendations_payload_allows_partial_bar_failures_when_enough_to_fill_top_k():
     payload = build_recommendations_payload(
         request_id="REQ-PARTIAL-BARS",
+        bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
+        tickers=["005930", "000660"],
+        top_k=1,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        market_data_client=_PartialFailingMarketDataClient(),
+    )
+
+    assert payload["status"] == "PASS"
+    assert [item["ticker"] for item in payload["recommendations"]] == ["005930"]
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert "000660" in diagnostics["bar_errors"]
+    assert diagnostics["partial_minute_bar_failures_allowed"] is True
+    assert diagnostics["scoring_tickers"] == ["005930"]
+
+
+def test_recommendations_payload_blocks_partial_bar_failures_when_underfilled_top_k():
+    payload = build_recommendations_payload(
+        request_id="REQ-PARTIAL-BARS-UNDERFILLED",
+        bundle_id="BUNDLE-TEST",
+        asof=REC_ASOF,
+        tickers=["005930", "000660"],
+        top_k=2,
+        include_diagnostics=True,
+        quant_agent=_FakeRecommendationQuant(),
+        market_data_client=_PartialFailingMarketDataClient(),
+    )
+
+    assert payload["status"] == "BLOCKED"
+    assert payload["reason"] == "partial_minute_bars_unavailable"
+    assert payload["recommendations"] == []
+    diagnostics = json.loads(payload["diagnostics_json"])
+    assert diagnostics["partial_minute_bar_failures_allowed"] is False
+    assert diagnostics["min_successful_tickers"] == 2
+    assert diagnostics["successful_bar_tickers"] == ["005930"]
+
+
+def test_recommendations_payload_blocks_partial_bar_failures_when_policy_disabled(
+    monkeypatch,
+):
+    original_config = grpc_payloads._resolve_recommendation_config
+
+    def policy_disabled_config() -> dict:
+        cfg = dict(original_config())
+        cfg["allow_partial_minute_bar_failures"] = False
+        return cfg
+
+    monkeypatch.setattr(
+        grpc_payloads,
+        "_resolve_recommendation_config",
+        policy_disabled_config,
+    )
+
+    payload = build_recommendations_payload(
+        request_id="REQ-PARTIAL-BARS-BLOCKED",
         bundle_id="BUNDLE-TEST",
         asof=REC_ASOF,
         tickers=["005930", "000660"],
@@ -523,15 +604,16 @@ def test_recommendations_payload_keeps_partial_bar_failures_as_diagnostics():
     assert payload["reason"] == "partial_minute_bars_unavailable"
     assert payload["recommendations"] == []
     diagnostics = json.loads(payload["diagnostics_json"])
-    assert "000660" in diagnostics["bar_errors"]
+    assert diagnostics["partial_minute_bar_failures_allowed"] is False
 
 
-def test_recommendations_payload_blocks_partial_fetch_timeout() -> None:
+def test_recommendations_payload_allows_partial_fetch_timeout_for_display() -> None:
     payload = build_recommendations_payload(
         request_id="REQ-TIMEOUT-BARS",
         bundle_id="BUNDLE-TEST",
         asof=REC_ASOF,
         tickers=["005930", "000660"],
+        top_k=1,
         include_diagnostics=True,
         quant_agent=_FakeRecommendationQuant(),
         minute_bar_cache=_minute_cache(
@@ -541,11 +623,12 @@ def test_recommendations_payload_blocks_partial_fetch_timeout() -> None:
         ),
     )
 
-    assert payload["status"] == "BLOCKED"
-    assert payload["reason"] == "partial_minute_bars_unavailable"
-    assert payload["recommendations"] == []
+    assert payload["status"] == "PASS"
+    assert [item["ticker"] for item in payload["recommendations"]] == ["005930"]
     diagnostics = json.loads(payload["diagnostics_json"])
     assert diagnostics["bar_errors"] == {"000660": "fetch_timeout"}
+    assert diagnostics["partial_minute_bar_failures_allowed"] is True
+    assert diagnostics["scoring_tickers"] == ["005930"]
     timeout_meta = diagnostics["minute_bar_window_cache"]["tickers"]["000660"]
     assert timeout_meta["reason"] == "fetch_timeout"
     assert timeout_meta["timeout_sec"] == 0.05
@@ -640,7 +723,7 @@ def test_recommendations_payload_blocks_non_contiguous_minute_window() -> None:
     assert ticker_meta["contiguity_status"] == "FAIL"
 
 
-def test_recommendations_payload_keeps_partial_invalid_scores_as_diagnostics():
+def test_recommendations_payload_blocks_underfilled_invalid_scores():
     payload = build_recommendations_payload(
         request_id="REQ-PARTIAL-SCORES",
         bundle_id="BUNDLE-TEST",
@@ -651,10 +734,13 @@ def test_recommendations_payload_keeps_partial_invalid_scores_as_diagnostics():
         market_data_client=_FakeMarketDataClient(),
     )
 
-    assert payload["status"] == "PASS"
-    assert [item["ticker"] for item in payload["recommendations"]] == ["005930"]
+    assert payload["status"] == "BLOCKED"
+    assert payload["reason"] == "insufficient_recommendations"
+    assert payload["recommendations"] == []
     diagnostics = json.loads(payload["diagnostics_json"])
     assert diagnostics["invalid_score_tickers"] == ["000660"]
+    assert diagnostics["finite_score_count"] == 1
+    assert diagnostics["min_recommendation_count"] == 2
 
 
 def test_recommendations_payload_blocks_when_quant_is_not_active():

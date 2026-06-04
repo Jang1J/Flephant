@@ -8,7 +8,9 @@ generated service wrapper.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import threading
 import uuid
 from datetime import datetime
@@ -23,13 +25,16 @@ from src.data.minute_bar_window_cache import (
 )
 from src.ops.service_readiness_status import build_service_status
 from src.utils.config_loader import load as config_load
+from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.ticker_utils import pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _RECOMMENDATION_BAR_CACHE: MinuteBarWindowCache | None = None
 _RECOMMENDATION_BAR_CACHE_CONFIG: MinuteBarWindowCacheConfig | None = None
+_RECOMMENDATION_BAR_CACHE_MARKET_DATA_MODE: str | None = None
 _RECOMMENDATION_BAR_CACHE_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -177,10 +182,20 @@ def _resolve_recommendation_config() -> dict[str, Any]:
     max_top_k = int(cfg["max_top_k"])
     risk_level_cfg = cfg.get("risk_level")
     risk_level_cfg = risk_level_cfg if isinstance(risk_level_cfg, dict) else {}
+    market_data_mode = os.getenv(
+        "AI_RECOMMENDATION_MARKET_DATA_MODE",
+        str(cfg.get("market_data_mode", "auto")),
+    ).strip().lower()
+    if market_data_mode not in {"auto", "mock", "virtual", "real"}:
+        raise ValueError(
+            "grpc_recommendations.market_data_mode must be one of "
+            "auto/mock/virtual/real",
+        )
     return {
         "default_bundle_id": str(cfg["default_bundle_id"]),
         "default_top_k": default_top_k,
         "max_top_k": max_top_k,
+        "market_data_mode": market_data_mode,
         "low_min_confidence": float(risk_level_cfg["low_min_confidence"]),
         "medium_min_confidence": float(risk_level_cfg["medium_min_confidence"]),
         "reason_code": str(cfg["reason_code"]),
@@ -189,6 +204,15 @@ def _resolve_recommendation_config() -> dict[str, Any]:
         ),
         "reason_ko_template": str(cfg["reason_ko_template"]),
         "parallel_fetch_workers": int(cfg["parallel_fetch_workers"]),
+        "allow_partial_minute_bar_failures": safe_bool(
+            cfg.get("allow_partial_minute_bar_failures", False),
+            default=False,
+        ),
+        "min_successful_tickers": safe_int(
+            cfg.get("min_successful_tickers", 1),
+            default=1,
+            min_value=1,
+        ),
     }
 
 
@@ -230,6 +254,24 @@ def _risk_level_ko(risk_level: str) -> str:
         "medium": "보통",
         "high": "높음",
     }.get(str(risk_level), str(risk_level))
+
+
+def _required_recommendation_count(
+    *,
+    resolved_top_k: int,
+    candidate_count: int,
+    cfg: dict[str, Any],
+) -> int:
+    if candidate_count <= 0:
+        return 0
+    configured_min = safe_int(
+        cfg.get("min_successful_tickers", 1),
+        default=1,
+        min_value=1,
+    )
+    configured_min = min(configured_min, int(resolved_top_k))
+    fill_requested_top_k = min(int(resolved_top_k), int(candidate_count))
+    return min(max(configured_min, fill_requested_top_k), int(candidate_count))
 
 
 def _recommendation_reason_ko(
@@ -288,10 +330,27 @@ def _make_recommendation_quant_agent(
     return QuantAgent(registry=registry, dual_source_loader=load_latest_scores)
 
 
-def _make_recommendation_market_client() -> Any:
+def _make_recommendation_market_client(*, market_data_mode: str = "auto") -> Any:
     from src.connectors.kis_rest import KISRestClient
+    from src.utils.auth import AuthManager
 
-    return KISRestClient()
+    if market_data_mode == "auto":
+        return KISRestClient()
+
+    class NoopRateLimiter:
+        def wait_and_acquire(
+            self,
+            tokens: int = 1,
+            max_wait_sec: float = 10.0,
+        ) -> None:
+            return None
+
+    class RecommendationAuthManager(AuthManager):
+        def get_mode(self) -> str:
+            return market_data_mode
+
+    rate_limiter = NoopRateLimiter() if market_data_mode == "mock" else None
+    return KISRestClient(auth=RecommendationAuthManager(), rate_limiter=rate_limiter)
 
 
 def _recommendation_minute_bar_cache(
@@ -299,19 +358,27 @@ def _recommendation_minute_bar_cache(
     config: MinuteBarWindowCacheConfig,
     market_data_client: Any | None,
     minute_bar_cache: MinuteBarWindowCache | None,
+    market_data_mode: str,
 ) -> MinuteBarWindowCache:
     if minute_bar_cache is not None:
         return minute_bar_cache
     if market_data_client is not None:
         return MinuteBarWindowCache(market_data_client, config)
-    global _RECOMMENDATION_BAR_CACHE, _RECOMMENDATION_BAR_CACHE_CONFIG
+    global _RECOMMENDATION_BAR_CACHE
+    global _RECOMMENDATION_BAR_CACHE_CONFIG
+    global _RECOMMENDATION_BAR_CACHE_MARKET_DATA_MODE
     with _RECOMMENDATION_BAR_CACHE_LOCK:
-        if _RECOMMENDATION_BAR_CACHE is None or _RECOMMENDATION_BAR_CACHE_CONFIG != config:
+        if (
+            _RECOMMENDATION_BAR_CACHE is None
+            or _RECOMMENDATION_BAR_CACHE_CONFIG != config
+            or _RECOMMENDATION_BAR_CACHE_MARKET_DATA_MODE != market_data_mode
+        ):
             _RECOMMENDATION_BAR_CACHE = MinuteBarWindowCache(
-                _make_recommendation_market_client(),
+                _make_recommendation_market_client(market_data_mode=market_data_mode),
                 config,
             )
             _RECOMMENDATION_BAR_CACHE_CONFIG = config
+            _RECOMMENDATION_BAR_CACHE_MARKET_DATA_MODE = market_data_mode
         return _RECOMMENDATION_BAR_CACHE
 
 
@@ -392,6 +459,7 @@ def build_recommendations_payload(
     resolved_top_k = int(top_k or cfg["default_top_k"])
     resolved_top_k = max(1, min(resolved_top_k, int(cfg["max_top_k"])))
     diagnostics["top_k"] = resolved_top_k
+    diagnostics["market_data_mode"] = cfg["market_data_mode"]
 
     try:
         quant = quant_agent or _make_recommendation_quant_agent(
@@ -433,6 +501,7 @@ def build_recommendations_payload(
             config=minute_bar_cache_config,
             market_data_client=market_data_client,
             minute_bar_cache=minute_bar_cache,
+            market_data_mode=str(cfg["market_data_mode"]),
         )
         cache_result = cache.get_windows(
             selected_tickers,
@@ -465,15 +534,51 @@ def build_recommendations_payload(
 
     if bar_errors:
         diagnostics["bar_errors"] = bar_errors
+
+    scoring_tickers = list(selected_tickers)
     if bar_errors:
+        successful_bar_tickers = [
+            ticker
+            for ticker in selected_tickers
+            if ticker not in bar_errors and ticker in cache_result.windows
+        ]
+        diagnostics["successful_bar_tickers"] = successful_bar_tickers
+        min_successful_tickers = _required_recommendation_count(
+            resolved_top_k=resolved_top_k,
+            candidate_count=len(selected_tickers),
+            cfg=cfg,
+        )
+        partial_allowed = bool(cfg["allow_partial_minute_bar_failures"])
+        if (
+            not partial_allowed
+            or len(successful_bar_tickers) < min_successful_tickers
+            or len(bar_errors) == len(selected_tickers)
+        ):
+            diagnostics["partial_minute_bar_failures_allowed"] = False
+            diagnostics["min_successful_tickers"] = min_successful_tickers
+            return _recommendation_blocked_payload(
+                request_id=response_request_id,
+                bundle_id=response_bundle_id,
+                reason=(
+                    "minute_bars_unavailable"
+                    if len(bar_errors) == len(selected_tickers)
+                    else "partial_minute_bars_unavailable"
+                ),
+                asof=resolved_asof,
+                model_version=model_version,
+                diagnostics=diagnostics,
+                include_diagnostics=include_diagnostics,
+            )
+        diagnostics["partial_minute_bar_failures_allowed"] = True
+        diagnostics["min_successful_tickers"] = min_successful_tickers
+        scoring_tickers = successful_bar_tickers
+
+    diagnostics["scoring_tickers"] = scoring_tickers
+    if not scoring_tickers:
         return _recommendation_blocked_payload(
             request_id=response_request_id,
             bundle_id=response_bundle_id,
-            reason=(
-                "minute_bars_unavailable"
-                if len(bar_errors) == len(selected_tickers)
-                else "partial_minute_bars_unavailable"
-            ),
+            reason="minute_bars_unavailable",
             asof=resolved_asof,
             model_version=model_version,
             diagnostics=diagnostics,
@@ -490,7 +595,7 @@ def build_recommendations_payload(
             include_diagnostics=include_diagnostics,
         )
 
-    quant_output = quant.score_cross_section(selected_tickers, asof=resolved_asof)
+    quant_output = quant.score_cross_section(scoring_tickers, asof=resolved_asof)
     quant_output = quant_output if isinstance(quant_output, dict) else {}
     diagnostics["quant_output"] = quant_output
     mode = str(quant_output.get("mode") or "blocked")
@@ -536,6 +641,53 @@ def build_recommendations_payload(
 
     confidences = quant_output.get("confidences")
     confidences = confidences if isinstance(confidences, dict) else {}
+    scoring_ticker_set = set(scoring_tickers)
+    finite_scores = {
+        ticker: score
+        for ticker, score in finite_scores.items()
+        if ticker in scoring_ticker_set
+    }
+    if not finite_scores:
+        diagnostics["unexpected_score_tickers"] = sorted(
+            pad_ticker(str(ticker))
+            for ticker in scores
+            if pad_ticker(str(ticker)) not in scoring_ticker_set
+        )
+        return _recommendation_blocked_payload(
+            request_id=response_request_id,
+            bundle_id=response_bundle_id,
+            reason="quant_scores_invalid_or_empty",
+            asof=resolved_asof,
+            mode=mode,
+            model_version=model_version,
+            diagnostics=diagnostics,
+            include_diagnostics=include_diagnostics,
+        )
+    min_recommendation_count = _required_recommendation_count(
+        resolved_top_k=resolved_top_k,
+        candidate_count=len(scoring_tickers),
+        cfg=cfg,
+    )
+    diagnostics["min_recommendation_count"] = min_recommendation_count
+    diagnostics["finite_score_count"] = len(finite_scores)
+    if len(finite_scores) < min_recommendation_count:
+        logger.warning(
+            "[grpc_recommendations] insufficient recommendations: finite=%d required=%d top_k=%d scoring=%d",
+            len(finite_scores),
+            min_recommendation_count,
+            resolved_top_k,
+            len(scoring_tickers),
+        )
+        return _recommendation_blocked_payload(
+            request_id=response_request_id,
+            bundle_id=response_bundle_id,
+            reason="insufficient_recommendations",
+            asof=resolved_asof,
+            mode=mode,
+            model_version=model_version,
+            diagnostics=diagnostics,
+            include_diagnostics=include_diagnostics,
+        )
     ranked = sorted(finite_scores.items(), key=lambda item: item[1], reverse=True)
     recommendations: list[dict[str, Any]] = []
     for rank, (ticker, score) in enumerate(ranked[:resolved_top_k], start=1):

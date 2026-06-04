@@ -184,7 +184,7 @@ class KISRestClient(BaseConnector):
         """KOSPI200 watch universe N종목 일괄 현재가 조회 (S5-1, C16).
 
         KIS REST는 단건 inquire_price 만 공식 제공. bulk endpoint 부재 시 N회 sequential 호출.
-        rate_limits.kis_rest = 20/sec, burst 50. KOSPI200 200종목 = 평균 3.3 req/s 사용 (안전).
+        호출 속도는 risk_config.yaml rate_limits.kis_rest 정책을 따른다.
 
         Args:
             tickers: 종목코드 리스트 (6자리 zero-padded 자동 적용).
