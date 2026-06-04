@@ -185,9 +185,13 @@ grpc_recommendations:
   reason_code: "MODEL_RANKING_SIGNAL"
   expected_return_unavailable_reason: "expected_return_unavailable_not_calibrated"
   reason_ko_template: "{stock_name}({ticker})는 현재 1분봉 기반 랭킹 모델 score가 후보군 중 {ranking}위로 산출되어 추천 목록에 포함됐습니다. 이 score는 보정된 기대수익률이 아니며, 주문 권고가 아닌 참고용 신호입니다. 위험도 표시는 {risk_level_ko}입니다."
+  # auto: KIS_MODE를 그대로 사용. mock/virtual/real: 추천 gRPC 분봉 조회에만 별도 KIS 모드 적용.
+  market_data_mode: "auto"
   # 가드 1: 30종목 KIS bar fetch 병렬화 worker 수. ThreadPoolExecutor(max_workers=N).
   # 하드코딩 회피 + 운영 중 조정 가능. KIS rate limit / shared limiter와 함께 운영.
-  parallel_fetch_workers: 10
+  parallel_fetch_workers: 2
+  allow_partial_minute_bar_failures: true
+  min_successful_tickers: 10
 
 minute_bar_window_cache:
   incremental_fetch_bars: 6
@@ -196,7 +200,7 @@ minute_bar_window_cache:
   expected_bar_interval_sec: 60
   max_contiguity_gap_sec: 60
   force_cold_on_session_date_change: true
-  batch_fetch_budget_sec: 45
+  batch_fetch_budget_sec: 80
   rationale: "Mode A 1분 cadence용 KIS minute-bar rolling cache. cold는 quant_agent.warmup_bars+1, 이후 tail 6개만 fetch한다. freshness/gap/session 경계는 fail-closed 또는 cold refetch."
 
 mode_b_deploy:

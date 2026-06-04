@@ -623,6 +623,13 @@ class QuantAgent(AgentBase):
         try:
             with path.open("rb") as fh:
                 return pickle.load(fh)
+        except FileNotFoundError as e:
+            logger.info(
+                "[quant_agent] optional trade classifier not found; "
+                "continuing without trade probability: %s",
+                e,
+            )
+            return None
         except Exception as e:
             logger.warning("[quant_agent] trade classifier load 실패: %s", e)
             return None
