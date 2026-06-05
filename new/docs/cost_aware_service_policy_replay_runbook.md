@@ -27,7 +27,7 @@ All values are loaded from `new/config/risk_config.yaml`.
 
 ```bash
 ELEPHANT_MODE=mode_b \
-PYTHONPATH=/Users/jangjaewon/Desktop/Elephant_Lab/new \
+PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
 /opt/anaconda3/envs/elephant/bin/python \
   new/scripts/service_policy_replay.py \
   --bundle-id BUNDLE-20260512-0AEEE37A
@@ -37,7 +37,7 @@ Optional explicit replay window:
 
 ```bash
 ELEPHANT_MODE=mode_b \
-PYTHONPATH=/Users/jangjaewon/Desktop/Elephant_Lab/new \
+PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
 /opt/anaconda3/envs/elephant/bin/python \
   new/scripts/service_policy_replay.py \
   --bundle-id BUNDLE-20260512-0AEEE37A \

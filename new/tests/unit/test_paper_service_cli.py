@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
 import paper_service_rehearsal  # noqa: E402
 import paper_trading_smoke  # noqa: E402
 import collect_kis_paper_evidence  # noqa: E402
+import paper_liquidate_positions  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -47,6 +48,56 @@ def test_paper_trading_smoke_can_assume_empty_system_positions() -> None:
         None,
         assume_empty=True,
     ) == []
+
+
+def test_paper_liquidate_positions_builds_one_share_sell_plan() -> None:
+    plan = paper_liquidate_positions._sell_plan(  # noqa: SLF001
+        [
+            {"ticker": "005930", "available_qty": 2, "current_price": 70000},
+            {"ticker": "42660", "qty": 1, "current_price": 112000},
+            {"ticker": "bad", "available_qty": 9, "current_price": 10},
+        ],
+        chunk_qty=1,
+    )
+
+    assert [row["ticker"] for row in plan] == ["005930", "005930", "042660"]
+    assert [row["qty"] for row in plan] == [1, 1, 1]
+
+
+def test_paper_liquidate_positions_dry_run_writes_summary(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeRunner:
+        def run_balance_reconciliation(self, write_report=True):
+            return {
+                "status": "PASS",
+                "stages": {
+                    "balance": {
+                        "positions": [
+                            {
+                                "ticker": "005930",
+                                "available_qty": 1,
+                                "current_price": 70000,
+                            }
+                        ]
+                    }
+                },
+            }
+
+    monkeypatch.setattr(paper_liquidate_positions, "PaperTradingRunner", FakeRunner)
+
+    rc = paper_liquidate_positions.main([
+        "--confirm-phrase",
+        "PAPER_ORDER_OK",
+        "--dry-run",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 0
+    summaries = list(tmp_path.glob("paper_liquidate_positions_*.json"))
+    assert len(summaries) == 1
 
 
 def test_collect_kis_paper_evidence_loads_system_positions_json(tmp_path: Path) -> None:
