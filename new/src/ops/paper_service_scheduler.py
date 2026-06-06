@@ -192,6 +192,11 @@ def _yyyymmdd(value: date) -> str:
     return value.strftime("%Y%m%d")
 
 
+def _max_selected_tickers(schedule: dict[str, Any]) -> int:
+    policy = schedule.get("execution_policy") if isinstance(schedule.get("execution_policy"), dict) else {}
+    return safe_int(policy.get("max_selected_tickers"), default=10, min_value=1)
+
+
 def command_for_task(
     task_id: str,
     *,
@@ -204,6 +209,7 @@ def command_for_task(
     generated_date: str | None = None,
 ) -> dict[str, Any]:
     root = repo_root or _REPO_ROOT
+    schedule = load_schedule(repo_root=root)
     python = sys.executable
     today = datetime.now(_KST).date()
     target_date = generated_date or _yyyymmdd(today)
@@ -270,12 +276,13 @@ def command_for_task(
             "--write-report",
         ])
     if task_id == "paper_auto_start":
+        max_selected = _max_selected_tickers(schedule)
         blockers: list[str] = []
         if invalid:
             blockers.append("selected_ticker_invalid_format")
         if not selected:
             blockers.append("selected_tickers_required_for_paper_auto_start")
-        if len(selected) > 10:
+        if len(selected) > max_selected:
             blockers.append("selected_ticker_count_exceeds_limit")
         if blockers:
             return {
@@ -284,6 +291,7 @@ def command_for_task(
                 "warnings": [],
                 "selected_tickers": selected,
                 "invalid_tickers": invalid,
+                "max_selected_tickers": max_selected,
             }
         return spec([
             python,

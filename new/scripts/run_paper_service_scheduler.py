@@ -12,6 +12,9 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "new"
@@ -28,7 +31,10 @@ def _parse_now(raw: str) -> datetime | None:
     value = str(raw or "").strip()
     if not value:
         return None
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=_KST)
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:

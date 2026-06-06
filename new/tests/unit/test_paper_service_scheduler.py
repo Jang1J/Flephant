@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from src.ops import paper_service_scheduler
 from tests.unit.test_paper_service_bundle import _write_repo
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+import run_paper_service_scheduler  # noqa: E402
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -56,6 +63,42 @@ def test_selected_paper_auto_start_dry_run_builds_command(tmp_path: Path) -> Non
     assert "--tickers" in command
     assert "000001" in command
     assert report["results"][0]["execution"]["status"] == "DRY_RUN"
+
+
+def test_selected_paper_auto_start_uses_schedule_max_selected_tickers(
+    tmp_path: Path,
+) -> None:
+    root = _write_repo(tmp_path)
+    schedule_path = root / "new" / "config" / "paper_service_schedule.yaml"
+    schedule_path.write_text(
+        schedule_path.read_text(encoding="utf-8").replace(
+            "  max_selected_tickers: 10",
+            "  max_selected_tickers: 1",
+        ),
+        encoding="utf-8",
+    )
+
+    report = paper_service_scheduler.build_scheduler_report(
+        repo_root=root,
+        bundle_id="BUNDLE-TEST",
+        task_ids=["paper_auto_start"],
+        selected_tickers="000001,000002",
+        execute=False,
+        now=datetime(2026, 6, 5, 9, 5, 0, tzinfo=_KST),
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "paper_auto_start:selected_ticker_count_exceeds_limit" in report["blockers"]
+    assert report["results"][0]["details"]["max_selected_tickers"] == 1
+
+
+def test_parse_now_attaches_kst_to_naive_timestamp() -> None:
+    parsed = run_paper_service_scheduler._parse_now("2026-06-05T08:30:10")  # noqa: SLF001
+
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.astimezone(_KST).hour == 8
+    assert parsed.astimezone(_KST).minute == 30
 
 
 def test_execute_uses_injected_runner(tmp_path: Path) -> None:

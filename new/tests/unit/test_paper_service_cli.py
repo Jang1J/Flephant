@@ -44,6 +44,12 @@ def _probe_pass_report() -> dict:
     }
 
 
+def _load_one_liquidate_summary(tmp_path: Path) -> dict:
+    summaries = list(tmp_path.glob("paper_liquidate_positions_*.json"))
+    assert len(summaries) == 1
+    return json.loads(summaries[0].read_text(encoding="utf-8"))
+
+
 def test_paper_trading_smoke_can_assume_empty_system_positions() -> None:
     assert paper_trading_smoke._load_system_positions(  # noqa: SLF001
         None,
@@ -154,8 +160,7 @@ def test_paper_liquidate_positions_actual_submission_records_summary(
 
     assert rc == 0
     assert submitted == [{"ticker": "005930", "side": "sell", "qty": 1}]
-    summaries = list(tmp_path.glob("paper_liquidate_positions_*.json"))
-    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    summary = _load_one_liquidate_summary(tmp_path)
     assert summary["status"] == "PASS"
     assert summary["submitted_order_count"] == 1
     assert summary["failure_count"] == 0
@@ -184,7 +189,7 @@ def test_paper_liquidate_positions_blocks_when_balance_fails(
     ])
 
     assert rc == 1
-    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    summary = _load_one_liquidate_summary(tmp_path)
     assert summary["status"] == "BLOCKED"
     assert summary["reason"] == "balance_reconciliation_not_pass"
 
@@ -229,7 +234,7 @@ def test_paper_liquidate_positions_records_submit_failure(
     ])
 
     assert rc == 1
-    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    summary = _load_one_liquidate_summary(tmp_path)
     assert summary["status"] == "BLOCKED"
     assert summary["submitted_order_count"] == 1
     assert summary["failure_count"] == 1
@@ -253,7 +258,7 @@ def test_paper_liquidate_positions_rejects_non_virtual_mode(
     ])
 
     assert rc == 1
-    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    summary = _load_one_liquidate_summary(tmp_path)
     assert summary["status"] == "BLOCKED"
     assert summary["reason"] == "kis_virtual_mode_required"
 
