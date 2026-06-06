@@ -16,7 +16,8 @@ Scope: FE to BE to AI paper-safe demo. This is not strict operational proof.
 
 ## Capture Targets
 
-Save screenshots under `/Users/jangjaewon/Desktop/Full_Part/artifacts/screenshots/`.
+Set `SCREENSHOT_DIR` for the current checkout, then save screenshots under
+`${SCREENSHOT_DIR}`. Example: `export SCREENSHOT_DIR=$PWD/../artifacts/screenshots`.
 
 - [ ] login screen or logged-in landing
 - [ ] recommendation list
@@ -25,7 +26,8 @@ Save screenshots under `/Users/jangjaewon/Desktop/Full_Part/artifacts/screenshot
 - [ ] start success or fail-closed reason
 - [ ] chart page
 
-Save copied JSON under `/Users/jangjaewon/Desktop/Full_Part/artifacts/demo_evidence/20260605/`.
+Set `DEMO_EVIDENCE_DIR` for the current checkout, then save copied JSON under
+`${DEMO_EVIDENCE_DIR}`. Example: `export DEMO_EVIDENCE_DIR=$PWD/../artifacts/demo_evidence/20260605`.
 
 - [ ] recommendations response
 - [ ] recommendation detail response

@@ -189,7 +189,7 @@ required features must block before broker reads or orders.
 ```bash
 # In an operator-approved shell, inject API credentials without printing them.
 # Do not commit credential-loading commands or secret values.
-export PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new
+export PYTHONPATH=$PWD/new
 /opt/anaconda3/envs/elephant/bin/python new/scripts/build_dart_corp_code_cache.py
 /opt/anaconda3/envs/elephant/bin/python new/scripts/build_news_dart_archive.py \
   --end-date 20260526 \
@@ -238,7 +238,7 @@ the rehearsal blocks with `active_version_null`.
 ```bash
 # In an operator-approved shell, inject KIS paper credentials without printing them.
 # Do not commit credential-loading commands or secret values.
-export PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new
+export PYTHONPATH=$PWD/new
 /opt/anaconda3/envs/elephant/bin/python new/scripts/collect_kis_paper_evidence.py \
   --bundle-id BUNDLE-20260521-POSTCLOSE \
   --registry-dir artifacts/lgbm_paper_candidate/BUNDLE-20260521-POSTCLOSE \
@@ -267,7 +267,7 @@ files from prior trading days.
 After evidence PASS, rerun read-only status gates:
 
 ```bash
-export PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new
+export PYTHONPATH=$PWD/new
 /opt/anaconda3/envs/elephant/bin/python new/scripts/service_readiness_status.py \
   --bundle-id BUNDLE-20260521-POSTCLOSE
 /opt/anaconda3/envs/elephant/bin/python new/scripts/prelive_gate.py \
@@ -284,7 +284,7 @@ longer windows.
 ```bash
 # In an operator-approved shell, inject KIS paper credentials without printing them.
 # Do not commit credential-loading commands or secret values.
-export PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new
+export PYTHONPATH=$PWD/new
 /opt/anaconda3/envs/elephant/bin/python new/scripts/paper_auto_trade.py \
   --bundle-id BUNDLE-20260521-POSTCLOSE \
   --registry-dir artifacts/lgbm_paper_candidate/BUNDLE-20260521-POSTCLOSE \

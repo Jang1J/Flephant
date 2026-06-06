@@ -46,9 +46,9 @@ hardening are not blockers for the demo video. They remain follow-up work.
 - Service readiness PASS: `artifacts/reports/service_readiness/service_readiness_BUNDLE-20260602-DEED529F_20260605_125114.json`
 - Strict prelive PASS: `artifacts/reports/prelive_gate/prelive_gate_20260605_125522.json`
 - Local screenshots:
-  - `/Users/jangjaewon/Desktop/Full_Part/artifacts/screenshots/local_fe_recommend_20260605_1230.png`
-  - `/Users/jangjaewon/Desktop/Full_Part/artifacts/screenshots/local_fe_recommend_detail_20260605_1231.png`
-  - `/Users/jangjaewon/Desktop/Full_Part/artifacts/screenshots/local_fe_chart_after_cors_20260605_1231.png`
+  - `${PROJECT_ROOT}/artifacts/screenshots/local_fe_recommend_20260605_1230.png`
+  - `${PROJECT_ROOT}/artifacts/screenshots/local_fe_recommend_detail_20260605_1231.png`
+  - `${PROJECT_ROOT}/artifacts/screenshots/local_fe_chart_after_cors_20260605_1231.png`
 
 Known caveat: local Kafka was not running in the last full-stack check. Mark
 notification path as `NOT_VERIFIED`, not as a trading failure.

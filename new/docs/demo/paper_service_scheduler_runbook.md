@@ -17,11 +17,11 @@
 ## 매분 서버 실행 예시
 
 ```bash
-cd /Users/jangjaewon/Desktop/Full_Part/Elephant_Lab
+cd "$(git rev-parse --show-toplevel)"
 set -a
-source /Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/.env
+source "${ELEPHANT_ENV_FILE:?set ELEPHANT_ENV_FILE to the operator-approved env path}"
 set +a
-PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
+PYTHONPATH=$PWD/new \
 /opt/anaconda3/envs/elephant/bin/python \
   new/scripts/run_paper_service_scheduler.py \
   --run-due \
@@ -35,7 +35,8 @@ PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
 사용자가 FE에서 추천 종목을 선택하고 BE가 tickers를 명시해 호출하는 경우에만 사용한다.
 
 ```bash
-PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
+cd "$(git rev-parse --show-toplevel)"
+PYTHONPATH=$PWD/new \
 /opt/anaconda3/envs/elephant/bin/python \
   new/scripts/run_paper_service_scheduler.py \
   --task-id paper_auto_start \
@@ -50,7 +51,8 @@ PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
 ## dry-run 점검
 
 ```bash
-PYTHONPATH=/Users/jangjaewon/Desktop/Full_Part/Elephant_Lab/new \
+cd "$(git rev-parse --show-toplevel)"
+PYTHONPATH=$PWD/new \
 /opt/anaconda3/envs/elephant/bin/python \
   new/scripts/run_paper_service_scheduler.py \
   --now 2026-06-05T08:30:10+09:00 \

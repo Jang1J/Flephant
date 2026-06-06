@@ -14,7 +14,7 @@ def _write_json(path: Path, payload: dict) -> None:
 def _write_repo(tmp_path: Path, *, active_version=None) -> Path:
     root = tmp_path
     config = root / "new" / "config"
-    config.mkdir(parents=True)
+    config.mkdir(parents=True, exist_ok=True)
     tickers = [f"{idx:06d}" for idx in range(1, 31)]
     stock_lines = "\n".join(
         f'      - {{ ticker: "{ticker}", name: "T{idx}", status: "active" }}'
@@ -174,7 +174,72 @@ def test_paper_service_bundle_report_passes_for_30t_demo(monkeypatch, tmp_path: 
     assert report["recommendations"]["recommendation_count"] == 10
     assert report["safety"]["live_trading_allowed"] is False
     assert report["safety"]["active_version"] is None
+    assert report["safety"]["real_order_enabled"] is False
+    assert report["safety"]["live_order_enabled"] is False
+    assert report["safety"]["require_kis_virtual"] is True
     assert report["be_runtime_hint"]["AI_PAPER_BUNDLE_ID"] == "BUNDLE-TEST"
+
+
+def test_paper_service_bundle_blocks_if_schedule_allows_real_orders(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = _write_repo(tmp_path)
+    schedule_path = root / "new" / "config" / "paper_service_schedule.yaml"
+    schedule_path.write_text(
+        schedule_path.read_text(encoding="utf-8").replace(
+            "  production_active_version: null",
+            "  production_active_version: null\n  allow_real_order: true",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        paper_service_bundle,
+        "build_service_status",
+        lambda **kwargs: _service_readiness(),
+    )
+
+    report = paper_service_bundle.build_paper_service_bundle_report(
+        repo_root=root,
+        bundle_id="BUNDLE-TEST",
+        mode="paper-service-30t",
+        tickers_arg="",
+        max_tickers=30,
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "schedule_allow_real_order_true" in report["blockers"]
+
+
+def test_paper_service_bundle_blocks_if_schedule_drops_virtual_requirement(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = _write_repo(tmp_path)
+    schedule_path = root / "new" / "config" / "paper_service_schedule.yaml"
+    schedule_path.write_text(
+        schedule_path.read_text(encoding="utf-8").replace(
+            "  production_active_version: null",
+            "  production_active_version: null\n  require_kis_virtual: false",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        paper_service_bundle,
+        "build_service_status",
+        lambda **kwargs: _service_readiness(),
+    )
+
+    report = paper_service_bundle.build_paper_service_bundle_report(
+        repo_root=root,
+        bundle_id="BUNDLE-TEST",
+        mode="paper-service-30t",
+        tickers_arg="",
+        max_tickers=30,
+    )
+
+    assert report["status"] == "BLOCKED"
+    assert "schedule_require_kis_virtual_false" in report["blockers"]
 
 
 def test_paper_service_bundle_blocks_explicit_tickers_for_30t_mode(

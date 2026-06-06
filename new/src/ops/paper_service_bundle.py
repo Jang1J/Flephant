@@ -17,7 +17,7 @@ import yaml
 
 from src.ops.paper_candidate_registry_validator import validate_paper_candidate_registry
 from src.ops.service_readiness_status import build_service_status
-from src.utils.safe_cast import safe_int
+from src.utils.safe_cast import safe_bool, safe_int
 from src.utils.ticker_utils import is_valid_ticker, pad_ticker
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -284,9 +284,11 @@ def _safety_state(
     *,
     production_registry: dict[str, Any],
     service_readiness: dict[str, Any],
+    schedule: dict[str, Any],
     no_live: bool,
 ) -> dict[str, Any]:
     blockers: list[str] = []
+    schedule_safety = schedule.get("safety") if isinstance(schedule.get("safety"), dict) else {}
     if not no_live:
         blockers.append("no_live_flag_required")
     if production_registry.get("active_version") is not None:
@@ -295,6 +297,20 @@ def _safety_state(
         blockers.append("production_registry_mutated")
     if bool(service_readiness.get("live_trading_allowed")):
         blockers.append("live_trading_allowed_true")
+    if safe_bool(schedule_safety.get("live_trading_allowed"), default=False):
+        blockers.append("schedule_live_trading_allowed_true")
+    if safe_bool(schedule_safety.get("allow_real_order"), default=False):
+        blockers.append("schedule_allow_real_order_true")
+    if safe_bool(schedule_safety.get("allow_live_order"), default=False):
+        blockers.append("schedule_allow_live_order_true")
+    if not safe_bool(schedule_safety.get("require_kis_virtual"), default=True):
+        blockers.append("schedule_require_kis_virtual_false")
+    if safe_bool(schedule_safety.get("registry_mutated"), default=False):
+        blockers.append("schedule_registry_mutated_true")
+    if schedule_safety.get("production_active_version") is not None:
+        blockers.append("schedule_production_active_version_not_null")
+    if safe_bool(schedule_safety.get("safe_to_enable_live_actions"), default=False):
+        blockers.append("schedule_safe_to_enable_live_actions_true")
     contract = service_readiness.get("be_contract") or {}
     if isinstance(contract, dict) and bool(contract.get("safe_to_enable_live_actions")):
         blockers.append("safe_to_enable_live_actions_true")
@@ -304,10 +320,23 @@ def _safety_state(
         "status": "PASS" if not blockers else "BLOCKED",
         "blockers": blockers,
         "active_version": production_registry.get("active_version"),
-        "live_trading_allowed": bool(service_readiness.get("live_trading_allowed")),
+        "live_trading_allowed": bool(service_readiness.get("live_trading_allowed"))
+        or safe_bool(schedule_safety.get("live_trading_allowed"), default=False),
         "registry_mutated": bool(service_readiness.get("registry_mutated"))
-        or bool(production_registry.get("registry_mutated")),
-        "real_order_enabled": False,
+        or bool(production_registry.get("registry_mutated"))
+        or safe_bool(schedule_safety.get("registry_mutated"), default=False),
+        "real_order_enabled": safe_bool(schedule_safety.get("allow_real_order"), default=False),
+        "live_order_enabled": safe_bool(schedule_safety.get("allow_live_order"), default=False),
+        "require_kis_virtual": safe_bool(schedule_safety.get("require_kis_virtual"), default=True),
+        "safe_to_enable_live_actions": safe_bool(
+            schedule_safety.get("safe_to_enable_live_actions"),
+            default=False,
+        )
+        or (
+            safe_bool(contract.get("safe_to_enable_live_actions"), default=False)
+            if isinstance(contract, dict)
+            else False
+        ),
     }
 
 
@@ -346,6 +375,7 @@ def build_paper_service_bundle_report(
     safety = _safety_state(
         production_registry=production_registry,
         service_readiness=readiness,
+        schedule=schedule,
         no_live=no_live,
     )
     recommendations = latest_recommendation_cache_state(

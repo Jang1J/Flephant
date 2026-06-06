@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +99,163 @@ def test_paper_liquidate_positions_dry_run_writes_summary(
     assert rc == 0
     summaries = list(tmp_path.glob("paper_liquidate_positions_*.json"))
     assert len(summaries) == 1
+
+
+def test_paper_liquidate_positions_actual_submission_records_summary(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    submitted: list[dict] = []
+
+    class FakeRunner:
+        def _client_mode(self):
+            return "virtual"
+
+        def run_balance_reconciliation(self, write_report=True):
+            if submitted:
+                return {"status": "PASS", "stages": {"balance": {"positions": []}}}
+            return {
+                "status": "PASS",
+                "stages": {
+                    "balance": {
+                        "positions": [
+                            {
+                                "ticker": "005930",
+                                "available_qty": 1,
+                                "current_price": 70000,
+                            }
+                        ]
+                    }
+                },
+            }
+
+        def submit_probe_order(
+            self,
+            ticker,
+            side,
+            qty,
+            price,
+            order_type,
+            confirm_phrase,
+            write_report=True,
+        ):
+            submitted.append({"ticker": ticker, "side": side, "qty": qty})
+            return {"status": "PASS", "report_path": "artifacts/reports/order.json"}
+
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    monkeypatch.setattr(paper_liquidate_positions, "PaperTradingRunner", FakeRunner)
+
+    rc = paper_liquidate_positions.main([
+        "--confirm-phrase",
+        "PAPER_ORDER_OK",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 0
+    assert submitted == [{"ticker": "005930", "side": "sell", "qty": 1}]
+    summaries = list(tmp_path.glob("paper_liquidate_positions_*.json"))
+    summary = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert summary["status"] == "PASS"
+    assert summary["submitted_order_count"] == 1
+    assert summary["failure_count"] == 0
+    assert summary["final_position_count"] == 0
+
+
+def test_paper_liquidate_positions_blocks_when_balance_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeRunner:
+        def _client_mode(self):
+            return "virtual"
+
+        def run_balance_reconciliation(self, write_report=True):
+            return {"status": "FAIL", "reason": "broker_down"}
+
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    monkeypatch.setattr(paper_liquidate_positions, "PaperTradingRunner", FakeRunner)
+
+    rc = paper_liquidate_positions.main([
+        "--confirm-phrase",
+        "PAPER_ORDER_OK",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 1
+    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    assert summary["status"] == "BLOCKED"
+    assert summary["reason"] == "balance_reconciliation_not_pass"
+
+
+def test_paper_liquidate_positions_records_submit_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls = {"balance": 0}
+
+    class FakeRunner:
+        def _client_mode(self):
+            return "virtual"
+
+        def run_balance_reconciliation(self, write_report=True):
+            calls["balance"] += 1
+            positions = [
+                {"ticker": "005930", "available_qty": 1, "current_price": 70000}
+            ] if calls["balance"] == 1 else []
+            return {"status": "PASS", "stages": {"balance": {"positions": positions}}}
+
+        def submit_probe_order(
+            self,
+            ticker,
+            side,
+            qty,
+            price,
+            order_type,
+            confirm_phrase,
+            write_report=True,
+        ):
+            return {"status": "FAIL", "report_path": "artifacts/reports/order.json"}
+
+    monkeypatch.setenv("KIS_MODE", "virtual")
+    monkeypatch.setattr(paper_liquidate_positions, "PaperTradingRunner", FakeRunner)
+
+    rc = paper_liquidate_positions.main([
+        "--confirm-phrase",
+        "PAPER_ORDER_OK",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 1
+    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    assert summary["status"] == "BLOCKED"
+    assert summary["submitted_order_count"] == 1
+    assert summary["failure_count"] == 1
+
+
+def test_paper_liquidate_positions_rejects_non_virtual_mode(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class FakeRunner:
+        pass
+
+    monkeypatch.setenv("KIS_MODE", "real")
+    monkeypatch.setattr(paper_liquidate_positions, "PaperTradingRunner", FakeRunner)
+
+    rc = paper_liquidate_positions.main([
+        "--confirm-phrase",
+        "PAPER_ORDER_OK",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 1
+    summary = json.loads(next(tmp_path.glob("paper_liquidate_positions_*.json")).read_text(encoding="utf-8"))
+    assert summary["status"] == "BLOCKED"
+    assert summary["reason"] == "kis_virtual_mode_required"
 
 
 def test_collect_kis_paper_evidence_loads_system_positions_json(tmp_path: Path) -> None:
