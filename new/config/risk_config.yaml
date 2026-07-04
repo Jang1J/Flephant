@@ -195,7 +195,7 @@ grpc_recommendations:
 
 minute_bar_window_cache:
   incremental_fetch_bars: 6
-  freshness_max_lag_sec: 120
+  freshness_max_lag_sec: 604800  # demo/local: allow recent closed-session bars for recommendation display
   gap_refetch_sec: 300
   expected_bar_interval_sec: 60
   max_contiguity_gap_sec: 60
@@ -1049,6 +1049,22 @@ live_data_readiness:
       start: "10:32"
       end: "11:01"
       reason: "KRX circuit breaker"
+    - date: "20260608"                # KIS virtual 1분봉 backfill opening artifact; 30종목 공통 09:03 이후 09:33/09:34 재개
+      start: "09:04"
+      end: "09:33"
+      reason: "KIS virtual minute backfill opening gap observed server-side"
+    - date: "20260608"                # KIS virtual 1분봉 backfill afternoon artifact; 일부 종목 14:36 이후 15:06/15:07 재개
+      start: "14:37"
+      end: "15:06"
+      reason: "KIS virtual minute backfill afternoon gap observed server-side"
+    - date: "20260623"                # KIS virtual 1분봉 backfill afternoon artifact; 27/30 종목 14:33 이후 15:03/15:04 재개
+      start: "14:33"
+      end: "15:03"
+      reason: "KIS virtual minute backfill afternoon gap observed server-side"
+    - date: "20260626"                # KIS virtual 1분봉 backfill noon artifact; 27/30 종목 12:10 이후 12:40 재개
+      start: "12:11"
+      end: "12:39"
+      reason: "KIS virtual minute backfill noon gap observed locally"
   require_all_tickers_for_backfill: true
   require_all_tickers_for_train: true
   max_consecutive_backfill_failed_dates: 3

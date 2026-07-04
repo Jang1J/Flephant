@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트).
 장중 매 1분 퀀트 시그널 + 이벤트 시 LLM 에이전트 개입 + 장마감 후 자동 진화.
 
-현재 단계 (2026-06-01 KST): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 non-live/paper-safe 경로 진행 중. `ai-1` 운영 baseline = `f2d2ebf` (#22 gRPC reason/universe + #23 C12 daily-series + #24 stale-test sync merge 완료). 열린 PR 없음. 2026-06-01 실제 raw archive 기반 Dual-Source 생성 + 30종목 KIS bars → Quant score 30개 → PPO Top-10 recommendation PASS. 현재 주간 목표는 BE 연결 live reliability pilot 준비이며, 우선순위는 operating path 정렬, 1분 cadence 병목(rolling/incremental bars cache), 4-gate/prelive evidence다. production registry `active_version=null` + `live_trading_allowed=false` 유지. `.env`는 사용자 승인 하 one-shot subshell source만 가능하며 원문 출력/저장 금지. 세부 최신 상태는 `PROGRESS.md` 상단 snapshot + 최신 세션 로그를 정본으로 본다.
+현재 단계 (2026-06-25 KST): Sprint 0~5 완료. Pre-Live Gate Phase 3 + Phase 4 non-live/paper-safe 경로 진행 중. `ai-1` 최신 head = `f2f9a45` (PR #39 paper-candidate-start-gate + #42 recommendation rate-limit merge 반영). 현재 작업 브랜치 `feature/paper-service-ops-bundle`: paper-service scheduler 실행기(`new/src/ops/paper_service_scheduler.py`) + deploy payload(`new/deploy/AI_DEPLOYMENT_PAYLOAD.md`) 정리 중. 휘발성 baseline/head/열린 PR 상세는 `PROGRESS.md` 상단 snapshot이 정본(이 줄에 hash를 박지 말 것). 현재 주간 목표는 BE 연결 live reliability pilot 준비이며, 우선순위는 operating path 정렬, 1분 cadence 병목(rolling/incremental bars cache), 4-gate/prelive evidence다. production registry `active_version=null` + `live_trading_allowed=false` 유지. `.env`는 사용자 승인 하 one-shot subshell source만 가능하며 원문 출력/저장 금지. 세부 최신 상태는 `PROGRESS.md` 상단 snapshot + 최신 세션 로그를 정본으로 본다.
 
 ## 파이프라인 v3 (2모드 × 5레이어)
 
@@ -114,13 +114,13 @@ Pre-Live Gate (Phase 3, 진행 중):
 - **Dual-Source**: 뉴스↔커뮤니티 divergence = uncertainty (Phase 2 80일 historical 확보 후 운영)
 - **Pre-Live Gate 4종**: deploy_quality + broker_evidence + prelive_gate + sanitized_release
 
-## 하네스 시스템 (v3, 2026-05-03 audit = 10 에이전트 + 20 스킬)
+## 하네스 시스템 (v3, 2026-06-25 audit = 10 에이전트 + 21 스킬)
 
 **에이전트 10**: architect, reviewer, coder, runner, modeler, data-engineer, presenter, doc-writer, analyst, gpt-tracker.
 
-**스킬 20 (4 카테고리)**:
+**스킬 21 (4 카테고리)**:
 1. **핵심 팀 (6)**: `/code-review` `/code-fix` `/run-pipeline` `/validate` `/build-model` `/team-merge`
-2. **전문가 (8)**: `/arch-sync` `/gpt` `/smoke-test` `/cleanup` `/agent-research` `/paper-trending` `/worklog` `/present`
+2. **전문가 (9)**: `/arch-sync` `/gpt` `/smoke-test` `/cleanup` `/agent-research` `/paper-trending` `/worklog` `/present` `/deploy-sync`
 3. **세이프티/세션 (5)**: `/careful` `/freeze` `/guard` `/unfreeze` `/checkpoint`
 4. **오케스트레이터 (1)**: `/elephant-ops [자연어]`
 
@@ -166,7 +166,7 @@ Pre-Live Gate (Phase 3, 진행 중):
 - 실데이터 smoke: `.env` 사용자 승인 후 서브셸에서만 source. 키 원문 출력/저장 금지
 - 4-yes check (`rules/cross-check.md §4`): "Critical 0건" 표기는 격리 / subprocess / canonical env Full PASS / 외부 cross-check 4개 모두 yes일 때만 허용
 - Canonical env: `/opt/anaconda3/envs/elephant/bin/python` (numpy 1.26.4 / lightgbm 4.6.0 / SB3). 최신 세션에서는 focused paper/service tests `35 passed`, 5/21 readiness/deploy no-write PASS. 더 큰 regression 기준은 `PROGRESS.md` 최신 로그를 우선한다.
-- 현재 협업 기준 branch: `ai-1`. 최신 확인 head는 `b85e29c fix(mode-b): service-policy evidence gate hardening`.
+- 현재 협업 기준 branch: `ai-1` (최신 head `f2f9a45`), 작업 브랜치 `feature/paper-service-ops-bundle`. 휘발성 head/PR는 `PROGRESS.md` snapshot이 정본.
 - PR #6 merge 반영 완료: `7372bf3 merge: PR #6 service-policy evidence gate 검증 추가`. deployer/scheduler service-policy evidence gate는 expected date range/universe binding 기준으로 hardening.
 - 공유 progress 파일(`PROGRESS.md`, `feature_list.json`)은 local handoff SSOT다 (`claude-progress.md`/`Codex-progress.md`는 2026-05-29 PROGRESS.md로 통합, 이제 redirect stub). 커밋/공유 여부는 사용자 지시에 따른다.
 - BE 연결은 read-only + paper-safe 범위만 허용. live trading enable, production registry mutation, 실계좌 주문 UI는 계속 금지.

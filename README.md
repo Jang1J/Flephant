@@ -1,6 +1,6 @@
 # Elephant Lab — KOSPI 1분봉 멀티에이전트 Decision OS
 
-KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트).
+KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트, A+).
 
 장중 매 1분 퀀트 시그널 + 이벤트 시 LLM 에이전트 개입 + 장마감 후 자동 진화의 **2모드 × 5레이어** 구조.
 
@@ -20,9 +20,9 @@ Mode B 장마감 (18:00~22:00):
 - **Blackboard 통신**: Shared Message Pool + Pub/Sub (MetaGPT 기반)
 - **Dual-Source**: 뉴스↔커뮤니티 divergence = uncertainty 신호
 
-## 현재 상태 (2026-05-15 기준)
+## 최종 상태 (2026-07-04 기준)
 
-### Sprint 진행률: **56 / 57 (98.2%)**
+### Sprint 진행률: **62 / 62 (100%)**
 
 | Sprint | 상태 | 비고 |
 |---|---|---|
@@ -30,12 +30,10 @@ Mode B 장마감 (18:00~22:00):
 | S1 Hot Path | done (11/11) | LightGBM + PPO + FDA + KIS virtual broker evidence |
 | S2 Cold Path | done (13/13) | News/Risk Fast/Slow/Debate + Blackboard + Event Gateway |
 | S3 Mode B | done (12/12) | Alpha Factor Engine + Co-STEER + Backtest Agent |
-| S4 통합 + Dual-Source | done 8/9, ongoing 1 | S4-6 external KIS evidence PASS, 1주 paper 운영 report 대기 |
+| S4 통합 + Dual-Source | done (14/14) | external KIS evidence, service readiness, paper-safe 운영 검증 |
 | S5 동적 유니버스 | done (4/4) | KOSPI200 watch → admission/exit lifecycle |
 
-남은 1건은 1주 paper 운영 리포트다. 외부 KIS virtual broker evidence는 2026-05-15 장중 확보 완료.
-
-팀 공유 요약: 실계좌 전환 제외, 데이터 수집-피처화-Mode B 검증-C12 deploy gate-C14 service replay-KIS virtual broker evidence까지 PASS 확인 완료. production registry는 비활성 유지했고, paper registry만 사용했다. 남은 것은 1주 paper 운영 리포트다.
+종합설계 최종 평가 완료. 데이터 수집-피처화-Mode B 검증-C12 deploy gate-C14 service replay-KIS virtual broker evidence까지 paper-safe 범위에서 검증했다. production registry는 비활성 유지했고, 실거래 전환은 프로젝트 범위에서 제외했다.
 
 ### Prelive Validation
 
@@ -110,8 +108,8 @@ PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/service_readi
 
 연구형 / 모의운용형 MVP. **mock → replay → paper-trading** 단계로 검증.
 
-- 실거래 (KIS real account) 는 Phase 2 이후. 현재는 paper (virtual) broker 만.
-- production registry active version 승격 금지 유지 (1주 paper 운영 리포트 완료 전까지).
+- 실거래 (KIS real account)는 프로젝트 범위 밖이다. 현재는 paper (virtual) broker만 다룬다.
+- production registry active version 승격 금지 유지.
 - broker action UI / live order action 차단 (`safe_to_enable_live_actions=false`).
 
 ## 프로젝트 구조
@@ -183,4 +181,4 @@ Elephant_Lab/
 
 ## 라이선스
 
-종합설계 프로젝트. 비공개.
+종합설계 포트폴리오용 공개 코드. 실거래 키, 계좌 정보, 런타임 산출물은 포함하지 않는다.

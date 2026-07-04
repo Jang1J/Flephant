@@ -428,6 +428,17 @@ def _run_command(
 Runner = Callable[[CommandSpec, Path, int], dict[str, Any]]
 
 
+def _execute_command(
+    runner: Runner | None,
+    command_spec: CommandSpec,
+    root: Path,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    if runner is None:
+        return _run_command(command_spec, cwd=root, timeout_sec=timeout_sec)
+    return runner(command_spec, root, timeout_sec)
+
+
 def _execute_internal(task_id: str, *, now: datetime) -> dict[str, Any]:
     if task_id == "trading_day_check":
         current_date = now.astimezone(_KST).date()
@@ -458,7 +469,6 @@ def run_tasks(
 ) -> list[dict[str, Any]]:
     root = repo_root or _REPO_ROOT
     current = (now or datetime.now(_KST)).astimezone(_KST)
-    command_runner = runner or _run_command
     results: list[dict[str, Any]] = []
     for task_id in task_ids:
         command_plan = command_for_task(
@@ -482,7 +492,12 @@ def run_tasks(
             task_result["command"] = command_spec.command
             task_result["env_overrides"] = sorted((command_spec.env or {}).keys())
             if execute:
-                task_result["execution"] = command_runner(command_spec, root, timeout_sec)
+                task_result["execution"] = _execute_command(
+                    runner,
+                    command_spec,
+                    root,
+                    timeout_sec,
+                )
             else:
                 task_result["execution"] = {"status": "DRY_RUN"}
         elif command_plan.get("status") == "INTERNAL":

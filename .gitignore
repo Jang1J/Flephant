@@ -73,6 +73,7 @@ feedback_/
 *.pdf
 
 # === 발표 보조 (시각자료/docx) — 코드 외부 자료는 별도 채널 ===
+*.docx
 new/GPT/*.svg
 new/GPT/*.docx
 new/docs/*.docx
