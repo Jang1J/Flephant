@@ -414,7 +414,6 @@ def test_score_cross_section_uses_tree_variance_when_dump_model_available(
     종목 B는 트리들이 분산 (variance>0 → low confidence). softmax 정규화 결과
     A의 confidence가 B보다 높아야 한다.
     """
-    n_trees = 4
     leaf_values = np.array([
         [1.0, -1.0],   # tree 0: leaf0=1, leaf1=-1
         [1.0, -1.0],   # tree 1

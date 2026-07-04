@@ -182,7 +182,6 @@ def _train_lambdarank_oof(panel, feature_cols, label_col):
     except ImportError as e:
         raise RuntimeError("lightgbm 미설치") from e
 
-    cfg_wf = config_load("risk_config.yaml", "walk_forward") or {}
     cfg_lgbm = config_load("risk_config.yaml", "lightgbm") or {}
 
     splitter = WalkForwardSplitter()

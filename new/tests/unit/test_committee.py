@@ -274,8 +274,6 @@ def test_cnn_branch_save_raises_when_scaler_none(tmp_path: Path):
 
 def test_cnn_branch_scaler_persists_after_fit():
     """fit() 후 self._scaler가 fitted StandardScaler여야 한다 (mean_/scale_ 보유)."""
-    from src.models.committee import CNNBranch
-
     branch = _make_cnn_branch(n_features=4)
     rng = np.random.default_rng(0)
     # Exogenous 모사: feature 스케일 이질적 (1e0, 1e2, 1e8 등)
@@ -313,8 +311,6 @@ def test_cnn_branch_fit_nan_aware_order():
 
     raw 단계에서 0으로 치환하지 않아야 통계량 왜곡이 없다 (팀원 리뷰 반영).
     """
-    from src.models.committee import CNNBranch
-
     branch = _make_cnn_branch(n_features=3)
     X = np.array([
         [1.0, 2.0, 3.0],
@@ -361,7 +357,7 @@ def test_cnn_branch_fit_nan_aware_order():
 
 def test_cnn_branch_predict_without_scaler_raises():
     """fit() 없이 _net만 있고 _scaler가 None이면 predict_proba가 명확한 에러 발생."""
-    from src.models.committee import CNNBranch, CommitteeTrainError
+    from src.models.committee import CommitteeTrainError
 
     branch = _make_cnn_branch(n_features=4)
     # _net은 있지만 _scaler는 None인 비정상 상태
@@ -375,8 +371,6 @@ def test_cnn_branch_predict_without_scaler_raises():
 def test_cnn_branch_save_persists_scaler(tmp_path: Path):
     """save() 후 cnn.pth 옆에 cnn_scaler.pkl 생성. 두 파일 다 있어야 운영 가능."""
     import pickle
-
-    from src.models.committee import CNNBranch
 
     branch = _make_cnn_branch(n_features=4)
     mock_net = MagicMock()
@@ -404,7 +398,7 @@ def test_cnn_branch_save_persists_scaler(tmp_path: Path):
 
 def test_cnn_branch_load_raises_when_scaler_missing(tmp_path: Path):
     """load() 시 cnn_scaler.pkl 없으면 명확한 CommitteeLoadError 발생."""
-    from src.models.committee import CNNBranch, CommitteeLoadError
+    from src.models.committee import CommitteeLoadError
 
     branch = _make_cnn_branch(n_features=4)
     pth_path = tmp_path / "cnn.pth"

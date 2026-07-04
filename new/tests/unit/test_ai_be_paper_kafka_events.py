@@ -564,7 +564,7 @@ def test_start_rpc_blocks_on_service_readiness_gate_without_grpc_error(
     expected_reason,
     require_prelive_pass,
 ) -> None:
-    registry_dir = _write_paper_candidate_registry(tmp_path)
+    _write_paper_candidate_registry(tmp_path)
     kafka = _RecordingKafka()
     session = _PaperAutoSession(kafka=kafka)
 

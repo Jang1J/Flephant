@@ -693,7 +693,6 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
         and isinstance(balance_stage, dict)
         and balance_stage.get("status") == "PASS"
     )
-    probe_ok = bool(probe and probe.get("status") == "PASS")
     probe_matched = _matched_order_count(probe)
     history_matched = _matched_order_count(order_history)
     probe_history = (probe.get("stages") or {}).get("order_history") if probe else {}
@@ -702,12 +701,6 @@ def _paper_trading_evidence_state(root: Path) -> dict[str, Any]:
         and probe_history.get("status") == "PASS"
         and probe_matched > 0
     )
-    explicit_history_ok = bool(
-        order_history
-        and order_history.get("status") == "PASS"
-        and history_matched > 0
-    )
-    order_history_ok = probe_history_ok or explicit_history_ok
     external = any(
         _contains_kis_virtual_mode(item)
         for item in (balance, probe, order_history)

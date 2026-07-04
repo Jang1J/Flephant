@@ -17,8 +17,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
-import pytest
-
 from src.connectors.kis_rest import KISRestClient
 from src.utils.auth import AuthManager
 from src.utils.rate_limiter import RateLimiter, get_shared_rate_limiter

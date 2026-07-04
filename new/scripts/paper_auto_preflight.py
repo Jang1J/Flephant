@@ -180,18 +180,12 @@ def _paper_evidence() -> dict[str, Any]:
         and isinstance(reconciliation_stage, dict)
         and reconciliation_stage.get("status") == "PASS"
     )
-    probe_ok = bool(probe and probe.get("status") == "PASS")
     probe_matched_order_count = _matched_order_count(probe)
     history_matched_order_count = _matched_order_count(order_history)
     probe_history_ok = bool(
         probe
         and probe.get("stages", {}).get("order_history", {}).get("status") == "PASS"
         and probe_matched_order_count > 0
-    )
-    history_ok = bool(
-        order_history
-        and order_history.get("status") == "PASS"
-        and history_matched_order_count > 0
     )
     evidence_reports = [balance]
     if probe:
