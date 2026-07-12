@@ -31,21 +31,24 @@ Flephant는 **KOSPI 30종목을 매분 분석**하고, 정량 모델과 전문 �
 ## Architecture
 
 ```mermaid
-flowchart LR
-    Market["1-minute market data"] --> Ranker["LightGBM ranker"]
-    Ranker --> PPO["PPO allocator"]
-    PPO --> PM["Portfolio manager"]
+flowchart TB
+    subgraph ModeA["Mode A · intraday"]
+        direction TB
+        subgraph Hot["Hot Path · every minute"]
+            direction LR
+            Market["Market data"] --> Ranker["LightGBM"] --> PPO["PPO"] --> PM["Portfolio manager"] --> FDA{"FDA gate"}
+        end
+        subgraph ColdPath["Cold Path · event-driven"]
+            direction LR
+            Events["News · filings · flow"] --> Cold["News · Risk · Debate"] --> FDA
+        end
+    end
 
-    Events["News · filings · flow"] --> Cold["News · Risk · Debate agents"]
-    PM --> FDA{"FDA approve / veto"}
-    Cold --> FDA
-    FDA --> Paper["KIS virtual paper broker"]
-    Paper --> Audit["C18 audit and feedback"]
+    FDA --> Paper["KIS virtual paper"] --> Audit["C18 audit and feedback"]
 
     subgraph ModeB["Mode B · post-close"]
-        Factors["Alpha factor engine"] --> CoSTEER["Co-STEER"]
-        CoSTEER --> Backtest["Backtest agent"]
-        Backtest --> Gate{"C12 / C14 gates"}
+        direction LR
+        Factors["Alpha factors"] --> CoSTEER["Co-STEER"] --> Backtest["Backtest agent"] --> Gate{"C12 / C14 gates"}
     end
 
     Audit --> Factors
