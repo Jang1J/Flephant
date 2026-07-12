@@ -79,15 +79,18 @@ flowchart TB
 
 아래 수치는 최종 paper-safe 검증 기록의 요약입니다. 원천 시세, 모델 binary, 계좌 정보와 broker evidence 원본은 공개본에서 제외했습니다.
 
-| Validation | Result |
-|---|---|
-| **C12 BacktestAgent** | `verdict=pass`, `deployable=true`, `leakage=pass`, `registry_mutated=false` |
-| **C14 service-policy replay** | `PASS`, no naked short, order caps respected, 12 days |
-| **Dual-source archive** | 80 days, coverage `1.0` |
-| **Exogenous archive** | 80 days, coverage `1.0` |
-| **Feature quality** | 90,230 / 90,230 non-neutral rows |
-| **KIS paper binding** | Balance reconciliation, probe order, history match `PASS` |
-| **Service readiness** | `PASS`, live actions disabled |
+- **C12 BacktestAgent**<br>
+  `verdict=pass` · `deployable=true` · `leakage=pass` · `registry_mutated=false`
+- **C14 service-policy replay**<br>
+  `PASS` · no naked short · order caps respected · 12 days
+- **Dual-source and exogenous archives**<br>
+  80 days each · coverage `1.0`
+- **Feature quality**<br>
+  90,230 / 90,230 non-neutral rows
+- **KIS paper binding**<br>
+  Balance reconciliation · probe order · history match `PASS`
+- **Service readiness**<br>
+  `PASS` · live actions disabled
 
 Representative backtest (`BUNDLE-20260512-0AEEE37A`, 12-day service-policy sample):
 
