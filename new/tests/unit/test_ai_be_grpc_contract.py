@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -91,6 +92,25 @@ def test_ai_be_proto_stubs_generate_after_paper_auto_contract_change(tmp_path):
     assert "orders_submitted" in generated
     assert "kafka_required" in generated
     assert "last_error" in generated
+
+
+def test_ai_be_proto_stub_generation_is_parallel_safe(tmp_path):
+    out_dir = tmp_path / "grpc_generated"
+
+    def generate() -> int:
+        return generate_ai_grpc_stubs([
+            "--proto", str(PROTO),
+            "--output-dir", str(out_dir),
+        ])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: generate(), range(8)))
+
+    assert results == [0] * 8
+    assert sorted(path.name for path in out_dir.glob("*_pb2*.py")) == [
+        "elephant_ai_bridge_pb2.py",
+        "elephant_ai_bridge_pb2_grpc.py",
+    ]
 
 
 def test_recommendation_proto_exposes_be_requested_fields_without_order_controls():

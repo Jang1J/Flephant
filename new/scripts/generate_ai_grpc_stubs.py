@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROTO = ROOT / "new" / "proto" / "elephant_ai_bridge.proto"
@@ -37,17 +38,21 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
 
-    result = protoc.main(
-        [
-            "grpc_tools.protoc",
-            f"-I{proto_path.parent}",
-            f"--python_out={output_dir}",
-            f"--grpc_python_out={output_dir}",
-            str(proto_path),
-        ]
-    )
-    if result != 0:
-        return int(result)
+    with TemporaryDirectory(prefix="elephant_grpc_codegen_") as temp_dir:
+        temp_output = Path(temp_dir)
+        result = protoc.main(
+            [
+                "grpc_tools.protoc",
+                f"-I{proto_path.parent}",
+                f"--python_out={temp_output}",
+                f"--grpc_python_out={temp_output}",
+                str(proto_path),
+            ]
+        )
+        if result != 0:
+            return int(result)
+        for generated_path in temp_output.glob("*_pb2*.py"):
+            generated_path.replace(output_dir / generated_path.name)
     print(f"[ai_grpc] generated stubs: {output_dir}")
     return 0
 
