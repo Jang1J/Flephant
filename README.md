@@ -34,23 +34,16 @@ Flephant는 **KOSPI 30종목을 매분 분석**하고, 정량 모델과 전문 �
 
 ```mermaid
 flowchart TB
-    subgraph ModeA["Mode A · intraday"]
-        direction TB
-        Market["1-minute market data"] --> Ranker["LightGBM ranker"]
-        Ranker --> PPO["PPO allocator"] --> PM["Portfolio manager"] --> FDA{"FDA gate"}
-        Events["News · filings · flow"] --> Cold["News · Risk · Debate"] --> FDA
+    subgraph Intraday["Mode A · intraday"]
+        direction LR
+        Market["1-minute market data"] --> Models["LightGBM ranker<br/>PPO allocator"]
+        Models --> Decision["Portfolio manager<br/>FDA approve / veto"] --> Paper["KIS virtual paper"]
+        Events["News · filings · flow"] --> Agents["News · Risk · Debate"] --> Decision
     end
 
-    FDA --> Paper["KIS virtual paper"] --> Audit["C18 audit and feedback"]
-
-    subgraph ModeB["Mode B · post-close"]
-        direction TB
-        Factors["Alpha factors"] --> CoSTEER["Co-STEER"]
-        CoSTEER --> Backtest["Backtest agent"] --> Gate{"C12 / C14 gates"}
-    end
-
-    Audit --> Factors
-    Gate -. "validated candidate" .-> Ranker
+    Paper --> Audit["C18 audit and feedback"]
+    Audit --> ModeB["Mode B · post-close<br/>Alpha factors · Co-STEER<br/>Backtest · C12 / C14 gates"]
+    ModeB -. "validated candidate" .-> Models
 ```
 
 ### Two Modes, Three Decision Paths
