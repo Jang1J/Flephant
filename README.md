@@ -13,6 +13,8 @@
 [![Safety](https://img.shields.io/badge/Trading-Paper_Only-1F6FEB)](#safety-boundary)
 [![Contracts](https://img.shields.io/badge/API_Contracts-C1--C18-6F42C1)](new/specs/api_contracts.md)
 
+[Architecture](#architecture) · [Results](#project-result) · [Quick Start](#quick-start) · [Safety](#safety-boundary)
+
 </div>
 
 ## Overview
@@ -34,21 +36,17 @@ Flephant는 **KOSPI 30종목을 매분 분석**하고, 정량 모델과 전문 �
 flowchart TB
     subgraph ModeA["Mode A · intraday"]
         direction TB
-        subgraph Hot["Hot Path · every minute"]
-            direction LR
-            Market["Market data"] --> Ranker["LightGBM"] --> PPO["PPO"] --> PM["Portfolio manager"] --> FDA{"FDA gate"}
-        end
-        subgraph ColdPath["Cold Path · event-driven"]
-            direction LR
-            Events["News · filings · flow"] --> Cold["News · Risk · Debate"] --> FDA
-        end
+        Market["1-minute market data"] --> Ranker["LightGBM ranker"]
+        Ranker --> PPO["PPO allocator"] --> PM["Portfolio manager"] --> FDA{"FDA gate"}
+        Events["News · filings · flow"] --> Cold["News · Risk · Debate"] --> FDA
     end
 
     FDA --> Paper["KIS virtual paper"] --> Audit["C18 audit and feedback"]
 
     subgraph ModeB["Mode B · post-close"]
-        direction LR
-        Factors["Alpha factors"] --> CoSTEER["Co-STEER"] --> Backtest["Backtest agent"] --> Gate{"C12 / C14 gates"}
+        direction TB
+        Factors["Alpha factors"] --> CoSTEER["Co-STEER"]
+        CoSTEER --> Backtest["Backtest agent"] --> Gate{"C12 / C14 gates"}
     end
 
     Audit --> Factors
@@ -57,11 +55,12 @@ flowchart TB
 
 ### Two Modes, Three Decision Paths
 
-| Path | Window | Responsibility | Latency target |
-|---|---|---|---|
-| **Hot Path** | 09:00~15:30 | 1분봉 → ranking → allocation → FDA | `<100ms`, no synchronous LLM |
-| **Cold Path** | Event-driven | 뉴스·공시·수급 해석과 리스크 토론 | 10~30s |
-| **Mode B** | 18:00~22:59 | 팩터 탐색, 재학습, backtest, 배포 후보 검증 | Post-close |
+- **Hot Path** · `09:00~15:30` · target `<100ms`<br>
+  1분봉 → ranking → allocation → FDA. Synchronous LLM 호출 없이 매분 실행합니다.
+- **Cold Path** · event-driven · 10~30s<br>
+  뉴스·공시·수급을 News, Risk, Debate Agent가 해석하고 FDA에 전달합니다.
+- **Mode B** · `18:00~22:59` · post-close<br>
+  팩터 탐색 → 재학습 → backtest → C12/C14 배포 후보 검증을 수행합니다.
 
 ## Project Result
 
@@ -92,9 +91,9 @@ flowchart TB
 
 Representative backtest (`BUNDLE-20260512-0AEEE37A`, 12-day service-policy sample):
 
-| IC | RankIC | ARR | SR/IR | MDD | Cost burn |
-|---:|---:|---:|---:|---:|---:|
-| 0.058 | 0.077 | 0.197 | 8.31 | -0.0008 | 38.40% |
+- **Signal quality:** IC `0.058`, RankIC `0.077`
+- **Return / risk sample:** ARR `0.197`, SR/IR `8.31`, MDD `-0.0008`
+- **Execution cost:** cost burn `38.40%`, cost-aware retraining candidate identified
 
 > The short evaluation window can overstate annualized metrics. The result is reported as engineering evidence, not as a live-investment claim.
 
