@@ -27,7 +27,7 @@ _PATH_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 _DOC_PATH_RE = re.compile(
-    r"(?:/Users/jangjaewon/Desktop/Elephant_Lab/)?"
+    r"(?:/Users/[^/\s]+/(?:Desktop/)?(?:Full_Part/)?Elephant_Lab/)?"
     r"(?:artifacts|new|dist)/[A-Za-z0-9_./\\-]+"
 )
 
@@ -283,11 +283,9 @@ def build_report(
         "missing_claims": [],
     }
     if include_notebooks:
-        notebook_scan = scan_notebooks([
-            ROOT / "new/docs/meetings/20260522_model_performance_validation.ipynb",
-            ROOT / "new/docs/meetings/20260522_paper_auto_1h_customer_report.ipynb",
-            ROOT / "new/docs/meetings/20260522_paper_auto_1h_report.ipynb",
-        ])
+        notebook_scan = scan_notebooks(sorted(
+            (ROOT / "new/docs/meetings").glob("*.ipynb")
+        ))
 
     zip_scan = {
         "zip_exists": None,

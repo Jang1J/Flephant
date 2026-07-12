@@ -1,0 +1,24 @@
+# Reproducible top-level dependency set validated on Python 3.12.13.
+# Install with: python -m pip install -r requirements.txt -c constraints.txt
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.17.1
+pyarrow==24.0.0
+pykrx==1.2.4
+yfinance==1.2.0
+scikit-learn==1.8.0
+lightgbm==4.6.0
+stable-baselines3==2.8.0
+gymnasium==1.2.3
+torch==2.11.0
+PyYAML==6.0.3
+jsonschema==4.26.0
+python-dotenv==1.2.2
+requests==2.32.5
+grpcio==1.80.0
+grpcio-tools==1.80.0
+kafka-python==2.3.2
+openai==2.29.0
+tsfresh==0.21.1
+transformers==5.8.1
+pytest==9.0.3

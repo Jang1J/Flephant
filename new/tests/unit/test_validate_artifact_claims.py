@@ -77,3 +77,22 @@ def test_scan_json_report_accepts_existing_claimed_path(tmp_path: Path):
 
     assert checked == 1
     assert issues == []
+
+
+def test_build_report_allows_public_tree_without_private_notebooks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    mod = _load_script("validate_artifact_claims")
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+
+    report = mod.build_report(
+        bundle_id="BUNDLE-TEST",
+        scope="current",
+        include_notebooks=True,
+        include_validation_zip=False,
+    )
+
+    assert report["status"] == "PASS"
+    assert report["notebooks"]["notebooks_scanned"] == 0
+    assert report["notebooks"]["missing_claim_count"] == 0

@@ -3,6 +3,7 @@
 # reviewer subagent 대안. 구현 직후 빠르게 돌리는 용도.
 
 set -e
+set -o pipefail
 
 PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -24,35 +25,28 @@ if [ "$LINES" -gt 200 ]; then
 fi
 
 # 3. v2.x 잔재 스캔
-V2X_COUNT=$(grep -rl "architect-reviewer\|idea-merger\|qa-inspector\|gpt-feedback-tracker" .claude/ new/ CLAUDE.md README.md 2>/dev/null | wc -l)
-if [ "$V2X_COUNT" -gt 0 ]; then
+V2X_FILES=$(grep -rl "architect-reviewer\|idea-merger\|qa-inspector\|gpt-feedback-tracker" new/ CLAUDE.md README.md 2>/dev/null || true)
+if [ -n "$V2X_FILES" ]; then
+    V2X_COUNT=$(printf '%s\n' "$V2X_FILES" | wc -l | tr -d ' ')
     echo "[eval] ⚠ v2.x 잔재 ${V2X_COUNT}건 발견"
-    grep -rl "architect-reviewer\|idea-merger\|qa-inspector\|gpt-feedback-tracker" .claude/ new/ CLAUDE.md README.md 2>/dev/null
+    printf '%s\n' "$V2X_FILES"
 else
     echo "[eval] ✓ v2.x 잔재 0건"
 fi
 
-# 4. feature_list.json 파싱 + 진행률
-if $PYTHON -c "
-import json
-data = json.load(open('feature_list.json'))
-total = sum(len(s['features']) for s in data['sprints'])
-done = sum(1 for s in data['sprints'] for f in s['features'] if f['status'] == 'done')
-# SHIP-fix A-2: round 기반 percent (feature_list.json progress.percent 계산식과 통일)
-percent = round(done / total * 100, 1) if total > 0 else 0.0
-print(f'[eval] ✓ feature_list.json: {done}/{total} 완료 ({percent}%)')
-" 2>/dev/null; then
-    :
-else
-    echo "[eval] ✗ feature_list.json 파싱 실패"
+# 4. 공개 배포물에 private handoff 파일이 섞이지 않았는지 확인
+PRIVATE_TRACKED=""
+for path in feature_list.json PROGRESS.md Codex-progress.md claude-progress.md; do
+    if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+        PRIVATE_TRACKED="${PRIVATE_TRACKED}${path}\n"
+    fi
+done
+if [ -n "$PRIVATE_TRACKED" ]; then
+    echo "[eval] ✗ private handoff 파일이 tracked 상태" >&2
+    printf '%b' "$PRIVATE_TRACKED" >&2
+    exit 1
 fi
-
-# 5. claude-progress.md 존재
-if [ -f "claude-progress.md" ]; then
-    echo "[eval] ✓ claude-progress.md 존재"
-else
-    echo "[eval] ⚠ claude-progress.md 없음 — 세션 handoff 불가"
-fi
+echo "[eval] ✓ private handoff 파일 제외 확인"
 
 echo ""
 echo "[eval] 검증 완료"

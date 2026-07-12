@@ -17,6 +17,8 @@ confirms removal.
   - Public portal page snapshots for API guide, category files, and error code pages.
 - `official_portal/json/`
   - Public API detail JSON snapshots for endpoints used by the project.
+  - Token response samples are excluded, even when expired, to keep public
+    secret scanners quiet.
 - `official_portal/excel/`
   - Downloaded official Excel guide files.
   - `domestic_stock_inquire_time_dailychartprice.xlsx`
@@ -37,4 +39,4 @@ confirms removal.
   `...OpenAPI...20260514...xlsx` were not found in local search, Trash, or the
   restored zip source.
 - The restored Excel files above are fresh downloads from the public KIS portal.
-- No `.env` or credential-like files are stored here.
+- No `.env`, access token, or credential-like files are stored here.

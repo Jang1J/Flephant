@@ -1,6 +1,6 @@
-# Elephant Lab — KOSPI 1분봉 멀티에이전트 Decision OS
+# Elephant Lab: KOSPI 1분봉 멀티에이전트 Decision OS
 
-KOSPI 30종목(active 20 + pending 10) 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트, A+).
+KOSPI 30종목 대상 1분봉 멀티에이전트 Decision OS (종합설계 프로젝트, A+).
 
 장중 매 1분 퀀트 시그널 + 이벤트 시 LLM 에이전트 개입 + 장마감 후 자동 진화의 **2모드 × 5레이어** 구조.
 
@@ -11,7 +11,7 @@ Mode A 장중 (09:00~15:30):
   Hot Path : 1분봉 → LightGBM → PPO → PM → FDA approve/veto   (<100ms, LLM 미호출)
   Cold Path: 뉴스/공시/수급 → News/Risk/Debate Agent → FDA    (이벤트 시, 10~30초)
 
-Mode B 장마감 (18:00~22:00):
+Mode B 장마감 (18:00~22:59):
   Alpha Factor Engine → Co-STEER → Backtest Agent → 22:00 배포 게이트
 ```
 
@@ -20,22 +20,24 @@ Mode B 장마감 (18:00~22:00):
 - **Blackboard 통신**: Shared Message Pool + Pub/Sub (MetaGPT 기반)
 - **Dual-Source**: 뉴스↔커뮤니티 divergence = uncertainty 신호
 
-## 최종 상태 (2026-07-04 기준)
+## 프로젝트 결과
 
-### Sprint 진행률: **62 / 62 (100%)**
+**종합설계 최종 평가 A+ · 학기 프로젝트 제출 범위 완료**
 
-| Sprint | 상태 | 비고 |
+| 영역 | 상태 | 비고 |
 |---|---|---|
-| S0 기본 인프라 | done (8/8) | new/src/ 16 디렉토리 + 커넥터 7개 + init/smoke |
-| S1 Hot Path | done (11/11) | LightGBM + PPO + FDA + KIS virtual broker evidence |
-| S2 Cold Path | done (13/13) | News/Risk Fast/Slow/Debate + Blackboard + Event Gateway |
-| S3 Mode B | done (12/12) | Alpha Factor Engine + Co-STEER + Backtest Agent |
-| S4 통합 + Dual-Source | done (14/14) | external KIS evidence, service readiness, paper-safe 운영 검증 |
-| S5 동적 유니버스 | done (4/4) | KOSPI200 watch → admission/exit lifecycle |
+| 기본 인프라 | 완료 | `new/src/` 19개 모듈 영역, connector/config/test harness |
+| Hot Path | 완료 | LightGBM + PPO + Portfolio Manager + FDA |
+| Cold Path | 완료 | News/Risk Fast·Slow/Debate + Blackboard + Event Gateway |
+| Mode B | 완료 | Alpha Factor Engine + Co-STEER + Backtest Agent |
+| 통합 검증 | 완료 | Dual-Source, C12/C14 gate, KIS virtual paper evidence |
+| 동적 유니버스 | 완료 | KOSPI200 watch → admission/exit lifecycle |
 
-종합설계 최종 평가 완료. 데이터 수집-피처화-Mode B 검증-C12 deploy gate-C14 service replay-KIS virtual broker evidence까지 paper-safe 범위에서 검증했다. production registry는 비활성 유지했고, 실거래 전환은 프로젝트 범위에서 제외했다.
+데이터 수집, 피처화, Mode B 검증, C12 deploy gate, C14 service replay, KIS virtual broker evidence까지 paper-safe 범위에서 검증했다. production registry는 비활성으로 유지했고 실거래 전환은 프로젝트 범위에서 제외했다.
 
 ### Prelive Validation
+
+아래 수치는 최종 paper-safe 검증 기록의 요약이다. 원천 시세, 모델 binary, 계좌 정보, broker evidence 원본은 공개본에서 제외했다.
 
 | 항목 | 결과 |
 |---|---|
@@ -53,45 +55,46 @@ Mode B 장마감 (18:00~22:00):
 - ARR=0.197, SR/IR=8.31 (12일 service-policy sample, deflation 검증 필요)
 - MDD=-0.0008, cost_burn_pct_total=38.40% (cost-aware retraining 후보 식별됨)
 
-### 다음 작업
+### 공개본 범위
 
-1. **1주 paper 운영**: KIS virtual broker 기반 일별 paper report 누적 + Sharpe/MDD 운영 리포트 생성.
-2. **Deflated Sharpe** (Bailey & Lopez de Prado 2014) 공식 산출 + full 8-fold walk-forward OOS 재검증.
-3. **cost-aware retraining**: session-close 라벨 실험 (`cost_aware_retraining_plan_*.json` recommended_experiment 참조). `do_not_auto_deploy=true` 존중.
+이 저장소는 소스 코드와 테스트 중심의 포트폴리오 공개본이다. API 키, 계좌 정보, 원천 시세, 학습된 모델, runtime registry, broker evidence는 포함하지 않는다. 따라서 코드 검증은 fresh clone에서 재현할 수 있지만, 과거 모델 배포 결과를 그대로 재실행하려면 별도 데이터와 모델 산출물이 필요하다.
 
 ## 빠른 시작
 
 ### 환경 부트스트랩
 
 ```bash
-./init.sh        # 환경 확인 + 핵심 파일 존재 확인 (9 체크)
-./smoke.sh       # 커넥터 + config 메타 smoke (13 체크)
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt -c constraints.txt
+
+PYTHON=$PWD/.venv/bin/python ./init.sh  # 구조 확인 + gRPC stub 생성
+PYTHON=$PWD/.venv/bin/python ./smoke.sh # mock/unit 기반 12개 smoke
 ```
 
 ### 단위 테스트
 
 ```bash
-PYTHONPATH=$PWD/new \
-  /opt/anaconda3/envs/elephant/bin/python -m pytest new/tests/unit -q
+PYTHONPATH=$PWD/new .venv/bin/python -m pytest new/tests/unit -q
 ```
 
-canonical env (numpy 1.26.4 / lightgbm 4.6.0 / SB3 호환). C-extension 충돌 시 file별 subprocess 전환은 `.claude/rules/test-isolation.md` 참조.
+검증 기준은 Python 3.12.13이며 정확한 top-level 패키지 버전은 `constraints.txt`에 고정했다. C-extension 충돌이 발생하면 각 `new/tests/unit/test_*.py` 파일을 별도 pytest process로 실행한다.
 
 ### 발표 데모 (Hot / Cold / Mode B)
 
 ```bash
 ./demo.sh                              # Hot + Cold + Mode B 통합 데모
-PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/src/jobs/run_final_demo.py --demo hot
-PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/src/jobs/run_final_demo.py --demo cold
-PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/src/jobs/run_final_demo.py --demo mode_b
+PYTHONPATH=new .venv/bin/python new/src/jobs/run_final_demo.py --demo hot
+PYTHONPATH=new .venv/bin/python new/src/jobs/run_final_demo.py --demo cold
+PYTHONPATH=new .venv/bin/python new/src/jobs/run_final_demo.py --demo mode_b
 ```
 
 ### Mode B 18:00~22:59 KST window
 
 ```bash
-ELEPHANT_MODE=mode_b PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/c12_recheck_runner.py --bundle-id BUNDLE-20260512-0AEEE37A --run
-PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/service_policy_replay.py --bundle-id BUNDLE-20260512-0AEEE37A
-PYTHONPATH=new /opt/anaconda3/envs/elephant/bin/python new/scripts/service_readiness_status.py --bundle-id BUNDLE-20260512-0AEEE37A
+ELEPHANT_MODE=mode_b PYTHONPATH=new .venv/bin/python new/scripts/c12_recheck_runner.py --bundle-id BUNDLE-20260512-0AEEE37A --run
+PYTHONPATH=new .venv/bin/python new/scripts/service_policy_replay.py --bundle-id BUNDLE-20260512-0AEEE37A
+PYTHONPATH=new .venv/bin/python new/scripts/service_readiness_status.py --bundle-id BUNDLE-20260512-0AEEE37A
 ```
 
 ## 핵심 차별점
@@ -133,8 +136,8 @@ Elephant_Lab/
 │   │   ├── dynamic_universe/  # C15/C16 admission/exit lifecycle (KOSPI200 watch)
 │   │   ├── eval/           #   L3 reason_code 분포 + Cause Attribution
 │   │   └── ops/            #   AuditLogger (C18), profiler, persistent cache
-│   ├── tests/              # pytest contract/unit/integration (1124 PASS at Sprint 5 close)
-│   ├── jobs/               # E2E / replay / backfill / Mode B / final_demo
+│   ├── tests/              # pytest contract/unit/integration (2,221 tests collected)
+│   ├── src/jobs/           # E2E / replay / backfill / Mode B / final_demo
 │   └── scripts/            # phase2_feature_backfill, c12_recheck, service_*, kis_paper_*
 ├── artifacts/              # gitignored 런타임 산출물 (모델/팩터/오디트/reports)
 ├── init.sh / smoke.sh / demo.sh / eval.sh
@@ -162,9 +165,9 @@ Elephant_Lab/
 | Mode B (장마감) | GPT-4o | 별도 예산 |
 | Fallback | GPT-4o (429/timeout 시) | circuit breaker 3회 → 5분 |
 
-## Artifacts 위치 (gitignored)
+## Runtime artifacts (gitignored)
 
-런타임 산출물은 `artifacts/` 하위. 주요 경로:
+런타임 산출물은 `artifacts/` 아래에서 생성되며 공개 저장소에는 포함하지 않는다. 주요 경로:
 
 | 경로 | 내용 |
 |---|---|
@@ -179,6 +182,6 @@ Elephant_Lab/
 | `artifacts/agent_memory/{agent}/{YYYYMMDD}.jsonl` | 에이전트 메모리 일별 append |
 | `artifacts/audit/agent_performance/{YYYYMMDD}.jsonl` | C18 AgentPerformance 18 필드 |
 
-## 라이선스
+## 공개 정책
 
-종합설계 포트폴리오용 공개 코드. 실거래 키, 계좌 정보, 런타임 산출물은 포함하지 않는다.
+개인 종합설계 포트폴리오 공개본. 실거래 키, 계좌 정보, 원천 데이터, 런타임 산출물은 포함하지 않는다. `vendor/reference/`의 제3자 자료는 각 원출처의 권리를 따른다.

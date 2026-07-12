@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -12,6 +13,12 @@ def _load_script(name: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
 def test_community_live_risk_smoke_publishes_and_reaches_fda(tmp_path, monkeypatch):
@@ -206,9 +213,54 @@ def test_community_source_health_standalone_from_smoke(tmp_path, monkeypatch):
 
 def test_source_scope_summary_reports_current_gap(tmp_path):
     script = _load_script("source_scope_summary")
+    script.ROOT = tmp_path
+    bundle_id = "BUNDLE-20260518-195M0001"
+
+    _write_json(
+        tmp_path / "artifacts/reports/build_news_dart_archive/build_news_dart_archive_fixture.json",
+        {
+            "status": "PASS",
+            "date_count": 2,
+            "ticker_count": 30,
+            "total_events": 12,
+            "zero_event_date_count": 0,
+        },
+    )
+    _write_json(
+        tmp_path / "artifacts/reports/dual_source_history/materialize_dual_source_history_fixture.json",
+        {
+            "status": "PASS",
+            "date_count": 2,
+            "files_written": ["day-1.json", "day-2.json"],
+            "per_date": [
+                {
+                    "score_count": 30,
+                    "non_neutral": True,
+                    "source_stats": {
+                        "news_event_count": 12,
+                        "community_event_count": 0,
+                    },
+                }
+            ],
+            "coverage": {
+                "dual_source_non_neutral_date_coverage": 1.0,
+                "min_dual_source_non_neutral_date_coverage": 0.8,
+            },
+        },
+    )
+    _write_json(
+        tmp_path / f"artifacts/bundles/{bundle_id}/lgbm/latest_model_metadata.json",
+        {
+            "version": "test-model",
+            "feature_cols": ["news_score_t", "us_sp500_change"],
+        },
+    )
+    implementation = tmp_path / "new/scripts/community_live_risk_smoke.py"
+    implementation.parent.mkdir(parents=True, exist_ok=True)
+    implementation.write_text("# synthetic fixture\n", encoding="utf-8")
 
     report = script.build_source_scope_summary(
-        bundle_id="BUNDLE-20260518-195M0001",
+        bundle_id=bundle_id,
         output_dir=tmp_path,
         write_report=False,
     )

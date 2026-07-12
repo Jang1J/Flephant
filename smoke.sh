@@ -4,6 +4,7 @@
 
 set -e
 set -u
+set -o pipefail
 
 PYTHON="${PYTHON:-/opt/anaconda3/envs/elephant/bin/python}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -12,6 +13,11 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 PASS=0
 FAIL=0
+PYTEST_LOG=$(mktemp "${TMPDIR:-/tmp}/elephant_pytest.XXXXXX")
+cleanup_log() {
+    rm -f "$PYTEST_LOG"
+}
+trap cleanup_log EXIT
 
 _pass() { echo "[smoke] ✓ $1"; PASS=$((PASS+1)); }
 _fail() { echo "[smoke] ✗ $1" >&2; FAIL=$((FAIL+1)); }
@@ -22,7 +28,7 @@ echo "[smoke] thread caps: OMP=$OMP_NUM_THREADS OPENBLAS=$OPENBLAS_NUM_THREADS M
 echo ""
 
 # ===========================================================================
-# 기존 메타 확인 (1~3)
+# 저장소 메타 확인
 # ===========================================================================
 
 # 1. CLAUDE.md 250줄 이하 (S0 cleanup 반영: audit + Sprint 5 + 4축 정합 추가로 증가)
@@ -55,13 +61,6 @@ else
     _fail "config yaml ${CONFIG_COUNT}개 (<10)"
 fi
 
-# 3c. feature_list.json 파싱 가능
-if $PYTHON -c "import json; json.load(open('feature_list.json'))" 2>/dev/null; then
-    _pass "feature_list.json 파싱 OK"
-else
-    _fail "feature_list.json 파싱 실패 (파일 없거나 JSON 오류)"
-fi
-
 # ===========================================================================
 # 코드 실 동작 검증 (4~11)
 # ===========================================================================
@@ -69,10 +68,10 @@ fi
 # 4. pytest 전체 실행
 echo ""
 echo "[smoke] --- pytest 실행 ---"
-if $PYTHON -m pytest new/tests/ -q 2>&1 | tee /tmp/elephant_pytest.log | tail -5; then
-    PYTEST_RESULT=$(tail -1 /tmp/elephant_pytest.log)
+if $PYTHON -m pytest new/tests/ -q 2>&1 | tee "$PYTEST_LOG" | tail -5; then
+    PYTEST_RESULT=$(tail -1 "$PYTEST_LOG")
     if echo "$PYTEST_RESULT" | grep -q "failed\|error"; then
-        _fail "pytest: 일부 실패 (로그: /tmp/elephant_pytest.log)"
+        _fail "pytest: 일부 실패"
     else
         _pass "pytest 전체 PASS ($PYTEST_RESULT)"
     fi
@@ -294,7 +293,7 @@ echo ""
 echo "================================================================"
 echo "[smoke] 결과: ${PASS} PASS / ${FAIL} FAIL"
 if [ "$FAIL" -eq 0 ]; then
-    echo "[smoke] ✓ 전체 PASS (${PASS}/13)"
+    echo "[smoke] ✓ 전체 PASS (${PASS}/12)"
     exit 0
 else
     echo "[smoke] ✗ ${FAIL}건 실패 — 확인 필요"
